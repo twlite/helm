@@ -44,10 +44,14 @@ services:
       - PORT=3000
       - CHROMA_URL=http://chromadb:8000
       - DESKTOP_HOST=desktop
+      - DESKTOP_CONTROL_MODE=docker-exec
+      - DESKTOP_CONTAINER=agent-desktop
       - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:1234/v1}
       - MODEL_PROVIDER=${MODEL_PROVIDER:-openai}
-      - EMBED_MODEL=${EMBED_MODEL:-nomic-embed-text}
+      - EMBED_MODEL=${EMBED_MODEL:-text-embedding-nomic-embed-text-v1.5}
       - VLM_MODEL=${VLM_MODEL:-qwen/qwen3.5-9b}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - chromadb
       - desktop

@@ -12,41 +12,6 @@ configure_desktop_look() {
 		wallpaper="$(find /usr/share/backgrounds -type f | head -n 1 || true)"
 	fi
 
-	if command -v chromium >/dev/null 2>&1; then
-		browser_exec="chromium"
-	elif command -v chromium-browser >/dev/null 2>&1; then
-		browser_exec="chromium-browser"
-	elif command -v firefox >/dev/null 2>&1; then
-		browser_exec="firefox"
-	fi
-
-	mkdir -p "$HOME/Desktop"
-	cat > "$HOME/Desktop/Browser.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Version=1.0
-Name=Browser
-Comment=Open web browser
-Exec=${browser_exec}
-Icon=web-browser
-Terminal=false
-Categories=Network;WebBrowser;
-EOF
-
-	cat > "$HOME/Desktop/Terminal.desktop" <<EOF
-[Desktop Entry]
-Type=Application
-Version=1.0
-Name=Terminal
-Comment=Open terminal
-Exec=xfce4-terminal
-Icon=utilities-terminal
-Terminal=false
-Categories=System;TerminalEmulator;
-EOF
-
-	chmod +x "$HOME/Desktop/Browser.desktop" "$HOME/Desktop/Terminal.desktop"
-
 	# Enable XFCE desktop icons and apply a less bare default visual style.
 	xfconf-query -c xfce4-desktop -p /desktop-icons/style -n -t int -s 2 || true
 	xfconf-query -c xfce4-desktop -p /desktop-icons/file-icons/show-home -n -t bool -s true || true

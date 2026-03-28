@@ -6,13 +6,19 @@
     "start": "tsx src/index.ts"
   },
   "dependencies": {
+    "@ai-sdk/devtools": "^0.0.15",
+    "@ai-sdk/openai-compatible": "^2.0.37",
+    "@chroma-core/default-embed": "^0.1.9",
     "@helm/desktop": "workspace:*",
     "@hono/node-server": "^1.19.11",
-    "hono": "^4.12.9"
+    "ai": "^6.0.141",
+    "chromadb": "^3.4.0",
+    "hono": "^4.12.9",
+    "tsx": "^4.21.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/node": "^20.11.17",
-    "tsx": "^4.21.0",
+    "@types/node": "catalog:",
     "typescript": "^5.8.3"
   }
 }
