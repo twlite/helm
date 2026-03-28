@@ -1,0 +1,79 @@
+services:
+  desktop:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    container_name: agent-desktop
+    ports:
+      - "6080:6080"
+    environment:
+      - DISPLAY=:99
+      - RESOLUTION=1280x720x24
+    volumes:
+      - desktop-home:/home/agent
+      - ./agent/scripts:/agent/scripts:ro
+    networks:
+      - internal
+    cap_add:
+      - SYS_ADMIN
+    restart: unless-stopped
+
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: agent-chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    networks:
+      - internal
+    restart: unless-stopped
+
+  server:
+    build:
+      context: .
+      dockerfile: ./apps/server/Dockerfile
+    container_name: agent-server
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - CHROMA_URL=http://chromadb:8000
+      - DESKTOP_HOST=desktop
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:1234/v1}
+      - MODEL_PROVIDER=${MODEL_PROVIDER:-openai}
+      - EMBED_MODEL=${EMBED_MODEL:-nomic-embed-text}
+      - VLM_MODEL=${VLM_MODEL:-qwen/qwen3.5-9b}
+    depends_on:
+      - chromadb
+      - desktop
+    networks:
+      - internal
+    restart: unless-stopped
+
+  client:
+    build:
+      context: .
+      dockerfile: ./apps/client/Dockerfile
+      args:
+        VITE_SERVER_URL: ${VITE_SERVER_URL:-http://localhost:3000}
+    container_name: agent-client
+    ports:
+      - "5173:80"
+    depends_on:
+      - server
+    networks:
+      - internal
+    restart: unless-stopped
+
+volumes:
+  chroma-data:
+  desktop-home:
+
+networks:
+  internal:
+    driver: bridge

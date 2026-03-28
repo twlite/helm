@@ -1,0 +1,14 @@
+{
+  "name": "@helm/monorepo",
+  "private": true,
+  "scripts": {},
+  "devDependencies": {
+    "@types/node": "^24.6.1"
+  },
+  "author": "Twilight <hello@twlite.dev>",
+  "license": "MIT",
+  "packageManager": "pnpm@10.30.3",
+  "volta": {
+    "node": "24.14.1"
+  }
+}

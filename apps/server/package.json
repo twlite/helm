@@ -1,0 +1,18 @@
+{
+  "name": "@helm/server",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx --watch src/index.ts",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@helm/desktop": "workspace:*",
+    "@hono/node-server": "^1.19.11",
+    "hono": "^4.12.9"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.17",
+    "tsx": "^4.21.0",
+    "typescript": "^5.8.3"
+  }
+}
