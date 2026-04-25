@@ -216,9 +216,11 @@ const buildCompletedNavigationFallback = (args: {
   return `Firefox navigated to ${args.url} and a screenshot was captured after navigation.${titleText} The page appears to be the Neplex website.`;
 };
 
-const isNavigationObserved = (steps: Array<{
-  toolResults: Array<{ toolName: string; output: unknown }>;
-}>): boolean => {
+const isNavigationObserved = (
+  steps: Array<{
+    toolResults: Array<{ toolName: string; output: unknown }>;
+  }>,
+): boolean => {
   const results = steps.flatMap((step) => step.toolResults);
   const navigationIndex = results.findLastIndex((result) => {
     if (result.toolName !== 'navigate_browser_url') {
@@ -242,9 +244,11 @@ const isNavigationObserved = (steps: Array<{
   });
 };
 
-const isTerminalPreviewObserved = (steps: Array<{
-  toolResults: Array<{ toolName: string; output: unknown }>;
-}>): boolean => {
+const isTerminalPreviewObserved = (
+  steps: Array<{
+    toolResults: Array<{ toolName: string; output: unknown }>;
+  }>,
+): boolean => {
   const results = steps.flatMap((step) => step.toolResults);
   return results.some((result) => {
     if (result.toolName !== 'run_terminal_command') {
@@ -533,7 +537,8 @@ export const runAgentConversation = async (args: {
       '- Treat screenshot/tool output as the only ground truth; do not infer unobserved details.',
       '- Use tools to interact with the desktop, one atomic step at a time.',
       '- For Firefox or Terminal, prefer open_application instead of coordinate clicking.',
-      '- For terminal file or shell tasks, prefer run_terminal_command because it returns stdout/stderr as ground truth.',
+      '- For basic file tasks, prefer create_file/read_file/delete_file/open_file/list_files.',
+      '- For complex shell tasks, prefer run_terminal_command because it returns stdout/stderr as ground truth.',
       '- Use list_desktop_windows to confirm launched applications and avoid relying only on cursor location.',
       '- Before each action, decide the expected visible outcome; after the action, verify that outcome.',
       '- Continue taking atomic steps in this same run until the objective is complete or blocked.',
@@ -576,12 +581,10 @@ export const runAgentConversation = async (args: {
     let assistantText = '';
     let reasoningText = '';
 
-    const consumeTextStream = async (
-      result: {
-        fullStream: AsyncIterable<Record<string, unknown>>;
-        text: PromiseLike<string>;
-      },
-    ): Promise<void> => {
+    const consumeTextStream = async (result: {
+      fullStream: AsyncIterable<Record<string, unknown>>;
+      text: PromiseLike<string>;
+    }): Promise<void> => {
       for await (const chunk of result.fullStream) {
         assertRunNotCancelled({ abortSignal, conversationId, runId });
         const chunkType = normalizeText(chunk.type);
@@ -690,7 +693,8 @@ export const runAgentConversation = async (args: {
             {
               type: 'image',
               image: imageBase64,
-              mediaType: normalizeText(screenshot.output.mimeType) || 'image/png',
+              mediaType:
+                normalizeText(screenshot.output.mimeType) || 'image/png',
             },
           ],
         },
