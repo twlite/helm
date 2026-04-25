@@ -22,3 +22,26 @@ export interface ScreenSize {
   width: number;
   height: number;
 }
+
+export type DesktopApplication = 'firefox' | 'terminal';
+
+export interface DesktopWindowInfo {
+  className?: string;
+  id: number;
+  name: string;
+}
+
+export interface DesktopLaunchResult {
+  action: 'focused_existing' | 'launched';
+  app: DesktopApplication;
+  matchedWindow?: DesktopWindowInfo;
+  windows: DesktopWindowInfo[];
+}
+
+export interface DesktopShellCommandResult {
+  command: string;
+  exitCode: number;
+  ok: boolean;
+  stderr: string;
+  stdout: string;
+}

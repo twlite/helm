@@ -1,41 +1,66 @@
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_PRIORITY=high
 
-# Install sudo, desktop, VNC, and general-purpose apps
-RUN apt-get update -qq && \
-    apt-get install -y -qq --no-install-recommends \
-      sudo xfce4 xfce4-goodies xfce4-terminal dbus-x11 x11-xserver-utils \
-      x11vnc xvfb novnc websockify \
-      xdotool scrot curl ca-certificates nano vim git wget gnupg \
-      libreoffice fonts-ubuntu papirus-icon-theme arc-theme \
-    && wget -q -O /tmp/google-chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-    && apt-get install -y -qq --no-install-recommends /tmp/google-chrome.deb \
-    && rm -f /tmp/google-chrome.deb \
-    && if [ "$(apt-cache policy chromium | awk '/Candidate:/ {print $2}')" != "(none)" ]; then \
-         apt-get install -y -qq --no-install-recommends chromium; \
-       elif [ "$(apt-cache policy chromium-browser | awk '/Candidate:/ {print $2}')" != "(none)" ]; then \
-         apt-get install -y -qq --no-install-recommends chromium-browser; \
-       else \
-         echo "[helm] Chromium package not available on this base image; continuing with Google Chrome only."; \
-       fi \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get -y upgrade && \
+    apt-get -y install \
+      xvfb \
+      ca-certificates \
+      xterm \
+      lxterminal \
+      xdotool \
+      scrot \
+      imagemagick \
+      sudo \
+      openbox \
+      dbus-x11 \
+      x11vnc \
+      tint2 \
+      pcmanfm \
+      desktop-file-utils \
+      adwaita-icon-theme \
+      fonts-dejavu \
+      xdg-utils \
+      gedit \
+      galculator \
+      net-tools \
+      netcat \
+      curl \
+      git \
+      unzip \
+      x11-apps \
+      x11-xserver-utils \
+      software-properties-common && \
+    add-apt-repository ppa:mozillateam/ppa && \
+    apt-get install -y --no-install-recommends \
+      firefox-esr && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Create agent user with passwordless sudo
-RUN useradd -ms /bin/bash agent && \
-    echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
+RUN git clone --branch v1.5.0 https://github.com/novnc/noVNC.git /opt/noVNC && \
+    git clone --branch v0.12.0 https://github.com/novnc/websockify /opt/noVNC/utils/websockify && \
+    ln -s /opt/noVNC/vnc.html /opt/noVNC/index.html
 
-# Non-root X servers require this directory to exist with sticky bit.
-RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+ENV USERNAME=agent
+ENV HOME=/home/$USERNAME
+RUN useradd -m -s /bin/bash -d $HOME $USERNAME && \
+    echo "${USERNAME} ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
 USER agent
-WORKDIR /home/agent
+WORKDIR $HOME
 
-# Copy scripts
-COPY ./scripts /agent/scripts
-RUN chmod +x /agent/scripts/entrypoint.sh || true
+ARG DISPLAY_NUM=99
+ARG HEIGHT=720
+ARG WIDTH=1280
+ENV DISPLAY_NUM=$DISPLAY_NUM
+ENV HEIGHT=$HEIGHT
+ENV WIDTH=$WIDTH
+ENV DISPLAY=:${DISPLAY_NUM}
 
-# Expose noVNC port
+COPY --chown=agent:agent ./scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
 EXPOSE 6080
 
-ENTRYPOINT ["/agent/scripts/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

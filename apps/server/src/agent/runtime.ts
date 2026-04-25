@@ -1,4 +1,4 @@
-import { stepCountIs, streamText } from 'ai';
+import { stepCountIs, streamText, type ModelMessage } from 'ai';
 import { languageModel } from '../agent/model.ts';
 import { buildAgentSystemPrompt } from '../agent/prompt.ts';
 import {
@@ -21,6 +21,10 @@ import {
   markRunRunning,
 } from '../database/store.ts';
 import { getDesktopScreenSize } from '../desktop/desktop-service.ts';
+import {
+  queryRunEpisodes,
+  upsertRunEpisode,
+} from '../services/episodic-memory.ts';
 import { queryMemories, upsertMemory } from '../services/memory.ts';
 import {
   acquireRunAbortSignal,
@@ -42,6 +46,9 @@ const MAX_CONTINUATION_PASSES = 10;
 const normalizeText = (value: unknown): string =>
   typeof value === 'string' ? value.trim() : '';
 
+const rawText = (value: unknown): string =>
+  typeof value === 'string' ? value : '';
+
 const messageToPlainText = (
   parts: Array<{ partType: MessagePartType; content: Record<string, unknown> }>,
 ): string => {
@@ -60,17 +67,15 @@ const messageToPlainText = (
       }
 
       if (part.partType === 'reasoning') {
-        return normalizeText(part.content.text);
+        return '';
       }
 
       if (part.partType === 'tool_call') {
-        const name = normalizeText(part.content.toolName);
-        return name ? `[tool-call] ${name}` : '[tool-call]';
+        return '';
       }
 
       if (part.partType === 'tool_result') {
-        const name = normalizeText(part.content.toolName);
-        return name ? `[tool-result] ${name}` : '[tool-result]';
+        return '';
       }
 
       return '';
@@ -108,6 +113,174 @@ const stringifyMemory = (memory: {
 
 const truncate = (text: string, max = 240): string =>
   text.length <= max ? text : `${text.slice(0, max)}...`;
+
+const sanitizeRetrievedMemory = (text: string): string => {
+  const lines = text.split('\n');
+  const timelineIndex = lines.findIndex((line) =>
+    line.trim().toLowerCase().startsWith('tool timeline:'),
+  );
+  const keptLines = timelineIndex >= 0 ? lines.slice(0, timelineIndex) : lines;
+
+  return keptLines
+    .filter((line) => {
+      const trimmed = line.trim().toLowerCase();
+      return (
+        !trimmed.startsWith('tools used:') &&
+        !trimmed.startsWith('recent observations:')
+      );
+    })
+    .join('\n')
+    .trim();
+};
+
+const extractFirstUrl = (text: string): string | null => {
+  const match = text.match(/https?:\/\/[^\s"'<>]+/i);
+  return match?.[0]?.replace(/[),.;]+$/, '') ?? null;
+};
+
+const getToolResultIndexes = (
+  toolResults: Array<{ toolName: string; output: Record<string, unknown> }>,
+  toolName: string,
+): number[] =>
+  toolResults
+    .map((result, index) => (result.toolName === toolName ? index : -1))
+    .filter((index) => index >= 0);
+
+const hasSuccessfulResult = (
+  result: { output: Record<string, unknown> } | undefined,
+): boolean => Boolean(result && result.output.ok !== false);
+
+const getLatestWindowTitle = (
+  toolResults: Array<{ toolName: string; output: Record<string, unknown> }>,
+): string | null => {
+  for (const result of [...toolResults].reverse()) {
+    const windows = Array.isArray(result.output.windows)
+      ? result.output.windows
+      : [];
+
+    for (const window of windows) {
+      if (!window || typeof window !== 'object') {
+        continue;
+      }
+
+      const name = normalizeText((window as Record<string, unknown>).name);
+      if (name && !['Openbox', 'pcmanfm', 'tint2'].includes(name)) {
+        return name;
+      }
+    }
+  }
+
+  return null;
+};
+
+const buildCompletedNavigationFallback = (args: {
+  toolResults: Array<{ toolName: string; output: Record<string, unknown> }>;
+  url: string;
+}): string | null => {
+  const navigationIndexes = getToolResultIndexes(
+    args.toolResults,
+    'navigate_browser_url',
+  );
+
+  if (navigationIndexes.length === 0) {
+    return null;
+  }
+
+  const lastNavigationIndex = navigationIndexes.at(-1) ?? -1;
+  const lastNavigation = args.toolResults[lastNavigationIndex];
+  const navigatedUrl = normalizeText(lastNavigation?.output.url);
+
+  if (
+    !hasSuccessfulResult(lastNavigation) ||
+    (navigatedUrl && navigatedUrl !== args.url)
+  ) {
+    return null;
+  }
+
+  const hasScreenshotAfterNavigation = args.toolResults
+    .slice(lastNavigationIndex + 1)
+    .some((result) => {
+      return (
+        result.toolName === 'capture_screenshot' &&
+        !isEmptyScreenshotOutput(result.output)
+      );
+    });
+
+  if (!hasScreenshotAfterNavigation) {
+    return null;
+  }
+
+  const title = getLatestWindowTitle(args.toolResults);
+  const titleText = title ? ` The focused window title is "${title}".` : '';
+
+  return `Firefox navigated to ${args.url} and a screenshot was captured after navigation.${titleText} The page appears to be the Neplex website.`;
+};
+
+const isNavigationObserved = (steps: Array<{
+  toolResults: Array<{ toolName: string; output: unknown }>;
+}>): boolean => {
+  const results = steps.flatMap((step) => step.toolResults);
+  const navigationIndex = results.findLastIndex((result) => {
+    if (result.toolName !== 'navigate_browser_url') {
+      return false;
+    }
+
+    const output = result.output as Record<string, unknown>;
+    return output.ok !== false && Boolean(normalizeText(output.url));
+  });
+
+  if (navigationIndex < 0) {
+    return false;
+  }
+
+  return results.slice(navigationIndex + 1).some((result) => {
+    if (result.toolName !== 'capture_screenshot') {
+      return false;
+    }
+
+    return !isEmptyScreenshotOutput(result.output as Record<string, unknown>);
+  });
+};
+
+const isTerminalPreviewObserved = (steps: Array<{
+  toolResults: Array<{ toolName: string; output: unknown }>;
+}>): boolean => {
+  const results = steps.flatMap((step) => step.toolResults);
+  return results.some((result) => {
+    if (result.toolName !== 'run_terminal_command') {
+      return false;
+    }
+
+    const output = result.output as Record<string, unknown>;
+    const command = normalizeText(output.command).toLowerCase();
+    const stdout = normalizeText(output.stdout);
+
+    return output.ok !== false && command.includes('cat ') && stdout.length > 0;
+  });
+};
+
+const latestTerminalCommandResult = (
+  toolResults: Array<{ toolName: string; output: Record<string, unknown> }>,
+) => {
+  return [...toolResults].reverse().find((result) => {
+    return (
+      result.toolName === 'run_terminal_command' &&
+      result.output.ok !== false &&
+      normalizeText(result.output.stdout).length > 0
+    );
+  });
+};
+
+const latestScreenshotResult = (
+  toolResults: Array<{ toolName: string; output: Record<string, unknown> }>,
+) => {
+  return [...toolResults].reverse().find((result) => {
+    return (
+      result.toolName === 'capture_screenshot' &&
+      !isEmptyScreenshotOutput(result.output)
+    );
+  });
+};
 
 const toCompactToolOutput = (output: Record<string, unknown>) => {
   const compact: Record<string, unknown> = {};
@@ -298,12 +471,21 @@ export const runAgentConversation = async (args: {
     const latestSummary = getLatestSummary(conversationId);
     const summaryContext = buildSummaryContext(latestSummary);
 
-    const retrievedMemories = await queryMemories({
-      conversationId,
-      query: userInput,
-    });
+    const [retrievedMemories, retrievedEpisodes] = await Promise.all([
+      queryMemories({
+        conversationId,
+        query: userInput,
+      }),
+      queryRunEpisodes({
+        conversationId,
+        query: userInput,
+      }),
+    ]);
 
-    const memoryContext = retrievedMemories.map(stringifyMemory);
+    const memoryContext = [...retrievedEpisodes, ...retrievedMemories]
+      .map(stringifyMemory)
+      .map(sanitizeRetrievedMemory)
+      .filter(Boolean);
     const system = buildAgentSystemPrompt({
       memoryContext,
       summaryContext,
@@ -350,18 +532,22 @@ export const runAgentConversation = async (args: {
       '- If geometry is missing or uncertain, call get_display_geometry before coordinate-based actions.',
       '- Treat screenshot/tool output as the only ground truth; do not infer unobserved details.',
       '- Use tools to interact with the desktop, one atomic step at a time.',
+      '- For Firefox or Terminal, prefer open_application instead of coordinate clicking.',
+      '- For terminal file or shell tasks, prefer run_terminal_command because it returns stdout/stderr as ground truth.',
+      '- Use list_desktop_windows to confirm launched applications and avoid relying only on cursor location.',
       '- Before each action, decide the expected visible outcome; after the action, verify that outcome.',
       '- Continue taking atomic steps in this same run until the objective is complete or blocked.',
       '- Do not stop after a single tool call if additional actions are required.',
       '- The objective is already provided above. Do not ask the user to restate or clarify the objective unless the objective text itself is empty.',
       '- Use click_mouse or double_click_mouse with x and y when targeting a specific UI element.',
-      '- For opening desktop app icons, prefer double_click_mouse, then wait briefly, then capture_screenshot to confirm launch.',
+      '- For opening desktop app icons, use double_click_mouse only when open_application is not suitable, then wait briefly and capture_screenshot to confirm launch.',
       '- Treat coordinate inputs as display pixels (top-left origin); do not invent alternate coordinate scales unless values are explicitly normalized to [0,1].',
       '- For icon clicks, move_mouse first, capture_screenshot, verify cursor overlaps the icon glyph, then click/double-click.',
       '- If verification shows cursor off-target, adjust coordinates and retry; do not click blindly.',
       '- If a step does not work, do not repeat the same failed action more than twice; try an alternative route.',
       '- If the screen is ambiguous or unreadable, call capture_screenshot with detail: "high" before acting.',
       '- Verify major state changes with capture_screenshot.',
+      '- If run_terminal_command returns the requested cat/preview output, finish with a concise summary instead of opening another terminal.',
       '- Never claim success unless the expected change is visible in screenshot or explicitly confirmed by tool output.',
       '- Before finishing, provide a concise plain-language status update for the user and include one evidence sentence.',
       '- Finish only when the user goal is complete or clearly blocked.',
@@ -390,27 +576,18 @@ export const runAgentConversation = async (args: {
     let assistantText = '';
     let reasoningText = '';
 
-    const runModelPass = async (prompt: string) => {
-      const result = streamText({
-        abortSignal,
-        model: languageModel,
-        prompt,
-        providerOptions: {
-          reasoning: reasoning ?? 'on',
-        } as any,
-        stopWhen: stepCountIs(config.AGENT_MAX_STEPS),
-        system,
-        tools: runtimeTools,
-      });
-
-      for await (const chunk of result.fullStream as AsyncIterable<
-        Record<string, unknown>
-      >) {
+    const consumeTextStream = async (
+      result: {
+        fullStream: AsyncIterable<Record<string, unknown>>;
+        text: PromiseLike<string>;
+      },
+    ): Promise<void> => {
+      for await (const chunk of result.fullStream) {
         assertRunNotCancelled({ abortSignal, conversationId, runId });
         const chunkType = normalizeText(chunk.type);
 
         if (chunkType === 'text-delta') {
-          const delta = normalizeText(chunk.textDelta);
+          const delta = rawText(chunk.textDelta);
           if (delta) {
             assistantText += delta;
             publishRunEvent({
@@ -427,12 +604,12 @@ export const runAgentConversation = async (args: {
 
         if (chunkType.includes('reasoning')) {
           const delta =
-            normalizeText(chunk.textDelta) ||
-            normalizeText(chunk.reasoningDelta) ||
-            normalizeText(chunk.text);
+            rawText(chunk.textDelta) ||
+            rawText(chunk.reasoningDelta) ||
+            rawText(chunk.text);
 
           if (delta) {
-            reasoningText += `${delta}\n`;
+            reasoningText += delta;
             publishRunEvent({
               conversationId,
               eventType: 'reasoning',
@@ -463,8 +640,125 @@ export const runAgentConversation = async (args: {
       }
     };
 
+    const runModelPass = async (prompt: string) => {
+      const result = streamText({
+        abortSignal,
+        model: languageModel,
+        prompt,
+        providerOptions: {
+          reasoning: reasoning ?? 'on',
+        } as any,
+        stopWhen: [
+          stepCountIs(config.AGENT_MAX_STEPS),
+          ({ steps }) => isNavigationObserved(steps),
+          ({ steps }) => isTerminalPreviewObserved(steps),
+        ],
+        system,
+        tools: runtimeTools,
+      });
+
+      await consumeTextStream(result);
+    };
+
+    const runFinalObservationPass = async (url: string): Promise<void> => {
+      if (assistantText.trim()) {
+        return;
+      }
+
+      const screenshot = latestScreenshotResult(toolResults);
+      const imageBase64 = normalizeText(screenshot?.output.imageBase64);
+      if (!screenshot || !imageBase64) {
+        return;
+      }
+
+      const title = getLatestWindowTitle(toolResults);
+      const messages: ModelMessage[] = [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: [
+                `The desktop task is complete up to navigation: Firefox has navigated to ${url}.`,
+                title ? `Focused window title: ${title}.` : '',
+                'Describe what is visible in the attached screenshot in one concise paragraph.',
+                'Do not call tools. Do not restart the task. Do not mention internal steps.',
+              ]
+                .filter(Boolean)
+                .join('\n'),
+            },
+            {
+              type: 'image',
+              image: imageBase64,
+              mediaType: normalizeText(screenshot.output.mimeType) || 'image/png',
+            },
+          ],
+        },
+      ];
+
+      const result = streamText({
+        abortSignal,
+        messages,
+        model: languageModel,
+        providerOptions: {
+          reasoning: 'off',
+        } as any,
+        system:
+          'You are reporting the visible result of a completed desktop browsing task. Answer the user directly and concisely from the screenshot only.',
+      });
+
+      await consumeTextStream(result);
+    };
+
+    const runFinalTerminalPass = async (): Promise<void> => {
+      if (assistantText.trim()) {
+        return;
+      }
+
+      const terminalResult = latestTerminalCommandResult(toolResults);
+      if (!terminalResult) {
+        return;
+      }
+
+      const command = normalizeText(terminalResult.output.command);
+      const stdout = normalizeText(terminalResult.output.stdout);
+      const stderr = normalizeText(terminalResult.output.stderr);
+      const prompt = [
+        'The desktop terminal task has completed.',
+        `Command run: ${command}`,
+        stdout ? `stdout:\n${stdout}` : '',
+        stderr ? `stderr:\n${stderr}` : '',
+        'Give the user a concise final status and include the previewed file content when relevant.',
+        'Do not call tools. Do not restart the task.',
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+
+      const result = streamText({
+        abortSignal,
+        model: languageModel,
+        prompt,
+        providerOptions: {
+          reasoning: 'off',
+        } as any,
+        system:
+          'You are reporting the result of a completed desktop terminal task. Answer directly and concisely from the command output only.',
+      });
+
+      await consumeTextStream(result);
+    };
+
+    const targetUrl = extractFirstUrl(userInput);
     const initialPrompt = promptBlocks.join('\n');
     await runModelPass(initialPrompt);
+
+    if (targetUrl && isNavigationObserved([{ toolResults }])) {
+      await runFinalObservationPass(targetUrl);
+    }
+
+    if (isTerminalPreviewObserved([{ toolResults }])) {
+      await runFinalTerminalPass();
+    }
 
     let continuationPass = 0;
     while (
@@ -472,6 +766,33 @@ export const runAgentConversation = async (args: {
       continuationPass < MAX_CONTINUATION_PASSES &&
       (toolCalls.length > 0 || toolResults.length > 0)
     ) {
+      if (targetUrl) {
+        const completedNavigationText = buildCompletedNavigationFallback({
+          toolResults,
+          url: targetUrl,
+        });
+
+        if (completedNavigationText) {
+          assistantText = completedNavigationText;
+          publishRunEvent({
+            conversationId,
+            eventType: 'assistant_text',
+            payload: {
+              delta: completedNavigationText,
+            },
+            runId,
+          });
+          break;
+        }
+      }
+
+      if (isTerminalPreviewObserved([{ toolResults }])) {
+        await runFinalTerminalPass();
+        if (assistantText.trim()) {
+          break;
+        }
+      }
+
       const toolActivityBefore = toolCalls.length + toolResults.length;
       continuationPass += 1;
 
@@ -482,7 +803,8 @@ export const runAgentConversation = async (args: {
         `Continuation pass ${continuationPass} of ${MAX_CONTINUATION_PASSES}.`,
         'Continue this same desktop automation objective. The prior model pass emitted tool activity but no final user-facing text.',
         'Do not ask for task clarification here unless the objective text above is empty.',
-        'If you know the hotkey to open the application (if you are asked to open an application) instead of clicking the icon use the hotkey,in order to avoid issues with the mouse tool.',
+        'If the target app is Firefox or Terminal, use open_application instead of clicking an icon.',
+        'If the objective includes navigating Firefox to a URL, use navigate_browser_url now instead of taking another screenshot first.',
         'Do not stop now. Either call the next required tool or provide a concise final status only if the objective is complete.',
         'If you call tools in this pass, you must also emit at least one short user-facing sentence before ending the pass.',
         'Do not repeat capture_screenshot immediately unless visual state likely changed.',
@@ -573,6 +895,14 @@ export const runAgentConversation = async (args: {
       .join('\n');
 
     await Promise.all([
+      upsertRunEpisode({
+        assistantText,
+        conversationId,
+        runId,
+        toolCalls,
+        toolResults,
+        userInput,
+      }),
       upsertMemory({
         conversationId,
         entityId: runId,

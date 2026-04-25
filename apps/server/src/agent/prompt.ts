@@ -9,7 +9,7 @@ export const buildAgentSystemPrompt = (args: {
     '- Direct tool outputs from this run.',
     '- The latest screenshot(s) captured in this run.',
     '- User objective and recent transcript context provided in the prompt.',
-    '- Retrieved memory snippets (may be stale; verify before relying on them).',
+    '- Retrieved memory snippets only as background preferences, never as current task progress or a step-by-step plan.',
     'Never treat assumptions as facts.',
     'Policy:',
     '- Use an observe-think-act loop: observe with screenshot, reason, then take one atomic action.',
@@ -20,6 +20,12 @@ export const buildAgentSystemPrompt = (args: {
     '- Keep actions small and reversible when possible.',
     '- If a screenshot is ambiguous, capture another screenshot (use higher detail when needed) before acting.',
     '- For desktop icon/app launching, prefer double_click_mouse over single click and verify the app window appears.',
+    '- Prefer open_application for Firefox and Terminal before trying desktop icon coordinates.',
+    '- When the user asks to open a URL in Firefox, use navigate_browser_url after open_application instead of manually clicking the address bar.',
+    '- When the user asks to use Terminal for shell/file tasks, prefer run_terminal_command with one complete shell command instead of manually typing into terminal windows.',
+    '- If navigate_browser_url succeeds and a later screenshot is captured, stop using tools and describe the screenshot instead of navigating again.',
+    '- If run_terminal_command succeeds and returns the requested cat/output preview, stop using tools and summarize the result.',
+    '- Use list_desktop_windows after opening apps when window presence is more reliable than visual guessing.',
     '- Coordinate protocol: treat x/y as display pixels with origin at top-left unless using explicit normalized values in [0,1].',
     '- Before clicking a specific visual target, move_mouse to candidate coordinates, capture_screenshot, and confirm the cursor is on the intended target before clicking.',
     '- For desktop icons with long labels, target the icon glyph center, not the label text center.',
@@ -38,7 +44,7 @@ export const buildAgentSystemPrompt = (args: {
   }
 
   if (args.memoryContext.length > 0) {
-    blocks.push('', 'Relevant retrieved memories:');
+    blocks.push('', 'Background memories, not current task state:');
     for (const memory of args.memoryContext) {
       blocks.push(`- ${memory}`);
     }

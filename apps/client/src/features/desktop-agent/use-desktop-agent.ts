@@ -88,8 +88,7 @@ const sanitizeReasoningDelta = (value: string): string => {
     .replace(/<\/?tool_call>/gi, '')
     .replace(/<\/?function[^>]*>/gi, '')
     .replace(/<\/?parameter[^>]*>/gi, '')
-    .replace(/<\/?tool_call[^>]*>/gi, '')
-    .trim();
+    .replace(/<\/?tool_call[^>]*>/gi, '');
 };
 
 export interface UseDesktopAgentResult {

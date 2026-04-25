@@ -28,7 +28,7 @@ Use a local `.env` file in `apps/client`.
 The desktop iframe source is rendered as:
 
 ```text
-$VITE_VNC_EMBED_URL?autoconnect=true
+$VITE_VNC_EMBED_URL?autoconnect=true&reconnect=true&resize=scale&path=websockify
 ```
 
 ## Key behavior

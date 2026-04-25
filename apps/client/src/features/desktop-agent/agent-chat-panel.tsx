@@ -44,7 +44,6 @@ import {
 } from '@/components/ai-elements/prompt-input';
 import {
   Reasoning,
-  ReasoningContent,
   ReasoningTrigger,
 } from '@/components/ai-elements/reasoning';
 import {
@@ -169,6 +168,281 @@ const toDisplayOutput = (
   };
 };
 
+const splitReasoningSteps = (text: string): string[] => {
+  const cleanText = text
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join('\n');
+
+  if (!cleanText) {
+    return [];
+  }
+
+  const paragraphSteps = cleanText
+    .split(/\n{2,}|(?=\n(?:[-*]|\d+[.)])\s+)/g)
+    .map((step) => step.trim())
+    .filter(Boolean);
+
+  if (paragraphSteps.length > 1) {
+    return paragraphSteps;
+  }
+
+  return cleanText
+    .split(/(?<=[.!?])\s+(?=[A-Z0-9])/g)
+    .map((step) => step.trim())
+    .filter(Boolean);
+};
+
+const getToolResultSummary = (
+  toolName: string,
+  output: Record<string, unknown>,
+): string => {
+  const error = getText(output.error);
+
+  if (error) {
+    return error;
+  }
+
+  if (toolName === 'capture_screenshot') {
+    const geometry = asRecord(output.geometry);
+    const width = Number(geometry.width);
+    const height = Number(geometry.height);
+    const imageSummary = getText(output.imageSummary);
+    const size =
+      Number.isFinite(width) && Number.isFinite(height)
+        ? `${width}x${height}`
+        : 'unknown size';
+    return imageSummary || `Captured desktop screenshot (${size}).`;
+  }
+
+  if (toolName === 'move_mouse' || toolName === 'click_mouse') {
+    const target = asRecord(output.resolvedTarget);
+    const x = Number(target.x);
+    const y = Number(target.y);
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      return `Target resolved to (${x}, ${y}).`;
+    }
+  }
+
+  if (toolName === 'open_application') {
+    const app = getText(output.app) || 'application';
+    const action = getText(output.action);
+    if (action === 'focused_existing') {
+      return `Focused existing ${app} window.`;
+    }
+    if (action === 'launched') {
+      return `Launched ${app}.`;
+    }
+    return `Requested ${app} launch.`;
+  }
+
+  if (toolName === 'navigate_browser_url') {
+    const url = getText(output.url);
+    return url ? `Navigated Firefox to ${url}.` : 'Navigated Firefox.';
+  }
+
+  if (toolName === 'run_terminal_command') {
+    const command = getText(output.command);
+    return command ? `Ran terminal command: ${command}` : 'Ran terminal command.';
+  }
+
+  if (toolName === 'list_desktop_windows') {
+    const count = Number(output.count);
+    return Number.isFinite(count)
+      ? `Found ${count} visible window${count === 1 ? '' : 's'}.`
+      : 'Listed visible windows.';
+  }
+
+  return output.ok === false ? 'Tool reported failure.' : 'Tool completed.';
+};
+
+const ReasoningStepList = ({ text }: { text: string }) => {
+  const steps = splitReasoningSteps(text);
+
+  if (steps.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="mt-3 space-y-2">
+      {steps.map((step, index) => (
+        <div
+          className="rounded-lg border border-border/60 bg-muted/25 px-3 py-2 text-muted-foreground text-sm"
+          key={`${index}-${step.slice(0, 24)}`}
+        >
+          <div className="mb-1 font-medium text-[11px] text-muted-foreground uppercase tracking-wide">
+            Step {index + 1}
+          </div>
+          <MessageResponse>{step}</MessageResponse>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+const ToolResultSummary = ({
+  output,
+  toolName,
+}: {
+  output: Record<string, unknown>;
+  toolName: string;
+}) => {
+  const isError = output.ok === false || Boolean(getText(output.error));
+
+  return (
+    <div
+      className={cn(
+        'rounded-lg border px-3 py-2 text-sm',
+        isError
+          ? 'border-destructive/30 bg-destructive/10 text-destructive'
+          : 'border-border/60 bg-muted/25 text-muted-foreground',
+      )}
+    >
+      {getToolResultSummary(toolName, output)}
+    </div>
+  );
+};
+
+interface ToolActivityEntry {
+  input: Record<string, unknown>;
+  output: Record<string, unknown> | null;
+  toolName: string;
+}
+
+const buildToolEntriesFromParts = (
+  parts: Array<{ content: Record<string, unknown>; partType: string }>,
+): ToolActivityEntry[] => {
+  const calls = parts
+    .filter((part) => part.partType === 'tool_call')
+    .map((part) => ({
+      input: asRecord(part.content.input),
+      toolName: getText(part.content.toolName) || 'tool',
+    }));
+  const results = parts
+    .filter((part) => part.partType === 'tool_result')
+    .map((part) => ({
+      output: asRecord(part.content.output),
+      toolName: getText(part.content.toolName) || 'tool',
+    }));
+  const count = Math.max(calls.length, results.length);
+
+  return Array.from({ length: count }, (_, index) => {
+    const call = calls[index];
+    const result = results[index];
+
+    return {
+      input: call?.input ?? {},
+      output: result?.output ?? null,
+      toolName: result?.toolName ?? call?.toolName ?? 'tool',
+    };
+  });
+};
+
+const buildLiveToolEntries = (
+  calls: LiveToolCall[],
+  results: LiveToolResult[],
+): ToolActivityEntry[] => {
+  const count = Math.max(calls.length, results.length);
+
+  return Array.from({ length: count }, (_, index) => ({
+    input: calls[index]?.input ?? {},
+    output: results[index]?.output ?? null,
+    toolName: results[index]?.toolName ?? calls[index]?.toolName ?? 'tool',
+  }));
+};
+
+const ToolActivityGroup = ({
+  entries,
+  isStreaming = false,
+}: {
+  entries: ToolActivityEntry[];
+  isStreaming?: boolean;
+}) => {
+  if (entries.length === 0) {
+    return null;
+  }
+
+  const latestCompleted = [...entries].reverse().find((entry) => entry.output);
+  const latestScreenshot = latestCompleted?.output
+    ? toScreenshotData(latestCompleted.output)
+    : null;
+  const counts = entries.reduce<Record<string, number>>((acc, entry) => {
+    acc[entry.toolName] = (acc[entry.toolName] ?? 0) + 1;
+    return acc;
+  }, {});
+  const countsText = Object.entries(counts)
+    .map(([toolName, count]) => `${toolName} x${count}`)
+    .join(', ');
+
+  return (
+    <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p className="font-medium text-sm">Tool activity</p>
+          <p className="text-muted-foreground text-xs">
+            {entries.length} event{entries.length === 1 ? '' : 's'}
+            {countsText ? `, ${countsText}` : ''}
+          </p>
+        </div>
+        {isStreaming ? (
+          <Badge className="gap-1" variant="secondary">
+            <Spinner className="size-3" />
+            Running
+          </Badge>
+        ) : null}
+      </div>
+
+      {latestCompleted?.output ? (
+        <div className="mt-3 space-y-2">
+          <ToolResultSummary
+            output={latestCompleted.output}
+            toolName={latestCompleted.toolName}
+          />
+          {latestScreenshot ? (
+            <ScreenshotPreview
+              base64={latestScreenshot.base64}
+              cursor={latestScreenshot.cursor}
+              geometry={latestScreenshot.geometry}
+              mediaType={latestScreenshot.mediaType}
+              toolName={latestCompleted.toolName}
+            />
+          ) : null}
+        </div>
+      ) : null}
+
+      <details className="mt-3 text-xs">
+        <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+          Show detailed tool log
+        </summary>
+        <div className="mt-2 space-y-2">
+          {entries.map((entry, index) => (
+            <Tool defaultOpen={false} key={`${entry.toolName}-${index}`}>
+              <ToolHeader
+                state={entry.output ? 'output-available' : 'input-available'}
+                toolName={entry.toolName}
+                type="dynamic-tool"
+              />
+              <ToolContent>
+                {Object.keys(entry.input).length > 0 ? (
+                  <ToolInput input={entry.input} />
+                ) : null}
+                {entry.output ? (
+                  <ToolOutput
+                    errorText={undefined}
+                    output={toDisplayOutput(entry.output)}
+                  />
+                ) : null}
+              </ToolContent>
+            </Tool>
+          ))}
+        </div>
+      </details>
+    </div>
+  );
+};
+
 const toAttachmentPartData = (
   content: Record<string, unknown>,
   id: string,
@@ -260,59 +534,15 @@ const SummaryContextIcon = ({
   );
 };
 
-const renderToolFromMessagePart = (
-  part: { content: Record<string, unknown>; partType: string },
-  index: number,
-) => {
-  const toolName = getText(part.content.toolName) || 'tool';
-  const input = asRecord(part.content.input);
-  const output = asRecord(part.content.output);
-  const screenshot = toScreenshotData(output);
-
-  if (part.partType === 'tool_call') {
-    return (
-      <Tool defaultOpen={false} key={`${toolName}-call-${index}`}>
-        <ToolHeader
-          state="input-available"
-          toolName={toolName}
-          type="dynamic-tool"
-        />
-        <ToolContent>
-          <ToolInput input={input} />
-        </ToolContent>
-      </Tool>
-    );
-  }
-
-  return (
-    <Tool defaultOpen={false} key={`${toolName}-result-${index}`}>
-      <ToolHeader
-        state="output-available"
-        toolName={toolName}
-        type="dynamic-tool"
-      />
-      <ToolContent>
-        {Object.keys(input).length > 0 ? <ToolInput input={input} /> : null}
-        {screenshot ? (
-          <ScreenshotPreview
-            base64={screenshot.base64}
-            cursor={screenshot.cursor}
-            geometry={screenshot.geometry}
-            mediaType={screenshot.mediaType}
-            toolName={toolName}
-          />
-        ) : null}
-        <ToolOutput errorText={undefined} output={toDisplayOutput(output)} />
-      </ToolContent>
-    </Tool>
-  );
-};
-
 const renderMessage = (
   message: ConversationMessageRecord,
   options: { showReasoning: boolean },
 ) => {
   const from = message.role === 'user' ? 'user' : 'assistant';
+  const toolParts = message.parts.filter(
+    (part) => part.partType === 'tool_call' || part.partType === 'tool_result',
+  );
+  let renderedToolActivity = false;
 
   return (
     <Message from={from}>
@@ -327,7 +557,7 @@ const renderMessage = (
             return (
               <Reasoning defaultOpen={false} key={`${part.id}-${index}`}>
                 <ReasoningTrigger />
-                <ReasoningContent>{content}</ReasoningContent>
+                <ReasoningStepList text={content} />
               </Reasoning>
             );
           }
@@ -336,7 +566,17 @@ const renderMessage = (
             part.partType === 'tool_call' ||
             part.partType === 'tool_result'
           ) {
-            return renderToolFromMessagePart(part, index);
+            if (renderedToolActivity) {
+              return null;
+            }
+
+            renderedToolActivity = true;
+            return (
+              <ToolActivityGroup
+                entries={buildToolEntriesFromParts(toolParts)}
+                key={`${message.id}-tool-activity`}
+              />
+            );
           }
 
           if (part.partType === 'attachment') {
@@ -487,14 +727,12 @@ const LiveConversationContent = memo(function LiveConversationContent({
   streamState,
 }: LiveConversationContentProps) {
   const liveReasoningText = liveReasoningMessages
-    .map((message) => message.trim())
-    .filter(Boolean)
-    .join('\n');
+    .join('')
+    .trim();
   const pendingToolCalls = liveToolCalls.slice(liveToolResults.length);
-  const visiblePendingToolCalls =
-    streamState === 'streaming' ? pendingToolCalls.slice(-1) : pendingToolCalls;
+  const liveToolEntries = buildLiveToolEntries(liveToolCalls, liveToolResults);
   const hasToolActivity =
-    visiblePendingToolCalls.length > 0 || liveToolResults.length > 0;
+    pendingToolCalls.length > 0 || liveToolResults.length > 0;
 
   if (
     !liveRunId ||
@@ -515,64 +753,15 @@ const LiveConversationContent = memo(function LiveConversationContent({
             isStreaming={streamState === 'streaming'}
           >
             <ReasoningTrigger />
-            <ReasoningContent>{liveReasoningText}</ReasoningContent>
+            <ReasoningStepList text={liveReasoningText} />
           </Reasoning>
         ) : null}
 
         {hasToolActivity ? (
-          <div className="space-y-2">
-            <p className="font-medium text-[11px] text-muted-foreground uppercase tracking-wide">
-              Tool activity
-            </p>
-
-            {visiblePendingToolCalls.map((toolCall, index) => (
-              <Tool
-                defaultOpen={false}
-                key={`live-call-${toolCall.toolName}-${index}`}
-              >
-                <ToolHeader
-                  state="input-available"
-                  toolName={toolCall.toolName}
-                  type="dynamic-tool"
-                />
-                <ToolContent>
-                  <ToolInput input={toolCall.input} />
-                </ToolContent>
-              </Tool>
-            ))}
-
-            {liveToolResults.map((toolResult, index) => {
-              const screenshot = toScreenshotData(toolResult.output);
-
-              return (
-                <Tool
-                  defaultOpen={false}
-                  key={`live-result-${toolResult.toolName}-${index}`}
-                >
-                  <ToolHeader
-                    state="output-available"
-                    toolName={toolResult.toolName}
-                    type="dynamic-tool"
-                  />
-                  <ToolContent>
-                    {screenshot ? (
-                      <ScreenshotPreview
-                        base64={screenshot.base64}
-                        cursor={screenshot.cursor}
-                        geometry={screenshot.geometry}
-                        mediaType={screenshot.mediaType}
-                        toolName={toolResult.toolName}
-                      />
-                    ) : null}
-                    <ToolOutput
-                      errorText={undefined}
-                      output={toDisplayOutput(toolResult.output)}
-                    />
-                  </ToolContent>
-                </Tool>
-              );
-            })}
-          </div>
+          <ToolActivityGroup
+            entries={liveToolEntries}
+            isStreaming={streamState === 'streaming'}
+          />
         ) : null}
 
         {liveAssistantText.trim() ? (

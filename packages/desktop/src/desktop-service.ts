@@ -3,12 +3,19 @@ import { DesktopServiceError } from './errors.js';
 import { execFile } from './exec-file.js';
 import type {
   DesktopDisplayGeometry,
+  DesktopApplication,
   DesktopControlMode,
+  DesktopLaunchResult,
+  DesktopShellCommandResult,
   DesktopScreenshotResult,
   DesktopServiceOptions,
+  DesktopWindowInfo,
   ScreenSize,
   ScrollDirection,
 } from './types.js';
+
+const toErrorText = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
 
 export class DesktopService {
   private readonly mode: DesktopControlMode;
@@ -122,6 +129,40 @@ export class DesktopService {
     }
   }
 
+  public async launchApplication(
+    app: DesktopApplication,
+  ): Promise<DesktopLaunchResult> {
+    const beforeWindows = await this.listWindows().catch(() => []);
+    const existingWindow = this.findApplicationWindow(app, beforeWindows);
+
+    if (existingWindow) {
+      await this.activateWindow(existingWindow.id);
+      const windows = await this.listWindows().catch(() => beforeWindows);
+      return {
+        action: 'focused_existing',
+        app,
+        matchedWindow: existingWindow,
+        windows,
+      };
+    }
+
+    const commandByApp: Record<DesktopApplication, string> = {
+      firefox: 'setsid firefox-esr about:blank >/tmp/helm-firefox-launch.log 2>&1 &',
+      terminal: 'setsid lxterminal >/tmp/helm-terminal-launch.log 2>&1 &',
+    };
+
+    await this.runShell(commandByApp[app], `launch ${app}`);
+    await this.waitForWindowRegistration();
+    const windows = await this.listWindows().catch(() => beforeWindows);
+
+    return {
+      action: 'launched',
+      app,
+      matchedWindow: this.findApplicationWindow(app, windows),
+      windows,
+    };
+  }
+
   public async scroll(direction: ScrollDirection, amount = 1): Promise<void> {
     const button = direction === 'up' ? '4' : '5';
     const safeAmount = Math.max(1, Math.trunc(amount));
@@ -188,9 +229,70 @@ export class DesktopService {
     };
   }
 
+  public async listWindows(): Promise<DesktopWindowInfo[]> {
+    const output = await this.runXdotool(
+      ['search', '--onlyvisible', '--name', '.*'],
+      'list windows',
+    );
+    const ids = output
+      .trim()
+      .split('\n')
+      .map((line) => Number(line.trim()))
+      .filter((id) => Number.isFinite(id));
+
+    const windows: DesktopWindowInfo[] = [];
+    for (const id of ids.slice(0, 80)) {
+      try {
+        const name = (
+          await this.runXdotool(['getwindowname', String(id)], 'get window name')
+        ).trim();
+        const className = (
+          await this.runXdotool(
+            ['getwindowclassname', String(id)],
+            'get window class',
+          ).catch(() => '')
+        ).trim();
+        windows.push({ className, id, name });
+      } catch {
+        windows.push({ id, name: '' });
+      }
+    }
+
+    return windows;
+  }
+
+  private findApplicationWindow(
+    app: DesktopApplication,
+    windows: DesktopWindowInfo[],
+  ): DesktopWindowInfo | undefined {
+    const titleMatchers: Record<DesktopApplication, RegExp[]> = {
+      firefox: [/firefox/i, /mozilla/i],
+      terminal: [/terminal/i, /lxterminal/i, /^agent@[^:]+:/i],
+    };
+
+    return windows.find((window) =>
+      titleMatchers[app].some((matcher) => {
+        return matcher.test(window.name) || matcher.test(window.className ?? '');
+      }),
+    );
+  }
+
+  private async activateWindow(windowId: number): Promise<void> {
+    const id = String(windowId);
+    try {
+      await this.runXdotool(['windowactivate', '--sync', id], 'activate window');
+    } catch {
+      await this.runXdotool(['windowactivate', id], 'activate window');
+    }
+  }
+
+  private async waitForWindowRegistration(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 900));
+  }
+
   public async screenshot(): Promise<DesktopScreenshotResult> {
     const command =
-      'tmp="$(mktemp /tmp/helm-screen-XXXXXX.png)" && rm -f "$tmp" && (scrot -p "$tmp" 2>/dev/null || true) && if [ ! -s "$tmp" ]; then xfce4-screenshooter -f -m -s "$tmp" >/dev/null 2>&1; fi && [ -s "$tmp" ] && base64 -w 0 "$tmp" && rm -f "$tmp"';
+      'tmp="$(mktemp /tmp/helm-screen-XXXXXX.png)" && rm -f "$tmp" && (scrot -p "$tmp" 2>/dev/null || scrot "$tmp" 2>/dev/null || import -window root "$tmp" 2>/dev/null || true) && [ -s "$tmp" ] && base64 -w 0 "$tmp"; rm -f "$tmp"';
 
     try {
       if (this.mode === 'local') {
@@ -237,6 +339,69 @@ export class DesktopService {
   public async screenshotDataUrl(): Promise<string> {
     const screenshot = await this.screenshot();
     return `data:${screenshot.mimeType};base64,${screenshot.pngBase64}`;
+  }
+
+  public async runShellCommand(
+    command: string,
+  ): Promise<DesktopShellCommandResult> {
+    try {
+      if (this.mode === 'local') {
+        const { stderr, stdout } = await execFile('sh', ['-lc', command], {
+          timeout: this.timeoutMs,
+          env: { ...process.env, DISPLAY: this.display },
+          cwd: process.env.HOME,
+        });
+
+        return {
+          command,
+          exitCode: 0,
+          ok: true,
+          stderr,
+          stdout,
+        };
+      }
+
+      const { stderr, stdout } = await execFile(
+        'docker',
+        [
+          'exec',
+          '--workdir',
+          '/home/agent',
+          this.desktopContainer,
+          'env',
+          'HOME=/home/agent',
+          `DISPLAY=${this.display}`,
+          'sh',
+          '-lc',
+          command,
+        ],
+        {
+          timeout: this.timeoutMs,
+        },
+      );
+
+      return {
+        command,
+        exitCode: 0,
+        ok: true,
+        stderr,
+        stdout,
+      };
+    } catch (error) {
+      const maybeError = error as {
+        code?: number;
+        stderr?: string;
+        stdout?: string;
+      };
+      return {
+        command,
+        exitCode:
+          typeof maybeError.code === 'number' ? maybeError.code : 1,
+        ok: false,
+        stderr: maybeError.stderr ?? toErrorText(error),
+        stdout: maybeError.stdout ?? '',
+      };
+    }
   }
 
   public async getDisplayGeometry(): Promise<DesktopDisplayGeometry> {
@@ -329,6 +494,39 @@ export class DesktopService {
           `DISPLAY=${this.display}`,
           'xdotool',
           ...args,
+        ],
+        {
+          timeout: this.timeoutMs,
+        },
+      );
+
+      return stdout;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new DesktopServiceError(`Failed to ${action}: ${message}`, error);
+    }
+  }
+
+  private async runShell(command: string, action: string): Promise<string> {
+    try {
+      if (this.mode === 'local') {
+        const { stdout } = await execFile('sh', ['-lc', command], {
+          timeout: this.timeoutMs,
+          env: { ...process.env, DISPLAY: this.display },
+        });
+        return stdout;
+      }
+
+      const { stdout } = await execFile(
+        'docker',
+        [
+          'exec',
+          this.desktopContainer,
+          'env',
+          `DISPLAY=${this.display}`,
+          'sh',
+          '-lc',
+          command,
         ],
         {
           timeout: this.timeoutMs,

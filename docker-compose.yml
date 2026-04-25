@@ -8,12 +8,18 @@ services:
       - "6080:6080"
     environment:
       - DISPLAY=:99
-      - RESOLUTION=1280x720x24
-    volumes:
-      - desktop-home:/home/agent
-      - ./agent/scripts:/agent/scripts:ro
+      - DISPLAY_NUM=99
+      - WIDTH=1366
+      - HEIGHT=768
     networks:
       - internal
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:6080/vnc.html >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     cap_add:
       - SYS_ADMIN
     restart: unless-stopped
@@ -49,7 +55,7 @@ services:
       - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:1234/v1}
       - MODEL_PROVIDER=${MODEL_PROVIDER:-openai}
       - EMBED_MODEL=${EMBED_MODEL:-text-embedding-nomic-embed-text-v1.5}
-      - VLM_MODEL=${VLM_MODEL:-qwen/qwen3.5-9b}
+      - VLM_MODEL=${VLM_MODEL:-google/gemma-4-e4b}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -76,7 +82,6 @@ services:
 
 volumes:
   chroma-data:
-  desktop-home:
 
 networks:
   internal:

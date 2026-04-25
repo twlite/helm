@@ -20,8 +20,7 @@ const toEventSafeToolOutput = (
   const kb = Math.round(base64.length / 1024);
   return {
     ...output,
-    imageBase64: '',
-    imageSummary: `[omitted screenshot base64 (${kb}KB)]`,
+    imageSummary: `[screenshot PNG (${kb}KB)]`,
   };
 };
 

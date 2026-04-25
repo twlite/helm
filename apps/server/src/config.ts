@@ -7,6 +7,7 @@ const envSchema = z.object({
   CLIENT_ORIGIN: z.url().optional(),
   DB_PATH: z.string().default('helm.db'),
   EMBED_MODEL: z.string().min(1),
+  EPISODIC_MEMORY_COLLECTION: z.string().default('helm_episodes'),
   LLM_BASE_URL: z.url(),
   MEMORY_COLLECTION: z.string().default('helm_memory'),
   MEMORY_TOP_K: z.coerce.number().int().positive().default(4),

@@ -24,7 +24,7 @@ export function DesktopVncPanel({ vncUrl }: DesktopVncPanelProps) {
       </CardHeader>
       <CardContent className="h-full min-h-0 p-0">
         <iframe
-          className="h-full min-h-95 w-full rounded-b-2xl bg-black"
+          className="block h-full min-h-0 w-full rounded-b-2xl bg-black"
           src={vncUrl}
           title="Desktop VNC"
         />

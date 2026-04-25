@@ -7,6 +7,43 @@ import {
 } from './context.ts';
 import { emitToolCall, emitToolResult } from './events.ts';
 
+type ScreenshotToolOutput = {
+  ok: boolean;
+  mimeType?: string;
+  imageBase64?: string;
+  bytes?: number;
+  geometry?: { width: number; height: number } | null;
+  cursor?: { x: number; y: number } | null;
+  error?: string;
+};
+
+const normalizeText = (value: unknown): string =>
+  typeof value === 'string' ? value.trim() : '';
+
+const toNumber = (value: unknown): number | null => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const buildScreenshotText = (output: ScreenshotToolOutput): string => {
+  const bytes = toNumber(output.bytes) ?? 0;
+  const kb = Math.max(0, Math.round(bytes / 1024));
+  const geometry = output.geometry;
+  const cursor = output.cursor;
+
+  const geometryText =
+    geometry && Number.isFinite(geometry.width) && Number.isFinite(geometry.height)
+      ? `${geometry.width}x${geometry.height}`
+      : 'unknown';
+
+  const cursorText =
+    cursor && Number.isFinite(cursor.x) && Number.isFinite(cursor.y)
+      ? `(${cursor.x}, ${cursor.y})`
+      : 'unknown';
+
+  return `Screenshot captured (${kb}KB PNG). Geometry: ${geometryText}. Cursor: ${cursorText}.`;
+};
+
 export const buildScreenshotTools = ({
   context,
   capture,
@@ -18,6 +55,38 @@ export const buildScreenshotTools = ({
       inputSchema: z.object({
         detail: z.enum(['low', 'high']).optional(),
       }),
+      toModelOutput: ({ output }) => {
+        const typedOutput = output as ScreenshotToolOutput;
+        const imageBase64 = normalizeText(typedOutput.imageBase64);
+        const mimeType = normalizeText(typedOutput.mimeType) || 'image/png';
+
+        if (!typedOutput.ok || !imageBase64) {
+          const errorText =
+            normalizeText(typedOutput.error) ||
+            'Screenshot capture failed or returned empty image data.';
+
+          return {
+            type: 'content' as const,
+            value: [{ type: 'text' as const, text: errorText }],
+          };
+        }
+
+        return {
+          type: 'content' as const,
+          value: [
+            {
+              type: 'text' as const,
+              text: buildScreenshotText(typedOutput),
+            },
+            {
+              type: 'file-data' as const,
+              data: imageBase64,
+              mediaType: mimeType,
+              filename: 'desktop-screenshot.png',
+            },
+          ],
+        };
+      },
       execute: async (input) => {
         assertRunNotCancelled(context);
         emitToolCall(context, 'capture_screenshot', input);
@@ -52,20 +121,11 @@ export const buildScreenshotTools = ({
           return emptyResult;
         }
 
-        const result = {
+        const result: ScreenshotToolOutput = {
           bytes: imageBase64.length,
           cursor,
           geometry,
           imageBase64,
-          mimeType: shot.mimeType,
-          ok: true,
-        };
-
-        const modelResult = {
-          bytes: result.bytes,
-          cursor,
-          geometry,
-          imageSummary: `Screenshot captured (${Math.round(result.bytes / 1024)}KB PNG).`,
           mimeType: shot.mimeType,
           ok: true,
         };
@@ -76,7 +136,7 @@ export const buildScreenshotTools = ({
           toolName: 'capture_screenshot',
         });
 
-        return modelResult;
+        return result;
       },
     }),
   };

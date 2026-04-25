@@ -1,71 +1,135 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-export DISPLAY=:99
+export DISPLAY=:${DISPLAY_NUM:-99}
 export HOME=/home/agent
+export XDG_RUNTIME_DIR=/tmp/runtime-agent
+export TERMINAL=lxterminal
 
-configure_desktop_look() {
-	local wallpaper="/usr/share/backgrounds/xfce/xfce-stripes.png"
-	local browser_exec="google-chrome"
+create_desktop_assets() {
+  mkdir -p "$HOME/Desktop" "$HOME/.config/libfm" "$HOME/.config/pcmanfm/default"
 
-	if [ ! -f "$wallpaper" ]; then
-		wallpaper="$(find /usr/share/backgrounds -type f | head -n 1 || true)"
-	fi
+  cat >"$HOME/.config/libfm/libfm.conf" <<EOF
+[config]
+single_click=0
 
-	# Enable XFCE desktop icons and apply a less bare default visual style.
-	xfconf-query -c xfce4-desktop -p /desktop-icons/style -n -t int -s 2 || true
-	xfconf-query -c xfce4-desktop -p /desktop-icons/file-icons/show-home -n -t bool -s true || true
-	xfconf-query -c xfce4-desktop -p /desktop-icons/file-icons/show-trash -n -t bool -s true || true
-	xfconf-query -c xfce4-desktop -p /desktop-icons/file-icons/show-filesystem -n -t bool -s true || true
+[ui]
+big_icon_size=64
+small_icon_size=24
+pane_icon_size=24
+thumbnail_size=128
+EOF
 
-	if [ -n "$wallpaper" ]; then
-		while IFS= read -r path; do
-			xfconf-query -c xfce4-desktop -p "$path" -s "$wallpaper" || true
-		done < <(xfconf-query -c xfce4-desktop -l | grep '/last-image$' || true)
-	fi
+  cat >"$HOME/.config/pcmanfm/default/desktop-items-0.conf" <<EOF
+[*]
+wallpaper_mode=color
+desktop_bg=#0b1220
+desktop_fg=#ffffff
+desktop_shadow=#000000
+desktop_font=Sans 13
+show_wm_menu=0
+sort=mtime;ascending;
+show_documents=0
+show_trash=0
+show_mounts=0
+EOF
 
-	xfconf-query -c xsettings -p /Net/IconThemeName -n -t string -s Papirus-Dark || true
-	xfconf-query -c xsettings -p /Net/ThemeName -n -t string -s Arc-Dark || true
-	xfconf-query -c xsettings -p /Net/CursorThemeName -n -t string -s Adwaita || true
+  cat >"$HOME/Desktop/Firefox.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Firefox
+Comment=Open the web browser
+Exec=firefox-esr about:blank
+Icon=firefox-esr
+Terminal=false
+Categories=Network;WebBrowser;
+EOF
 
-	if ! pgrep -x xfdesktop >/dev/null 2>&1; then
-		xfdesktop &
-	fi
+  cat >"$HOME/Desktop/Terminal.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Comment=Open a terminal
+Exec=lxterminal
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+EOF
+
+  chmod +x "$HOME/Desktop/Firefox.desktop" "$HOME/Desktop/Terminal.desktop"
 }
 
-echo "[helm] Preparing writable agent home..."
-sudo mkdir -p "$HOME" "$HOME/.config" "$HOME/.cache" "$HOME/.dbus"
-# Named volumes can be root-owned from prior runs; fix ownership so XFCE can initialize.
-sudo chown -R agent:agent "$HOME"
-touch "$HOME/.Xauthority" "$HOME/.ICEauthority"
-chmod 700 "$HOME/.dbus"
+echo "[helm] Preparing runtime directories..."
+mkdir -p "$HOME" "$HOME/Desktop" "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+create_desktop_assets
 
-echo "[helm] Cleaning stale X11 display locks..."
-sudo rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+echo "[helm] Cleaning stale X11 locks..."
+sudo mkdir -p /tmp/.X11-unix
+sudo chmod 1777 /tmp/.X11-unix
+sudo rm -f /tmp/.X${DISPLAY_NUM:-99}-lock /tmp/.X11-unix/X${DISPLAY_NUM:-99}
 
 echo "[helm] Starting Xvfb..."
-Xvfb :99 -screen 0 ${RESOLUTION:-1280x720x24} &
-sleep 1
+Xvfb "$DISPLAY" -screen 0 "${WIDTH:-1366}x${HEIGHT:-768}x24" -ac -nolisten tcp +extension RANDR &
+XVFB_PID=$!
 
-echo "[helm] Starting XFCE desktop..."
-if command -v dbus-launch >/dev/null 2>&1; then
-	eval "$(dbus-launch --sh-syntax)"
-	startxfce4 &
-else
-	startxfce4 &
+echo "[helm] Waiting for X display..."
+for _ in $(seq 1 100); do
+  if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+
+if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
+  echo "[helm] X display failed to start"
+  exit 1
 fi
-sleep 3
 
-echo "[helm] Applying desktop style..."
-configure_desktop_look
+echo "[helm] Starting D-Bus session..."
+if command -v dbus-launch >/dev/null 2>&1; then
+  eval "$(dbus-launch --sh-syntax)"
+fi
+
+echo "[helm] Starting window manager..."
+openbox >/tmp/openbox.log 2>&1 &
+OPENBOX_PID=$!
+sleep 0.5
+
+echo "[helm] Setting desktop background..."
+xsetroot -display "$DISPLAY" -solid "#1f2430"
+
+echo "[helm] Starting desktop manager..."
+pcmanfm --desktop --profile default --display="$DISPLAY" >/tmp/pcmanfm.log 2>&1 &
+sleep 0.5
+
+echo "[helm] Starting taskbar..."
+tint2 >/tmp/tint2.log 2>&1 &
+
+echo "[helm] Desktop apps available as large launch icons: Firefox and Terminal"
 
 echo "[helm] Starting x11vnc..."
-x11vnc -display :99 -nopw -listen 0.0.0.0 -xkb -forever -shared -noxdamage &
+x11vnc \
+  -display "$DISPLAY" \
+  -nopw \
+  -listen 0.0.0.0 \
+  -rfbport 5900 \
+  -xkb \
+  -forever \
+  -shared \
+  -repeat \
+  -noxdamage \
+  -quiet &
+X11VNC_PID=$!
 
 echo "[helm] Starting noVNC..."
-websockify --web /usr/share/novnc 6080 localhost:5900 &
+/opt/noVNC/utils/novnc_proxy \
+  --vnc localhost:5900 \
+  --listen 6080 >/tmp/novnc.log 2>&1 &
+NOVNC_PID=$!
 
-echo "[helm] Desktop ready at http://localhost:6080/vnc.html"
+echo "[helm] Desktop ready at http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
 
-# Keep container alive
-wait
+wait -n "$XVFB_PID" "$OPENBOX_PID" "$X11VNC_PID" "$NOVNC_PID"
+echo "[helm] One of the core desktop processes exited"
+exit 1

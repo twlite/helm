@@ -69,11 +69,14 @@ export const buildVncUrl = (): string => {
     if (!url.searchParams.has('reconnect')) {
       url.searchParams.set('reconnect', 'true');
     }
+    if (!url.searchParams.has('resize')) {
+      url.searchParams.set('resize', 'scale');
+    }
 
     return url.toString();
   } catch {
     const separator = rawBase.includes('?') ? '&' : '?';
-    return `${rawBase}${separator}autoconnect=true&reconnect=true&path=websockify`;
+    return `${rawBase}${separator}autoconnect=true&reconnect=true&resize=scale&path=websockify`;
   }
 };
 
