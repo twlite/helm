@@ -4,7 +4,7 @@ import { queryMemories, upsertMemory } from './memory.ts';
 interface ToolTraceEntry {
   toolName: string;
   input?: Record<string, unknown>;
-  output?: Record<string, unknown>;
+  output?: object;
 }
 
 interface EpisodeInput {
@@ -13,7 +13,7 @@ interface EpisodeInput {
   runId: string;
   userInput: string;
   toolCalls: Array<{ toolName: string; input: Record<string, unknown> }>;
-  toolResults: Array<{ toolName: string; output: Record<string, unknown> }>;
+  toolResults: Array<{ toolName: string; output: object }>;
 }
 
 const normalizeText = (value: unknown): string =>
@@ -32,22 +32,23 @@ const compactJson = (value: unknown): string => {
 
 const toCompactToolOutput = (
   toolName: string,
-  output: Record<string, unknown>,
+  output: object,
 ): Record<string, unknown> => {
+  const outputRecord = output as Record<string, unknown>;
   if (toolName !== 'capture_screenshot') {
-    return output;
+    return outputRecord;
   }
 
-  const imageBase64 = normalizeText(output.imageBase64);
+  const imageBase64 = normalizeText(outputRecord.imageBase64);
   return {
-    bytes: output.bytes,
-    cursor: output.cursor,
-    geometry: output.geometry,
+    bytes: outputRecord.bytes,
+    cursor: outputRecord.cursor,
+    geometry: outputRecord.geometry,
     imageSummary: imageBase64
       ? `[screenshot omitted ${Math.round(imageBase64.length / 1024)}KB]`
-      : output.imageSummary,
-    mimeType: output.mimeType,
-    ok: output.ok,
+      : outputRecord.imageSummary,
+    mimeType: outputRecord.mimeType,
+    ok: outputRecord.ok,
   };
 };
 
@@ -83,12 +84,14 @@ const buildToolTimeline = (input: EpisodeInput): ToolTraceEntry[] => {
 
 const inferOutcome = (input: EpisodeInput): string => {
   const failedTool = input.toolResults.find((result) => {
-    return result.output.ok === false || typeof result.output.error === 'string';
+    const o = result.output as Record<string, unknown>;
+    return o.ok === false || typeof o.error === 'string';
   });
 
   if (failedTool) {
+    const o = failedTool.output as Record<string, unknown>;
     return `Blocked or degraded by ${failedTool.toolName}: ${truncate(
-      normalizeText(failedTool.output.error) || compactJson(failedTool.output),
+      normalizeText(o.error) || compactJson(o),
       260,
     )}`;
   }

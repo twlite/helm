@@ -7,6 +7,7 @@ import {
   type RuntimeToolDependencies,
 } from './context.ts';
 import { emitToolCall, emitToolResult } from './events.ts';
+import { upsertMemory } from '../../services/memory.ts';
 
 const DESKTOP_FILE_ROOT =
   process.env.DESKTOP_FILE_ROOT?.trim() || '/home/agent';
@@ -469,6 +470,31 @@ export const buildUtilityTools = ({
         const result = { ok: true, waitedMs: milliseconds };
         emitToolResult(context, 'wait', result);
         capture.onToolResult({ output: result, toolName: 'wait' });
+        return result;
+      },
+    }),
+    save_memory: tool({
+      description:
+        'Persist a note to long-term memory so it is available in future runs. Use this when the user states a preference, constraint, or fact that should influence future behaviour — e.g. "always do X graphically", "never use curl", "the user\'s preferred browser is Firefox". Do NOT use for task progress or intermediate results.',
+      inputSchema: z.object({
+        text: z.string().min(1).max(2000).describe('The note to remember. Be concise and specific.'),
+      }),
+      execute: async ({ text }) => {
+        assertRunNotCancelled(context);
+        const input = { text };
+        emitToolCall(context, 'save_memory', input);
+        capture.onToolCall({ input, toolName: 'save_memory' });
+
+        await upsertMemory({
+          conversationId: context.conversationId,
+          entityId: context.runId,
+          entityType: 'agent_note',
+          text,
+        });
+
+        const result = { ok: true, saved: text };
+        emitToolResult(context, 'save_memory', result);
+        capture.onToolResult({ output: result, toolName: 'save_memory' });
         return result;
       },
     }),

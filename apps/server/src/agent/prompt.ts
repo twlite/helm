@@ -43,6 +43,12 @@ export const buildAgentSystemPrompt = (args: {
     '- Do not repeat the same failed action more than twice — stop and report the blocker.',
     '- For file read/write tasks that do not need to be visible: prefer create_file/read_file/delete_file.',
     '- End every run with a concise status update including one concrete evidence point.',
+    '',
+    'Memory rules:',
+    '- Call save_memory when the user states a preference, constraint, or standing instruction that should apply to future runs — e.g. "always do this graphically", "never use curl", "prefer Mousepad as the text editor".',
+    '- Save the note as a concise, actionable statement ("User prefers graphical approach; do not use curl or terminal hacks.").',
+    '- Do NOT save task progress, intermediate results, or one-off facts that only matter for this run.',
+    '- Relevant past notes are injected at the top of this prompt — read them before acting.',
   ];
 
   if (args.customInstructions?.trim()) {

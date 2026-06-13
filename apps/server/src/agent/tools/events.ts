@@ -6,20 +6,21 @@ const normalizeText = (value: unknown): string =>
 
 const toEventSafeToolOutput = (
   toolName: string,
-  output: Record<string, unknown>,
+  output: object,
 ): Record<string, unknown> => {
+  const record = output as Record<string, unknown>;
   if (toolName !== 'capture_screenshot') {
-    return output;
+    return record;
   }
 
-  const base64 = normalizeText(output.imageBase64);
+  const base64 = normalizeText(record.imageBase64);
   if (!base64) {
-    return output;
+    return record;
   }
 
   const kb = Math.round(base64.length / 1024);
   return {
-    ...output,
+    ...record,
     imageSummary: `[screenshot PNG (${kb}KB)]`,
   };
 };
@@ -43,7 +44,7 @@ export const emitToolCall = (
 export const emitToolResult = (
   context: ToolContext,
   toolName: string,
-  output: Record<string, unknown>,
+  output: object,
 ): void => {
   const eventOutput = toEventSafeToolOutput(toolName, output);
 

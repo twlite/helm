@@ -25,7 +25,7 @@ import {
   queryRunEpisodes,
   upsertRunEpisode,
 } from '../services/episodic-memory.ts';
-import { queryMemories, upsertMemory } from '../services/memory.ts';
+import { queryMemories } from '../services/memory.ts';
 import {
   acquireRunAbortSignal,
   releaseRunControl,
@@ -100,7 +100,7 @@ const collectAssistantParts = (args: {
   assistantText: string;
   reasoningText: string;
   toolCalls: Array<{ toolName: string; input: Record<string, unknown> }>;
-  toolResults: Array<{ toolName: string; output: Record<string, unknown> }>;
+  toolResults: Array<{ toolName: string; output: object }>;
 }) => {
   const parts: Array<{
     type: MessagePartType;
@@ -160,7 +160,7 @@ export const runAgentConversation = async (args: {
     [];
   const toolResults: Array<{
     toolName: string;
-    output: Record<string, unknown>;
+    output: object;
   }> = [];
   let assistantText = '';
   let reasoningText = '';
@@ -406,31 +406,15 @@ export const runAgentConversation = async (args: {
       runId,
     });
 
-    // Persist memories for future runs
-    await Promise.all([
-      upsertRunEpisode({
-        assistantText,
-        conversationId,
-        runId,
-        toolCalls,
-        toolResults,
-        userInput,
-      }),
-      upsertMemory({
-        conversationId,
-        entityId: runId,
-        entityType: 'run_user_input',
-        metadata: { attachmentCount: userAttachments.length, preview: truncate(userInput) },
-        text: userInput,
-      }),
-      upsertMemory({
-        conversationId,
-        entityId: assistantMessage.id,
-        entityType: 'run_assistant_output',
-        metadata: { preview: truncate(assistantText) },
-        text: [reasoningText.trim(), assistantText.trim()].filter(Boolean).join('\n\n'),
-      }),
-    ]);
+    // Persist episodic context for future runs (agent-decided facts are saved via save_memory tool)
+    await upsertRunEpisode({
+      assistantText,
+      conversationId,
+      runId,
+      toolCalls,
+      toolResults,
+      userInput,
+    });
 
     const afterMessages = getMessagesByConversationId(conversationId);
     const followUpSummary = await maybeSummarizeConversation({

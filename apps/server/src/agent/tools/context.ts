@@ -14,7 +14,7 @@ export interface ToolCapture {
   }) => void;
   onToolResult: (entry: {
     toolName: string;
-    output: Record<string, unknown>;
+    output: object;
   }) => void;
 }
 
