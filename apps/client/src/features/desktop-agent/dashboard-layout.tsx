@@ -21,6 +21,8 @@ const MOUSE_TOOL_NAMES = new Set([
   "move_mouse",
 ]);
 
+const CLICK_TOOL_NAMES = new Set(["click_mouse", "double_click_mouse"]);
+
 const resolveDirection = (): PanelDirection => {
   if (typeof window === "undefined") return "horizontal";
   return window.matchMedia("(min-width: 1024px)").matches ? "horizontal" : "vertical";
@@ -48,22 +50,69 @@ const getNumber = (record: Record<string, unknown> | null, key: string): number 
   return null;
 };
 
-const extractPoint = (output: Record<string, unknown>): { x: number; y: number } | null => {
+const hasFractionalPart = (value: number): boolean => !Number.isInteger(value);
+
+const resolveRawPoint = (
+  point: { x: number; y: number },
+  geometry: { width: number; height: number },
+): { x: number; y: number } => {
+  if (
+    point.x >= 0 &&
+    point.x <= 1 &&
+    point.y >= 0 &&
+    point.y <= 1 &&
+    (hasFractionalPart(point.x) || hasFractionalPart(point.y))
+  ) {
+    return {
+      x: point.x * Math.max(0, geometry.width - 1),
+      y: point.y * Math.max(0, geometry.height - 1),
+    };
+  }
+
+  const maxX = Math.max(0, geometry.width - 1);
+  const maxY = Math.max(0, geometry.height - 1);
+  if (
+    point.x >= 0 &&
+    point.x <= 1000 &&
+    point.y >= 0 &&
+    point.y <= 1000 &&
+    (point.x > maxX || point.y > maxY)
+  ) {
+    return {
+      x: (point.x / 1000) * maxX,
+      y: (point.y / 1000) * maxY,
+    };
+  }
+
+  return point;
+};
+
+const extractPoint = (
+  output: Record<string, unknown>,
+  geometry: { width: number; height: number },
+): { x: number; y: number } | null => {
   const cursor = asRecord(output.cursor);
   const resolvedTarget = asRecord(output.resolvedTarget);
   const cursorAfter = asRecord(output.cursorAfter);
   const cursorAfterMove = asRecord(output.cursorAfterMove);
+  const movedTo = asRecord(output.movedTo);
 
   const candidates = [
-    { x: getNumber(output, "x"), y: getNumber(output, "y") },
-    { x: getNumber(cursor, "x"), y: getNumber(cursor, "y") },
-    { x: getNumber(resolvedTarget, "x"), y: getNumber(resolvedTarget, "y") },
-    { x: getNumber(cursorAfter, "x"), y: getNumber(cursorAfter, "y") },
     { x: getNumber(cursorAfterMove, "x"), y: getNumber(cursorAfterMove, "y") },
+    { x: getNumber(resolvedTarget, "x"), y: getNumber(resolvedTarget, "y") },
+    { x: getNumber(movedTo, "x"), y: getNumber(movedTo, "y") },
+    { x: getNumber(cursorAfter, "x"), y: getNumber(cursorAfter, "y") },
+    { x: getNumber(cursor, "x"), y: getNumber(cursor, "y") },
+    { x: getNumber(output, "x"), y: getNumber(output, "y"), needsResolution: true },
   ];
 
   const match = candidates.find((point) => point.x !== null && point.y !== null);
-  return match ? { x: match.x as number, y: match.y as number } : null;
+  if (!match) {
+    return null;
+  }
+
+  const point = { x: match.x as number, y: match.y as number };
+  return "needsResolution" in match ? resolveRawPoint(point, geometry) : point;
 };
 
 const extractGeometry = (
@@ -89,17 +138,20 @@ const deriveAgentCursor = (liveEvents: LiveEvent[]): AgentCursorPosition | null 
     }
 
     const payload = event.type === "tool_result" ? event.output : event.input;
-    const point = extractPoint(payload);
+    const geometry = extractGeometry(payload) ?? { width: 1366, height: 768 };
+    const point = extractPoint(payload, geometry);
     if (!point) {
       continue;
     }
 
-    const geometry = extractGeometry(payload) ?? { width: 1366, height: 768 };
     return {
+      clickKey: CLICK_TOOL_NAMES.has(event.toolName)
+        ? `${index}-${event.type}-${event.toolName}-click`
+        : null,
       eventKey: `${index}-${event.type}-${event.toolName}`,
-      isClicking:
-        event.type === "tool_call" &&
-        (event.toolName === "click_mouse" || event.toolName === "double_click_mouse"),
+      height: geometry.height,
+      isClicking: event.type === "tool_call" && CLICK_TOOL_NAMES.has(event.toolName),
+      width: geometry.width,
       xPercent: clampPercent((point.x / geometry.width) * 100),
       yPercent: clampPercent((point.y / geometry.height) * 100),
     };

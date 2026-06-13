@@ -1,4 +1,4 @@
-import { stepCountIs, streamText } from 'ai';
+import { stepCountIs, streamText, type ModelMessage } from 'ai';
 import { languageModel } from '../agent/model.ts';
 import { buildAgentSystemPrompt } from '../agent/prompt.ts';
 import {
@@ -106,6 +106,38 @@ const truncate = (text: string, max = 240): string =>
   text.length <= max ? text : `${text.slice(0, max)}...`;
 
 const estimateTextTokens = (text: string): number => Math.ceil(text.length / 4);
+
+const buildInitialUserMessage = (args: {
+  attachments: Array<{
+    filename: string;
+    mediaType: string;
+    url: string;
+  }>;
+  text: string;
+}): ModelMessage => {
+  const content: Array<
+    | { type: 'text'; text: string }
+    | { type: 'file'; data: string; filename: string; mediaType: string }
+  > = [{ type: 'text', text: args.text }];
+
+  for (const attachment of args.attachments) {
+    if (!attachment.mediaType.startsWith('image/')) {
+      continue;
+    }
+
+    content.push({
+      data: attachment.url,
+      filename: attachment.filename,
+      mediaType: attachment.mediaType,
+      type: 'file',
+    });
+  }
+
+  return {
+    content,
+    role: 'user',
+  };
+};
 
 const collectAssistantParts = (args: {
   assistantText: string;
@@ -280,6 +312,10 @@ export const runAgentConversation = async (args: {
       'Recent conversation:',
       transcript || '(empty)',
     ];
+    const initialUserMessage = buildInitialUserMessage({
+      attachments: userAttachments,
+      text: promptBlocks.join('\n'),
+    });
 
     const toolContext: ToolContext = { abortSignal, conversationId, runId };
 
@@ -310,7 +346,7 @@ export const runAgentConversation = async (args: {
           system: nextSystem,
         };
       },
-      prompt: promptBlocks.join('\n'),
+      messages: [initialUserMessage],
       providerOptions: { reasoning: reasoning ?? 'on' } as any,
       stopWhen: [stepCountIs(config.AGENT_MAX_STEPS)],
       system,

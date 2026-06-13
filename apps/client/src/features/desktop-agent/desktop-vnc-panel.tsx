@@ -1,9 +1,13 @@
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
 export interface AgentCursorPosition {
+  clickKey: string | null;
   eventKey: string;
+  height: number;
   isClicking: boolean;
+  width: number;
   xPercent: number;
   yPercent: number;
 }
@@ -15,30 +19,81 @@ interface DesktopVncPanelProps {
 }
 
 export function DesktopVncPanel({ agentCursor, vncUrl, isActive = false }: DesktopVncPanelProps) {
-  return (
-    <Card className="relative h-full min-h-0 overflow-hidden border-border/70 bg-card/80 !p-0" size="sm">
-      <CardContent className="relative h-full min-h-0 overflow-hidden !p-0">
-        <iframe
-          className="absolute inset-0 block h-full min-h-0 w-full rounded-2xl bg-black"
-          src={vncUrl}
-          title="Desktop VNC"
-        />
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [containerSize, setContainerSize] = useState({ height: 0, width: 0 });
+  const desktopWidth = agentCursor?.width && agentCursor.width > 0 ? agentCursor.width : 1366;
+  const desktopHeight = agentCursor?.height && agentCursor.height > 0 ? agentCursor.height : 768;
+  const desktopRect = useMemo(() => {
+    if (containerSize.width <= 0 || containerSize.height <= 0) {
+      return { height: "100%", width: "100%" };
+    }
 
-        {agentCursor ? (
-          <div aria-hidden={true} className="pointer-events-none absolute inset-0 z-50">
-            <div
-              className="absolute drop-shadow-[0_6px_12px_rgba(0,0,0,0.45)] transition-[left,top,opacity] duration-500 ease-out"
-              style={{
-                left: `${agentCursor.xPercent}%`,
-                opacity: isActive ? 1 : 0.72,
-                top: `${agentCursor.yPercent}%`,
-              }}
-            >
-              <div className="-translate-x-[2px] -translate-y-[2px]">
-                {agentCursor.isClicking ? (
+    const aspectRatio = desktopWidth / desktopHeight;
+    const containerAspectRatio = containerSize.width / containerSize.height;
+
+    if (containerAspectRatio > aspectRatio) {
+      const height = containerSize.height;
+      return { height, width: height * aspectRatio };
+    }
+
+    const width = containerSize.width;
+    return { height: width / aspectRatio, width };
+  }, [containerSize.height, containerSize.width, desktopHeight, desktopWidth]);
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element) {
+      return;
+    }
+
+    const updateSize = () => {
+      const rect = element.getBoundingClientRect();
+      setContainerSize({
+        height: rect.height,
+        width: rect.width,
+      });
+    };
+
+    updateSize();
+    const resizeObserver = new ResizeObserver(updateSize);
+    resizeObserver.observe(element);
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, []);
+
+  return (
+    <div ref={containerRef} className="flex h-full min-h-0 w-full items-start justify-start overflow-hidden">
+      <Card
+        className="relative min-h-0 overflow-hidden border-border/70 bg-black !p-0"
+        size="sm"
+        style={{
+          height: desktopRect.height,
+          width: desktopRect.width,
+        }}
+      >
+        <CardContent className="relative h-full min-h-0 overflow-hidden rounded-2xl bg-black !p-0">
+          <iframe
+            className="absolute inset-0 block h-full min-h-0 w-full bg-black"
+            src={vncUrl}
+            title="Desktop VNC"
+          />
+
+          {agentCursor ? (
+            <div aria-hidden={true} className="pointer-events-none absolute inset-0 z-50 overflow-hidden">
+              <div
+                className="absolute size-8 drop-shadow-[0_6px_12px_rgba(0,0,0,0.45)] transition-[left,top,opacity] duration-500 ease-out"
+                style={{
+                  left: `clamp(0px, calc(${agentCursor.xPercent}% - 2px), calc(100% - 32px))`,
+                  opacity: isActive ? 1 : 0.72,
+                  top: `clamp(0px, calc(${agentCursor.yPercent}% - 2px), calc(100% - 32px))`,
+                }}
+              >
+                {agentCursor.clickKey ? (
                   <span
                     className="absolute left-1 top-1 size-8 -translate-x-1/2 -translate-y-1/2 rounded-full border border-sky-300 bg-sky-400/25"
-                    key={agentCursor.eventKey}
+                    key={agentCursor.clickKey}
                     style={{ animation: "helm-cursor-click 520ms ease-out 1 forwards" }}
                   />
                 ) : null}
@@ -72,44 +127,41 @@ export function DesktopVncPanel({ agentCursor, vncUrl, isActive = false }: Deskt
                 </svg>
               </div>
             </div>
-          </div>
-        ) : null}
+          ) : null}
 
-        {/* Animated haze overlays — only visible when agent is working */}
-        <div
-          className={cn(
-            "pointer-events-none absolute inset-x-0 top-0 h-24 rounded-t-2xl transition-opacity duration-700",
-            isActive ? "opacity-100" : "opacity-0",
-          )}
-          style={{
-            background: "linear-gradient(to bottom, rgba(59,130,246,0.28) 0%, transparent 100%)",
-            animation: isActive ? "helm-haze-pulse 2.4s ease-in-out infinite" : undefined,
-          }}
-        />
-        <div
-          className={cn(
-            "pointer-events-none absolute inset-x-0 bottom-0 h-24 rounded-b-2xl transition-opacity duration-700",
-            isActive ? "opacity-100" : "opacity-0",
-          )}
-          style={{
-            background: "linear-gradient(to top, rgba(59,130,246,0.28) 0%, transparent 100%)",
-            animation: isActive ? "helm-haze-pulse 2.4s ease-in-out infinite 1.2s" : undefined,
-          }}
-        />
-
-        {/* Animated border glow */}
-        <div
-          className={cn(
-            "pointer-events-none absolute inset-0 rounded-2xl border-2 transition-opacity duration-700",
-            isActive ? "opacity-100" : "opacity-0",
-          )}
-          style={{
-            borderColor: "rgba(59,130,246,0.45)",
-            boxShadow: "inset 0 0 24px rgba(59,130,246,0.12)",
-            animation: isActive ? "helm-haze-pulse 2.4s ease-in-out infinite" : undefined,
-          }}
-        />
-      </CardContent>
-    </Card>
+          <div
+            className={cn(
+              "pointer-events-none absolute inset-x-0 top-0 z-40 h-24 transition-opacity duration-700",
+              isActive ? "opacity-100" : "opacity-0",
+            )}
+            style={{
+              background: "linear-gradient(to bottom, rgba(59,130,246,0.28) 0%, transparent 100%)",
+              animation: isActive ? "helm-haze-pulse 2.4s ease-in-out infinite" : undefined,
+            }}
+          />
+          <div
+            className={cn(
+              "pointer-events-none absolute inset-x-0 bottom-0 z-40 h-24 transition-opacity duration-700",
+              isActive ? "opacity-100" : "opacity-0",
+            )}
+            style={{
+              background: "linear-gradient(to top, rgba(59,130,246,0.28) 0%, transparent 100%)",
+              animation: isActive ? "helm-haze-pulse 2.4s ease-in-out infinite 1.2s" : undefined,
+            }}
+          />
+          <div
+            className={cn(
+              "pointer-events-none absolute inset-0 z-40 rounded-2xl border-2 transition-opacity duration-700",
+              isActive ? "opacity-100" : "opacity-0",
+            )}
+            style={{
+              borderColor: "rgba(59,130,246,0.45)",
+              boxShadow: "inset 0 0 24px rgba(59,130,246,0.12)",
+              animation: isActive ? "helm-haze-pulse 2.4s ease-in-out infinite" : undefined,
+            }}
+          />
+        </CardContent>
+      </Card>
+    </div>
   );
 }

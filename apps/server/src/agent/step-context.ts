@@ -295,6 +295,48 @@ const stripScreenshotImagePayload = (output: unknown): unknown => {
   return output;
 };
 
+const extractScreenshotImagePayload = (
+  output: unknown,
+): { data: string; mediaType: string } | null => {
+  if (!isRecord(output)) {
+    return null;
+  }
+
+  const imageBase64 = normalizeText(output.imageBase64);
+  if (imageBase64) {
+    return {
+      data: imageBase64,
+      mediaType: normalizeText(output.mimeType) || 'image/png',
+    };
+  }
+
+  if (output.type !== 'content' || !Array.isArray(output.value)) {
+    return null;
+  }
+
+  for (const item of output.value) {
+    if (!isRecord(item)) {
+      continue;
+    }
+
+    if (
+      item.type !== 'media' &&
+      item.type !== 'image-data' &&
+      item.type !== 'file-data'
+    ) {
+      continue;
+    }
+
+    const data = normalizeText(item.data);
+    const mediaType = normalizeText(item.mediaType) || 'image/png';
+    if (data && mediaType.startsWith('image/')) {
+      return { data, mediaType };
+    }
+  }
+
+  return null;
+};
+
 export const pruneOlderScreenshotImages = <TMessage extends MessageLike>(
   messages: TMessage[],
 ): TMessage[] => {
@@ -349,17 +391,13 @@ export const appendLatestScreenshotImageMessage = <
   messages: TMessage[],
 ): TMessage[] => {
   const latestScreenshot = getLatestScreenshotResult(messages);
-  const output = latestScreenshot?.part.output;
-  if (!isRecord(output)) {
+  const screenshotImage = extractScreenshotImagePayload(
+    latestScreenshot?.part.output,
+  );
+  if (!screenshotImage) {
     return messages;
   }
 
-  const imageBase64 = normalizeText(output.imageBase64);
-  if (!imageBase64) {
-    return messages;
-  }
-
-  const mimeType = normalizeText(output.mimeType) || 'image/png';
   const screenshotMessage = {
     role: 'user',
     content: [
@@ -373,8 +411,8 @@ export const appendLatestScreenshotImageMessage = <
       },
       {
         type: 'file',
-        data: imageBase64,
-        mediaType: mimeType,
+        data: screenshotImage.data,
+        mediaType: screenshotImage.mediaType,
         filename: 'desktop-screenshot.png',
       },
     ],

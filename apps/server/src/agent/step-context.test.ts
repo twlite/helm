@@ -340,8 +340,46 @@ describe('agent step context', () => {
 
     assert.equal(next.length, 2);
     assert.equal(injected.role, 'user');
+    assert.match(injected.content[0].text, /Latest desktop screenshot image/);
     assert.deepEqual(injected.content[1], {
       data: 'latest-image',
+      filename: 'desktop-screenshot.png',
+      mediaType: 'image/png',
+      type: 'file',
+    });
+  });
+
+  it('appends screenshots from AI SDK model-output content shape', () => {
+    const messages = [
+      {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            toolName: 'capture_screenshot',
+            output: {
+              type: 'content',
+              value: [
+                { type: 'text', text: 'Screenshot captured.' },
+                {
+                  data: 'model-output-image',
+                  mediaType: 'image/png',
+                  type: 'image-data',
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ];
+
+    const next = appendLatestScreenshotImageMessage(messages as any) as any[];
+    const injected = next.at(-1);
+
+    assert.equal(next.length, 2);
+    assert.equal(injected.role, 'user');
+    assert.deepEqual(injected.content[1], {
+      data: 'model-output-image',
       filename: 'desktop-screenshot.png',
       mediaType: 'image/png',
       type: 'file',
