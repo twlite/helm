@@ -115,30 +115,30 @@ export function ScreenshotPreview({
           )}
         </DialogTrigger>
 
-        <DialogContent className="max-w-5xl p-4 sm:p-6">
-          <DialogTitle>{toolName} screenshot</DialogTitle>
-          <DialogDescription>
-            Click outside to close. Image loads only when expanded.
-          </DialogDescription>
+        <DialogContent className="max-h-[96dvh] w-[min(96vw,1440px)] max-w-none gap-4 p-3 sm:p-4">
+          <DialogTitle>Captured screenshot</DialogTitle>
+          <DialogDescription>Click outside to close.</DialogDescription>
           {open ? (
-            <div className="relative overflow-hidden rounded-lg border border-border/70 bg-muted/20">
-              <img
-                alt={`${toolName} screenshot full view`}
-                className="max-h-[72dvh] w-full object-contain"
-                decoding="async"
-                loading="lazy"
-                src={imageSrc}
-              />
-              {cursorPosition ? (
-                <span
-                  aria-hidden={true}
-                  className="pointer-events-none absolute z-10 block size-3 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white bg-red-500 shadow-[0_0_0_1px_rgba(0,0,0,0.55)]"
-                  style={{
-                    left: `${cursorPosition.left}%`,
-                    top: `${cursorPosition.top}%`,
-                  }}
+            <div className="flex max-h-[calc(96dvh-5.75rem)] justify-center overflow-auto rounded-lg border border-border/70 bg-muted/20">
+              <div className="relative inline-block max-w-full">
+                <img
+                  alt={`${toolName} screenshot full view`}
+                  className="block max-h-[calc(96dvh-5.75rem)] max-w-full object-contain"
+                  decoding="async"
+                  loading="lazy"
+                  src={imageSrc}
                 />
-              ) : null}
+                {cursorPosition ? (
+                  <span
+                    aria-hidden={true}
+                    className="pointer-events-none absolute z-10 block size-3 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white bg-red-500 shadow-[0_0_0_1px_rgba(0,0,0,0.55)]"
+                    style={{
+                      left: `${cursorPosition.left}%`,
+                      top: `${cursorPosition.top}%`,
+                    }}
+                  />
+                ) : null}
+              </div>
             </div>
           ) : null}
         </DialogContent>
