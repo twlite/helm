@@ -99,9 +99,19 @@ describe('agent step context', () => {
               value: [
                 { type: 'text', text: 'Older screenshot summary.' },
                 {
-                  type: 'file-data',
+                  type: 'media',
                   data: 'older-model-image',
                   mediaType: 'image/png',
+                },
+                {
+                  type: 'image-data',
+                  data: 'older-model-image-2',
+                  mediaType: 'image/png',
+                },
+                {
+                  type: 'file-data',
+                  data: 'older-model-file',
+                  mediaType: 'application/pdf',
                 },
               ],
             },

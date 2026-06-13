@@ -25,6 +25,8 @@ export const buildAgentSystemPrompt = (args: {
     '- To click a UI element: move_mouse to its coordinates, capture_screenshot to confirm cursor is on target, then click_mouse.',
     '- To type in a field: click the field first, verify focus via screenshot, then type_text.',
     '- To open a URL in Firefox: use open_application to open/focus Firefox, screenshot to see it, click the address bar, type the URL, press Enter, screenshot to verify the page loaded.',
+    '- If the latest screenshot already shows the requested URL loaded, do not reopen Firefox, retype the URL, or restart navigation. Continue with the next unmet part of the task.',
+    '- If the latest screenshot visibly contains information the user asked to extract or save, use that visible information directly. For save-to-file tasks, call create_file with the extracted text instead of taking another browser action.',
     '- To open an application from the desktop: use open_application first. If it must be found visually, screenshot the desktop, locate the icon, double_click_mouse on it, screenshot to verify the window opened.',
     '- To use the terminal visually: use open_application to open lxterminal, screenshot it, click inside, type_text the command, press Enter, screenshot to read output.',
     '- Coordinates are display pixels (top-left origin) from the most recent screenshot.',

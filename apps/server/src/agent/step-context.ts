@@ -76,7 +76,10 @@ const stripScreenshotImagePayload = (output: unknown): unknown => {
     return {
       ...output,
       value: output.value.filter((item) => {
-        return !isRecord(item) || item.type !== 'file-data';
+        return (
+          !isRecord(item) ||
+          !['file-data', 'image-data', 'media'].includes(normalizeText(item.type))
+        );
       }),
     };
   }

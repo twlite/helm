@@ -96,10 +96,9 @@ export const buildScreenshotTools = ({
               text: buildScreenshotText(typedOutput),
             },
             {
-              type: 'file-data' as const,
+              type: 'media' as const,
               data: imageBase64,
               mediaType: mimeType,
-              filename: 'desktop-screenshot.png',
             },
           ],
         };
