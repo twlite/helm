@@ -41,7 +41,6 @@ import {
   PromptInputTextarea,
   PromptInputTools,
   usePromptInputAttachments,
-  usePromptInputController,
 } from '@/components/ai-elements/prompt-input';
 import {
   Reasoning,
@@ -73,6 +72,7 @@ import {
   GripVerticalIcon,
   ListIcon,
   ListPlusIcon,
+  SendIcon,
   XIcon,
 } from 'lucide-react';
 import { ScreenshotPreview } from './screenshot-preview';
@@ -360,31 +360,6 @@ const toAttachmentPartData = (
     type: 'file',
     url,
   };
-};
-
-const QueueSubmitButton = ({ onEnqueue }: { onEnqueue: (text: string) => void }) => {
-  const { textInput } = usePromptInputController();
-  const hasText = textInput.value.trim().length > 0;
-  if (!hasText) return null;
-  return (
-    <Button
-      aria-label="Queue message"
-      className="h-8 gap-1.5 px-2.5 text-xs"
-      onClick={() => {
-        const text = textInput.value.trim();
-        if (text) {
-          onEnqueue(text);
-          textInput.clear();
-        }
-      }}
-      size="sm"
-      type="button"
-      variant="outline"
-    >
-      <ListPlusIcon className="size-3.5" />
-      Queue
-    </Button>
-  );
 };
 
 const ComposerAttachments = () => {
@@ -964,17 +939,23 @@ export function AgentChatPanel({
                     </PromptInputButton>
                   </PromptInputTools>
                   <div className="flex items-center gap-1">
-                    {isBusy && !isCancelling && (
-                      <QueueSubmitButton onEnqueue={onEnqueueMessage} />
-                    )}
-                    {!isBusy && (
-                      <PromptInputSubmit
-                        aria-label="Submit prompt"
-                        className="shrink-0"
-                        disabled={composerDisabled}
-                        status="ready"
-                      />
-                    )}
+                    <PromptInputSubmit
+                      aria-label={isBusy ? 'Queue message' : 'Submit prompt'}
+                      className={cn(
+                        'shrink-0',
+                        isBusy && !isCancelling
+                          ? 'bg-primary/10 text-primary ring-1 ring-primary/30 hover:bg-primary/20'
+                          : undefined,
+                      )}
+                      disabled={composerDisabled}
+                      status="ready"
+                    >
+                      {isBusy && !isCancelling ? (
+                        <ListPlusIcon className="size-4" />
+                      ) : (
+                        <SendIcon className="size-4" />
+                      )}
+                    </PromptInputSubmit>
                     {isBusy && (
                       <Button
                         aria-label="Cancel run"
