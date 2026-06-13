@@ -1,6 +1,7 @@
 import { memo, useCallback, useMemo, useRef, useState } from 'react';
 import type { FileUIPart } from 'ai';
 import type {
+  ContextSummaryStats,
   ConversationMessageRecord,
   ConversationTimelineResponse,
   RunReasoningSetting,
@@ -89,6 +90,7 @@ const MESSAGE_VIRTUAL_WINDOW = 140;
 const CONTEXT_ICON_RADIUS = 8;
 const CONTEXT_ICON_SIZE = 20;
 const CONTEXT_ICON_STROKE = 2;
+const SUMMARY_HISTORY_LIMIT = 4;
 
 const AGENT_STATUS_LABELS: Record<AgentStatus, string> = {
   idle: 'Idle',
@@ -159,6 +161,27 @@ const toDisplayOutput = (output: Record<string, unknown>): Record<string, unknow
   if (!screenshot) return output;
   const kb = Math.round(screenshot.base64.length / 1024);
   return { ...output, imageBase64: `[omitted screenshot base64 (${kb}KB)]` };
+};
+
+const formatNumber = (value: number | null | undefined): string =>
+  typeof value === 'number' && Number.isFinite(value)
+    ? value.toLocaleString()
+    : 'N/A';
+
+const formatTokenCount = (value: number | null | undefined): string =>
+  typeof value === 'number' && Number.isFinite(value)
+    ? `${value.toLocaleString()} tok`
+    : 'N/A';
+
+const formatDateTime = (value: string): string => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    month: 'short',
+  }).format(date);
 };
 
 const splitReasoningSteps = (text: string): string[] => {
@@ -402,6 +425,228 @@ const SummaryContextIcon = ({ hasSummary, percent }: { hasSummary: boolean; perc
   );
 };
 
+const ContextMetric = ({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) => (
+  <div className="min-w-0 rounded-md border border-border/55 bg-background/70 px-2.5 py-2">
+    <p className="truncate text-[11px] text-muted-foreground">{label}</p>
+    <p className="mt-0.5 truncate font-medium text-sm">{value}</p>
+  </div>
+);
+
+const ContextProgress = ({
+  label,
+  percent,
+  value,
+}: {
+  label: string;
+  percent: number;
+  value: string;
+}) => {
+  const bounded = Math.max(0, Math.min(100, percent));
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-3 text-xs">
+        <span className="text-muted-foreground">{label}</span>
+        <span className="font-medium">{value}</span>
+      </div>
+      <div className="h-2 overflow-hidden rounded-full bg-muted">
+        <div
+          className={cn(
+            'h-full rounded-full transition-[width]',
+            bounded >= 80 ? 'bg-amber-500' : bounded >= 55 ? 'bg-blue-500' : 'bg-emerald-500',
+          )}
+          style={{ width: `${bounded}%` }}
+        />
+      </div>
+    </div>
+  );
+};
+
+const fallbackContextSummary = (args: {
+  latestSummary: ConversationTimelineResponse['latestSummary'];
+  messagesLength: number;
+  totalMessageCount: number;
+}): ContextSummaryStats => {
+  const summarizedMessageCount = args.latestSummary?.upToMessageCount ?? 0;
+  return {
+    activeMessageCount: Math.max(0, args.totalMessageCount - summarizedMessageCount),
+    activeTokenEstimate: 0,
+    compressionPercent:
+      args.totalMessageCount > 0
+        ? Math.round((summarizedMessageCount / args.totalMessageCount) * 100)
+        : 0,
+    contextWindowTokens: null,
+    latestSummaryTokenEstimate: null,
+    source: 'fallback',
+    summarizedMessageCount,
+    summarizedTokenEstimate: args.latestSummary?.tokenEstimate ?? 0,
+    summaryCount: args.latestSummary ? 1 : 0,
+    summaryTokenEstimate: 0,
+    totalMessageCount: args.totalMessageCount || args.messagesLength,
+    triggerTokens: 0,
+    usagePercent: 0,
+  };
+};
+
+const ContextSummaryHoverCard = ({
+  contextSummary,
+  isBusy,
+  isCancelling,
+  isSummarizing,
+  latestSummary,
+  liveRunStatus,
+  summaryHistory,
+}: {
+  contextSummary: ContextSummaryStats;
+  isBusy: boolean;
+  isCancelling: boolean;
+  isSummarizing: boolean;
+  latestSummary: ConversationTimelineResponse['latestSummary'];
+  liveRunStatus: RunStatus | null;
+  summaryHistory: ConversationTimelineResponse['summaryHistory'];
+}) => {
+  const hasSummary = contextSummary.summaryCount > 0;
+  const stateLabel = isCancelling
+    ? 'Cancelling'
+    : isSummarizing
+      ? 'Summarizing'
+      : isBusy
+        ? liveRunStatus === 'queued'
+          ? 'Queued'
+          : 'Streaming'
+        : 'Idle';
+  const recentHistory = summaryHistory.slice(-SUMMARY_HISTORY_LIMIT).reverse();
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="font-medium text-xs text-muted-foreground uppercase tracking-wide">
+            Context Summary
+          </p>
+          <p className="mt-1 text-sm leading-snug">
+            {hasSummary
+              ? 'Older messages are compressed while recent turns stay available verbatim.'
+              : 'No summary has been created yet. The active context is still raw message history.'}
+          </p>
+        </div>
+        <Badge variant={isSummarizing ? 'default' : hasSummary ? 'secondary' : 'outline'}>
+          {stateLabel}
+        </Badge>
+      </div>
+
+      <div className="rounded-lg border border-border/60 bg-muted/25 p-3">
+        <ContextProgress
+          label="Active context used"
+          percent={contextSummary.usagePercent}
+          value={`${contextSummary.usagePercent}%`}
+        />
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <ContextMetric
+            label="Active tokens"
+            value={formatTokenCount(contextSummary.activeTokenEstimate)}
+          />
+          <ContextMetric
+            label="Trigger"
+            value={formatTokenCount(contextSummary.triggerTokens)}
+          />
+          <ContextMetric
+            label="Context window"
+            value={
+              contextSummary.contextWindowTokens
+                ? formatTokenCount(contextSummary.contextWindowTokens)
+                : 'Provider unknown'
+            }
+          />
+          <ContextMetric
+            label="Threshold source"
+            value={contextSummary.source}
+          />
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <ContextMetric
+          label="Total messages"
+          value={formatNumber(contextSummary.totalMessageCount)}
+        />
+        <ContextMetric
+          label="Summarized"
+          value={`${formatNumber(contextSummary.summarizedMessageCount)} (${contextSummary.compressionPercent}%)`}
+        />
+        <ContextMetric
+          label="Compressed tokens"
+          value={formatTokenCount(contextSummary.summarizedTokenEstimate)}
+        />
+        <ContextMetric
+          label="Summary tokens"
+          value={formatTokenCount(contextSummary.summaryTokenEstimate)}
+        />
+      </div>
+
+      {latestSummary ? (
+        <div className="rounded-lg border border-border/60 bg-background/75 p-3">
+          <div className="flex items-center justify-between gap-2">
+            <p className="font-medium text-xs">Latest summary</p>
+            <span className="text-[11px] text-muted-foreground">
+              {formatDateTime(latestSummary.createdAt)}
+            </span>
+          </div>
+          <p className="mt-1 line-clamp-3 text-muted-foreground text-xs leading-relaxed">
+            {latestSummary.summaryText}
+          </p>
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            <Badge variant="outline">covers {latestSummary.upToMessageCount} messages</Badge>
+            <Badge variant="outline">
+              {formatTokenCount(contextSummary.latestSummaryTokenEstimate)}
+            </Badge>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <p className="font-medium text-xs">Summary history</p>
+          <span className="text-[11px] text-muted-foreground">
+            {contextSummary.summaryCount} total
+          </span>
+        </div>
+        {recentHistory.length > 0 ? (
+          <div className="space-y-1.5">
+            {recentHistory.map((summary) => (
+              <div
+                className="grid grid-cols-[1fr_auto] gap-2 rounded-md border border-border/50 bg-muted/20 px-2.5 py-2 text-xs"
+                key={summary.id}
+              >
+                <div className="min-w-0">
+                  <p className="truncate font-medium">
+                    {formatDateTime(summary.createdAt)}
+                  </p>
+                  <p className="truncate text-muted-foreground">
+                    covers {summary.upToMessageCount} messages
+                  </p>
+                </div>
+                <span className="self-center text-muted-foreground">
+                  {formatTokenCount(summary.tokenEstimate)}
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="rounded-md border border-dashed border-border/70 px-3 py-2 text-muted-foreground text-xs">
+            No compression history yet.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
 const renderMessage = (message: ConversationMessageRecord, options: { showReasoning: boolean }) => {
   const from = message.role === 'user' ? 'user' : 'assistant';
   const toolParts = message.parts.filter(
@@ -576,22 +821,61 @@ const StatusChipDetail = ({ event }: { event: StatusEvent }) => {
     );
   }
   if (event.kind === 'context_summarizing') {
-    const { tokenEstimate } = event.payload;
+    const {
+      contextWindowTokens,
+      source,
+      tokenEstimate,
+      triggerTokens,
+      upToMessageCount,
+    } = event.payload;
     return (
-      <p className="text-xs">
-        Older messages being compressed so the active context window stays within token budget.
-        {typeof tokenEstimate === 'number' ? ` Estimated ${tokenEstimate.toLocaleString()} tokens.` : ''}
-      </p>
+      <div className="space-y-2 text-xs">
+        <p>
+          Older messages are being compressed before the active context exceeds the model budget.
+        </p>
+        <div className="grid grid-cols-2 gap-1.5">
+          <div>
+            <p className="opacity-70">Active estimate</p>
+            <p className="font-semibold">{formatTokenCount(tokenEstimate)}</p>
+          </div>
+          <div>
+            <p className="opacity-70">Trigger</p>
+            <p className="font-semibold">{formatTokenCount(triggerTokens)}</p>
+          </div>
+          <div>
+            <p className="opacity-70">Context window</p>
+            <p className="font-semibold">{formatTokenCount(contextWindowTokens)}</p>
+          </div>
+          <div>
+            <p className="opacity-70">Covers through</p>
+            <p className="font-semibold">
+              {typeof upToMessageCount === 'number' ? `${upToMessageCount} messages` : 'N/A'}
+            </p>
+          </div>
+        </div>
+        {source ? <p className="opacity-70">Threshold source: {source}</p> : null}
+      </div>
     );
   }
   if (event.kind === 'context_summarized') {
-    const { tokenEstimate, upToMessageCount } = event.payload;
+    const { summaryTokenEstimate, tokenEstimate, upToMessageCount } = event.payload;
     return (
-      <p className="text-xs">
-        Conversation summarized
-        {typeof upToMessageCount === 'number' ? ` (covers ${upToMessageCount} messages)` : ''}.
-        {typeof tokenEstimate === 'number' ? ` Summary ≈ ${tokenEstimate.toLocaleString()} tokens.` : ''}
-      </p>
+      <div className="space-y-2 text-xs">
+        <p>
+          Conversation summary stored
+          {typeof upToMessageCount === 'number' ? `, covering the first ${upToMessageCount} messages.` : '.'}
+        </p>
+        <div className="grid grid-cols-2 gap-1.5">
+          <div>
+            <p className="opacity-70">Compressed estimate</p>
+            <p className="font-semibold">{formatTokenCount(tokenEstimate)}</p>
+          </div>
+          <div>
+            <p className="opacity-70">Summary size</p>
+            <p className="font-semibold">{formatTokenCount(summaryTokenEstimate)}</p>
+          </div>
+        </div>
+      </div>
     );
   }
   return null;
@@ -806,15 +1090,26 @@ export function AgentChatPanel({
   const [renderWindow, setRenderWindow] = useState(MESSAGE_VIRTUAL_WINDOW);
   const [showReasoning, setShowReasoning] = useState(true);
 
-  const latestSummary = timeline?.latestSummary;
-  const hasSummary = Boolean(latestSummary);
-  const summarizedMessageCount = latestSummary?.upToMessageCount ?? 0;
+  const latestSummary = timeline?.latestSummary ?? null;
   const totalMessageCount = timeline?.messageCount ?? messages.length;
-  const contextCoveragePercent =
-    totalMessageCount > 0
-      ? Math.min(100, Math.round((summarizedMessageCount / totalMessageCount) * 100))
-      : 0;
-  const summaryTokenEstimate = latestSummary?.tokenEstimate;
+  const contextSummary =
+    timeline?.contextSummary ??
+    fallbackContextSummary({
+      latestSummary,
+      messagesLength: messages.length,
+      totalMessageCount,
+    });
+  const hasSummary = contextSummary.summaryCount > 0;
+  const contextCoveragePercent = contextSummary.compressionPercent;
+  const latestSummaryEvent = liveEvents.findLast(
+    (event) =>
+      event.type === 'status' &&
+      (event.kind === 'context_summarizing' || event.kind === 'context_summarized'),
+  );
+  const isSummarizing =
+    latestSummaryEvent?.type === 'status' &&
+    latestSummaryEvent.kind === 'context_summarizing' &&
+    isBusy;
   const composerDisabled = !activeConversationId || isCancelling;
 
   const visibleMessages = useMemo(() => {
@@ -976,27 +1271,19 @@ export function AgentChatPanel({
                 <PromptInputHoverCard>
                   <PromptInputHoverCardTrigger>
                     <Button aria-label="View context summary details" className="size-5 p-0" size="icon-xs" type="button" variant="ghost">
-                      <SummaryContextIcon hasSummary={hasSummary} percent={contextCoveragePercent} />
+                      <SummaryContextIcon hasSummary={hasSummary || isSummarizing} percent={contextSummary.usagePercent || contextCoveragePercent} />
                     </Button>
                   </PromptInputHoverCardTrigger>
-                  <PromptInputHoverCardContent align="end" className="w-72 p-3">
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="font-medium text-xs text-muted-foreground uppercase tracking-wide">Context Summary</p>
-                        <Badge variant={hasSummary ? 'secondary' : 'outline'}>{contextCoveragePercent}%</Badge>
-                      </div>
-                      <p className="text-xs text-muted-foreground">
-                        {hasSummary
-                          ? 'Older messages are compressed into a summary so the active context stays compact.'
-                          : 'No summary yet. Full message history remains in context.'}
-                      </p>
-                      <div className="grid grid-cols-2 gap-2 rounded-lg border border-border/60 bg-muted/35 p-2 text-xs">
-                        <div><p className="text-muted-foreground">Total</p><p className="font-medium">{totalMessageCount}</p></div>
-                        <div><p className="text-muted-foreground">Summarized</p><p className="font-medium">{summarizedMessageCount}</p></div>
-                        <div><p className="text-muted-foreground">Summary tokens</p><p className="font-medium">{summaryTokenEstimate ?? 'N/A'}</p></div>
-                        <div><p className="text-muted-foreground">State</p><p className="font-medium">{isCancelling ? 'Cancelling' : isBusy ? 'Streaming' : 'Idle'}</p></div>
-                      </div>
-                    </div>
+                  <PromptInputHoverCardContent align="end" className="w-96 p-3">
+                    <ContextSummaryHoverCard
+                      contextSummary={contextSummary}
+                      isBusy={isBusy}
+                      isCancelling={isCancelling}
+                      isSummarizing={isSummarizing}
+                      latestSummary={latestSummary}
+                      liveRunStatus={liveRunStatus}
+                      summaryHistory={timeline?.summaryHistory ?? []}
+                    />
                   </PromptInputHoverCardContent>
                 </PromptInputHoverCard>
               </div>

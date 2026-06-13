@@ -17,6 +17,13 @@ import {
 export const maybeSummarizeConversation = async (args: {
   conversationId: string;
   messages: ConversationMessageRecord[];
+  onSummarizing?: (details: {
+    contextWindowTokens: number | null;
+    source: 'provider' | 'fallback';
+    tokenEstimate: number;
+    triggerTokens: number;
+    upToMessageCount: number;
+  }) => void;
 }): Promise<ConversationSummaryRecord | null> => {
   const latestSummary = getLatestSummary(args.conversationId);
   const summaryContext = await getEffectiveSummaryContext({
@@ -34,6 +41,14 @@ export const maybeSummarizeConversation = async (args: {
   if (!plan) {
     return null;
   }
+
+  args.onSummarizing?.({
+    contextWindowTokens: summaryContext.contextWindowTokens,
+    source: summaryContext.source,
+    tokenEstimate: plan.tokenEstimate,
+    triggerTokens: summaryContext.triggerTokens,
+    upToMessageCount: plan.upToMessageCount,
+  });
 
   const transcript = toTranscript(plan.targetMessages);
 

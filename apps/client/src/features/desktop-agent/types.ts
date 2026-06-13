@@ -29,9 +29,16 @@ export type LiveStatusKind =
 export interface LiveStatusPayload {
   memory_reading: { count?: number; query?: string };
   memory_saved: { toolCallCount?: number };
-  context_summarizing: { tokenEstimate?: number };
+  context_summarizing: {
+    contextWindowTokens?: number | null;
+    source?: 'provider' | 'fallback';
+    tokenEstimate?: number;
+    triggerTokens?: number;
+    upToMessageCount?: number;
+  };
   context_summarized: {
     summaryId?: string;
+    summaryTokenEstimate?: number;
     tokenEstimate?: number;
     upToMessageCount?: number;
   };

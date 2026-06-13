@@ -95,12 +95,30 @@ export interface ConversationSummaryRecord {
   createdAt: string;
 }
 
+export interface ContextSummaryStats {
+  activeMessageCount: number;
+  activeTokenEstimate: number;
+  compressionPercent: number;
+  contextWindowTokens: number | null;
+  latestSummaryTokenEstimate: number | null;
+  source: 'provider' | 'fallback';
+  summarizedMessageCount: number;
+  summarizedTokenEstimate: number;
+  summaryCount: number;
+  summaryTokenEstimate: number;
+  totalMessageCount: number;
+  triggerTokens: number;
+  usagePercent: number;
+}
+
 export interface ConversationTimelineResponse {
   conversation: ConversationRecord;
   activeRun: ConversationRunRecord | null;
+  contextSummary: ContextSummaryStats;
   latestSummary: ConversationSummaryRecord | null;
   messageCount: number;
   messages: ConversationMessageRecord[];
+  summaryHistory: ConversationSummaryRecord[];
 }
 
 export interface ListConversationsResponse {

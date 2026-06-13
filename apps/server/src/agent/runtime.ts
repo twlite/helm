@@ -100,6 +100,8 @@ const stringifyMemory = (memory: {
 const truncate = (text: string, max = 240): string =>
   text.length <= max ? text : `${text.slice(0, max)}...`;
 
+const estimateTextTokens = (text: string): number => Math.ceil(text.length / 4);
+
 const collectAssistantParts = (args: {
   assistantText: string;
   reasoningText: string;
@@ -190,20 +192,23 @@ export const runAgentConversation = async (args: {
     const createdSummary = await maybeSummarizeConversation({
       conversationId,
       messages: beforeMessages,
+      onSummarizing: (details) => {
+        publishRunEvent({
+          conversationId,
+          eventType: 'context_summarizing',
+          payload: details,
+          runId,
+        });
+      },
     });
 
     if (createdSummary) {
       publishRunEvent({
         conversationId,
-        eventType: 'context_summarizing',
-        payload: { tokenEstimate: createdSummary.tokenEstimate },
-        runId,
-      });
-      publishRunEvent({
-        conversationId,
         eventType: 'summary_created',
         payload: {
           summaryId: createdSummary.id,
+          summaryTokenEstimate: estimateTextTokens(createdSummary.summaryText),
           tokenEstimate: createdSummary.tokenEstimate,
           upToMessageCount: createdSummary.upToMessageCount,
         },
@@ -391,6 +396,14 @@ export const runAgentConversation = async (args: {
     const followUpSummary = await maybeSummarizeConversation({
       conversationId,
       messages: afterMessages,
+      onSummarizing: (details) => {
+        publishRunEvent({
+          conversationId,
+          eventType: 'context_summarizing',
+          payload: details,
+          runId,
+        });
+      },
     });
 
     if (followUpSummary) {
@@ -399,6 +412,7 @@ export const runAgentConversation = async (args: {
         eventType: 'summary_created',
         payload: {
           summaryId: followUpSummary.id,
+          summaryTokenEstimate: estimateTextTokens(followUpSummary.summaryText),
           tokenEstimate: followUpSummary.tokenEstimate,
           upToMessageCount: followUpSummary.upToMessageCount,
         },

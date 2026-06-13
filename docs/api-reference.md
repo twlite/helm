@@ -53,7 +53,7 @@ Deletes a conversation and all associated messages, runs, events, and embedding 
 
 ### `GET /api/conversations/:conversationId`
 
-Returns the conversation timeline including the active run (if any), the latest context summary, and optionally recent messages.
+Returns the conversation timeline including the active run (if any), context usage metadata, summary history, and optionally recent messages.
 
 **Query parameters**
 
@@ -66,9 +66,25 @@ Returns the conversation timeline including the active run (if any), the latest 
 {
   "conversation": { ...ConversationRecord },
   "activeRun": { ...ConversationRunRecord } | null,
+  "contextSummary": {
+    "activeMessageCount": 24,
+    "activeTokenEstimate": 18400,
+    "compressionPercent": 38,
+    "contextWindowTokens": 128000,
+    "latestSummaryTokenEstimate": 920,
+    "source": "provider",
+    "summarizedMessageCount": 18,
+    "summarizedTokenEstimate": 11200,
+    "summaryCount": 2,
+    "summaryTokenEstimate": 1640,
+    "totalMessageCount": 42,
+    "triggerTokens": 102400,
+    "usagePercent": 18
+  },
   "latestSummary": { ...ConversationSummaryRecord } | null,
   "messageCount": 42,
-  "messages": [ ...ConversationMessageRecord[] ]
+  "messages": [ ...ConversationMessageRecord[] ],
+  "summaryHistory": [ ...ConversationSummaryRecord[] ]
 }
 ```
 
@@ -149,8 +165,8 @@ Opens a Server-Sent Events stream for live run output. Events are replayed from 
 | `assistant_text` | `{ delta }` | Incremental assistant response text |
 | `memory_reading` | `{ count, query }` | RAG retrieval found relevant memories |
 | `memory_saved` | `{ toolCallCount }` | Episodic memory persisted after run |
-| `context_summarizing` | `{ tokenEstimate? }` | Context window compression started |
-| `summary_created` | `{ summaryId, tokenEstimate, upToMessageCount }` | Summary created and stored |
+| `context_summarizing` | `{ tokenEstimate, triggerTokens, contextWindowTokens, source, upToMessageCount }` | Context window compression started |
+| `summary_created` | `{ summaryId, tokenEstimate, summaryTokenEstimate, upToMessageCount }` | Summary created and stored |
 | `run_completed` | `{ assistantMessageId, preview }` | Run finished successfully |
 | `run_failed` | `{ message }` | Run encountered an error |
 | `run_cancelled` | `{ message }` | Run was cancelled |

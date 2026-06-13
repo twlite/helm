@@ -788,6 +788,27 @@ export const getLatestSummary = (
   return row ? toSummaryRecord(row) : null;
 };
 
+export const listSummariesByConversationId = (
+  conversationId: string,
+): ConversationSummaryRecord[] => {
+  const rows = db
+    .prepare(
+      `SELECT
+        id,
+        conversation_id,
+        summary_text,
+        up_to_message_count,
+        token_estimate,
+        created_at
+      FROM conversation_summaries
+      WHERE conversation_id = ?
+      ORDER BY created_at ASC`,
+    )
+    .all(conversationId) as unknown as SummaryRow[];
+
+  return rows.map(toSummaryRecord);
+};
+
 export const insertSummary = (args: {
   conversationId: string;
   summaryText: string;

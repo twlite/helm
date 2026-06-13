@@ -451,7 +451,11 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
 
       if (parsed.eventType === 'context_summarizing') {
         pushStatusEvent('context_summarizing', {
+          contextWindowTokens: typeof parsed.payload.contextWindowTokens === 'number' ? parsed.payload.contextWindowTokens : null,
+          source: parsed.payload.source === 'provider' || parsed.payload.source === 'fallback' ? parsed.payload.source : undefined,
           tokenEstimate: typeof parsed.payload.tokenEstimate === 'number' ? parsed.payload.tokenEstimate : undefined,
+          triggerTokens: typeof parsed.payload.triggerTokens === 'number' ? parsed.payload.triggerTokens : undefined,
+          upToMessageCount: typeof parsed.payload.upToMessageCount === 'number' ? parsed.payload.upToMessageCount : undefined,
         });
         return;
       }
@@ -459,6 +463,7 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
       if (parsed.eventType === 'summary_created') {
         pushStatusEvent('context_summarized', {
           summaryId: getText(parsed.payload.summaryId) || undefined,
+          summaryTokenEstimate: typeof parsed.payload.summaryTokenEstimate === 'number' ? parsed.payload.summaryTokenEstimate : undefined,
           tokenEstimate: typeof parsed.payload.tokenEstimate === 'number' ? parsed.payload.tokenEstimate : undefined,
           upToMessageCount: typeof parsed.payload.upToMessageCount === 'number' ? parsed.payload.upToMessageCount : undefined,
         });

@@ -6,14 +6,19 @@ import {
   getActiveRunForConversation,
   getConversationById,
   getConversationTimeline,
+  getMessagesByConversationId,
   listConversationMessagesPage,
   listConversations,
   listRunEvents,
+  listSummariesByConversationId,
   markRunCancelled,
   withTransaction,
 } from '../database/store.ts';
 import { notFound } from '../errors.ts';
+import { config } from '../config.ts';
+import { buildContextSummaryStats } from '../services/context-summary.ts';
 import { deleteConversationMemories } from '../services/memory.ts';
+import { getEffectiveSummaryContext } from '../services/model-context.ts';
 import { requestRunCancellation } from '../services/run-control.ts';
 import { publishRunEvent } from '../services/run-events.ts';
 import { safeJsonBody } from './shared.ts';
@@ -104,7 +109,7 @@ export const registerConversationRoutes = (app: Hono) => {
     return c.body(null, 204);
   });
 
-  app.get('/api/conversations/:conversationId', (c) => {
+  app.get('/api/conversations/:conversationId', async (c) => {
     const conversationId = c.req.param('conversationId');
     const query = timelineQuerySchema.parse(c.req.query());
     const timeline = getConversationTimeline(
@@ -116,7 +121,27 @@ export const registerConversationRoutes = (app: Hono) => {
       throw notFound(`Conversation ${conversationId} was not found.`);
     }
 
-    return c.json(timeline);
+    const allMessages = timeline.messages.length
+      ? timeline.messages
+      : getMessagesByConversationId(conversationId);
+    const summaryHistory = listSummariesByConversationId(conversationId);
+    const summaryContext = await getEffectiveSummaryContext({
+      baseUrl: config.LLM_BASE_URL,
+      fallbackTriggerTokens: config.SUMMARY_TRIGGER_TOKENS,
+      modelId: config.VLM_MODEL,
+    });
+
+    return c.json({
+      ...timeline,
+      contextSummary: buildContextSummaryStats({
+        contextWindowTokens: summaryContext.contextWindowTokens,
+        messages: allMessages,
+        source: summaryContext.source,
+        summaries: summaryHistory,
+        triggerTokens: summaryContext.triggerTokens,
+      }),
+      summaryHistory,
+    });
   });
 
   app.get('/api/conversations/:conversationId/messages', (c) => {
