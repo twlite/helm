@@ -68,6 +68,9 @@ export type RunEventType =
   | 'tool_call'
   | 'tool_result'
   | 'assistant_text'
+  | 'memory_reading'
+  | 'memory_saved'
+  | 'context_summarizing'
   | 'summary_created'
   | 'run_completed'
   | 'run_failed'
@@ -96,6 +99,7 @@ export interface ConversationTimelineResponse {
   conversation: ConversationRecord;
   activeRun: ConversationRunRecord | null;
   latestSummary: ConversationSummaryRecord | null;
+  messageCount: number;
   messages: ConversationMessageRecord[];
 }
 
@@ -129,3 +133,4 @@ export interface ApiErrorResponse {
     message: string;
   };
 }
+

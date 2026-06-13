@@ -31,6 +31,7 @@ const startRunSchema = z
   .object({
     attachments: z.array(runAttachmentSchema).max(12).default([]),
     input: z.string().trim().max(20_000).default(''),
+    instructions: z.string().trim().max(4_000).default(''),
     reasoning: z.enum(['off', 'low', 'medium', 'high', 'on']).optional(),
   })
   .superRefine((value, context) => {
@@ -57,6 +58,7 @@ export const registerRunRoutes = (app: Hono) => {
     const body = startRunSchema.parse(await safeJsonBody(c.req.raw));
     const inputText = body.input.trim();
     const reasoning = body.reasoning;
+    const instructions = body.instructions.trim() || undefined;
     const attachments = body.attachments.map((attachment) => ({
       filename: attachment.filename,
       mediaType: attachment.mediaType ?? 'application/octet-stream',
@@ -112,6 +114,7 @@ export const registerRunRoutes = (app: Hono) => {
     queueMicrotask(() => {
       void runAgentConversation({
         conversationId,
+        instructions,
         reasoning,
         runId: run.id,
         userAttachments: attachments,

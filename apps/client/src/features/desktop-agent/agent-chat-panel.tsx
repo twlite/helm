@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState } from 'react';
+import { memo, useCallback, useMemo, useRef, useState } from 'react';
 import type { FileUIPart } from 'ai';
 import type {
   ConversationMessageRecord,
@@ -64,15 +64,41 @@ import {
 } from '@/components/ui/card';
 import { Spinner } from '@/components/ui/spinner';
 import { cn } from '@/lib/utils';
-import { ArrowLeftIcon, BrainIcon } from 'lucide-react';
+import {
+  ArrowRightIcon,
+  BrainIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  GripVerticalIcon,
+  ListIcon,
+  PlusIcon,
+  XIcon,
+} from 'lucide-react';
 import { ScreenshotPreview } from './screenshot-preview';
-import type { LiveToolCall, LiveToolResult, StreamState } from './types';
-import { asRecord, formatStatus, getText, partText } from './utils';
+import type {
+  AgentStatus,
+  LiveEvent,
+  LiveStatusKind,
+  QueuedMessage,
+  StreamState,
+} from './types';
+import { asRecord, getText, partText } from './utils';
 
 const MESSAGE_VIRTUAL_WINDOW = 140;
-const CONTEXT_ICON_RADIUS = 11;
-const CONTEXT_ICON_SIZE = 28;
-const CONTEXT_ICON_STROKE = 2.5;
+const CONTEXT_ICON_RADIUS = 8;
+const CONTEXT_ICON_SIZE = 20;
+const CONTEXT_ICON_STROKE = 2;
+
+const AGENT_STATUS_LABELS: Record<AgentStatus, string> = {
+  idle: 'Idle',
+  starting: 'Starting…',
+  thinking: 'Thinking…',
+  working: 'Working…',
+  responding: 'Responding…',
+  reading_memory: 'Reading memory…',
+  compressing: 'Compressing context…',
+  cancelling: 'Cancelling…',
+};
 
 interface AgentChatPanelProps {
   loading: boolean;
@@ -81,17 +107,16 @@ interface AgentChatPanelProps {
   hasMoreMessages: boolean;
   loadingOlderMessages: boolean;
   streamState: StreamState;
+  agentStatus: AgentStatus;
   isBusy: boolean;
   isCancelling: boolean;
   liveRunStatus: RunStatus | null;
   liveRunId: string | null;
-  liveAssistantText: string;
-  liveReasoningMessages: string[];
-  liveToolCalls: LiveToolCall[];
-  liveToolResults: LiveToolResult[];
+  liveEvents: LiveEvent[];
   activeConversationId: string | null;
   streamError: string | null;
   error: string | null;
+  messageQueue: QueuedMessage[];
   onStartRun: (args: {
     text: string;
     files?: FileUIPart[];
@@ -99,172 +124,105 @@ interface AgentChatPanelProps {
   }) => Promise<void>;
   onCancelRun: () => Promise<void>;
   onLoadOlderMessages: () => Promise<void>;
-  onBackToChats?: () => void;
+  onViewChats?: () => void;
+  onEnqueueMessage: (text: string) => void;
+  onDequeueMessage: (id: string) => void;
+  onReorderQueue: (from: number, to: number) => void;
+  onSteerWithMessage: (id: string) => Promise<void>;
 }
 
 interface ScreenshotData {
   base64: string;
-  cursor: {
-    x: number;
-    y: number;
-  } | null;
-  geometry: {
-    height: number;
-    width: number;
-  } | null;
+  cursor: { x: number; y: number } | null;
+  geometry: { height: number; width: number } | null;
   mediaType: string;
 }
 
-const toScreenshotData = (
-  output: Record<string, unknown>,
-): ScreenshotData | null => {
+const toScreenshotData = (output: Record<string, unknown>): ScreenshotData | null => {
   const base64 = getText(output.imageBase64);
-  if (!base64) {
-    return null;
-  }
-
+  if (!base64) return null;
   const cursorRecord = asRecord(output.cursor);
   const cursorX = Number(cursorRecord.x);
   const cursorY = Number(cursorRecord.y);
   const cursor =
-    Number.isFinite(cursorX) && Number.isFinite(cursorY)
-      ? {
-          x: cursorX,
-          y: cursorY,
-        }
-      : null;
-
+    Number.isFinite(cursorX) && Number.isFinite(cursorY) ? { x: cursorX, y: cursorY } : null;
   const geometryRecord = asRecord(output.geometry);
-  const geometryWidth = Number(geometryRecord.width);
-  const geometryHeight = Number(geometryRecord.height);
-  const geometry =
-    Number.isFinite(geometryWidth) && Number.isFinite(geometryHeight)
-      ? {
-          height: geometryHeight,
-          width: geometryWidth,
-        }
-      : null;
-
-  return {
-    base64,
-    cursor,
-    geometry,
-    mediaType: getText(output.mimeType) || 'image/png',
-  };
+  const gw = Number(geometryRecord.width);
+  const gh = Number(geometryRecord.height);
+  const geometry = Number.isFinite(gw) && Number.isFinite(gh) ? { height: gh, width: gw } : null;
+  return { base64, cursor, geometry, mediaType: getText(output.mimeType) || 'image/png' };
 };
 
-const toDisplayOutput = (
-  output: Record<string, unknown>,
-): Record<string, unknown> => {
+const toDisplayOutput = (output: Record<string, unknown>): Record<string, unknown> => {
   const screenshot = toScreenshotData(output);
-  if (!screenshot) {
-    return output;
-  }
-
+  if (!screenshot) return output;
   const kb = Math.round(screenshot.base64.length / 1024);
-  return {
-    ...output,
-    imageBase64: `[omitted screenshot base64 (${kb}KB)]`,
-  };
+  return { ...output, imageBase64: `[omitted screenshot base64 (${kb}KB)]` };
 };
 
 const splitReasoningSteps = (text: string): string[] => {
-  const cleanText = text
+  const clean = text
     .replace(/\r\n/g, '\n')
     .split('\n')
-    .map((line) => line.trim())
+    .map((l) => l.trim())
     .filter(Boolean)
     .join('\n');
-
-  if (!cleanText) {
-    return [];
-  }
-
-  const paragraphSteps = cleanText
+  if (!clean) return [];
+  const para = clean
     .split(/\n{2,}|(?=\n(?:[-*]|\d+[.)])\s+)/g)
-    .map((step) => step.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
-
-  if (paragraphSteps.length > 1) {
-    return paragraphSteps;
-  }
-
-  return cleanText
+  if (para.length > 1) return para;
+  return clean
     .split(/(?<=[.!?])\s+(?=[A-Z0-9])/g)
-    .map((step) => step.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
 };
 
-const getToolResultSummary = (
-  toolName: string,
-  output: Record<string, unknown>,
-): string => {
+const getToolResultSummary = (toolName: string, output: Record<string, unknown>): string => {
   const error = getText(output.error);
-
-  if (error) {
-    return error;
-  }
-
+  if (error) return error;
   if (toolName === 'capture_screenshot') {
     const geometry = asRecord(output.geometry);
-    const width = Number(geometry.width);
-    const height = Number(geometry.height);
+    const w = Number(geometry.width);
+    const h = Number(geometry.height);
     const imageSummary = getText(output.imageSummary);
-    const size =
-      Number.isFinite(width) && Number.isFinite(height)
-        ? `${width}x${height}`
-        : 'unknown size';
+    const size = Number.isFinite(w) && Number.isFinite(h) ? `${w}x${h}` : 'unknown size';
     return imageSummary || `Captured desktop screenshot (${size}).`;
   }
-
   if (toolName === 'move_mouse' || toolName === 'click_mouse') {
     const target = asRecord(output.resolvedTarget);
     const x = Number(target.x);
     const y = Number(target.y);
-    if (Number.isFinite(x) && Number.isFinite(y)) {
-      return `Target resolved to (${x}, ${y}).`;
-    }
+    if (Number.isFinite(x) && Number.isFinite(y)) return `Target resolved to (${x}, ${y}).`;
   }
-
   if (toolName === 'open_application') {
     const app = getText(output.app) || 'application';
     const action = getText(output.action);
-    if (action === 'focused_existing') {
-      return `Focused existing ${app} window.`;
-    }
-    if (action === 'launched') {
-      return `Launched ${app}.`;
-    }
+    if (action === 'focused_existing') return `Focused existing ${app} window.`;
+    if (action === 'launched') return `Launched ${app}.`;
     return `Requested ${app} launch.`;
   }
-
   if (toolName === 'navigate_browser_url') {
     const url = getText(output.url);
     return url ? `Navigated Firefox to ${url}.` : 'Navigated Firefox.';
   }
-
   if (toolName === 'run_terminal_command') {
-    const command = getText(output.command);
-    return command ? `Ran terminal command: ${command}` : 'Ran terminal command.';
+    const cmd = getText(output.command);
+    return cmd ? `Ran terminal command: ${cmd}` : 'Ran terminal command.';
   }
-
   if (toolName === 'list_desktop_windows') {
     const count = Number(output.count);
     return Number.isFinite(count)
       ? `Found ${count} visible window${count === 1 ? '' : 's'}.`
       : 'Listed visible windows.';
   }
-
   return output.ok === false ? 'Tool reported failure.' : 'Tool completed.';
 };
 
 const ReasoningStepList = ({ text }: { text: string }) => {
   const steps = splitReasoningSteps(text);
-
-  if (steps.length === 0) {
-    return null;
-  }
-
+  if (steps.length === 0) return null;
   return (
     <div className="mt-3 space-y-2">
       {steps.map((step, index) => (
@@ -282,15 +240,8 @@ const ReasoningStepList = ({ text }: { text: string }) => {
   );
 };
 
-const ToolResultSummary = ({
-  output,
-  toolName,
-}: {
-  output: Record<string, unknown>;
-  toolName: string;
-}) => {
+const ToolResultSummary = ({ output, toolName }: { output: Record<string, unknown>; toolName: string }) => {
   const isError = output.ok === false || Boolean(getText(output.error));
-
   return (
     <div
       className={cn(
@@ -315,66 +266,28 @@ const buildToolEntriesFromParts = (
   parts: Array<{ content: Record<string, unknown>; partType: string }>,
 ): ToolActivityEntry[] => {
   const calls = parts
-    .filter((part) => part.partType === 'tool_call')
-    .map((part) => ({
-      input: asRecord(part.content.input),
-      toolName: getText(part.content.toolName) || 'tool',
-    }));
+    .filter((p) => p.partType === 'tool_call')
+    .map((p) => ({ input: asRecord(p.content.input), toolName: getText(p.content.toolName) || 'tool' }));
   const results = parts
-    .filter((part) => part.partType === 'tool_result')
-    .map((part) => ({
-      output: asRecord(part.content.output),
-      toolName: getText(part.content.toolName) || 'tool',
-    }));
+    .filter((p) => p.partType === 'tool_result')
+    .map((p) => ({ output: asRecord(p.content.output), toolName: getText(p.content.toolName) || 'tool' }));
   const count = Math.max(calls.length, results.length);
-
-  return Array.from({ length: count }, (_, index) => {
-    const call = calls[index];
-    const result = results[index];
-
-    return {
-      input: call?.input ?? {},
-      output: result?.output ?? null,
-      toolName: result?.toolName ?? call?.toolName ?? 'tool',
-    };
-  });
-};
-
-const buildLiveToolEntries = (
-  calls: LiveToolCall[],
-  results: LiveToolResult[],
-): ToolActivityEntry[] => {
-  const count = Math.max(calls.length, results.length);
-
-  return Array.from({ length: count }, (_, index) => ({
-    input: calls[index]?.input ?? {},
-    output: results[index]?.output ?? null,
-    toolName: results[index]?.toolName ?? calls[index]?.toolName ?? 'tool',
+  return Array.from({ length: count }, (_, i) => ({
+    input: calls[i]?.input ?? {},
+    output: results[i]?.output ?? null,
+    toolName: results[i]?.toolName ?? calls[i]?.toolName ?? 'tool',
   }));
 };
 
-const ToolActivityGroup = ({
-  entries,
-  isStreaming = false,
-}: {
-  entries: ToolActivityEntry[];
-  isStreaming?: boolean;
-}) => {
-  if (entries.length === 0) {
-    return null;
-  }
-
-  const latestCompleted = [...entries].reverse().find((entry) => entry.output);
-  const latestScreenshot = latestCompleted?.output
-    ? toScreenshotData(latestCompleted.output)
-    : null;
-  const counts = entries.reduce<Record<string, number>>((acc, entry) => {
-    acc[entry.toolName] = (acc[entry.toolName] ?? 0) + 1;
+const ToolActivityGroup = ({ entries, isStreaming = false }: { entries: ToolActivityEntry[]; isStreaming?: boolean }) => {
+  if (entries.length === 0) return null;
+  const latestCompleted = [...entries].reverse().find((e) => e.output);
+  const latestScreenshot = latestCompleted?.output ? toScreenshotData(latestCompleted.output) : null;
+  const counts = entries.reduce<Record<string, number>>((acc, e) => {
+    acc[e.toolName] = (acc[e.toolName] ?? 0) + 1;
     return acc;
   }, {});
-  const countsText = Object.entries(counts)
-    .map(([toolName, count]) => `${toolName} x${count}`)
-    .join(', ');
+  const countsText = Object.entries(counts).map(([n, c]) => `${n} x${c}`).join(', ');
 
   return (
     <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
@@ -393,13 +306,9 @@ const ToolActivityGroup = ({
           </Badge>
         ) : null}
       </div>
-
       {latestCompleted?.output ? (
         <div className="mt-3 space-y-2">
-          <ToolResultSummary
-            output={latestCompleted.output}
-            toolName={latestCompleted.toolName}
-          />
+          <ToolResultSummary output={latestCompleted.output} toolName={latestCompleted.toolName} />
           {latestScreenshot ? (
             <ScreenshotPreview
               base64={latestScreenshot.base64}
@@ -411,7 +320,6 @@ const ToolActivityGroup = ({
           ) : null}
         </div>
       ) : null}
-
       <details className="mt-3 text-xs">
         <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
           Show detailed tool log
@@ -425,14 +333,9 @@ const ToolActivityGroup = ({
                 type="dynamic-tool"
               />
               <ToolContent>
-                {Object.keys(entry.input).length > 0 ? (
-                  <ToolInput input={entry.input} />
-                ) : null}
+                {Object.keys(entry.input).length > 0 ? <ToolInput input={entry.input} /> : null}
                 {entry.output ? (
-                  <ToolOutput
-                    errorText={undefined}
-                    output={toDisplayOutput(entry.output)}
-                  />
+                  <ToolOutput errorText={undefined} output={toDisplayOutput(entry.output)} />
                 ) : null}
               </ToolContent>
             </Tool>
@@ -448,10 +351,7 @@ const toAttachmentPartData = (
   id: string,
 ): (FileUIPart & { id: string }) | null => {
   const url = getText(content.url);
-  if (!url) {
-    return null;
-  }
-
+  if (!url) return null;
   return {
     filename: getText(content.filename) || 'attachment',
     id,
@@ -463,21 +363,11 @@ const toAttachmentPartData = (
 
 const ComposerAttachments = () => {
   const attachments = usePromptInputAttachments();
-
-  if (attachments.files.length === 0) {
-    return null;
-  }
-
+  if (attachments.files.length === 0) return null;
   return (
     <Attachments className="w-full" variant="list">
       {attachments.files.map((file) => (
-        <Attachment
-          data={file}
-          key={file.id}
-          onRemove={() => {
-            attachments.remove(file.id);
-          }}
-        >
+        <Attachment data={file} key={file.id} onRemove={() => attachments.remove(file.id)}>
           <AttachmentPreview />
           <AttachmentInfo showMediaType={true} />
           <AttachmentRemove />
@@ -487,46 +377,23 @@ const ComposerAttachments = () => {
   );
 };
 
-const SummaryContextIcon = ({
-  hasSummary,
-  percent,
-}: {
-  hasSummary: boolean;
-  percent: number;
-}) => {
-  const boundedPercent = Math.max(0, Math.min(100, percent));
+const SummaryContextIcon = ({ hasSummary, percent }: { hasSummary: boolean; percent: number }) => {
+  const bounded = Math.max(0, Math.min(100, percent));
   const circumference = 2 * Math.PI * CONTEXT_ICON_RADIUS;
-  const dashOffset = circumference * (1 - boundedPercent / 100);
-
+  const dashOffset = circumference * (1 - bounded / 100);
   return (
     <svg
       aria-label="Context summary coverage"
-      className={cn(
-        'size-7',
-        hasSummary ? 'text-primary' : 'text-muted-foreground',
-      )}
+      className={cn('size-5', hasSummary ? 'text-primary' : 'text-muted-foreground')}
       role="img"
       viewBox={`0 0 ${CONTEXT_ICON_SIZE} ${CONTEXT_ICON_SIZE}`}
     >
+      <circle cx={CONTEXT_ICON_SIZE / 2} cy={CONTEXT_ICON_SIZE / 2} fill="none" opacity="0.28" r={CONTEXT_ICON_RADIUS} stroke="currentColor" strokeWidth={CONTEXT_ICON_STROKE} />
       <circle
-        cx={CONTEXT_ICON_SIZE / 2}
-        cy={CONTEXT_ICON_SIZE / 2}
-        fill="none"
-        opacity="0.28"
-        r={CONTEXT_ICON_RADIUS}
-        stroke="currentColor"
-        strokeWidth={CONTEXT_ICON_STROKE}
-      />
-      <circle
-        cx={CONTEXT_ICON_SIZE / 2}
-        cy={CONTEXT_ICON_SIZE / 2}
-        fill="none"
-        opacity="0.95"
-        r={CONTEXT_ICON_RADIUS}
-        stroke="currentColor"
+        cx={CONTEXT_ICON_SIZE / 2} cy={CONTEXT_ICON_SIZE / 2} fill="none" opacity="0.95"
+        r={CONTEXT_ICON_RADIUS} stroke="currentColor"
         strokeDasharray={`${circumference} ${circumference}`}
-        strokeDashoffset={dashOffset}
-        strokeLinecap="round"
+        strokeDashoffset={dashOffset} strokeLinecap="round"
         strokeWidth={CONTEXT_ICON_STROKE}
         style={{ transform: 'rotate(-90deg)', transformOrigin: 'center' }}
       />
@@ -534,13 +401,10 @@ const SummaryContextIcon = ({
   );
 };
 
-const renderMessage = (
-  message: ConversationMessageRecord,
-  options: { showReasoning: boolean },
-) => {
+const renderMessage = (message: ConversationMessageRecord, options: { showReasoning: boolean }) => {
   const from = message.role === 'user' ? 'user' : 'assistant';
   const toolParts = message.parts.filter(
-    (part) => part.partType === 'tool_call' || part.partType === 'tool_result',
+    (p) => p.partType === 'tool_call' || p.partType === 'tool_result',
   );
   let renderedToolActivity = false;
 
@@ -549,27 +413,16 @@ const renderMessage = (
       <MessageContent>
         {message.parts.map((part, index) => {
           if (part.partType === 'reasoning') {
-            if (!options.showReasoning) {
-              return null;
-            }
-
-            const content = partText(part);
+            if (!options.showReasoning) return null;
             return (
               <Reasoning defaultOpen={false} key={`${part.id}-${index}`}>
                 <ReasoningTrigger />
-                <ReasoningStepList text={content} />
+                <ReasoningStepList text={partText(part)} />
               </Reasoning>
             );
           }
-
-          if (
-            part.partType === 'tool_call' ||
-            part.partType === 'tool_result'
-          ) {
-            if (renderedToolActivity) {
-              return null;
-            }
-
+          if (part.partType === 'tool_call' || part.partType === 'tool_result') {
+            if (renderedToolActivity) return null;
             renderedToolActivity = true;
             return (
               <ToolActivityGroup
@@ -578,13 +431,9 @@ const renderMessage = (
               />
             );
           }
-
           if (part.partType === 'attachment') {
             const attachment = toAttachmentPartData(part.content, part.id);
-            if (!attachment) {
-              return null;
-            }
-
+            if (!attachment) return null;
             return (
               <Attachments key={`${part.id}-${index}`} variant="list">
                 <Attachment data={attachment}>
@@ -594,20 +443,10 @@ const renderMessage = (
               </Attachments>
             );
           }
-
           if (part.partType === 'status') {
-            return (
-              <Badge key={`${part.id}-${index}`} variant="secondary">
-                {partText(part)}
-              </Badge>
-            );
+            return <Badge key={`${part.id}-${index}`} variant="secondary">{partText(part)}</Badge>;
           }
-
-          return (
-            <MessageResponse key={`${part.id}-${index}`}>
-              {partText(part)}
-            </MessageResponse>
-          );
+          return <MessageResponse key={`${part.id}-${index}`}>{partText(part)}</MessageResponse>;
         })}
       </MessageContent>
     </Message>
@@ -626,151 +465,316 @@ interface HistoricalConversationContentProps {
   onRenderOlderLoaded: () => void;
 }
 
-const HistoricalConversationContent = memo(
-  function HistoricalConversationContent({
-    timeline,
-    hasMoreMessages,
-    loadingOlderMessages,
-    hiddenLoadedCount,
-    messagesCount,
-    visibleMessages,
-    showReasoning,
-    onLoadOlderMessages,
-    onRenderOlderLoaded,
-  }: HistoricalConversationContentProps) {
-    return (
-      <>
-        {timeline?.latestSummary ? (
-          <Card className="bg-muted/40 ring-border/60" size="sm">
-            <CardHeader>
-              <CardTitle className="text-sm">
-                Compressed Context Summary
-              </CardTitle>
-              <CardDescription>
-                Covers first {timeline.latestSummary.upToMessageCount} messages
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <MessageResponse>
-                {timeline.latestSummary.summaryText}
-              </MessageResponse>
-            </CardContent>
-          </Card>
-        ) : null}
+const HistoricalConversationContent = memo(function HistoricalConversationContent({
+  timeline,
+  hasMoreMessages,
+  loadingOlderMessages,
+  hiddenLoadedCount,
+  messagesCount,
+  visibleMessages,
+  showReasoning,
+  onLoadOlderMessages,
+  onRenderOlderLoaded,
+}: HistoricalConversationContentProps) {
+  return (
+    <>
+      {timeline?.latestSummary ? (
+        <Card className="bg-muted/40 ring-border/60" size="sm">
+          <CardHeader>
+            <CardTitle className="text-sm">Compressed Context Summary</CardTitle>
+            <CardDescription>
+              Covers first {timeline.latestSummary.upToMessageCount} messages
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <MessageResponse>{timeline.latestSummary.summaryText}</MessageResponse>
+          </CardContent>
+        </Card>
+      ) : null}
 
-        {hasMoreMessages ? (
-          <div className="flex justify-center">
-            <Button
-              disabled={loadingOlderMessages}
-              onClick={() => {
-                void onLoadOlderMessages();
-              }}
-              size="sm"
-              variant="outline"
-            >
-              {loadingOlderMessages
-                ? 'Loading older messages...'
-                : 'Load older messages'}
-            </Button>
+      {hasMoreMessages ? (
+        <div className="flex justify-center">
+          <Button disabled={loadingOlderMessages} onClick={() => { void onLoadOlderMessages(); }} size="sm" variant="outline">
+            {loadingOlderMessages ? 'Loading older messages...' : 'Load older messages'}
+          </Button>
+        </div>
+      ) : null}
+
+      {hiddenLoadedCount > 0 ? (
+        <div className="flex items-center justify-between rounded-xl border border-border/60 bg-muted/35 px-3 py-2 text-xs">
+          <span>Virtualized view: showing latest {visibleMessages.length} of {messagesCount} loaded messages</span>
+          <Button onClick={onRenderOlderLoaded} size="sm" variant="ghost">Render older loaded</Button>
+        </div>
+      ) : null}
+
+      {messagesCount ? (
+        visibleMessages.map((message) => (
+          <div className="[contain-intrinsic-size:220px] [content-visibility:auto]" key={message.id}>
+            {renderMessage(message, { showReasoning })}
           </div>
-        ) : null}
+        ))
+      ) : (
+        <ConversationEmptyState
+          description="Send a goal and Helm will observe, reason, and act through tool calls."
+          title="No agent messages yet"
+        />
+      )}
+    </>
+  );
+});
 
-        {hiddenLoadedCount > 0 ? (
-          <div className="flex items-center justify-between rounded-xl border border-border/60 bg-muted/35 px-3 py-2 text-xs">
-            <span>
-              Virtualized view: showing latest {visibleMessages.length} of{' '}
-              {messagesCount} loaded messages
-            </span>
-            <Button onClick={onRenderOlderLoaded} size="sm" variant="ghost">
-              Render older loaded
-            </Button>
-          </div>
-        ) : null}
+// ─── Status Chip with expandable detail ───────────────────────────────────────
 
-        {messagesCount ? (
-          visibleMessages.map((message) => (
-            <div
-              className="[contain-intrinsic-size:220px] [content-visibility:auto]"
-              key={message.id}
-            >
-              {renderMessage(message, { showReasoning })}
-            </div>
-          ))
-        ) : (
-          <ConversationEmptyState
-            description="Send a goal and Helm will observe, reason, and act through tool calls."
-            title="No agent messages yet"
-          />
-        )}
-      </>
-    );
+const STATUS_META: Record<LiveStatusKind, { label: string; icon: string; className: string }> = {
+  memory_reading: {
+    label: 'Reading memory',
+    icon: '🧠',
+    className: 'border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400',
   },
-);
+  memory_saved: {
+    label: 'Memory saved',
+    icon: '💾',
+    className: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+  },
+  context_summarizing: {
+    label: 'Compressing context',
+    icon: '📦',
+    className: 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
+  },
+  context_summarized: {
+    label: 'Context compressed',
+    icon: '✅',
+    className: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+  },
+};
 
-interface LiveConversationContentProps {
-  liveRunId: string | null;
-  liveAssistantText: string;
-  liveReasoningMessages: string[];
-  liveToolCalls: LiveToolCall[];
-  liveToolResults: LiveToolResult[];
-  showReasoning: boolean;
-  streamState: StreamState;
-}
+type StatusEvent = Extract<LiveEvent, { type: 'status' }>;
+
+const StatusChipDetail = ({ event }: { event: StatusEvent }) => {
+  if (event.kind === 'memory_reading') {
+    const { count, query } = event.payload;
+    return (
+      <div className="space-y-1">
+        {typeof count === 'number' ? (
+          <p className="text-xs">
+            <span className="font-semibold">{count}</span>{' '}
+            relevant {count === 1 ? 'memory' : 'memories'} retrieved via RAG similarity search.
+          </p>
+        ) : null}
+        {query ? <p className="text-xs italic opacity-75">Query: "{query}"</p> : null}
+      </div>
+    );
+  }
+  if (event.kind === 'memory_saved') {
+    const { toolCallCount } = event.payload;
+    return (
+      <p className="text-xs">
+        Episodic run memory and semantic embeddings persisted to ChromaDB
+        {typeof toolCallCount === 'number' ? ` (${toolCallCount} tool call${toolCallCount === 1 ? '' : 's'} recorded)` : ''}.
+      </p>
+    );
+  }
+  if (event.kind === 'context_summarizing') {
+    const { tokenEstimate } = event.payload;
+    return (
+      <p className="text-xs">
+        Older messages being compressed so the active context window stays within token budget.
+        {typeof tokenEstimate === 'number' ? ` Estimated ${tokenEstimate.toLocaleString()} tokens.` : ''}
+      </p>
+    );
+  }
+  if (event.kind === 'context_summarized') {
+    const { tokenEstimate, upToMessageCount } = event.payload;
+    return (
+      <p className="text-xs">
+        Conversation summarized
+        {typeof upToMessageCount === 'number' ? ` (covers ${upToMessageCount} messages)` : ''}.
+        {typeof tokenEstimate === 'number' ? ` Summary ≈ ${tokenEstimate.toLocaleString()} tokens.` : ''}
+      </p>
+    );
+  }
+  return null;
+};
+
+const StatusChip = ({ event }: { event: StatusEvent }) => {
+  const [expanded, setExpanded] = useState(false);
+  const meta = STATUS_META[event.kind];
+  return (
+    <div className={cn('rounded-lg border text-xs font-medium overflow-hidden', meta.className)}>
+      <button
+        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left hover:opacity-80 transition-opacity"
+        onClick={() => setExpanded((p) => !p)}
+        type="button"
+      >
+        <span aria-hidden="true">{meta.icon}</span>
+        <span className="flex-1">{meta.label}</span>
+        {expanded
+          ? <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
+          : <ChevronRightIcon className="size-3 shrink-0 opacity-60" />}
+      </button>
+      {expanded ? (
+        <div className="border-t border-current/20 px-2.5 py-2 opacity-90">
+          <StatusChipDetail event={event} />
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
+// ─── Live segments ────────────────────────────────────────────────────────────
+
+type LiveSegment =
+  | { kind: 'reasoning'; text: string; isLast: boolean }
+  | { kind: 'tool_pair'; call: { toolName: string; input: Record<string, unknown> }; result: { toolName: string; output: Record<string, unknown> } | null; isLast: boolean }
+  | { kind: 'text'; text: string }
+  | { kind: 'status'; event: StatusEvent };
+
+const buildLiveSegments = (events: LiveEvent[], isStreaming: boolean): LiveSegment[] => {
+  const segments: LiveSegment[] = [];
+  let i = 0;
+  while (i < events.length) {
+    const ev = events[i];
+    if (ev.type === 'reasoning') {
+      segments.push({ kind: 'reasoning', text: ev.text, isLast: isStreaming && i === events.length - 1 });
+      i++;
+      continue;
+    }
+    if (ev.type === 'tool_call') {
+      const next = events[i + 1];
+      const result = next?.type === 'tool_result'
+        ? { toolName: next.toolName, output: next.output } : null;
+      const consumed = result ? 2 : 1;
+      segments.push({ kind: 'tool_pair', call: { toolName: ev.toolName, input: ev.input }, result, isLast: isStreaming && i + consumed - 1 === events.length - 1 });
+      i += consumed;
+      continue;
+    }
+    if (ev.type === 'tool_result') {
+      segments.push({ kind: 'tool_pair', call: { toolName: ev.toolName, input: {} }, result: { toolName: ev.toolName, output: ev.output }, isLast: isStreaming && i === events.length - 1 });
+      i++;
+      continue;
+    }
+    if (ev.type === 'text') {
+      segments.push({ kind: 'text', text: ev.text });
+      i++;
+      continue;
+    }
+    if (ev.type === 'status') {
+      segments.push({ kind: 'status', event: ev });
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return segments;
+};
 
 const LiveConversationContent = memo(function LiveConversationContent({
-  liveRunId,
-  liveAssistantText,
-  liveReasoningMessages,
-  liveToolCalls,
-  liveToolResults,
-  showReasoning,
-  streamState,
-}: LiveConversationContentProps) {
-  const liveReasoningText = liveReasoningMessages
-    .join('')
-    .trim();
-  const pendingToolCalls = liveToolCalls.slice(liveToolResults.length);
-  const liveToolEntries = buildLiveToolEntries(liveToolCalls, liveToolResults);
-  const hasToolActivity =
-    pendingToolCalls.length > 0 || liveToolResults.length > 0;
-
-  if (
-    !liveRunId ||
-    (!liveAssistantText &&
-      !liveReasoningText &&
-      liveToolCalls.length === 0 &&
-      liveToolResults.length === 0)
-  ) {
-    return null;
-  }
-
+  liveRunId, liveEvents, showReasoning, streamState,
+}: { liveRunId: string | null; liveEvents: LiveEvent[]; showReasoning: boolean; streamState: StreamState }) {
+  const isStreaming = streamState === 'streaming';
+  if (!liveRunId || liveEvents.length === 0) return null;
+  const segments = buildLiveSegments(liveEvents, isStreaming);
   return (
     <Message from="assistant">
       <MessageContent>
-        {showReasoning && liveReasoningText ? (
-          <Reasoning
-            defaultOpen={true}
-            isStreaming={streamState === 'streaming'}
-          >
-            <ReasoningTrigger />
-            <ReasoningStepList text={liveReasoningText} />
-          </Reasoning>
-        ) : null}
-
-        {hasToolActivity ? (
-          <ToolActivityGroup
-            entries={liveToolEntries}
-            isStreaming={streamState === 'streaming'}
-          />
-        ) : null}
-
-        {liveAssistantText.trim() ? (
-          <MessageResponse>{liveAssistantText}</MessageResponse>
-        ) : null}
+        {segments.map((seg, idx) => {
+          if (seg.kind === 'reasoning') {
+            if (!showReasoning) return null;
+            return (
+              <Reasoning defaultOpen={true} isStreaming={seg.isLast} key={`reasoning-${idx}`}>
+                <ReasoningTrigger />
+                <ReasoningStepList text={seg.text} />
+              </Reasoning>
+            );
+          }
+          if (seg.kind === 'tool_pair') {
+            return (
+              <ToolActivityGroup
+                entries={[{ input: seg.call.input, output: seg.result?.output ?? null, toolName: seg.result?.toolName ?? seg.call.toolName }]}
+                isStreaming={seg.isLast}
+                key={`tool-${idx}`}
+              />
+            );
+          }
+          if (seg.kind === 'text' && seg.text.trim()) {
+            return <MessageResponse key={`text-${idx}`}>{seg.text}</MessageResponse>;
+          }
+          if (seg.kind === 'status') {
+            return <StatusChip event={seg.event} key={`status-${idx}-${seg.event.kind}`} />;
+          }
+          return null;
+        })}
       </MessageContent>
     </Message>
   );
 });
+
+// ─── Message Queue Panel ──────────────────────────────────────────────────────
+
+const MessageQueuePanel = memo(function MessageQueuePanel({
+  queue, isBusy, onSteer, onRemove, onReorder,
+}: {
+  queue: QueuedMessage[];
+  isBusy: boolean;
+  onSteer: (id: string) => Promise<void>;
+  onRemove: (id: string) => void;
+  onReorder: (from: number, to: number) => void;
+}) {
+  const dragIndexRef = useRef<number | null>(null);
+
+  if (queue.length === 0) return null;
+
+  return (
+    <div className="border-t border-border/60 px-3 py-2">
+      <p className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+        <span className="size-1.5 rounded-full bg-blue-500/60" />
+        Queued ({queue.length}) — auto-sends when idle
+      </p>
+      <div className="space-y-1">
+        {queue.map((msg, index) => (
+          <div
+            className="group flex items-center gap-1.5 rounded-lg border border-border/50 bg-muted/25 px-2 py-1.5 transition-colors hover:bg-muted/40 cursor-grab active:cursor-grabbing"
+            draggable
+            key={msg.id}
+            onDragEnd={() => { dragIndexRef.current = null; }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              const from = dragIndexRef.current;
+              if (from !== null && from !== index) { onReorder(from, index); dragIndexRef.current = index; }
+            }}
+            onDragStart={() => { dragIndexRef.current = index; }}
+          >
+            <GripVerticalIcon className="size-3.5 shrink-0 text-muted-foreground/40 group-hover:text-muted-foreground/70" />
+            <span className="min-w-0 flex-1 truncate text-xs">{msg.text}</span>
+            <div className="flex shrink-0 items-center gap-0.5">
+              <Button
+                className="size-6 p-0 text-blue-500 hover:bg-blue-500/10"
+                disabled={isBusy}
+                onClick={() => { void onSteer(msg.id); }}
+                size="icon-sm"
+                title="Send now (steer conversation)"
+                variant="ghost"
+              >
+                <ArrowRightIcon className="size-3" />
+              </Button>
+              <Button
+                className="size-6 p-0 text-destructive hover:bg-destructive/10"
+                onClick={() => onRemove(msg.id)}
+                size="icon-sm"
+                title="Remove from queue"
+                variant="ghost"
+              >
+                <XIcon className="size-3" />
+              </Button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+});
+
+// ─── Main component ───────────────────────────────────────────────────────────
 
 export function AgentChatPanel({
   loading,
@@ -779,87 +783,86 @@ export function AgentChatPanel({
   hasMoreMessages,
   loadingOlderMessages,
   streamState,
+  agentStatus,
   isBusy,
   isCancelling,
   liveRunStatus,
   liveRunId,
-  liveAssistantText,
-  liveReasoningMessages,
-  liveToolCalls,
-  liveToolResults,
+  liveEvents,
   activeConversationId,
   streamError,
   error,
+  messageQueue,
   onStartRun,
   onCancelRun,
   onLoadOlderMessages,
-  onBackToChats,
+  onViewChats,
+  onEnqueueMessage,
+  onDequeueMessage,
+  onReorderQueue,
+  onSteerWithMessage,
 }: AgentChatPanelProps) {
   const [renderWindow, setRenderWindow] = useState(MESSAGE_VIRTUAL_WINDOW);
   const [showReasoning, setShowReasoning] = useState(true);
+  const [queueDraft, setQueueDraft] = useState('');
 
   const latestSummary = timeline?.latestSummary;
   const hasSummary = Boolean(latestSummary);
   const summarizedMessageCount = latestSummary?.upToMessageCount ?? 0;
-  const contextCoveragePercent = messages.length
-    ? Math.min(
-        100,
-        Math.round((summarizedMessageCount / messages.length) * 100),
-      )
-    : 0;
+  const totalMessageCount = timeline?.messageCount ?? messages.length;
+  const contextCoveragePercent =
+    totalMessageCount > 0
+      ? Math.min(100, Math.round((summarizedMessageCount / totalMessageCount) * 100))
+      : 0;
   const summaryTokenEstimate = latestSummary?.tokenEstimate;
   const composerDisabled = !activeConversationId || isCancelling;
 
   const visibleMessages = useMemo(() => {
-    if (messages.length <= renderWindow) {
-      return messages;
-    }
-
+    if (messages.length <= renderWindow) return messages;
     return messages.slice(messages.length - renderWindow);
   }, [messages, renderWindow]);
 
-  const hiddenLoadedCount = Math.max(
-    0,
-    messages.length - visibleMessages.length,
-  );
-
+  const hiddenLoadedCount = Math.max(0, messages.length - visibleMessages.length);
   const handleRenderOlderLoaded = useCallback(() => {
     setRenderWindow((prev) => prev + MESSAGE_VIRTUAL_WINDOW);
   }, []);
 
+  const handleAddToQueue = () => {
+    const text = queueDraft.trim();
+    if (!text) return;
+    onEnqueueMessage(text);
+    setQueueDraft('');
+  };
+
   return (
-    <Card
-      className="flex h-full min-h-0 flex-col overflow-hidden border-border/70 bg-card/80"
-      size="sm"
-    >
-      <CardHeader className="border-b border-border/70 pb-3">
-        <CardTitle className="flex items-center justify-between text-base">
-          <div className="flex items-center gap-2">
-            {onBackToChats ? (
-              <Button
-                onClick={onBackToChats}
-                size="icon-sm"
-                type="button"
-                variant="ghost"
-              >
-                <ArrowLeftIcon className="size-4" />
+    <Card className="flex h-full min-h-0 flex-col overflow-hidden border-border/70 bg-card/80" size="sm">
+      <CardHeader className="border-b border-border/70 pb-2.5">
+        <CardTitle className="flex items-center justify-between text-sm">
+          <div className="flex items-center gap-1.5">
+            {onViewChats ? (
+              <Button onClick={onViewChats} size="icon-sm" title="Back to all chats" type="button" variant="ghost">
+                <ListIcon className="size-4" />
               </Button>
             ) : null}
-            <span>Agent Chat</span>
+            <span className="text-base">Agent Chat</span>
           </div>
-          <div className="flex items-center gap-2">
-            {isBusy ? <Spinner className="size-4" /> : null}
-            <Badge variant={isBusy ? 'default' : 'outline'}>
-              {isBusy ? 'Streaming' : 'Idle'}
-            </Badge>
-            {liveRunStatus ? (
-              <Badge variant="secondary">{formatStatus(liveRunStatus)}</Badge>
-            ) : null}
+          <div className="flex items-center gap-1.5">
+            {isBusy ? (
+              <span className="flex items-center gap-1.5 text-xs font-medium text-blue-500">
+                <span className="relative flex size-1.5">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-500 opacity-75" />
+                  <span className="relative inline-flex size-1.5 rounded-full bg-blue-500" />
+                </span>
+                {AGENT_STATUS_LABELS[agentStatus]}
+              </span>
+            ) : (
+              <span className="flex items-center gap-1.5 text-muted-foreground text-xs">
+                <span className="size-1.5 rounded-full bg-muted-foreground/40" />
+                Idle
+              </span>
+            )}
           </div>
         </CardTitle>
-        <CardDescription>
-          Includes messages, chain-of-thought, tool calls, and tool results
-        </CardDescription>
       </CardHeader>
 
       <CardContent className="flex min-h-0 flex-1 flex-col gap-3 p-0">
@@ -882,13 +885,9 @@ export function AgentChatPanel({
                   timeline={timeline}
                   visibleMessages={visibleMessages}
                 />
-
                 <LiveConversationContent
-                  liveAssistantText={liveAssistantText}
-                  liveReasoningMessages={liveReasoningMessages}
+                  liveEvents={liveEvents}
                   liveRunId={liveRunId}
-                  liveToolCalls={liveToolCalls}
-                  liveToolResults={liveToolResults}
                   showReasoning={showReasoning}
                   streamState={streamState}
                 />
@@ -896,15 +895,19 @@ export function AgentChatPanel({
               <ConversationScrollButton />
             </Conversation>
 
+            <MessageQueuePanel
+              isBusy={isBusy}
+              onRemove={onDequeueMessage}
+              onReorder={onReorderQueue}
+              onSteer={onSteerWithMessage}
+              queue={messageQueue}
+            />
+
             <div className="border-t border-border/70 p-3">
               <PromptInput
-                onSubmit={({ files, text }) => {
-                  return onStartRun({
-                    files,
-                    reasoning: showReasoning ? 'on' : 'off',
-                    text,
-                  });
-                }}
+                onSubmit={({ files, text }) =>
+                  onStartRun({ files, reasoning: showReasoning ? 'on' : 'off', text })
+                }
               >
                 <PromptInputBody>
                   <ComposerAttachments />
@@ -917,10 +920,7 @@ export function AgentChatPanel({
                 <PromptInputFooter className="items-end gap-1.5">
                   <PromptInputTools className="gap-1.5">
                     <PromptInputActionMenu>
-                      <PromptInputActionMenuTrigger
-                        disabled={composerDisabled || isBusy}
-                        tooltip="Attach files"
-                      />
+                      <PromptInputActionMenuTrigger disabled={composerDisabled || isBusy} tooltip="Attach files" />
                       <PromptInputActionMenuContent>
                         <PromptInputActionAddAttachments />
                         <PromptInputActionAddScreenshot />
@@ -928,24 +928,14 @@ export function AgentChatPanel({
                     </PromptInputActionMenu>
 
                     <PromptInputButton
-                      aria-label={
-                        showReasoning
-                          ? 'Reasoning enabled'
-                          : 'Reasoning disabled'
-                      }
+                      aria-label={showReasoning ? 'Reasoning enabled' : 'Reasoning disabled'}
                       className={cn(
                         showReasoning
                           ? 'bg-amber-500/18 text-amber-700 ring-1 ring-amber-500/30 hover:bg-amber-500/26 dark:text-amber-300'
                           : undefined,
                       )}
-                      onClick={() => {
-                        setShowReasoning((prev) => !prev);
-                      }}
-                      tooltip={
-                        showReasoning
-                          ? 'Reasoning mode: on'
-                          : 'Reasoning mode: off'
-                      }
+                      onClick={() => setShowReasoning((prev) => !prev)}
+                      tooltip={showReasoning ? 'Reasoning mode: on' : 'Reasoning mode: off'}
                     >
                       <BrainIcon className="size-4" />
                     </PromptInputButton>
@@ -960,93 +950,67 @@ export function AgentChatPanel({
                           : undefined,
                       )}
                       disabled={composerDisabled}
-                      onStop={() => {
-                        void onCancelRun();
-                      }}
-                      status={
-                        isCancelling
-                          ? 'submitted'
-                          : isBusy
-                            ? 'streaming'
-                            : 'ready'
-                      }
+                      onStop={() => { void onCancelRun(); }}
+                      status={isCancelling ? 'submitted' : isBusy ? 'streaming' : 'ready'}
                     />
                   </div>
                 </PromptInputFooter>
               </PromptInput>
 
+              {/* Queue add input */}
+              {activeConversationId ? (
+                <div className="mt-2 flex gap-1.5">
+                  <input
+                    className="h-7 min-w-0 flex-1 rounded-md border border-border/60 bg-muted/25 px-2.5 text-xs placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40"
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleAddToQueue(); }}
+                    onChange={(e) => setQueueDraft(e.target.value)}
+                    placeholder="Queue next message…"
+                    value={queueDraft}
+                  />
+                  <Button
+                    className="h-7 px-2 text-xs"
+                    disabled={!queueDraft.trim()}
+                    onClick={handleAddToQueue}
+                    size="sm"
+                    variant="outline"
+                  >
+                    <PlusIcon className="mr-1 size-3" />
+                    Queue
+                  </Button>
+                </div>
+              ) : null}
+
               <div className="mt-1.5 flex justify-end">
                 <PromptInputHoverCard>
                   <PromptInputHoverCardTrigger>
-                    <Button
-                      aria-label="View context summary details"
-                      className="size-4"
-                      size="icon-xs"
-                      type="button"
-                      variant="ghost"
-                    >
-                      <SummaryContextIcon
-                        hasSummary={hasSummary}
-                        percent={contextCoveragePercent}
-                      />
+                    <Button aria-label="View context summary details" className="size-5 p-0" size="icon-xs" type="button" variant="ghost">
+                      <SummaryContextIcon hasSummary={hasSummary} percent={contextCoveragePercent} />
                     </Button>
                   </PromptInputHoverCardTrigger>
                   <PromptInputHoverCardContent align="end" className="w-72 p-3">
                     <div className="space-y-2">
                       <div className="flex items-center justify-between gap-2">
-                        <p className="font-medium text-xs text-muted-foreground uppercase tracking-wide">
-                          Context Summary
-                        </p>
-                        <Badge variant={hasSummary ? 'secondary' : 'outline'}>
-                          {contextCoveragePercent}%
-                        </Badge>
+                        <p className="font-medium text-xs text-muted-foreground uppercase tracking-wide">Context Summary</p>
+                        <Badge variant={hasSummary ? 'secondary' : 'outline'}>{contextCoveragePercent}%</Badge>
                       </div>
                       <p className="text-xs text-muted-foreground">
                         {hasSummary
                           ? 'Older messages are compressed into a summary so the active context stays compact.'
-                          : 'No summary has been generated yet. Full message history remains in context.'}
+                          : 'No summary yet. Full message history remains in context.'}
                       </p>
                       <div className="grid grid-cols-2 gap-2 rounded-lg border border-border/60 bg-muted/35 p-2 text-xs">
-                        <div>
-                          <p className="text-muted-foreground">Loaded</p>
-                          <p className="font-medium">{messages.length}</p>
-                        </div>
-                        <div>
-                          <p className="text-muted-foreground">Summarized</p>
-                          <p className="font-medium">
-                            {summarizedMessageCount}
-                          </p>
-                        </div>
-                        <div>
-                          <p className="text-muted-foreground">
-                            Summary tokens
-                          </p>
-                          <p className="font-medium">
-                            {summaryTokenEstimate ?? 'Not available'}
-                          </p>
-                        </div>
-                        <div>
-                          <p className="text-muted-foreground">State</p>
-                          <p className="font-medium">
-                            {isCancelling
-                              ? 'Cancelling'
-                              : isBusy
-                                ? 'Streaming'
-                                : 'Idle'}
-                          </p>
-                        </div>
+                        <div><p className="text-muted-foreground">Total</p><p className="font-medium">{totalMessageCount}</p></div>
+                        <div><p className="text-muted-foreground">Summarized</p><p className="font-medium">{summarizedMessageCount}</p></div>
+                        <div><p className="text-muted-foreground">Summary tokens</p><p className="font-medium">{summaryTokenEstimate ?? 'N/A'}</p></div>
+                        <div><p className="text-muted-foreground">State</p><p className="font-medium">{isCancelling ? 'Cancelling' : isBusy ? 'Streaming' : 'Idle'}</p></div>
                       </div>
                     </div>
                   </PromptInputHoverCardContent>
                 </PromptInputHoverCard>
               </div>
 
-              {streamError ? (
-                <p className="mt-2 text-destructive text-xs">{streamError}</p>
-              ) : null}
-              {error ? (
-                <p className="mt-2 text-destructive text-xs">{error}</p>
-              ) : null}
+              {streamError ? <p className="mt-2 text-destructive text-xs">{streamError}</p> : null}
+              {error ? <p className="mt-2 text-destructive text-xs">{error}</p> : null}
             </div>
           </>
         )}

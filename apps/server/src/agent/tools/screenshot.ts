@@ -14,6 +14,7 @@ type ScreenshotToolOutput = {
   bytes?: number;
   geometry?: { width: number; height: number } | null;
   cursor?: { x: number; y: number } | null;
+  windows?: Array<{ id?: number; name?: string }>;
   error?: string;
 };
 
@@ -41,7 +42,15 @@ const buildScreenshotText = (output: ScreenshotToolOutput): string => {
       ? `(${cursor.x}, ${cursor.y})`
       : 'unknown';
 
-  return `Screenshot captured (${kb}KB PNG). Geometry: ${geometryText}. Cursor: ${cursorText}.`;
+  const windows = Array.isArray(output.windows) ? output.windows as Array<{ name?: string }> : [];
+  const windowNames = windows
+    .map((w) => (typeof w.name === 'string' ? w.name.trim() : ''))
+    .filter(Boolean);
+  const windowsText = windowNames.length > 0
+    ? ` Open windows: ${windowNames.join('; ')}.`
+    : ' No named windows detected.';
+
+  return `Screenshot captured (${kb}KB PNG). Geometry: ${geometryText}. Cursor: ${cursorText}.${windowsText}`;
 };
 
 export const buildScreenshotTools = ({
@@ -92,11 +101,19 @@ export const buildScreenshotTools = ({
         emitToolCall(context, 'capture_screenshot', input);
         capture.onToolCall({ input, toolName: 'capture_screenshot' });
 
-        const [shot, cursor, geometry] = await Promise.all([
+        const [shot, cursor, geometry, rawWindows] = await Promise.all([
           desktopService.screenshot(),
           desktopService.getMouseLocation().catch(() => null),
           desktopService.getDisplayGeometry().catch(() => null),
+          desktopService.listWindows().catch(() => []),
         ]);
+
+        // Filter out compositor/WM noise so the model gets meaningful window names
+        const SYSTEM_WINDOW_NAMES = new Set(['openbox', 'pcmanfm', 'tint2', 'desktop', '']);
+        const windows = rawWindows
+          .filter((w) => !SYSTEM_WINDOW_NAMES.has((w.name ?? '').toLowerCase().trim()))
+          .slice(0, 12)
+          .map((w) => ({ id: w.id, name: w.name }));
 
         const imageBase64 = shot.pngBase64.trim();
 
@@ -110,6 +127,7 @@ export const buildScreenshotTools = ({
             imageBase64: '',
             mimeType: shot.mimeType,
             ok: false,
+            windows,
           };
 
           emitToolResult(context, 'capture_screenshot', emptyResult);
@@ -128,6 +146,7 @@ export const buildScreenshotTools = ({
           imageBase64,
           mimeType: shot.mimeType,
           ok: true,
+          windows,
         };
 
         emitToolResult(context, 'capture_screenshot', result);

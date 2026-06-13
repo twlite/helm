@@ -1,6 +1,6 @@
 # Helm
 
-Agentic desktop automation using Vision-Language Models, ReAct planning, and episodic memory via RAG.
+Simple agentic desktop automation using Vision-Language Models, ReAct planning, and episodic memory via RAG.
 
 Helm runs a Linux desktop inside a Docker container and lets a VLM agent control it — clicking, typing, and navigating — until a natural-language goal is fulfilled.
 

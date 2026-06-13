@@ -74,10 +74,30 @@ export type RunEventType =
   | 'tool_call'
   | 'tool_result'
   | 'assistant_text'
+  | 'memory_reading'
+  | 'memory_saved'
+  | 'context_summarizing'
   | 'summary_created'
   | 'run_completed'
   | 'run_failed'
   | 'run_cancelled';
+
+export interface ServerInfo {
+  model: string;
+  provider: string;
+  embedModel: string;
+  summaryTriggerTokens: number;
+}
+
+export interface MemoryRecord {
+  id: string;
+  conversationId: string;
+  entityType: string;
+  entityId: string;
+  chromaCollection: string;
+  chromaId: string;
+  createdAt: string;
+}
 
 export interface RunEventRecord {
   id: string;
@@ -102,6 +122,7 @@ export interface ConversationTimelineResponse {
   conversation: ConversationRecord;
   activeRun: ConversationRunRecord | null;
   latestSummary: ConversationSummaryRecord | null;
+  messageCount: number;
   messages: ConversationMessageRecord[];
 }
 
@@ -249,6 +270,7 @@ export const startConversationRun = async (args: {
   input?: string;
   attachments?: RunAttachmentInput[];
   reasoning?: RunReasoningSetting;
+  instructions?: string;
 }): Promise<ConversationRunRecord> => {
   const response = await request<{ run: ConversationRunRecord }>(
     `/api/conversations/${args.conversationId}/runs`,
@@ -256,6 +278,7 @@ export const startConversationRun = async (args: {
       body: JSON.stringify({
         attachments: args.attachments ?? [],
         input: args.input ?? '',
+        instructions: args.instructions ?? '',
         reasoning: args.reasoning,
       }),
       method: 'POST',
@@ -263,6 +286,24 @@ export const startConversationRun = async (args: {
   );
 
   return response.run;
+};
+
+export const getServerInfo = async (): Promise<ServerInfo> => {
+  return request<ServerInfo>('/api/info');
+};
+
+export const listMemories = async (): Promise<MemoryRecord[]> => {
+  const response = await request<{ memories: MemoryRecord[] }>('/api/memories');
+  return response.memories;
+};
+
+export const getMemoryText = async (id: string): Promise<string | null> => {
+  const response = await request<{ text: string | null }>(`/api/memories/${id}/text`);
+  return response.text;
+};
+
+export const deleteMemory = async (id: string): Promise<void> => {
+  await request<void>(`/api/memories/${id}`, { method: 'DELETE' });
 };
 
 export const cancelConversationRun = async (args: {

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router';
 import type { FileUIPart } from 'ai';
 import {
   buildRunStreamUrl,
@@ -23,7 +24,7 @@ import {
   buildVncUrl,
   getText,
 } from './utils';
-import type { LiveToolCall, LiveToolResult, StreamState } from './types';
+import type { AgentStatus, LiveEvent, LiveStatusKind, LiveToolCall, LiveToolResult, QueuedMessage, StreamState } from './types';
 
 const MESSAGE_PAGE_SIZE = 60;
 
@@ -103,16 +104,15 @@ export interface UseDesktopAgentResult {
   streamState: StreamState;
   streamError: string | null;
   liveRunId: string | null;
-  liveAssistantText: string;
-  liveReasoningMessages: string[];
-  liveToolCalls: LiveToolCall[];
-  liveToolResults: LiveToolResult[];
+  liveEvents: LiveEvent[];
+  agentStatus: AgentStatus;
   isBusy: boolean;
   isCancelling: boolean;
   deletingConversationId: string | null;
   activeTitle: string;
   liveRunStatus: RunStatus | null;
   vncUrl: string;
+  messageQueue: QueuedMessage[];
   refreshActiveTimeline: () => Promise<void>;
   openConversation: (conversationId: string) => Promise<boolean>;
   createAndOpenConversation: () => Promise<boolean>;
@@ -124,9 +124,37 @@ export interface UseDesktopAgentResult {
   }) => Promise<void>;
   handleCancelRun: () => Promise<void>;
   loadOlderMessages: () => Promise<void>;
+  enqueueMessage: (text: string) => void;
+  dequeueMessage: (id: string) => void;
+  reorderQueue: (from: number, to: number) => void;
+  steerWithMessage: (id: string) => Promise<void>;
 }
 
-export const useDesktopAgent = (): UseDesktopAgentResult => {
+const deriveAgentStatus = (args: {
+  isBusy: boolean;
+  isCancelling: boolean;
+  liveEvents: LiveEvent[];
+}): AgentStatus => {
+  if (args.isCancelling) return 'cancelling';
+  if (!args.isBusy) return 'idle';
+  if (args.liveEvents.length === 0) return 'starting';
+
+  const last = args.liveEvents[args.liveEvents.length - 1];
+  if (last.type === 'reasoning') return 'thinking';
+  if (last.type === 'tool_call' || last.type === 'tool_result') return 'working';
+  if (last.type === 'text') return 'responding';
+  if (last.type === 'status') {
+    if (last.kind === 'memory_reading') return 'reading_memory';
+    if (last.kind === 'context_summarizing') return 'compressing';
+  }
+  return 'working';
+};
+
+// Kept for compat – derived from liveEvents
+export { type LiveToolCall, type LiveToolResult };
+
+export const useDesktopAgent = (initialConversationId?: string | null): UseDesktopAgentResult => {
+  const navigate = useNavigate();
   const [conversations, setConversations] = useState<ConversationRecord[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<
     string | null
@@ -146,23 +174,19 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
   const [streamState, setStreamState] = useState<StreamState>('idle');
   const [streamError, setStreamError] = useState<string | null>(null);
   const [liveRunId, setLiveRunId] = useState<string | null>(null);
-  const [liveAssistantText, setLiveAssistantText] = useState('');
-  const [liveReasoningMessages, setLiveReasoningMessages] = useState<string[]>(
-    [],
-  );
-  const [liveToolCalls, setLiveToolCalls] = useState<LiveToolCall[]>([]);
-  const [liveToolResults, setLiveToolResults] = useState<LiveToolResult[]>([]);
+  const [liveEvents, setLiveEvents] = useState<LiveEvent[]>([]);
   const [isCancelling, setIsCancelling] = useState(false);
   const [deletingConversationId, setDeletingConversationId] = useState<
     string | null
   >(null);
+  const [messageQueue, setMessageQueue] = useState<QueuedMessage[]>([]);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const activeStreamRunIdRef = useRef<string | null>(null);
   const seenStreamEventIdsRef = useRef<Set<string>>(new Set());
   const terminalEventHandledRef = useRef(false);
-  const liveAssistantBufferRef = useRef('');
-  const liveReasoningBufferRef = useRef<string[]>([]);
+  // Ordered event buffer — mutated in place, then snapshotted to state every ~40ms
+  const liveEventsBufferRef = useRef<LiveEvent[]>([]);
   const liveFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const clearLiveBuffers = useCallback(() => {
@@ -170,9 +194,7 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
       clearTimeout(liveFlushTimerRef.current);
       liveFlushTimerRef.current = null;
     }
-
-    liveAssistantBufferRef.current = '';
-    liveReasoningBufferRef.current = [];
+    liveEventsBufferRef.current = [];
   }, []);
 
   const flushLiveBuffers = useCallback(() => {
@@ -180,32 +202,58 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
       clearTimeout(liveFlushTimerRef.current);
       liveFlushTimerRef.current = null;
     }
-
-    const assistantDelta = liveAssistantBufferRef.current;
-    const reasoningDeltas = liveReasoningBufferRef.current;
-
-    liveAssistantBufferRef.current = '';
-    liveReasoningBufferRef.current = [];
-
-    if (assistantDelta) {
-      setLiveAssistantText((prev) => `${prev}${assistantDelta}`);
-    }
-
-    if (reasoningDeltas.length > 0) {
-      setLiveReasoningMessages((prev) => [...prev, ...reasoningDeltas]);
-    }
+    setLiveEvents([...liveEventsBufferRef.current]);
   }, []);
 
   const scheduleLiveFlush = useCallback(() => {
     if (liveFlushTimerRef.current) {
       return;
     }
-
     liveFlushTimerRef.current = setTimeout(() => {
       liveFlushTimerRef.current = null;
       flushLiveBuffers();
     }, 40);
   }, [flushLiveBuffers]);
+
+  const appendReasoningDelta = useCallback((delta: string) => {
+    const events = liveEventsBufferRef.current;
+    const last = events[events.length - 1];
+    if (last && last.type === 'reasoning') {
+      last.text += delta;
+    } else {
+      events.push({ type: 'reasoning', text: delta });
+    }
+    scheduleLiveFlush();
+  }, [scheduleLiveFlush]);
+
+  const appendTextDelta = useCallback((delta: string) => {
+    const events = liveEventsBufferRef.current;
+    const last = events[events.length - 1];
+    if (last && last.type === 'text') {
+      last.text += delta;
+    } else {
+      events.push({ type: 'text', text: delta });
+    }
+    scheduleLiveFlush();
+  }, [scheduleLiveFlush]);
+
+  const pushToolCall = useCallback((toolName: string, input: Record<string, unknown>) => {
+    liveEventsBufferRef.current.push({ type: 'tool_call', toolName, input });
+    setLiveEvents([...liveEventsBufferRef.current]);
+  }, []);
+
+  const pushToolResult = useCallback((toolName: string, output: Record<string, unknown>) => {
+    liveEventsBufferRef.current.push({ type: 'tool_result', toolName, output });
+    setLiveEvents([...liveEventsBufferRef.current]);
+  }, []);
+
+  const pushStatusEvent = useCallback(
+    <K extends LiveStatusKind>(kind: K, payload: import('./types').LiveStatusPayload[K]) => {
+      liveEventsBufferRef.current.push({ type: 'status', kind, payload } as LiveEvent);
+      setLiveEvents([...liveEventsBufferRef.current]);
+    },
+    [],
+  );
 
   const closeEventSource = useCallback(() => {
     if (eventSourceRef.current) {
@@ -219,10 +267,7 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
   const resetLiveState = useCallback(() => {
     clearLiveBuffers();
     setLiveRunId(null);
-    setLiveAssistantText('');
-    setLiveReasoningMessages([]);
-    setLiveToolCalls([]);
-    setLiveToolResults([]);
+    setLiveEvents([]);
   }, [clearLiveBuffers]);
 
   const refreshConversations = useCallback(async () => {
@@ -257,7 +302,11 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
 
     try {
       const existing = await refreshConversations();
-      let selected = existing[0];
+
+      // If a specific conversation was requested via URL, open it if it exists
+      let selected = initialConversationId
+        ? (existing.find((c) => c.id === initialConversationId) ?? existing[0])
+        : existing[0];
 
       if (!selected) {
         selected = await createConversation('Desktop automation task');
@@ -272,6 +321,7 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
       }
 
       setActiveConversationId(selected.id);
+      navigate(`/conversations/${selected.id}`, { replace: true });
       await Promise.all([
         refreshTimeline(selected.id),
         refreshLatestMessages(selected.id),
@@ -283,7 +333,7 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
     } finally {
       setLoading(false);
     }
-  }, [refreshConversations, refreshLatestMessages, refreshTimeline]);
+  }, [initialConversationId, navigate, refreshConversations, refreshLatestMessages, refreshTimeline]);
 
   useEffect(() => {
     void bootstrap();
@@ -304,6 +354,7 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
       setMessageCursor(null);
       setActiveConversationId(conversationId);
       setError(null);
+      navigate(`/conversations/${conversationId}`);
 
       try {
         await Promise.all([
@@ -316,7 +367,7 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
         );
       }
     },
-    [closeEventSource, refreshLatestMessages, refreshTimeline, resetLiveState],
+    [closeEventSource, navigate, refreshLatestMessages, refreshTimeline, resetLiveState],
   );
 
   const handleSseEvent = useCallback(
@@ -354,8 +405,7 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
       if (parsed.eventType === 'assistant_text') {
         const delta = getText(parsed.payload.delta);
         if (delta) {
-          liveAssistantBufferRef.current += delta;
-          scheduleLiveFlush();
+          appendTextDelta(delta);
         }
         return;
       }
@@ -363,31 +413,55 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
       if (parsed.eventType === 'reasoning') {
         const delta = sanitizeReasoningDelta(getText(parsed.payload.delta));
         if (delta) {
-          liveReasoningBufferRef.current.push(delta);
-          scheduleLiveFlush();
+          appendReasoningDelta(delta);
         }
         return;
       }
 
       if (parsed.eventType === 'tool_call') {
-        setLiveToolCalls((prev) => [
-          ...prev,
-          {
-            input: asRecord(parsed.payload.input),
-            toolName: getText(parsed.payload.toolName) || 'tool',
-          },
-        ]);
+        pushToolCall(
+          getText(parsed.payload.toolName) || 'tool',
+          asRecord(parsed.payload.input),
+        );
         return;
       }
 
       if (parsed.eventType === 'tool_result') {
-        setLiveToolResults((prev) => [
-          ...prev,
-          {
-            output: asRecord(parsed.payload.output),
-            toolName: getText(parsed.payload.toolName) || 'tool',
-          },
-        ]);
+        pushToolResult(
+          getText(parsed.payload.toolName) || 'tool',
+          asRecord(parsed.payload.output),
+        );
+        return;
+      }
+
+      if (parsed.eventType === 'memory_reading') {
+        pushStatusEvent('memory_reading', {
+          count: typeof parsed.payload.count === 'number' ? parsed.payload.count : undefined,
+          query: getText(parsed.payload.query) || undefined,
+        });
+        return;
+      }
+
+      if (parsed.eventType === 'memory_saved') {
+        pushStatusEvent('memory_saved', {
+          toolCallCount: typeof parsed.payload.toolCallCount === 'number' ? parsed.payload.toolCallCount : undefined,
+        });
+        return;
+      }
+
+      if (parsed.eventType === 'context_summarizing') {
+        pushStatusEvent('context_summarizing', {
+          tokenEstimate: typeof parsed.payload.tokenEstimate === 'number' ? parsed.payload.tokenEstimate : undefined,
+        });
+        return;
+      }
+
+      if (parsed.eventType === 'summary_created') {
+        pushStatusEvent('context_summarized', {
+          summaryId: getText(parsed.payload.summaryId) || undefined,
+          tokenEstimate: typeof parsed.payload.tokenEstimate === 'number' ? parsed.payload.tokenEstimate : undefined,
+          upToMessageCount: typeof parsed.payload.upToMessageCount === 'number' ? parsed.payload.upToMessageCount : undefined,
+        });
         return;
       }
 
@@ -401,7 +475,7 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
         setStreamState(parsed.eventType === 'run_failed' ? 'error' : 'idle');
       }
     },
-    [flushLiveBuffers, scheduleLiveFlush, streamError],
+    [appendReasoningDelta, appendTextDelta, flushLiveBuffers, pushStatusEvent, pushToolCall, pushToolResult, streamError],
   );
 
   const startStream = useCallback(
@@ -417,10 +491,7 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
       setLiveRunId(runId);
       setStreamState('streaming');
       setStreamError(null);
-      setLiveAssistantText('');
-      setLiveReasoningMessages([]);
-      setLiveToolCalls([]);
-      setLiveToolResults([]);
+      setLiveEvents([]);
 
       const streamUrl = buildRunStreamUrl(conversationId, runId);
       const source = new EventSource(streamUrl);
@@ -433,6 +504,9 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
         'tool_call',
         'tool_result',
         'status',
+        'memory_reading',
+        'memory_saved',
+        'context_summarizing',
         'summary_created',
         'run_started',
         'run_completed',
@@ -514,6 +588,11 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
       refreshLatestMessages,
       refreshTimeline,
       resetLiveState,
+      appendReasoningDelta,
+      appendTextDelta,
+      pushStatusEvent,
+      pushToolCall,
+      pushToolResult,
     ],
   );
 
@@ -554,10 +633,12 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
       setStreamError(null);
 
       try {
+        const storedInstructions = localStorage.getItem('helm_custom_instructions') ?? '';
         const run = await startConversationRun({
           attachments,
           conversationId: activeConversationId,
           input: cleanText,
+          instructions: storedInstructions || undefined,
           reasoning,
         });
 
@@ -655,6 +736,31 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
     loadingOlderMessages,
     messageCursor,
   ]);
+
+  const enqueueMessage = useCallback((text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    setMessageQueue((prev) => [
+      ...prev,
+      { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, text: trimmed },
+    ]);
+  }, []);
+
+  const dequeueMessage = useCallback((id: string) => {
+    setMessageQueue((prev) => prev.filter((m) => m.id !== id));
+  }, []);
+
+  const reorderQueue = useCallback((from: number, to: number) => {
+    setMessageQueue((prev) => {
+      const next = [...prev];
+      const [item] = next.splice(from, 1);
+      if (item) next.splice(to, 0, item);
+      return next;
+    });
+  }, []);
+
+  // Submitted from queue — remove the item then fire the run
+  const steerWithMessageRef = useRef<((id: string) => Promise<void>) | null>(null);
 
   const confirmAndStopActiveRun = useCallback(
     async (nextConversationId: string | null): Promise<boolean> => {
@@ -790,6 +896,52 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
   }, [activeConversationId, refreshLatestMessages, refreshTimeline]);
 
   const isBusy = streamState === 'streaming';
+  const prevIsBusyRef = useRef(isBusy);
+
+  const steerWithMessage = useCallback(
+    async (id: string) => {
+      setMessageQueue((prev) => {
+        const item = prev.find((m) => m.id === id);
+        if (!item) return prev;
+        // Fire async; we just need the text here
+        void (async () => {
+          try {
+            const storedInstructions = localStorage.getItem('helm_custom_instructions') ?? '';
+            if (!activeConversationId) return;
+            const run = await startConversationRun({
+              attachments: [],
+              conversationId: activeConversationId,
+              input: item.text,
+              instructions: storedInstructions || undefined,
+            });
+            await startStream(activeConversationId, run.id);
+          } catch (nextError) {
+            setError(nextError instanceof Error ? nextError.message : String(nextError));
+          }
+        })();
+        return prev.filter((m) => m.id !== id);
+      });
+    },
+    [activeConversationId, startStream],
+  );
+
+  // Auto-submit the first queued message when the agent goes idle
+  useEffect(() => {
+    const wasbusy = prevIsBusyRef.current;
+    prevIsBusyRef.current = isBusy;
+
+    if (wasbusy && !isBusy && !isCancelling && messageQueue.length > 0) {
+      const first = messageQueue[0];
+      if (first) {
+        void steerWithMessage(first.id);
+      }
+    }
+  }, [isBusy, isCancelling, messageQueue, steerWithMessage]);
+
+  const agentStatus = useMemo(
+    () => deriveAgentStatus({ isBusy, isCancelling, liveEvents }),
+    [isBusy, isCancelling, liveEvents],
+  );
 
   const activeTitle = useMemo(() => {
     if (!timeline) {
@@ -805,8 +957,12 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
   return {
     activeConversationId,
     activeTitle,
+    agentStatus,
     conversations,
     createAndOpenConversation,
+    deletingConversationId,
+    dequeueMessage,
+    enqueueMessage,
     error,
     handleCancelRun,
     handleDeleteConversation,
@@ -814,19 +970,18 @@ export const useDesktopAgent = (): UseDesktopAgentResult => {
     hasMoreMessages,
     isBusy,
     isCancelling,
-    deletingConversationId,
-    liveAssistantText,
-    liveReasoningMessages,
+    liveEvents,
     liveRunId,
     liveRunStatus,
-    liveToolCalls,
-    liveToolResults,
     loadOlderMessages,
     loading,
     loadingOlderMessages,
+    messageQueue,
     messages,
     openConversation,
     refreshActiveTimeline,
+    reorderQueue,
+    steerWithMessage,
     streamError,
     streamState,
     timeline,

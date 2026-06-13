@@ -265,10 +265,13 @@ export const getConversationTimeline = (
     return null;
   }
 
+  const messageCount = countConversationMessages(conversationId);
+
   return {
     activeRun: getActiveRunForConversation(conversationId),
     conversation,
     latestSummary: getLatestSummary(conversationId),
+    messageCount,
     messages: includeMessages
       ? getMessagesByConversationId(conversationId)
       : [],
@@ -887,6 +890,48 @@ export const listEmbeddingLinksByConversation = (
     chromaId: row.chroma_id,
     createdAt: row.created_at,
   }));
+};
+
+export const listAllEmbeddingLinks = (): Array<{
+  id: string;
+  conversationId: string;
+  entityType: string;
+  entityId: string;
+  chromaCollection: string;
+  chromaId: string;
+  createdAt: string;
+}> => {
+  const rows = db
+    .prepare(
+      `SELECT
+        id,
+        conversation_id,
+        entity_type,
+        entity_id,
+        chroma_collection,
+        chroma_id,
+        created_at
+      FROM embedding_links
+      ORDER BY created_at DESC`,
+    )
+    .all() as unknown as EmbeddingLinkRow[];
+
+  return rows.map((row) => ({
+    id: row.id,
+    conversationId: row.conversation_id,
+    entityType: row.entity_type,
+    entityId: row.entity_id,
+    chromaCollection: row.chroma_collection,
+    chromaId: row.chroma_id,
+    createdAt: row.created_at,
+  }));
+};
+
+export const deleteEmbeddingLinkById = (id: string): boolean => {
+  const result = db
+    .prepare('DELETE FROM embedding_links WHERE id = ?')
+    .run(id) as SqlRunResult;
+  return result.changes > 0;
 };
 
 export const countConversationMessages = (conversationId: string): number => {

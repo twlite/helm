@@ -137,6 +137,8 @@ export class DesktopService {
 
     if (existingWindow) {
       await this.activateWindow(existingWindow.id);
+      // Settle so the X11 compositor redraws the focused window before any screenshot
+      await new Promise((resolve) => setTimeout(resolve, 600));
       const windows = await this.listWindows().catch(() => beforeWindows);
       return {
         action: 'focused_existing',
@@ -152,15 +154,35 @@ export class DesktopService {
     };
 
     await this.runShell(commandByApp[app], `launch ${app}`);
-    await this.waitForWindowRegistration();
+    const matchedWindow = await this.pollForWindow(app);
     const windows = await this.listWindows().catch(() => beforeWindows);
 
     return {
       action: 'launched',
       app,
-      matchedWindow: this.findApplicationWindow(app, windows),
+      matchedWindow,
       windows,
     };
+  }
+
+  /** Poll until the app window appears or timeout expires. */
+  private async pollForWindow(
+    app: DesktopApplication,
+    timeoutMs = 8000,
+    intervalMs = 500,
+  ): Promise<DesktopWindowInfo | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const windows = await this.listWindows().catch(() => []);
+      const found = this.findApplicationWindow(app, windows);
+      if (found) {
+        // Extra settle so the window finishes rendering before a screenshot
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        return found;
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    return undefined;
   }
 
   public async scroll(direction: ScrollDirection, amount = 1): Promise<void> {
@@ -284,10 +306,6 @@ export class DesktopService {
     } catch {
       await this.runXdotool(['windowactivate', id], 'activate window');
     }
-  }
-
-  private async waitForWindowRegistration(): Promise<void> {
-    await new Promise((resolve) => setTimeout(resolve, 900));
   }
 
   public async screenshot(): Promise<DesktopScreenshotResult> {

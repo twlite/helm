@@ -134,46 +134,9 @@ export const buildUtilityTools = ({
         return result;
       },
     }),
-    navigate_browser_url: tool({
-      description:
-        'Navigate the focused Firefox window to a URL using reliable keyboard input. This focuses or opens Firefox first, presses Ctrl+L, types the URL, and presses Enter.',
-      inputSchema: z.object({
-        url: z.string().url(),
-      }),
-      execute: async ({ url }) => {
-        assertRunNotCancelled(context);
-        const input = { url };
-        emitToolCall(context, 'navigate_browser_url', input);
-        capture.onToolCall({ input, toolName: 'navigate_browser_url' });
-
-        const launchResult = await desktopService.launchApplication('firefox');
-        await desktopService.hotkey(['ctrl', 'l']);
-        await desktopService.typeText(url, 4);
-        await desktopService.pressKey('Enter');
-        await new Promise((resolve) => setTimeout(resolve, 1200));
-
-        const windows = await desktopService
-          .listWindows()
-          .catch(() => launchResult.windows);
-        const result = {
-          app: 'firefox',
-          focusedWindow: launchResult.matchedWindow ?? null,
-          ok: true,
-          url,
-          windows,
-        };
-
-        emitToolResult(context, 'navigate_browser_url', result);
-        capture.onToolResult({
-          output: result,
-          toolName: 'navigate_browser_url',
-        });
-        return result;
-      },
-    }),
     run_terminal_command: tool({
       description:
-        'Run a shell command in the desktop user home directory and return stdout/stderr. Prefer this for complex shell workflows or command-line inspection.',
+        'Execute a shell command on the desktop and return stdout/stderr. Runs silently via the container shell — use this for file inspection, curl, or other headless tasks. For tasks requiring visible terminal interaction, open the terminal via open_application, click on it, and type_text the command instead.',
       inputSchema: z.object({
         command: z.string().min(1),
       }),
@@ -183,11 +146,7 @@ export const buildUtilityTools = ({
         emitToolCall(context, 'run_terminal_command', input);
         capture.onToolCall({ input, toolName: 'run_terminal_command' });
 
-        const launchResult = await desktopService.launchApplication('terminal');
-        const result = {
-          ...(await desktopService.runShellCommand(command)),
-          focusedWindow: launchResult.matchedWindow ?? null,
-        };
+        const result = await desktopService.runShellCommand(command);
 
         emitToolResult(context, 'run_terminal_command', result);
         capture.onToolResult({

@@ -92,7 +92,6 @@ export const queryMemories = async (input: {
       include: ['metadatas', 'documents', 'distances'],
       nResults: input.topK ?? config.MEMORY_TOP_K,
       queryEmbeddings: [embeddingResult.embedding],
-      where: { conversationId: input.conversationId },
     });
 
     const ids = result.ids?.[0] ?? [];
