@@ -41,6 +41,7 @@ import {
   PromptInputTextarea,
   PromptInputTools,
   usePromptInputAttachments,
+  usePromptInputController,
 } from '@/components/ai-elements/prompt-input';
 import {
   Reasoning,
@@ -71,7 +72,7 @@ import {
   ChevronRightIcon,
   GripVerticalIcon,
   ListIcon,
-  PlusIcon,
+  ListPlusIcon,
   XIcon,
 } from 'lucide-react';
 import { ScreenshotPreview } from './screenshot-preview';
@@ -359,6 +360,31 @@ const toAttachmentPartData = (
     type: 'file',
     url,
   };
+};
+
+const QueueSubmitButton = ({ onEnqueue }: { onEnqueue: (text: string) => void }) => {
+  const { textInput } = usePromptInputController();
+  const hasText = textInput.value.trim().length > 0;
+  if (!hasText) return null;
+  return (
+    <Button
+      aria-label="Queue message"
+      className="h-8 gap-1.5 px-2.5 text-xs"
+      onClick={() => {
+        const text = textInput.value.trim();
+        if (text) {
+          onEnqueue(text);
+          textInput.clear();
+        }
+      }}
+      size="sm"
+      type="button"
+      variant="outline"
+    >
+      <ListPlusIcon className="size-3.5" />
+      Queue
+    </Button>
+  );
 };
 
 const ComposerAttachments = () => {
@@ -804,7 +830,6 @@ export function AgentChatPanel({
 }: AgentChatPanelProps) {
   const [renderWindow, setRenderWindow] = useState(MESSAGE_VIRTUAL_WINDOW);
   const [showReasoning, setShowReasoning] = useState(true);
-  const [queueDraft, setQueueDraft] = useState('');
 
   const latestSummary = timeline?.latestSummary;
   const hasSummary = Boolean(latestSummary);
@@ -826,13 +851,6 @@ export function AgentChatPanel({
   const handleRenderOlderLoaded = useCallback(() => {
     setRenderWindow((prev) => prev + MESSAGE_VIRTUAL_WINDOW);
   }, []);
-
-  const handleAddToQueue = () => {
-    const text = queueDraft.trim();
-    if (!text) return;
-    onEnqueueMessage(text);
-    setQueueDraft('');
-  };
 
   return (
     <Card className="flex h-full min-h-0 flex-col overflow-hidden border-border/70 bg-card/80" size="sm">
@@ -905,16 +923,20 @@ export function AgentChatPanel({
 
             <div className="border-t border-border/70 p-3">
               <PromptInput
-                onSubmit={({ files, text }) =>
-                  onStartRun({ files, reasoning: showReasoning ? 'on' : 'off', text })
-                }
+                onSubmit={({ files, text }) => {
+                  if (isBusy) {
+                    onEnqueueMessage(text);
+                    return;
+                  }
+                  void onStartRun({ files, reasoning: showReasoning ? 'on' : 'off', text });
+                }}
               >
                 <PromptInputBody>
                   <ComposerAttachments />
                   <PromptInputTextarea
                     className="max-h-40 min-h-12"
-                    disabled={isBusy || isCancelling}
-                    placeholder="Describe what to do on the desktop..."
+                    disabled={isCancelling}
+                    placeholder={isBusy ? 'Type to queue a follow-up message…' : 'Describe what to do on the desktop…'}
                   />
                 </PromptInputBody>
                 <PromptInputFooter className="items-end gap-1.5">
@@ -934,51 +956,40 @@ export function AgentChatPanel({
                           ? 'bg-amber-500/18 text-amber-700 ring-1 ring-amber-500/30 hover:bg-amber-500/26 dark:text-amber-300'
                           : undefined,
                       )}
+                      disabled={isBusy}
                       onClick={() => setShowReasoning((prev) => !prev)}
                       tooltip={showReasoning ? 'Reasoning mode: on' : 'Reasoning mode: off'}
                     >
                       <BrainIcon className="size-4" />
                     </PromptInputButton>
                   </PromptInputTools>
-                  <div className="flex items-center">
-                    <PromptInputSubmit
-                      aria-label={isBusy ? 'Cancel run' : 'Submit prompt'}
-                      className={cn(
-                        'shrink-0',
-                        isBusy && !isCancelling
-                          ? 'bg-destructive text-destructive-foreground hover:bg-destructive/90'
-                          : undefined,
-                      )}
-                      disabled={composerDisabled}
-                      onStop={() => { void onCancelRun(); }}
-                      status={isCancelling ? 'submitted' : isBusy ? 'streaming' : 'ready'}
-                    />
+                  <div className="flex items-center gap-1">
+                    {isBusy && !isCancelling && (
+                      <QueueSubmitButton onEnqueue={onEnqueueMessage} />
+                    )}
+                    {!isBusy && (
+                      <PromptInputSubmit
+                        aria-label="Submit prompt"
+                        className="shrink-0"
+                        disabled={composerDisabled}
+                        status="ready"
+                      />
+                    )}
+                    {isBusy && (
+                      <Button
+                        aria-label="Cancel run"
+                        className="size-8 shrink-0 bg-destructive p-0 text-destructive-foreground hover:bg-destructive/90"
+                        disabled={isCancelling}
+                        onClick={() => { void onCancelRun(); }}
+                        size="icon-xs"
+                        type="button"
+                      >
+                        <XIcon className="size-4" />
+                      </Button>
+                    )}
                   </div>
                 </PromptInputFooter>
               </PromptInput>
-
-              {/* Queue add input */}
-              {activeConversationId ? (
-                <div className="mt-2 flex gap-1.5">
-                  <input
-                    className="h-7 min-w-0 flex-1 rounded-md border border-border/60 bg-muted/25 px-2.5 text-xs placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/40"
-                    onKeyDown={(e) => { if (e.key === 'Enter') handleAddToQueue(); }}
-                    onChange={(e) => setQueueDraft(e.target.value)}
-                    placeholder="Queue next message…"
-                    value={queueDraft}
-                  />
-                  <Button
-                    className="h-7 px-2 text-xs"
-                    disabled={!queueDraft.trim()}
-                    onClick={handleAddToQueue}
-                    size="sm"
-                    variant="outline"
-                  >
-                    <PlusIcon className="mr-1 size-3" />
-                    Queue
-                  </Button>
-                </div>
-              ) : null}
 
               <div className="mt-1.5 flex justify-end">
                 <PromptInputHoverCard>

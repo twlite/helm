@@ -75,16 +75,18 @@ Below the conversation and above the composer, a queue panel appears when messag
   - **Arrow (→)**: send this message immediately, interrupting the queue order.
   - **✕**: remove the message from the queue.
 
-To add a message to the queue, type in the small "Queue next message…" input below the main composer and press Enter or click **Queue**. This is useful for pre-loading a sequence of instructions to run back-to-back.
+To add a message to the queue, type it in the main composer while the agent is running, then click the **Queue** button that appears next to the submit area. Pressing Enter in the composer while the agent is busy will also queue the message rather than send it immediately. This is useful for pre-loading a sequence of instructions to run back-to-back.
 
 ### Composer
 
-The main composer at the bottom sends a message immediately (or cancels if the agent is running).
+The main composer at the bottom sends a message immediately when the agent is idle, or queues it when the agent is busy.
 
-- **Textarea**: type the user goal here. Supports multi-line input.
-- **Attachment button**: opens a menu to attach files or capture the current desktop screenshot as an attachment.
-- **Brain toggle**: enables or disables the model's reasoning mode. When enabled (amber), the model emits extended reasoning text before each action.
-- **Submit / Stop button**: submits the message when idle; shows as a red stop button when the agent is running.
+- **Textarea**: type the user goal here. Supports multi-line input. While the agent is running, the placeholder changes to indicate queue mode.
+- **Attachment button**: opens a menu to attach files or capture the current desktop screenshot as an attachment (only available when agent is idle).
+- **Brain toggle**: enables or disables the model's reasoning mode. When enabled (amber), the model emits extended reasoning text before each action (only available when agent is idle).
+- **Queue button** (appears while agent is busy): click to add the current textarea content to the message queue and clear the textarea.
+- **Submit button** (when idle): submits the message immediately.
+- **Stop button** (when busy): red button that cancels the current run. Any progress accumulated so far is saved as a partial assistant message.
 - **Context summary icon**: a small circular progress indicator (bottom-right of the composer) showing what percentage of the conversation has been compressed into a summary. Hover over it to see a card with full context statistics.
 
 ## Right Panel: Desktop VNC

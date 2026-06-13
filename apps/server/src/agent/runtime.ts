@@ -162,6 +162,8 @@ export const runAgentConversation = async (args: {
     toolName: string;
     output: Record<string, unknown>;
   }> = [];
+  let assistantText = '';
+  let reasoningText = '';
 
   try {
     const existingRun = getRunById(runId);
@@ -273,9 +275,6 @@ export const runAgentConversation = async (args: {
     };
 
     const runtimeTools = buildRuntimeTools({ capture: toolCapture, context: toolContext });
-
-    let assistantText = '';
-    let reasoningText = '';
 
     const result = streamText({
       abortSignal,
@@ -436,12 +435,6 @@ export const runAgentConversation = async (args: {
     ]);
 
     const afterMessages = getMessagesByConversationId(conversationId);
-    publishRunEvent({
-      conversationId,
-      eventType: 'context_summarizing',
-      payload: { phase: 'post-run' },
-      runId,
-    });
     const followUpSummary = await maybeSummarizeConversation({
       conversationId,
       messages: afterMessages,
@@ -466,12 +459,21 @@ export const runAgentConversation = async (args: {
 
       if (changed) {
         publishRunEvent({ conversationId, eventType: 'run_cancelled', payload: { message }, runId });
-        appendMessage({
-          conversationId,
-          parts: [{ content: { text: message }, type: 'status' }],
-          role: 'assistant',
-          runId,
-        });
+        const partialParts: Parameters<typeof appendMessage>[0]['parts'] = [];
+        if (reasoningText.trim()) {
+          partialParts.push({ content: { text: reasoningText.trim() }, type: 'reasoning' });
+        }
+        for (const call of toolCalls) {
+          partialParts.push({ content: { input: call.input, toolName: call.toolName }, type: 'tool_call' });
+        }
+        for (const result of toolResults) {
+          partialParts.push({ content: { output: result.output, toolName: result.toolName }, type: 'tool_result' });
+        }
+        if (assistantText.trim()) {
+          partialParts.push({ content: { text: assistantText.trim() }, type: 'text' });
+        }
+        partialParts.push({ content: { text: message }, type: 'status' });
+        appendMessage({ conversationId, parts: partialParts, role: 'assistant', runId });
       }
       return;
     }

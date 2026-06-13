@@ -759,9 +759,6 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
     });
   }, []);
 
-  // Submitted from queue — remove the item then fire the run
-  const steerWithMessageRef = useRef<((id: string) => Promise<void>) | null>(null);
-
   const confirmAndStopActiveRun = useCallback(
     async (nextConversationId: string | null): Promise<boolean> => {
       if (!activeConversationId) {
@@ -900,29 +897,24 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
 
   const steerWithMessage = useCallback(
     async (id: string) => {
-      setMessageQueue((prev) => {
-        const item = prev.find((m) => m.id === id);
-        if (!item) return prev;
-        // Fire async; we just need the text here
-        void (async () => {
-          try {
-            const storedInstructions = localStorage.getItem('helm_custom_instructions') ?? '';
-            if (!activeConversationId) return;
-            const run = await startConversationRun({
-              attachments: [],
-              conversationId: activeConversationId,
-              input: item.text,
-              instructions: storedInstructions || undefined,
-            });
-            await startStream(activeConversationId, run.id);
-          } catch (nextError) {
-            setError(nextError instanceof Error ? nextError.message : String(nextError));
-          }
-        })();
-        return prev.filter((m) => m.id !== id);
-      });
+      const item = messageQueue.find((m) => m.id === id);
+      if (!item) return;
+      setMessageQueue((prev) => prev.filter((m) => m.id !== id));
+      try {
+        const storedInstructions = localStorage.getItem('helm_custom_instructions') ?? '';
+        if (!activeConversationId) return;
+        const run = await startConversationRun({
+          attachments: [],
+          conversationId: activeConversationId,
+          input: item.text,
+          instructions: storedInstructions || undefined,
+        });
+        await startStream(activeConversationId, run.id);
+      } catch (nextError) {
+        setError(nextError instanceof Error ? nextError.message : String(nextError));
+      }
     },
-    [activeConversationId, startStream],
+    [activeConversationId, messageQueue, startStream],
   );
 
   // Auto-submit the first queued message when the agent goes idle
