@@ -310,15 +310,13 @@ export const runAgentConversation = async (args: {
             ) {
               return part;
             }
-            const output = part.output as { type: string; value?: unknown[] };
-            if (output.type !== 'content' || !Array.isArray(output.value)) return part;
-            const prunedValue = output.value.filter(
-              (v: unknown) => (v as { type?: string }).type !== 'file-data',
-            );
-            if (prunedValue.length === output.value.length) return part;
+            // The raw execute() output is ScreenshotToolOutput — strip imageBase64
+            // so toModelOutput produces a text-only summary for older screenshots.
+            const output = part.output as Record<string, unknown>;
+            if (!output.imageBase64) return part;
             return {
               ...part,
-              output: { ...output, value: prunedValue },
+              output: { ...output, imageBase64: '' },
             };
           });
           return { ...toolMsg, content: prunedContent };

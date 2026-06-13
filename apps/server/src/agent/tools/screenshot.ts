@@ -69,7 +69,7 @@ export const buildScreenshotTools = ({
         const imageBase64 = normalizeText(typedOutput.imageBase64);
         const mimeType = normalizeText(typedOutput.mimeType) || 'image/png';
 
-        if (!typedOutput.ok || !imageBase64) {
+        if (!typedOutput.ok) {
           const errorText =
             normalizeText(typedOutput.error) ||
             'Screenshot capture failed or returned empty image data.';
@@ -77,6 +77,14 @@ export const buildScreenshotTools = ({
           return {
             type: 'content' as const,
             value: [{ type: 'text' as const, text: errorText }],
+          };
+        }
+
+        // Image was stripped by prepareStep to save context — return text summary only.
+        if (!imageBase64) {
+          return {
+            type: 'content' as const,
+            value: [{ type: 'text' as const, text: buildScreenshotText(typedOutput) }],
           };
         }
 
