@@ -35,6 +35,10 @@ import {
   buildSummaryContext,
   maybeSummarizeConversation,
 } from '../services/summarizer.ts';
+import {
+  buildStepSystemContext,
+  pruneOlderScreenshotImages,
+} from './step-context.ts';
 
 const toErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
@@ -279,50 +283,17 @@ export const runAgentConversation = async (args: {
     const result = streamText({
       abortSignal,
       model: languageModel,
-      prepareStep: ({ messages }) => {
-        // Strip screenshot image data from all but the most recent screenshot tool result.
-        // This prevents the model from confusing older screenshots with the current state
-        // and avoids context bloat from accumulated PNG base64 data.
-        let lastScreenshotIdx = -1;
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const msg = messages[i];
-          if (msg.role !== 'tool') continue;
-          const toolMsg = msg as { role: 'tool'; content: Array<{ type: string; toolName?: string; output?: unknown }> };
-          const hasScreenshot = toolMsg.content.some(
-            (part) => part.type === 'tool-result' && part.toolName === 'capture_screenshot',
-          );
-          if (hasScreenshot) {
-            lastScreenshotIdx = i;
-            break;
-          }
-        }
-
-        if (lastScreenshotIdx <= 0) return {};
-
-        const prunedMessages = messages.map((msg, idx) => {
-          if (msg.role !== 'tool' || idx === lastScreenshotIdx) return msg;
-          const toolMsg = msg as { role: 'tool'; content: Array<{ type: 'tool-result'; toolName?: string; output?: unknown }> };
-          const prunedContent = toolMsg.content.map((part) => {
-            if (
-              part.type !== 'tool-result' ||
-              part.toolName !== 'capture_screenshot' ||
-              !part.output
-            ) {
-              return part;
-            }
-            // The raw execute() output is ScreenshotToolOutput — strip imageBase64
-            // so toModelOutput produces a text-only summary for older screenshots.
-            const output = part.output as Record<string, unknown>;
-            if (!output.imageBase64) return part;
-            return {
-              ...part,
-              output: { ...output, imageBase64: '' },
-            };
-          });
-          return { ...toolMsg, content: prunedContent };
+      prepareStep: ({ messages, stepNumber }) => {
+        const prunedMessages = pruneOlderScreenshotImages(messages);
+        const stepContext = buildStepSystemContext({
+          messages: prunedMessages,
+          stepNumber,
         });
 
-        return { messages: prunedMessages as typeof messages };
+        return {
+          messages: prunedMessages,
+          system: stepContext ? `${system}\n\n${stepContext}` : system,
+        };
       },
       prompt: promptBlocks.join('\n'),
       providerOptions: { reasoning: reasoning ?? 'on' } as any,
