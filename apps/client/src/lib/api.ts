@@ -86,6 +86,8 @@ export interface ServerInfo {
   model: string;
   provider: string;
   embedModel: string;
+  contextWindowTokens: number | null;
+  summaryTriggerSource: 'provider' | 'fallback';
   summaryTriggerTokens: number;
 }
 

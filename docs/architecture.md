@@ -74,7 +74,7 @@ The server is a lightweight HTTP server built on the Hono web framework, running
 - **Agent runtime**: the heart of the system — a `streamText` loop from the Vercel AI SDK that drives the model through the ReAct loop, calling desktop tools and persisting intermediate state.
 - **Database**: all persistent state (conversations, messages, runs, run events, summaries) lives in a single SQLite file managed by `better-sqlite3`.
 - **Memory services**: after each run, episodic summaries and semantic embeddings are upserted into ChromaDB; relevant embeddings are retrieved at the start of the next run.
-- **Summariser**: when the conversation token estimate exceeds `SUMMARY_TRIGGER_TOKENS`, older messages are summarised by the LLM and the summary is stored; subsequent runs inject the summary into the system prompt.
+- **Summariser**: when active context reaches about 80% of the model context window reported by the provider, older messages are summarised by the LLM and the summary is stored; subsequent runs inject the summary into the system prompt. If provider metadata is unavailable, the server falls back to `SUMMARY_TRIGGER_TOKENS`.
 
 ### Desktop Container (Docker)
 

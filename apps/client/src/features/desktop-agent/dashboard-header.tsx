@@ -130,6 +130,13 @@ export function DashboardHeader({
                 <p><span className="text-muted-foreground">Provider:</span> <span className="font-mono">{serverInfo.provider}</span></p>
                 <p><span className="text-muted-foreground">Embed model:</span> <span className="font-mono">{serverInfo.embedModel}</span></p>
                 <p><span className="text-muted-foreground">Summary trigger:</span> {serverInfo.summaryTriggerTokens.toLocaleString()} tokens</p>
+                <p>
+                  <span className="text-muted-foreground">Context window:</span>{' '}
+                  {serverInfo.contextWindowTokens
+                    ? `${serverInfo.contextWindowTokens.toLocaleString()} tokens`
+                    : 'Provider metadata unavailable'}
+                  <span className="text-muted-foreground"> ({serverInfo.summaryTriggerSource})</span>
+                </p>
               </div>
             ) : null}
             <div className="flex justify-end gap-2">

@@ -223,7 +223,9 @@ Returns the server's model configuration. Used by the client to display which mo
   "model": "string",
   "provider": "string",
   "embedModel": "string",
-  "summaryTriggerTokens": 9000
+  "contextWindowTokens": 32768,
+  "summaryTriggerSource": "provider",
+  "summaryTriggerTokens": 26214
 }
 ```
 

@@ -35,7 +35,7 @@ Create a `.env` file in the repository root or pass these variables to the serve
 | `CHROMA_URL` | `http://localhost:8000` | ChromaDB HTTP endpoint |
 | `AGENT_MAX_STEPS` | `50` | Maximum tool-call steps per run |
 | `AGENT_CONTEXT_RECENT_MESSAGES` | `24` | Number of recent messages included in each run's context |
-| `SUMMARY_TRIGGER_TOKENS` | `9000` | Token threshold at which context compression triggers |
+| `SUMMARY_TRIGGER_TOKENS` | `9000` | Fallback compression threshold when provider context-window metadata is unavailable |
 | `SUMMARY_KEEP_RECENT_MESSAGES` | `10` | Messages preserved verbatim after compression |
 | `MEMORY_TOP_K` | `4` | Number of memory entries retrieved per run |
 | `MEMORY_COLLECTION` | `helm_memory` | ChromaDB collection for semantic memory |

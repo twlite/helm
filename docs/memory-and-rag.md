@@ -116,11 +116,11 @@ The `distance` value (lower = more similar) helps the model gauge how relevant e
 
 Conversations accumulate messages over time. To prevent the active context window from exceeding the model's token limit, Helm compresses older messages into a summary.
 
-**Trigger**: when the estimated token count of the conversation exceeds `SUMMARY_TRIGGER_TOKENS` (default 9,000 tokens).
+**Trigger**: when the estimated active context reaches about 80% of the model context window reported by the OpenAI-compatible `/models` endpoint. If that metadata is unavailable, Helm falls back to `SUMMARY_TRIGGER_TOKENS` (default 9,000 tokens).
 
 **Process**:
 1. `maybeSummarizeConversation()` is called before and after each run.
-2. It estimates the token count of all messages since the last summary.
+2. It estimates the token count of active, unsummarized messages plus the current summary.
 3. If the threshold is exceeded, it calls the LLM to produce a concise summary of those messages.
 4. The summary is stored in SQLite (`conversation_summaries` table) and ChromaDB.
 5. Future runs include the summary in the system prompt and load only the most recent messages for full context, keeping the total token count bounded.
