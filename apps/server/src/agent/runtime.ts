@@ -30,12 +30,17 @@ import {
   acquireRunAbortSignal,
   releaseRunControl,
 } from '../services/run-control.ts';
+import {
+  buildRunSteeringContext,
+  clearRunSteeringMessages,
+} from '../services/run-steering.ts';
 import { publishRunEvent } from '../services/run-events.ts';
 import {
   buildSummaryContext,
   maybeSummarizeConversation,
 } from '../services/summarizer.ts';
 import {
+  appendLatestScreenshotImageMessage,
   buildStepSystemContext,
   pruneOlderScreenshotImages,
 } from './step-context.ts';
@@ -290,14 +295,19 @@ export const runAgentConversation = async (args: {
       model: languageModel,
       prepareStep: ({ messages, stepNumber }) => {
         const prunedMessages = pruneOlderScreenshotImages(messages);
+        const modelMessages = appendLatestScreenshotImageMessage(prunedMessages);
         const stepContext = buildStepSystemContext({
           messages: prunedMessages,
           stepNumber,
         });
+        const steeringContext = buildRunSteeringContext(runId);
+        const nextSystem = [system, stepContext, steeringContext]
+          .filter(Boolean)
+          .join('\n\n');
 
         return {
-          messages: prunedMessages,
-          system: stepContext ? `${system}\n\n${stepContext}` : system,
+          messages: modelMessages,
+          system: nextSystem,
         };
       },
       prompt: promptBlocks.join('\n'),
@@ -455,6 +465,7 @@ export const runAgentConversation = async (args: {
       runId,
     });
   } finally {
+    clearRunSteeringMessages(runId);
     releaseRunControl(runId);
   }
 };

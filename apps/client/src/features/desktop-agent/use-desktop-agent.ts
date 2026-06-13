@@ -10,6 +10,7 @@ import {
   getConversationTimeline,
   listConversations,
   startConversationRun,
+  steerConversationRun,
   type ConversationMessageRecord,
   type ConversationRecord,
   type ConversationTimelineResponse,
@@ -639,15 +640,16 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
 
       try {
         const storedInstructions = localStorage.getItem('helm_custom_instructions') ?? '';
-        const run = await startConversationRun({
+        const response = await startConversationRun({
           attachments,
           conversationId: activeConversationId,
           input: cleanText,
           instructions: storedInstructions || undefined,
           reasoning,
         });
+        setMessages((prev) => mergeUniqueMessages([...prev, response.userMessage]));
 
-        await startStream(activeConversationId, run.id);
+        await startStream(activeConversationId, response.run.id);
       } catch (nextError) {
         setError(
           nextError instanceof Error ? nextError.message : String(nextError),
@@ -906,20 +908,39 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
       if (!item) return;
       setMessageQueue((prev) => prev.filter((m) => m.id !== id));
       try {
-        const storedInstructions = localStorage.getItem('helm_custom_instructions') ?? '';
         if (!activeConversationId) return;
-        const run = await startConversationRun({
+        if (isBusy && liveRunId) {
+          await steerConversationRun({
+            conversationId: activeConversationId,
+            input: item.text,
+            runId: liveRunId,
+          });
+          await refreshLatestMessages(activeConversationId);
+          return;
+        }
+
+        const storedInstructions = localStorage.getItem('helm_custom_instructions') ?? '';
+        const response = await startConversationRun({
           attachments: [],
           conversationId: activeConversationId,
           input: item.text,
           instructions: storedInstructions || undefined,
         });
-        await startStream(activeConversationId, run.id);
+        setMessages((prev) => mergeUniqueMessages([...prev, response.userMessage]));
+        await startStream(activeConversationId, response.run.id);
       } catch (nextError) {
+        setMessageQueue((prev) => [item, ...prev]);
         setError(nextError instanceof Error ? nextError.message : String(nextError));
       }
     },
-    [activeConversationId, messageQueue, startStream],
+    [
+      activeConversationId,
+      isBusy,
+      liveRunId,
+      messageQueue,
+      refreshLatestMessages,
+      startStream,
+    ],
   );
 
   // Auto-submit the first queued message when the agent goes idle

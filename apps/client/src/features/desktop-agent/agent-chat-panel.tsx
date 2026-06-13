@@ -1018,7 +1018,7 @@ const MessageQueuePanel = memo(function MessageQueuePanel({
       <div className="space-y-1">
         {queue.map((msg, index) => (
           <div
-            className="group flex items-center gap-1.5 rounded-lg border border-border/50 bg-muted/25 px-2 py-1.5 transition-colors hover:bg-muted/40 cursor-grab active:cursor-grabbing"
+            className="group flex items-center gap-1.5 rounded-lg border border-border/50 bg-muted/25 px-2 py-1.5 transition-colors hover:bg-muted/40"
             draggable
             key={msg.id}
             onDragEnd={() => { dragIndexRef.current = null; }}
@@ -1029,15 +1029,14 @@ const MessageQueuePanel = memo(function MessageQueuePanel({
             }}
             onDragStart={() => { dragIndexRef.current = index; }}
           >
-            <GripVerticalIcon className="size-3.5 shrink-0 text-muted-foreground/40 group-hover:text-muted-foreground/70" />
+            <GripVerticalIcon className="size-3.5 shrink-0 cursor-grab text-muted-foreground/40 group-hover:text-muted-foreground/70 active:cursor-grabbing" />
             <span className="min-w-0 flex-1 truncate text-xs">{msg.text}</span>
             <div className="flex shrink-0 items-center gap-0.5">
               <Button
                 className="size-6 p-0 text-blue-500 hover:bg-blue-500/10"
-                disabled={isBusy}
                 onClick={() => { void onSteer(msg.id); }}
                 size="icon-sm"
-                title="Send now (steer conversation)"
+                title={isBusy ? "Steer active run" : "Send now"}
                 variant="ghost"
               >
                 <ArrowRightIcon className="size-3" />

@@ -139,6 +139,7 @@ export interface ConversationMessagesPageResponse {
 
 export interface StartRunResponse {
   run: ConversationRunRecord;
+  userMessage: ConversationMessageRecord;
 }
 
 export interface CreateConversationResponse {

@@ -291,8 +291,14 @@ export const startConversationRun = async (args: {
   attachments?: RunAttachmentInput[];
   reasoning?: RunReasoningSetting;
   instructions?: string;
-}): Promise<ConversationRunRecord> => {
-  const response = await request<{ run: ConversationRunRecord }>(
+}): Promise<{
+  run: ConversationRunRecord;
+  userMessage: ConversationMessageRecord;
+}> => {
+  return request<{
+    run: ConversationRunRecord;
+    userMessage: ConversationMessageRecord;
+  }>(
     `/api/conversations/${args.conversationId}/runs`,
     {
       body: JSON.stringify({
@@ -304,8 +310,20 @@ export const startConversationRun = async (args: {
       method: 'POST',
     },
   );
+};
 
-  return response.run;
+export const steerConversationRun = async (args: {
+  conversationId: string;
+  input: string;
+  runId: string;
+}): Promise<void> => {
+  await request<void>(
+    `/api/conversations/${args.conversationId}/runs/${args.runId}/steer`,
+    {
+      body: JSON.stringify({ input: args.input }),
+      method: 'POST',
+    },
+  );
 };
 
 export const getServerInfo = async (): Promise<ServerInfo> => {

@@ -70,6 +70,7 @@ export const buildKeyboardTools = ({
         const callInput = {
           delayMs,
           length: text.length,
+          text,
         };
         emitToolCall(context, 'type_text', callInput);
         capture.onToolCall({ input: callInput, toolName: 'type_text' });

@@ -139,6 +139,7 @@ export const queryRunEpisodes = async (input: {
     collectionName: config.EPISODIC_MEMORY_COLLECTION,
     conversationId: input.conversationId,
     query: input.query,
+    sameConversationOnly: true,
     topK: input.topK ?? config.MEMORY_TOP_K,
   });
 };

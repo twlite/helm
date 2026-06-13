@@ -72,6 +72,7 @@ export const queryMemories = async (input: {
   query: string;
   topK?: number;
   collectionName?: string;
+  sameConversationOnly?: boolean;
 }): Promise<RetrievedMemory[]> => {
   const cleanQuery = input.query.trim();
   if (!cleanQuery) {
@@ -92,6 +93,9 @@ export const queryMemories = async (input: {
       include: ['metadatas', 'documents', 'distances'],
       nResults: input.topK ?? config.MEMORY_TOP_K,
       queryEmbeddings: [embeddingResult.embedding],
+      ...(input.sameConversationOnly
+        ? { where: { conversationId: input.conversationId } }
+        : {}),
     });
 
     const ids = result.ids?.[0] ?? [];

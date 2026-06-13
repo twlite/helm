@@ -18,6 +18,7 @@ import { conflict, notFound } from '../errors.ts';
 import { subscribeRunEvents } from '../services/event-bus.ts';
 import { requestRunCancellation } from '../services/run-control.ts';
 import { publishRunEvent } from '../services/run-events.ts';
+import { addRunSteeringMessage } from '../services/run-steering.ts';
 import { generateConversationTitle } from '../services/title.ts';
 import { doneEventTypes, safeJsonBody } from './shared.ts';
 
@@ -46,6 +47,10 @@ const startRunSchema = z
     });
   });
 
+const steerRunSchema = z.object({
+  input: z.string().trim().min(1).max(20_000),
+});
+
 export const registerRunRoutes = (app: Hono) => {
   app.post('/api/conversations/:conversationId/runs', async (c) => {
     const conversationId = c.req.param('conversationId');
@@ -73,7 +78,7 @@ export const registerRunRoutes = (app: Hono) => {
       );
     }
 
-    const { run } = withTransaction(() => {
+    const { run, userMessage } = withTransaction(() => {
       const userMessage = appendMessage({
         conversationId,
         parts: [
@@ -108,7 +113,7 @@ export const registerRunRoutes = (app: Hono) => {
         runId: nextRun.id,
       });
 
-      return { run: nextRun };
+      return { run: nextRun, userMessage };
     });
 
     queueMicrotask(() => {
@@ -141,7 +146,7 @@ export const registerRunRoutes = (app: Hono) => {
       })();
     });
 
-    return c.json({ run }, 202);
+    return c.json({ run, userMessage }, 202);
   });
 
   app.post('/api/conversations/:conversationId/runs/:runId/cancel', (c) => {
@@ -191,6 +196,51 @@ export const registerRunRoutes = (app: Hono) => {
     }
 
     return c.json({ run: refreshed });
+  });
+
+  app.post('/api/conversations/:conversationId/runs/:runId/steer', async (c) => {
+    const conversationId = c.req.param('conversationId');
+    const runId = c.req.param('runId');
+    const conversation = getConversationById(conversationId);
+    if (!conversation) {
+      throw notFound(`Conversation ${conversationId} was not found.`);
+    }
+
+    const run = getRunById(runId);
+    if (!run || run.conversationId !== conversationId) {
+      throw notFound(
+        `Run ${runId} was not found in conversation ${conversationId}.`,
+      );
+    }
+
+    if (run.status !== 'queued' && run.status !== 'running') {
+      throw conflict(
+        'Cannot steer a run that is not active.',
+        'run_not_active',
+      );
+    }
+
+    const body = steerRunSchema.parse(await safeJsonBody(c.req.raw));
+    const steering = addRunSteeringMessage({ runId, text: body.input });
+    const message = appendMessage({
+      conversationId,
+      parts: [{ content: { text: body.input }, type: 'text' as const }],
+      role: 'user',
+      runId,
+    });
+
+    publishRunEvent({
+      conversationId,
+      eventType: 'status',
+      payload: {
+        message: 'User steering received',
+        steeringCreatedAt: steering.createdAt,
+        userMessageId: message.id,
+      },
+      runId,
+    });
+
+    return c.json({ message, ok: true, steering });
   });
 
   app.get(

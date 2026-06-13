@@ -1,21 +1,112 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import { AgentChatPanel } from "./agent-chat-panel";
 import { ChatHistoryPanel } from "./chat-history-panel";
 import { DashboardHeader } from "./dashboard-header";
-import { DesktopVncPanel } from "./desktop-vnc-panel";
+import { DesktopVncPanel, type AgentCursorPosition } from "./desktop-vnc-panel";
+import type { LiveEvent } from "./types";
 import { useThemeMode } from "./use-theme-mode";
 import type { UseDesktopAgentResult } from "./use-desktop-agent";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 
 type PanelView = "history" | "chat";
 type PanelDirection = "horizontal" | "vertical";
+
+const MOUSE_TOOL_NAMES = new Set([
+  "capture_screenshot",
+  "click_mouse",
+  "double_click_mouse",
+  "drag_mouse",
+  "get_mouse_location",
+  "move_mouse",
+]);
+
 const resolveDirection = (): PanelDirection => {
   if (typeof window === "undefined") return "horizontal";
   return window.matchMedia("(min-width: 1024px)").matches ? "horizontal" : "vertical";
 };
 
 interface DashboardLayoutProps { agent: UseDesktopAgentResult; }
+
+const asRecord = (value: unknown): Record<string, unknown> | null => {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+};
+
+const getNumber = (record: Record<string, unknown> | null, key: string): number | null => {
+  const value = record?.[key];
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+};
+
+const extractPoint = (output: Record<string, unknown>): { x: number; y: number } | null => {
+  const cursor = asRecord(output.cursor);
+  const resolvedTarget = asRecord(output.resolvedTarget);
+  const cursorAfter = asRecord(output.cursorAfter);
+  const cursorAfterMove = asRecord(output.cursorAfterMove);
+
+  const candidates = [
+    { x: getNumber(output, "x"), y: getNumber(output, "y") },
+    { x: getNumber(cursor, "x"), y: getNumber(cursor, "y") },
+    { x: getNumber(resolvedTarget, "x"), y: getNumber(resolvedTarget, "y") },
+    { x: getNumber(cursorAfter, "x"), y: getNumber(cursorAfter, "y") },
+    { x: getNumber(cursorAfterMove, "x"), y: getNumber(cursorAfterMove, "y") },
+  ];
+
+  const match = candidates.find((point) => point.x !== null && point.y !== null);
+  return match ? { x: match.x as number, y: match.y as number } : null;
+};
+
+const extractGeometry = (
+  output: Record<string, unknown>,
+): { width: number; height: number } | null => {
+  const geometry = asRecord(output.displayGeometry) ?? asRecord(output.geometry);
+  const width = getNumber(geometry, "width");
+  const height = getNumber(geometry, "height");
+
+  return width && height && width > 0 && height > 0 ? { width, height } : null;
+};
+
+const clampPercent = (value: number): number => Math.max(0, Math.min(100, value));
+
+const deriveAgentCursor = (liveEvents: LiveEvent[]): AgentCursorPosition | null => {
+  for (let index = liveEvents.length - 1; index >= 0; index -= 1) {
+    const event = liveEvents[index];
+    if (
+      (event?.type !== "tool_result" && event?.type !== "tool_call") ||
+      !MOUSE_TOOL_NAMES.has(event.toolName)
+    ) {
+      continue;
+    }
+
+    const payload = event.type === "tool_result" ? event.output : event.input;
+    const point = extractPoint(payload);
+    if (!point) {
+      continue;
+    }
+
+    const geometry = extractGeometry(payload) ?? { width: 1366, height: 768 };
+    return {
+      eventKey: `${index}-${event.type}-${event.toolName}`,
+      isClicking:
+        event.type === "tool_call" &&
+        (event.toolName === "click_mouse" || event.toolName === "double_click_mouse"),
+      xPercent: clampPercent((point.x / geometry.width) * 100),
+      yPercent: clampPercent((point.y / geometry.height) * 100),
+    };
+  }
+
+  return null;
+};
 
 export function DashboardLayout({ agent }: DashboardLayoutProps) {
   const [panelDirection, setPanelDirection] = useState<PanelDirection>(resolveDirection);
@@ -48,7 +139,6 @@ export function DashboardLayout({ agent }: DashboardLayoutProps) {
     messageQueue,
     messages,
     openConversation,
-    refreshActiveTimeline,
     reorderQueue,
     steerWithMessage,
     streamError,
@@ -98,6 +188,7 @@ export function DashboardLayout({ agent }: DashboardLayoutProps) {
   };
 
   const isAgentActive = agentStatus !== "idle";
+  const agentCursor = useMemo(() => deriveAgentCursor(liveEvents), [liveEvents]);
 
   return (
     <div className="min-h-dvh bg-[radial-gradient(circle_at_top,color-mix(in_oklch,var(--background),var(--foreground)_7%)_0%,var(--background)_52%)] text-foreground">
@@ -159,7 +250,7 @@ export function DashboardLayout({ agent }: DashboardLayoutProps) {
           <ResizableHandle withHandle={true} />
           <ResizablePanel defaultSize={58} minSize={30}>
             <div className="h-full min-h-0 pl-2">
-              <DesktopVncPanel isActive={isAgentActive} vncUrl={vncUrl} />
+              <DesktopVncPanel agentCursor={agentCursor} isActive={isAgentActive} vncUrl={vncUrl} />
             </div>
           </ResizablePanel>
         </ResizablePanelGroup>
