@@ -147,6 +147,27 @@
   }
 }
 
+@keyframes helm-screenshot-edge-flash {
+  0% {
+    opacity: 0;
+    transform: scale(0.995);
+  }
+  16% {
+    opacity: 0.82;
+    transform: scale(1);
+  }
+  46% {
+    opacity: 0.34;
+  }
+  72% {
+    opacity: 0.58;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.002);
+  }
+}
+
 /* Thin custom scrollbar */
 * {
   scrollbar-width: thin;

@@ -16,9 +16,15 @@ interface DesktopVncPanelProps {
   vncUrl: string;
   isActive?: boolean;
   agentCursor?: AgentCursorPosition | null;
+  screenshotFlashKey?: string | null;
 }
 
-export function DesktopVncPanel({ agentCursor, vncUrl, isActive = false }: DesktopVncPanelProps) {
+export function DesktopVncPanel({
+  agentCursor,
+  screenshotFlashKey,
+  vncUrl,
+  isActive = false,
+}: DesktopVncPanelProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [containerSize, setContainerSize] = useState({ height: 0, width: 0 });
   const desktopWidth = agentCursor?.width && agentCursor.width > 0 ? agentCursor.width : 1366;
@@ -79,6 +85,18 @@ export function DesktopVncPanel({ agentCursor, vncUrl, isActive = false }: Deskt
             src={vncUrl}
             title="Desktop VNC"
           />
+
+          {screenshotFlashKey ? (
+            <div
+              aria-hidden={true}
+              className="pointer-events-none absolute inset-0 z-[45] rounded-2xl border-2 border-cyan-200/55"
+              key={screenshotFlashKey}
+              style={{
+                animation: "helm-screenshot-edge-flash 900ms ease-out 1 both",
+                boxShadow: "inset 0 0 30px rgba(34,211,238,0.22), 0 0 18px rgba(34,211,238,0.18)",
+              }}
+            />
+          ) : null}
 
           {agentCursor ? (
             <div aria-hidden={true} className="pointer-events-none absolute inset-0 z-50 overflow-hidden">
