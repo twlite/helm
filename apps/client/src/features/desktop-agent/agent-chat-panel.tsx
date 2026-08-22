@@ -34,7 +34,6 @@ import {
   PromptInputActionMenuContent,
   PromptInputActionMenuTrigger,
   PromptInputBody,
-  PromptInputButton,
   PromptInputFooter,
   PromptInputHoverCard,
   PromptInputHoverCardContent,
@@ -68,7 +67,6 @@ import { Spinner } from '@/components/ui/spinner';
 import { cn } from '@/lib/utils';
 import {
   ArrowRightIcon,
-  BrainIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   GripVerticalIcon,
@@ -77,6 +75,7 @@ import {
   SendIcon,
   XIcon,
 } from 'lucide-react';
+import { ReasoningModeSelector } from './reasoning-mode-selector';
 import { ScreenshotPreview } from './screenshot-preview';
 import { ModelSelector } from './model-selector';
 import type {
@@ -93,6 +92,29 @@ const CONTEXT_ICON_RADIUS = 8;
 const CONTEXT_ICON_SIZE = 20;
 const CONTEXT_ICON_STROKE = 2;
 const SUMMARY_HISTORY_LIMIT = 4;
+const REASONING_MODE_STORAGE_KEY = 'helm_reasoning_mode';
+const REASONING_MODE_VALUES: RunReasoningSetting[] = [
+  'on',
+  'low',
+  'medium',
+  'high',
+  'off',
+];
+
+const readStoredReasoningMode = (): RunReasoningSetting => {
+  if (typeof window === 'undefined') {
+    return 'on';
+  }
+
+  try {
+    const stored = window.localStorage.getItem(REASONING_MODE_STORAGE_KEY);
+    return REASONING_MODE_VALUES.includes(stored as RunReasoningSetting)
+      ? (stored as RunReasoningSetting)
+      : 'on';
+  } catch {
+    return 'on';
+  }
+};
 
 const AGENT_STATUS_LABELS: Record<AgentStatus, string> = {
   idle: 'Idle',
@@ -1095,7 +1117,17 @@ export function AgentChatPanel({
   serverInfo,
 }: AgentChatPanelProps) {
   const [renderWindow, setRenderWindow] = useState(MESSAGE_VIRTUAL_WINDOW);
-  const [showReasoning, setShowReasoning] = useState(true);
+  const [reasoningMode, setReasoningMode] = useState<RunReasoningSetting>(readStoredReasoningMode);
+  const showReasoning = reasoningMode !== 'off';
+
+  const handleReasoningModeChange = useCallback((mode: RunReasoningSetting) => {
+    setReasoningMode(mode);
+    try {
+      window.localStorage.setItem(REASONING_MODE_STORAGE_KEY, mode);
+    } catch {
+      // Preferences are optional when storage is unavailable.
+    }
+  }, []);
 
   const latestSummary = timeline?.latestSummary ?? null;
   const totalMessageCount = timeline?.messageCount ?? messages.length;
@@ -1205,7 +1237,7 @@ export function AgentChatPanel({
                     onEnqueueMessage(text);
                     return;
                   }
-                  void onStartRun({ files, reasoning: showReasoning ? 'on' : 'off', text });
+                  void onStartRun({ files, reasoning: reasoningMode, text });
                 }}
               >
                 <PromptInputBody>
@@ -1234,19 +1266,11 @@ export function AgentChatPanel({
                         </PromptInputActionMenuContent>
                       </PromptInputActionMenu>
 
-                      <PromptInputButton
-                        aria-label={showReasoning ? 'Reasoning enabled' : 'Reasoning disabled'}
-                        className={cn(
-                          showReasoning
-                            ? 'bg-amber-500/18 text-amber-700 ring-1 ring-amber-500/30 hover:bg-amber-500/26 dark:text-amber-300'
-                            : undefined,
-                        )}
-                        disabled={isBusy}
-                        onClick={() => setShowReasoning((prev) => !prev)}
-                        tooltip={showReasoning ? 'Reasoning mode: on' : 'Reasoning mode: off'}
-                      >
-                        <BrainIcon className="size-4" />
-                      </PromptInputButton>
+                      <ReasoningModeSelector
+                        disabled={isBusy || isCancelling}
+                        onChange={handleReasoningModeChange}
+                        value={reasoningMode}
+                      />
                     </PromptInputTools>
                   </div>
                   <div className="flex items-center gap-1">

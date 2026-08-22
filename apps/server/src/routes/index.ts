@@ -1,5 +1,6 @@
 import type { Hono } from 'hono';
 import { registerConversationRoutes } from './conversations.ts';
+import { registerDesktopRoutes } from './desktop.ts';
 import { registerHealthRoutes } from './health.ts';
 import { registerInfoRoute } from './info.ts';
 import { registerMemoryRoutes } from './memories.ts';
@@ -11,6 +12,7 @@ export const registerRoutes = (app: Hono) => {
   registerInfoRoute(app);
   registerMemoryRoutes(app);
   registerConversationRoutes(app);
+  registerDesktopRoutes(app);
   registerRunRoutes(app);
   registerRootRoute(app);
 };

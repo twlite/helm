@@ -156,6 +156,14 @@ export interface ContextSummaryStats {
   usagePercent: number;
 }
 
+export interface DesktopScreenshotResponse {
+  cursor: { x: number; y: number } | null;
+  dataUrl: string;
+  filename: string;
+  geometry: { height: number; width: number } | null;
+  mimeType: string;
+}
+
 export interface ConversationTimelineResponse {
   conversation: ConversationRecord;
   activeRun: ConversationRunRecord | null;
@@ -350,6 +358,10 @@ export const steerConversationRun = async (args: {
 
 export const getServerInfo = async (): Promise<ServerInfo> => {
   return request<ServerInfo>('/api/info');
+};
+
+export const captureDesktopScreenshot = async (): Promise<DesktopScreenshotResponse> => {
+  return request<DesktopScreenshotResponse>('/api/desktop/screenshot');
 };
 
 export const listMemories = async (): Promise<MemoryRecord[]> => {

@@ -15,6 +15,7 @@ import {
   ResizablePanel,
   ResizablePanelGroup,
 } from '@/components/ui/resizable';
+import { PromptInputProvider } from '@/components/ai-elements/prompt-input';
 
 type PanelView = 'history' | 'chat';
 type PanelDirection = 'horizontal' | 'vertical';
@@ -143,70 +144,72 @@ export function DashboardLayout({ agent }: DashboardLayoutProps) {
           serverInfo={serverInfo}
           themeMode={themeMode}
         />
-        <ResizablePanelGroup
-          autoSaveId="desktop-main-layout"
-          className="min-h-0 flex-1"
-          direction={panelDirection}
-        >
-          <ResizablePanel defaultSize={24} minSize={20}>
-            <div className="h-full min-h-0 pr-2">
-              {panelView === 'chat' && activeConversationId ? (
-                <AgentChatPanel
-                  activeConversationId={activeConversationId}
-                  agentStatus={agentStatus}
-                  error={error}
-                  hasMoreMessages={hasMoreMessages}
-                  isBusy={isBusy}
-                  isCancelling={isCancelling}
-                  key={activeConversationId}
-                  liveEvents={liveEvents}
-                  liveRunId={liveRunId}
-                  liveRunStatus={liveRunStatus}
-                  loading={loading}
-                  loadingOlderMessages={loadingOlderMessages}
-                  messageQueue={messageQueue}
-                  messages={messages}
-                  onCancelRun={handleCancelRun}
-                  onDequeueMessage={dequeueMessage}
-                  onEnqueueMessage={enqueueMessage}
-                  onLoadOlderMessages={loadOlderMessages}
-                  onReorderQueue={reorderQueue}
-                  onStartRun={handleStartRun}
-                  onSteerWithMessage={steerWithMessage}
-                  onViewChats={() => setPanelView('history')}
-                  streamError={streamError}
-                  streamState={streamState}
-                  onSelectModel={selectModel}
-                  selectedModelId={selectedModelId}
-                  serverInfo={serverInfo}
-                  timeline={timeline}
+        <PromptInputProvider key={activeConversationId ?? 'no-active-conversation'}>
+          <ResizablePanelGroup
+            autoSaveId="desktop-main-layout"
+            className="min-h-0 flex-1"
+            direction={panelDirection}
+          >
+            <ResizablePanel defaultSize={24} minSize={20}>
+              <div className="h-full min-h-0 pr-2">
+                {panelView === 'chat' && activeConversationId ? (
+                  <AgentChatPanel
+                    activeConversationId={activeConversationId}
+                    agentStatus={agentStatus}
+                    error={error}
+                    hasMoreMessages={hasMoreMessages}
+                    isBusy={isBusy}
+                    isCancelling={isCancelling}
+                    key={activeConversationId}
+                    liveEvents={liveEvents}
+                    liveRunId={liveRunId}
+                    liveRunStatus={liveRunStatus}
+                    loading={loading}
+                    loadingOlderMessages={loadingOlderMessages}
+                    messageQueue={messageQueue}
+                    messages={messages}
+                    onCancelRun={handleCancelRun}
+                    onDequeueMessage={dequeueMessage}
+                    onEnqueueMessage={enqueueMessage}
+                    onLoadOlderMessages={loadOlderMessages}
+                    onReorderQueue={reorderQueue}
+                    onStartRun={handleStartRun}
+                    onSteerWithMessage={steerWithMessage}
+                    onViewChats={() => setPanelView('history')}
+                    streamError={streamError}
+                    streamState={streamState}
+                    onSelectModel={selectModel}
+                    selectedModelId={selectedModelId}
+                    serverInfo={serverInfo}
+                    timeline={timeline}
+                  />
+                ) : (
+                  <ChatHistoryPanel
+                    activeConversationId={activeConversationId}
+                    agentStatus={agentStatus}
+                    conversations={conversations}
+                    deletingConversationId={deletingConversationId}
+                    isBusy={isBusy}
+                    onCreateConversation={handleCreateConversation}
+                    onDeleteConversation={handleDeleteConversationFromList}
+                    onOpenConversation={handleOpenConversation}
+                  />
+                )}
+              </div>
+            </ResizablePanel>
+            <ResizableHandle withHandle={true} />
+            <ResizablePanel defaultSize={58} minSize={30}>
+              <div className="h-full min-h-0 pl-2">
+                <DesktopVncPanel
+                  agentCursor={agentCursor}
+                  isActive={isAgentActive}
+                  screenshotFlashKey={screenshotFlashKey}
+                  vncUrl={vncUrl}
                 />
-              ) : (
-                <ChatHistoryPanel
-                  activeConversationId={activeConversationId}
-                  agentStatus={agentStatus}
-                  conversations={conversations}
-                  deletingConversationId={deletingConversationId}
-                  isBusy={isBusy}
-                  onCreateConversation={handleCreateConversation}
-                  onDeleteConversation={handleDeleteConversationFromList}
-                  onOpenConversation={handleOpenConversation}
-                />
-              )}
-            </div>
-          </ResizablePanel>
-          <ResizableHandle withHandle={true} />
-          <ResizablePanel defaultSize={58} minSize={30}>
-            <div className="h-full min-h-0 pl-2">
-              <DesktopVncPanel
-                agentCursor={agentCursor}
-                isActive={isAgentActive}
-                screenshotFlashKey={screenshotFlashKey}
-                vncUrl={vncUrl}
-              />
-            </div>
-          </ResizablePanel>
-        </ResizablePanelGroup>
+              </div>
+            </ResizablePanel>
+          </ResizablePanelGroup>
+        </PromptInputProvider>
       </main>
     </div>
   );
