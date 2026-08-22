@@ -28,7 +28,10 @@ export type RunTurnOptions = {
   input: RelayInputPart[];
   model?: string;
   onDelta?: (delta: string) => void | Promise<void>;
+  onThreadCreated?: (threadId: string) => void;
+  onTurnStarted?: () => void;
   signal?: AbortSignal;
+  threadId?: string;
 };
 
 type PendingRequest = {
@@ -356,34 +359,48 @@ export class CodexAppServer {
     input,
     model,
     onDelta,
+    onThreadCreated,
+    onTurnStarted,
     signal,
+    threadId,
   }: RunTurnOptions): Promise<string> {
     if (signal?.aborted) {
       throw createAbortError();
     }
 
-    const thread = await this.call<ThreadStartResult>(
-      'thread/start',
-      {
-        approvalPolicy: 'never',
-        cwd: this.cwd,
-        ephemeral: true,
-        ...(model ?? this.model ? { model: model ?? this.model } : {}),
-        sandbox: 'read-only',
-        ...(developerInstructions ? { developerInstructions } : {}),
-      },
-      signal,
-    );
+    let activeThreadId = threadId;
 
-    const threadId = thread.thread?.id;
+    if (!activeThreadId) {
+      const effectiveModel = model ?? this.model;
+      const thread = await this.call<ThreadStartResult>(
+        'thread/start',
+        {
+          approvalPolicy: 'never',
+          cwd: this.cwd,
+          ephemeral: true,
+          ...(effectiveModel ? { model: effectiveModel } : {}),
+          sandbox: 'read-only',
+          ...(developerInstructions ? { developerInstructions } : {}),
+        },
+        signal,
+      );
 
-    if (!threadId) {
-      throw new Error('Codex did not return a thread id.');
+      activeThreadId = thread.thread?.id;
+
+      if (!activeThreadId) {
+        throw new Error('Codex did not return a thread id.');
+      }
+
+      onThreadCreated?.(activeThreadId);
     }
 
     const started = await this.call<TurnStartResult>(
       'turn/start',
-      { input, threadId },
+      {
+        input,
+        ...(model ? { model } : {}),
+        threadId: activeThreadId,
+      },
       signal,
     );
 
@@ -392,6 +409,8 @@ export class CodexAppServer {
     if (!turnId) {
       throw new Error('Codex did not return a turn id.');
     }
+
+    onTurnStarted?.();
 
     return new Promise<string>((resolve, reject) => {
       if (this.failure) {
@@ -435,7 +454,10 @@ export class CodexAppServer {
         this.turnBuffers.delete(turnId);
         signal?.removeEventListener('abort', onAbort);
 
-        void this.call('turn/interrupt', { threadId, turnId }).catch(() => {
+        void this.call('turn/interrupt', {
+          threadId: activeThreadId,
+          turnId,
+        }).catch(() => {
           // The request is already being aborted; the app-server may have
           // completed the turn before it received the interrupt.
         });

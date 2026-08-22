@@ -1,5 +1,5 @@
 import { stepCountIs, streamText, type ModelMessage } from 'ai';
-import { getLanguageModel } from '../agent/model.ts';
+import { getLanguageModel, withHelmSession } from '../agent/model.ts';
 import { buildAgentSystemPrompt } from '../agent/prompt.ts';
 import {
   assertRunNotCancelled,
@@ -329,66 +329,69 @@ export const runAgentConversation = async (args: {
 
     const runtimeTools = buildRuntimeTools({ capture: toolCapture, context: toolContext });
 
-    const result = streamText({
-      abortSignal,
-      model: selectedModel,
-      prepareStep: ({ messages, stepNumber }) => {
-        const prunedMessages = pruneOlderScreenshotImages(messages);
-        const modelMessages = appendLatestScreenshotImageMessage(prunedMessages);
-        const stepContext = buildStepSystemContext({
-          messages: prunedMessages,
-          stepNumber,
-        });
-        const steeringContext = buildRunSteeringContext(runId);
-        const nextSystem = [system, stepContext, steeringContext]
-          .filter(Boolean)
-          .join('\n\n');
+    const settledText = await withHelmSession(conversationId, async () => {
+      const result = streamText({
+        abortSignal,
+        model: selectedModel,
+        prepareStep: ({ messages, stepNumber }) => {
+          const prunedMessages = pruneOlderScreenshotImages(messages);
+          const modelMessages = appendLatestScreenshotImageMessage(prunedMessages);
+          const stepContext = buildStepSystemContext({
+            messages: prunedMessages,
+            stepNumber,
+          });
+          const steeringContext = buildRunSteeringContext(runId);
+          const nextSystem = [system, stepContext, steeringContext]
+            .filter(Boolean)
+            .join('\n\n');
 
-        return {
-          messages: modelMessages,
-          system: nextSystem,
-        };
-      },
-      messages: [initialUserMessage],
-      providerOptions: { reasoning: reasoning ?? 'on' } as any,
-      stopWhen: [stepCountIs(config.AGENT_MAX_STEPS)],
-      system,
-      tools: runtimeTools,
+          return {
+            messages: modelMessages,
+            system: nextSystem,
+          };
+        },
+        messages: [initialUserMessage],
+        providerOptions: { reasoning: reasoning ?? 'on' } as any,
+        stopWhen: [stepCountIs(config.AGENT_MAX_STEPS)],
+        system,
+        tools: runtimeTools,
+      });
+
+      for await (const chunk of result.fullStream) {
+        assertRunNotCancelled({ abortSignal, conversationId, runId });
+
+        if (chunk.type === 'text-delta') {
+          const delta = chunk.text;
+          if (delta) {
+            assistantText += delta;
+            publishRunEvent({
+              conversationId,
+              eventType: 'assistant_text',
+              payload: { delta },
+              runId,
+            });
+          }
+          continue;
+        }
+
+        if (chunk.type === 'reasoning-delta') {
+          const delta = chunk.text;
+          if (delta) {
+            reasoningText += delta;
+            publishRunEvent({
+              conversationId,
+              eventType: 'reasoning',
+              payload: { delta },
+              runId,
+            });
+          }
+          continue;
+        }
+      }
+
+      return (await result.text).trim();
     });
 
-    for await (const chunk of result.fullStream) {
-      assertRunNotCancelled({ abortSignal, conversationId, runId });
-
-      if (chunk.type === 'text-delta') {
-        const delta = chunk.text;
-        if (delta) {
-          assistantText += delta;
-          publishRunEvent({
-            conversationId,
-            eventType: 'assistant_text',
-            payload: { delta },
-            runId,
-          });
-        }
-        continue;
-      }
-
-      if (chunk.type === 'reasoning-delta') {
-        const delta = chunk.text;
-        if (delta) {
-          reasoningText += delta;
-          publishRunEvent({
-            conversationId,
-            eventType: 'reasoning',
-            payload: { delta },
-            runId,
-          });
-        }
-        continue;
-      }
-    }
-
-    const settledText = (await result.text).trim();
     if (!assistantText.trim() && settledText) {
       assistantText = settledText;
       publishRunEvent({

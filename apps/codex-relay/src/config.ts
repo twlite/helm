@@ -1,4 +1,5 @@
 const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024;
+const DEFAULT_SESSION_TTL_MS = 30 * 60 * 1000;
 
 const readPositiveInt = (name: string, fallback: number): number => {
   const raw = process.env[name];
@@ -29,4 +30,5 @@ export const config = {
   maxBodyBytes: readPositiveInt('RELAY_MAX_BODY_BYTES', DEFAULT_MAX_BODY_BYTES),
   port: readPositiveInt('PORT', 8787),
   relayToken: readOptionalString('RELAY_TOKEN'),
+  sessionTtlMs: readPositiveInt('RELAY_SESSION_TTL_MS', DEFAULT_SESSION_TTL_MS),
 };

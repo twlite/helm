@@ -1,4 +1,6 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createOpenAICompatible, type OpenAICompatibleProvider } from '@ai-sdk/openai-compatible';
+import type { OpenAICompatibleProviderSettings } from '@ai-sdk/openai-compatible';
 import type { EmbeddingModel, LanguageModel } from 'ai';
 import {
   embedding,
@@ -7,6 +9,30 @@ import {
 } from '../config.ts';
 
 const SCREENSHOT_IMAGE_MARKER = 'Latest desktop screenshot image for visual inspection.';
+
+const helmSessionStorage = new AsyncLocalStorage<string>();
+type ProviderFetch = NonNullable<OpenAICompatibleProviderSettings['fetch']>;
+
+const sessionAwareFetch: ProviderFetch = async (input, init) => {
+  const sessionId = helmSessionStorage.getStore();
+
+  if (!sessionId) {
+    return globalThis.fetch(input, init);
+  }
+
+  const headers = new Headers(init?.headers);
+  headers.set('X-Helm-Session', sessionId);
+
+  return globalThis.fetch(input, {
+    ...init,
+    headers,
+  });
+};
+
+export const withHelmSession = <T>(
+  sessionId: string,
+  callback: () => Promise<T>,
+): Promise<T> => helmSessionStorage.run(sessionId, callback);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -83,6 +109,7 @@ const getProvider = (connection: ProviderConnection): OpenAICompatibleProvider =
   const provider = createOpenAICompatible({
     apiKey: connection.apiKey,
     baseURL: connection.baseUrl,
+    fetch: sessionAwareFetch,
     headers: connection.headers,
     includeUsage: true,
     name: connection.provider,

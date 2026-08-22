@@ -2,6 +2,7 @@ import { serve } from '@hono/node-server';
 import { config } from './config.ts';
 import { CodexAppServer } from './relay.ts';
 import { createApp } from './server.ts';
+import { RelaySessionStore } from './session-store.ts';
 
 try {
   process.loadEnvFile();
@@ -11,6 +12,10 @@ const relay = new CodexAppServer({
   bin: config.codexBin,
   cwd: config.codexCwd,
   model: config.codexModel,
+});
+const sessions = new RelaySessionStore({
+  sweepIntervalMs: Math.min(config.sessionTtlMs, 60_000),
+  ttlMs: config.sessionTtlMs,
 });
 
 try {
@@ -26,6 +31,7 @@ const app = createApp({
   maxBodyBytes: config.maxBodyBytes,
   modelId: config.codexModel,
   relay,
+  sessions,
   token: config.relayToken,
 });
 
@@ -51,6 +57,7 @@ const shutdown = (signal: string) => {
 
   shuttingDown = true;
   console.log(`Received ${signal}; shutting down Codex relay.`);
+  sessions.close();
   relay.close();
 
   server.close((error) => {

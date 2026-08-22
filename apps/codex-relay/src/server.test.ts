@@ -1,17 +1,19 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import type { RunTurnOptions } from './relay.ts';
 import { createApp } from './server.ts';
+import { RelaySessionStore } from './session-store.ts';
 
 const token = 'test-token';
 
 const makeApp = (
-  runTurn: (options: {
-    onDelta?: (delta: string) => void | Promise<void>;
-  }) => Promise<string>,
+  runTurn: (options: RunTurnOptions) => Promise<string>,
+  sessions?: RelaySessionStore,
 ) =>
   createApp({
     maxBodyBytes: 1_024,
     relay: { runTurn },
+    sessions,
     token,
   });
 
@@ -153,5 +155,122 @@ describe('codex relay app', () => {
 
     assert.equal(response.status, 200);
     assert.equal((await response.json()).object, 'list');
+  });
+
+  it('reuses a Codex thread and sends only the incremental session turn', async () => {
+    const received: RunTurnOptions[] = [];
+    const sessions = new RelaySessionStore({ ttlMs: 60_000 });
+    const app = makeApp(async (options) => {
+      received.push(options);
+      if (!options.threadId) {
+        options.onThreadCreated?.('thread-1');
+      }
+      options.onTurnStarted?.();
+      return 'answer';
+    }, sessions);
+
+    const first = await request(app, '/v1/chat/completions', {
+      body: JSON.stringify({
+        messages: [
+          { content: 'Be concise.', role: 'system' },
+          { content: 'First turn', role: 'user' },
+        ],
+      }),
+      headers: { 'X-Helm-Session': 'helm-session-1' },
+      method: 'POST',
+    });
+    const second = await request(app, '/v1/chat/completions', {
+      body: JSON.stringify({
+        messages: [
+          { content: 'Be concise.', role: 'system' },
+          { content: 'First turn', role: 'user' },
+          { content: 'First answer', role: 'assistant' },
+          { content: 'Second turn', role: 'user' },
+        ],
+      }),
+      headers: { 'X-Helm-Session': 'helm-session-1' },
+      method: 'POST',
+    });
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal(received.length, 2);
+    assert.equal(received[0]?.threadId, undefined);
+    assert.equal(received[1]?.threadId, 'thread-1');
+    assert.equal(received[1]?.developerInstructions, undefined);
+    assert.deepEqual(received[1]?.input, [
+      { text: 'ASSISTANT:\nFirst answer', type: 'text' },
+      { text: 'USER:\nSecond turn', type: 'text' },
+    ]);
+
+    const third = await request(app, '/v1/chat/completions', {
+      body: JSON.stringify({
+        messages: [{ content: 'A new conversation turn', role: 'user' }],
+      }),
+      headers: { 'X-Helm-Session': 'helm-session-1' },
+      method: 'POST',
+    });
+
+    assert.equal(third.status, 200);
+    assert.equal(received[2]?.threadId, 'thread-1');
+    assert.deepEqual(received[2]?.input, [
+      { text: 'USER:\nA new conversation turn', type: 'text' },
+    ]);
+  });
+
+  it('rejects a repeated session turn and supports idempotent reset', async () => {
+    let threadCount = 0;
+    const sessions = new RelaySessionStore({ ttlMs: 60_000 });
+    const app = makeApp(async (options) => {
+      if (!options.threadId) {
+        threadCount += 1;
+        options.onThreadCreated?.(`thread-${threadCount}`);
+      }
+      options.onTurnStarted?.();
+      return 'answer';
+    }, sessions);
+    const body = JSON.stringify({
+      messages: [{ content: 'One turn', role: 'user' }],
+    });
+
+    const first = await request(app, '/v1/chat/completions', {
+      body,
+      headers: { 'X-Helm-Session': 'helm-session-2' },
+      method: 'POST',
+    });
+    const repeated = await request(app, '/v1/chat/completions', {
+      body,
+      headers: { 'X-Helm-Session': 'helm-session-2' },
+      method: 'POST',
+    });
+    const deleted = await request(app, '/v1/helm/sessions/helm-session-2', {
+      method: 'DELETE',
+    });
+    const deletedAgain = await request(
+      app,
+      '/v1/helm/sessions/helm-session-2',
+      { method: 'DELETE' },
+    );
+    const afterReset = await request(app, '/v1/chat/completions', {
+      body: JSON.stringify({
+        messages: [{ content: 'New turn', role: 'user' }],
+      }),
+      headers: { 'X-Helm-Session': 'helm-session-2' },
+      method: 'POST',
+    });
+
+    assert.equal(first.status, 200);
+    assert.equal(repeated.status, 409);
+    assert.deepEqual(await repeated.json(), {
+      error: {
+        message:
+          'The Helm session request contains no new turn. Send a new message or reset the session before retrying.',
+        type: 'session_error',
+      },
+    });
+    assert.deepEqual(await deleted.json(), { deleted: true });
+    assert.deepEqual(await deletedAgain.json(), { deleted: false });
+    assert.equal(afterReset.status, 200);
+    assert.equal(threadCount, 2);
   });
 });
