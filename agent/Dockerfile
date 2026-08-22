@@ -31,9 +31,19 @@ RUN apt-get update && \
       git \
       unzip \
       x11-apps \
-      x11-xserver-utils \
-      software-properties-common && \
-    add-apt-repository ppa:mozillateam/ppa && \
+      x11-xserver-utils && \
+    install -d -m 0755 /etc/apt/keyrings && \
+    curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg \
+      -o /etc/apt/keyrings/packages.mozilla.org.asc && \
+    printf '%s\n' \
+      'deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main' \
+      > /etc/apt/sources.list.d/mozilla.list && \
+    printf '%s\n' \
+      'Package: *' \
+      'Pin: origin packages.mozilla.org' \
+      'Pin-Priority: 1000' \
+      > /etc/apt/preferences.d/mozilla && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
       firefox-esr && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
