@@ -1,5 +1,5 @@
 import { generateText } from 'ai';
-import { languageModel } from '../agent/model.ts';
+import { getLanguageModel } from '../agent/model.ts';
 
 const MAX_TITLE_LENGTH = 72;
 
@@ -31,6 +31,7 @@ const buildFallbackTitle = (args: {
 };
 
 export const generateConversationTitle = async (args: {
+  modelId?: string;
   userInput: string;
   attachments: Array<{ filename: string; mediaType: string }>;
 }): Promise<string> => {
@@ -57,7 +58,7 @@ export const generateConversationTitle = async (args: {
 
   try {
     const result = await generateText({
-      model: languageModel,
+      model: getLanguageModel(args.modelId),
       prompt,
       system:
         'You create short chat titles for automation sessions. Be factual, concise, and avoid punctuation noise.',

@@ -1,5 +1,5 @@
 import { stepCountIs, streamText, type ModelMessage } from 'ai';
-import { languageModel } from '../agent/model.ts';
+import { getLanguageModel } from '../agent/model.ts';
 import { buildAgentSystemPrompt } from '../agent/prompt.ts';
 import {
   assertRunNotCancelled,
@@ -183,6 +183,7 @@ const collectAssistantParts = (args: {
 
 export const runAgentConversation = async (args: {
   conversationId: string;
+  modelId?: string;
   runId: string;
   userInput: string;
   reasoning?: RunReasoningSetting;
@@ -197,6 +198,7 @@ export const runAgentConversation = async (args: {
   const reasoning = args.reasoning;
   const instructions = args.instructions;
   const userAttachments = args.userAttachments ?? [];
+  const selectedModel = getLanguageModel(args.modelId);
   const abortSignal = acquireRunAbortSignal(runId);
 
   const toolCalls: Array<{ toolName: string; input: Record<string, unknown> }> =
@@ -228,6 +230,7 @@ export const runAgentConversation = async (args: {
 
     const createdSummary = await maybeSummarizeConversation({
       conversationId,
+      modelId: args.modelId,
       messages: beforeMessages,
       onSummarizing: (details) => {
         publishRunEvent({
@@ -328,7 +331,7 @@ export const runAgentConversation = async (args: {
 
     const result = streamText({
       abortSignal,
-      model: languageModel,
+      model: selectedModel,
       prepareStep: ({ messages, stepNumber }) => {
         const prunedMessages = pruneOlderScreenshotImages(messages);
         const modelMessages = appendLatestScreenshotImageMessage(prunedMessages);
@@ -441,6 +444,7 @@ export const runAgentConversation = async (args: {
     const afterMessages = getMessagesByConversationId(conversationId);
     const followUpSummary = await maybeSummarizeConversation({
       conversationId,
+      modelId: args.modelId,
       messages: afterMessages,
       onSummarizing: (details) => {
         publishRunEvent({

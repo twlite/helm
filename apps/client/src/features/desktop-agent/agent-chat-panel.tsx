@@ -4,6 +4,7 @@ import type {
   ContextSummaryStats,
   ConversationMessageRecord,
   ConversationTimelineResponse,
+  ServerInfo,
   RunReasoningSetting,
   RunStatus,
 } from '@/lib/api';
@@ -77,6 +78,7 @@ import {
   XIcon,
 } from 'lucide-react';
 import { ScreenshotPreview } from './screenshot-preview';
+import { ModelSelector } from './model-selector';
 import type {
   AgentStatus,
   LiveEvent,
@@ -132,6 +134,9 @@ interface AgentChatPanelProps {
   onDequeueMessage: (id: string) => void;
   onReorderQueue: (from: number, to: number) => void;
   onSteerWithMessage: (id: string) => Promise<void>;
+  onSelectModel: (modelId: string) => void;
+  selectedModelId: string;
+  serverInfo: ServerInfo | null;
 }
 
 interface ScreenshotData {
@@ -1085,6 +1090,9 @@ export function AgentChatPanel({
   onDequeueMessage,
   onReorderQueue,
   onSteerWithMessage,
+  onSelectModel,
+  selectedModelId,
+  serverInfo,
 }: AgentChatPanelProps) {
   const [renderWindow, setRenderWindow] = useState(MESSAGE_VIRTUAL_WINDOW);
   const [showReasoning, setShowReasoning] = useState(true);
@@ -1209,29 +1217,38 @@ export function AgentChatPanel({
                   />
                 </PromptInputBody>
                 <PromptInputFooter className="items-end gap-1.5">
-                  <PromptInputTools className="gap-1.5">
-                    <PromptInputActionMenu>
-                      <PromptInputActionMenuTrigger disabled={composerDisabled || isBusy} tooltip="Attach files" />
-                      <PromptInputActionMenuContent>
-                        <PromptInputActionAddAttachments />
-                        <PromptInputActionAddScreenshot />
-                      </PromptInputActionMenuContent>
-                    </PromptInputActionMenu>
+                  <div className="flex min-w-0 items-center gap-1">
+                    <ModelSelector
+                      contextSummary={contextSummary}
+                      disabled={isBusy || isCancelling}
+                      modelId={selectedModelId}
+                      onSelect={onSelectModel}
+                      serverInfo={serverInfo}
+                    />
+                    <PromptInputTools className="gap-1.5">
+                      <PromptInputActionMenu>
+                        <PromptInputActionMenuTrigger disabled={composerDisabled || isBusy} tooltip="Attach files" />
+                        <PromptInputActionMenuContent>
+                          <PromptInputActionAddAttachments />
+                          <PromptInputActionAddScreenshot />
+                        </PromptInputActionMenuContent>
+                      </PromptInputActionMenu>
 
-                    <PromptInputButton
-                      aria-label={showReasoning ? 'Reasoning enabled' : 'Reasoning disabled'}
-                      className={cn(
-                        showReasoning
-                          ? 'bg-amber-500/18 text-amber-700 ring-1 ring-amber-500/30 hover:bg-amber-500/26 dark:text-amber-300'
-                          : undefined,
-                      )}
-                      disabled={isBusy}
-                      onClick={() => setShowReasoning((prev) => !prev)}
-                      tooltip={showReasoning ? 'Reasoning mode: on' : 'Reasoning mode: off'}
-                    >
-                      <BrainIcon className="size-4" />
-                    </PromptInputButton>
-                  </PromptInputTools>
+                      <PromptInputButton
+                        aria-label={showReasoning ? 'Reasoning enabled' : 'Reasoning disabled'}
+                        className={cn(
+                          showReasoning
+                            ? 'bg-amber-500/18 text-amber-700 ring-1 ring-amber-500/30 hover:bg-amber-500/26 dark:text-amber-300'
+                            : undefined,
+                        )}
+                        disabled={isBusy}
+                        onClick={() => setShowReasoning((prev) => !prev)}
+                        tooltip={showReasoning ? 'Reasoning mode: on' : 'Reasoning mode: off'}
+                      >
+                        <BrainIcon className="size-4" />
+                      </PromptInputButton>
+                    </PromptInputTools>
+                  </div>
                   <div className="flex items-center gap-1">
                     <PromptInputSubmit
                       aria-label={isBusy ? 'Queue message' : 'Submit prompt'}

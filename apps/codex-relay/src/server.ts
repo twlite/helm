@@ -15,7 +15,7 @@ type AppOptions = {
   maxBodyBytes: number;
   modelId?: string;
   relay: RelayService;
-  token: string;
+  token?: string;
 };
 
 const errorBody = (message: string, type = 'relay_error') => ({
@@ -51,6 +51,11 @@ const createApp = ({
   const app = new Hono();
 
   app.use('/v1/*', async (c, next) => {
+    if (!token) {
+      await next();
+      return;
+    }
+
     if (c.req.header('authorization') !== `Bearer ${token}`) {
       c.header('WWW-Authenticate', 'Bearer');
       return c.json(errorBody('Unauthorized', 'authentication_error'), 401);
@@ -94,6 +99,7 @@ const createApp = ({
       const turn: RunTurnOptions = {
         developerInstructions: request.developerInstructions,
         input: request.input,
+        model: request.model,
         signal: c.req.raw.signal,
       };
 

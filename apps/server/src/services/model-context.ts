@@ -184,33 +184,42 @@ export const toSummaryTriggerTokens = (args: {
   );
 };
 
-let cachedContextKey: string | null = null;
-let cachedContextPromise: Promise<ModelContextResolution> | null = null;
+const contextCache = new Map<string, Promise<ModelContextResolution>>();
 
 export const clearModelContextWindowCache = (): void => {
-  cachedContextKey = null;
-  cachedContextPromise = null;
+  contextCache.clear();
 };
 
 export const getEffectiveSummaryContext = async (args: {
   baseUrl: string;
+  configuredContextWindowTokens?: number | null;
   fallbackTriggerTokens: number;
   fetchFn?: typeof fetch;
   modelId: string;
 }): Promise<EffectiveSummaryContext> => {
-  const cacheKey = `${args.baseUrl}\n${args.modelId}`;
-  if (cachedContextKey !== cacheKey) {
-    cachedContextKey = cacheKey;
-    cachedContextPromise = null;
+  if (args.configuredContextWindowTokens) {
+    return {
+      contextWindowTokens: args.configuredContextWindowTokens,
+      source: 'provider',
+      triggerTokens: toSummaryTriggerTokens({
+        fallbackTriggerTokens: args.fallbackTriggerTokens,
+        resolvedContextWindowTokens: args.configuredContextWindowTokens,
+      }),
+    };
   }
 
-  cachedContextPromise ??= resolveModelContextWindow({
-    baseUrl: args.baseUrl,
-    fetchFn: args.fetchFn,
-    modelId: args.modelId,
-  });
+  const cacheKey = `${args.baseUrl}\n${args.modelId}`;
+  let contextPromise = contextCache.get(cacheKey);
+  if (!contextPromise) {
+    contextPromise = resolveModelContextWindow({
+      baseUrl: args.baseUrl,
+      fetchFn: args.fetchFn,
+      modelId: args.modelId,
+    });
+    contextCache.set(cacheKey, contextPromise);
+  }
 
-  const resolved = await cachedContextPromise;
+  const resolved = await contextPromise;
   return {
     ...resolved,
     triggerTokens: toSummaryTriggerTokens({

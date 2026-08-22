@@ -18,6 +18,7 @@ COPY packages/desktop/package.json ./packages/desktop/package.json
 RUN pnpm install --filter @helm/server... --prod --frozen-lockfile
 
 COPY apps/server/src ./apps/server/src
+COPY apps/server/helm.config.json ./apps/server/helm.config.json
 COPY apps/server/tsconfig.json ./apps/server/tsconfig.json
 COPY packages/desktop/src ./packages/desktop/src
 

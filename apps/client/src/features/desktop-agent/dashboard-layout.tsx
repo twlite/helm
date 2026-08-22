@@ -63,6 +63,9 @@ export function DashboardLayout({ agent }: DashboardLayoutProps) {
     messages,
     openConversation,
     reorderQueue,
+    selectModel,
+    selectedModelId,
+    serverInfo,
     steerWithMessage,
     streamError,
     streamState,
@@ -134,9 +137,10 @@ export function DashboardLayout({ agent }: DashboardLayoutProps) {
           activeTitle={activeTitle}
           agentStatus={agentStatus}
           conversationStatus={timeline?.conversation.status ?? null}
-          isBusy={isBusy}
           onNavigateToMemories={() => navigate('/memories')}
           onToggleThemeMode={toggleThemeMode}
+          selectedModelId={selectedModelId}
+          serverInfo={serverInfo}
           themeMode={themeMode}
         />
         <ResizablePanelGroup
@@ -172,6 +176,9 @@ export function DashboardLayout({ agent }: DashboardLayoutProps) {
                   onViewChats={() => setPanelView('history')}
                   streamError={streamError}
                   streamState={streamState}
+                  onSelectModel={selectModel}
+                  selectedModelId={selectedModelId}
+                  serverInfo={serverInfo}
                   timeline={timeline}
                 />
               ) : (

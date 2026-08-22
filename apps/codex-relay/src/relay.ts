@@ -26,6 +26,7 @@ export type RpcMessage = {
 export type RunTurnOptions = {
   developerInstructions?: string;
   input: RelayInputPart[];
+  model?: string;
   onDelta?: (delta: string) => void | Promise<void>;
   signal?: AbortSignal;
 };
@@ -353,6 +354,7 @@ export class CodexAppServer {
   async runTurn({
     developerInstructions,
     input,
+    model,
     onDelta,
     signal,
   }: RunTurnOptions): Promise<string> {
@@ -366,7 +368,7 @@ export class CodexAppServer {
         approvalPolicy: 'never',
         cwd: this.cwd,
         ephemeral: true,
-        ...(this.model ? { model: this.model } : {}),
+        ...(model ?? this.model ? { model: model ?? this.model } : {}),
         sandbox: 'read-only',
         ...(developerInstructions ? { developerInstructions } : {}),
       },

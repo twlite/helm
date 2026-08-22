@@ -24,7 +24,7 @@ try {
 
 const app = createApp({
   maxBodyBytes: config.maxBodyBytes,
-  modelId: 'codex',
+  modelId: config.codexModel,
   relay,
   token: config.relayToken,
 });

@@ -15,7 +15,7 @@ import {
   withTransaction,
 } from '../database/store.ts';
 import { notFound } from '../errors.ts';
-import { config } from '../config.ts';
+import { config, defaultModel } from '../config.ts';
 import { buildContextSummaryStats } from '../services/context-summary.ts';
 import { deleteConversationMemories } from '../services/memory.ts';
 import { getEffectiveSummaryContext } from '../services/model-context.ts';
@@ -126,9 +126,10 @@ export const registerConversationRoutes = (app: Hono) => {
       : getMessagesByConversationId(conversationId);
     const summaryHistory = listSummariesByConversationId(conversationId);
     const summaryContext = await getEffectiveSummaryContext({
-      baseUrl: config.LLM_BASE_URL,
+      baseUrl: defaultModel.baseUrl,
+      configuredContextWindowTokens: defaultModel.contextWindowTokens,
       fallbackTriggerTokens: config.SUMMARY_TRIGGER_TOKENS,
-      modelId: config.VLM_MODEL,
+      modelId: defaultModel.model,
     });
 
     return c.json({

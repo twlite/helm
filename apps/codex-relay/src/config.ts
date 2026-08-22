@@ -24,9 +24,9 @@ const readOptionalString = (name: string): string | undefined => {
 export const config = {
   codexBin: process.env.CODEX_BIN?.trim() || 'codex',
   codexCwd: process.env.CODEX_CWD?.trim() || '/tmp',
-  codexModel: readOptionalString('CODEX_MODEL'),
+  codexModel: readOptionalString('CODEX_MODEL') ?? 'gpt-5.6-luna',
   host: process.env.HOST?.trim() || '127.0.0.1',
   maxBodyBytes: readPositiveInt('RELAY_MAX_BODY_BYTES', DEFAULT_MAX_BODY_BYTES),
   port: readPositiveInt('PORT', 8787),
-  relayToken: process.env.RELAY_TOKEN?.trim() || 'helm-local',
+  relayToken: readOptionalString('RELAY_TOKEN'),
 };

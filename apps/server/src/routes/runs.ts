@@ -2,7 +2,7 @@ import type { Hono } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
 import { runAgentConversation } from '../agent/runtime.ts';
-import { config } from '../config.ts';
+import { config, getModelDefinition } from '../config.ts';
 import {
   appendMessage,
   createRun,
@@ -14,7 +14,7 @@ import {
   setConversationTitleIfAuto,
   withTransaction,
 } from '../database/store.ts';
-import { conflict, notFound } from '../errors.ts';
+import { badRequest, conflict, notFound } from '../errors.ts';
 import { subscribeRunEvents } from '../services/event-bus.ts';
 import { requestRunCancellation } from '../services/run-control.ts';
 import { publishRunEvent } from '../services/run-events.ts';
@@ -33,6 +33,7 @@ const startRunSchema = z
     attachments: z.array(runAttachmentSchema).max(12).default([]),
     input: z.string().trim().max(20_000).default(''),
     instructions: z.string().trim().max(4_000).default(''),
+    modelId: z.string().trim().min(1).max(500).optional(),
     reasoning: z.enum(['off', 'low', 'medium', 'high', 'on']).optional(),
   })
   .superRefine((value, context) => {
@@ -61,6 +62,15 @@ export const registerRunRoutes = (app: Hono) => {
     }
 
     const body = startRunSchema.parse(await safeJsonBody(c.req.raw));
+    let model: ReturnType<typeof getModelDefinition>;
+    try {
+      model = getModelDefinition(body.modelId);
+    } catch (error) {
+      throw badRequest(
+        error instanceof Error ? error.message : String(error),
+        'unknown_model',
+      );
+    }
     const inputText = body.input.trim();
     const reasoning = body.reasoning;
     const instructions = body.instructions.trim() || undefined;
@@ -120,6 +130,7 @@ export const registerRunRoutes = (app: Hono) => {
       void runAgentConversation({
         conversationId,
         instructions,
+        modelId: model.id,
         reasoning,
         runId: run.id,
         userAttachments: attachments,
@@ -134,6 +145,7 @@ export const registerRunRoutes = (app: Hono) => {
         try {
           const title = await generateConversationTitle({
             attachments,
+            modelId: model.id,
             userInput:
               inputText ||
               attachments.map((attachment) => attachment.filename).join(', '),

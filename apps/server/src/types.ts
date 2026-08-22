@@ -1,11 +1,13 @@
 declare global {
   namespace NodeJS {
     interface ProcessEnv {
-      LLM_BASE_URL: string;
+      LLM_BASE_URL?: string;
       PORT: string;
-      MODEL_PROVIDER: string;
-      EMBED_MODEL: string;
-      VLM_MODEL: string;
+      MODEL_PROVIDER?: string;
+      EMBED_BASE_URL?: string;
+      EMBED_MODEL?: string;
+      VLM_MODEL?: string;
+      HELM_CONFIG_PATH?: string;
       CHROMA_URL: string;
       DB_PATH?: string;
       DESKTOP_CONTROL_MODE?: 'docker-exec' | 'local';

@@ -8,12 +8,14 @@ import {
   deleteConversation,
   getConversationMessagesPage,
   getConversationTimeline,
+  getServerInfo,
   listConversations,
   startConversationRun,
   steerConversationRun,
   type ConversationMessageRecord,
   type ConversationRecord,
   type ConversationTimelineResponse,
+  type ServerInfo,
   type RunReasoningSetting,
   type RunAttachmentInput,
   type RunEventRecord,
@@ -28,6 +30,15 @@ import {
 import type { AgentStatus, LiveEvent, LiveStatusKind, LiveToolCall, LiveToolResult, QueuedMessage, StreamState } from './types';
 
 const MESSAGE_PAGE_SIZE = 60;
+const MODEL_SELECTION_KEY = 'helm_selected_model';
+
+const readStoredModelId = (): string => {
+  if (typeof window === 'undefined') {
+    return '';
+  }
+
+  return window.localStorage.getItem(MODEL_SELECTION_KEY) ?? '';
+};
 
 interface MessageCursor {
   beforeCreatedAt: string;
@@ -114,6 +125,9 @@ export interface UseDesktopAgentResult {
   liveRunStatus: RunStatus | null;
   vncUrl: string;
   messageQueue: QueuedMessage[];
+  serverInfo: ServerInfo | null;
+  selectedModelId: string;
+  selectModel: (modelId: string) => void;
   refreshActiveTimeline: () => Promise<void>;
   openConversation: (conversationId: string) => Promise<boolean>;
   createAndOpenConversation: () => Promise<boolean>;
@@ -121,6 +135,7 @@ export interface UseDesktopAgentResult {
   handleStartRun: (args: {
     text: string;
     files?: FileUIPart[];
+    modelId?: string;
     reasoning?: RunReasoningSetting;
   }) => Promise<void>;
   handleCancelRun: () => Promise<void>;
@@ -181,6 +196,8 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
     string | null
   >(null);
   const [messageQueue, setMessageQueue] = useState<QueuedMessage[]>([]);
+  const [serverInfo, setServerInfo] = useState<ServerInfo | null>(null);
+  const [selectedModelId, setSelectedModelId] = useState(readStoredModelId);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const activeStreamRunIdRef = useRef<string | null>(null);
@@ -343,6 +360,52 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
       clearLiveBuffers();
     };
   }, [bootstrap, clearLiveBuffers, closeEventSource]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void getServerInfo()
+      .then((next) => {
+        if (!cancelled) {
+          setServerInfo(next);
+        }
+      })
+      .catch(() => {
+        // Conversation loading remains useful even when provider metadata is unavailable.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!serverInfo) {
+      return;
+    }
+
+    setSelectedModelId((current) => {
+      const isAvailable = serverInfo.models.some((model) => model.id === current);
+      const next = isAvailable ? current : serverInfo.defaultModelId;
+      if (next && next !== current) {
+        window.localStorage.setItem(MODEL_SELECTION_KEY, next);
+      }
+      return next;
+    });
+  }, [serverInfo]);
+
+  const selectModel = useCallback((modelId: string) => {
+    setSelectedModelId(modelId);
+    window.localStorage.setItem(MODEL_SELECTION_KEY, modelId);
+  }, []);
+
+  const activeModelId = useMemo(() => {
+    if (serverInfo?.models.some((model) => model.id === selectedModelId)) {
+      return selectedModelId;
+    }
+
+    return serverInfo?.defaultModelId ?? selectedModelId;
+  }, [selectedModelId, serverInfo]);
 
   const openConversationDirect = useCallback(
     async (conversationId: string) => {
@@ -617,6 +680,7 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
     async (args: {
       text: string;
       files?: FileUIPart[];
+      modelId?: string;
       reasoning?: RunReasoningSetting;
     }) => {
       if (!activeConversationId) {
@@ -645,6 +709,7 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
           conversationId: activeConversationId,
           input: cleanText,
           instructions: storedInstructions || undefined,
+          modelId: (args.modelId ?? activeModelId) || undefined,
           reasoning,
         });
         setMessages((prev) => mergeUniqueMessages([...prev, response.userMessage]));
@@ -656,7 +721,7 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
         );
       }
     },
-    [activeConversationId, isCancelling, startStream, streamState],
+    [activeConversationId, activeModelId, isCancelling, startStream, streamState],
   );
 
   const handleCancelRun = useCallback(async () => {
@@ -925,6 +990,7 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
           conversationId: activeConversationId,
           input: item.text,
           instructions: storedInstructions || undefined,
+          modelId: activeModelId || undefined,
         });
         setMessages((prev) => mergeUniqueMessages([...prev, response.userMessage]));
         await startStream(activeConversationId, response.run.id);
@@ -935,6 +1001,7 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
     },
     [
       activeConversationId,
+      activeModelId,
       isBusy,
       liveRunId,
       messageQueue,
@@ -1004,5 +1071,8 @@ export const useDesktopAgent = (initialConversationId?: string | null): UseDeskt
     streamState,
     timeline,
     vncUrl,
+    serverInfo,
+    selectedModelId: activeModelId,
+    selectModel,
   };
 };

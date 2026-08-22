@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -7,7 +7,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
-import { getServerInfo, type ServerInfo } from "@/lib/api";
+import type { ServerInfo } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { DatabaseIcon, MoonIcon, SettingsIcon, SunIcon } from "lucide-react";
 import type { AgentStatus } from "./types";
@@ -30,28 +30,26 @@ interface DashboardHeaderProps {
   activeTitle: string;
   agentStatus: AgentStatus;
   conversationStatus: string | null;
-  isBusy: boolean;
   onNavigateToMemories: () => void;
   onToggleThemeMode: () => void;
+  serverInfo: ServerInfo | null;
+  selectedModelId: string;
   themeMode: ThemeMode;
 }
 
 export function DashboardHeader({
   activeTitle,
   agentStatus,
-  isBusy,
   onNavigateToMemories,
   onToggleThemeMode,
+  serverInfo,
+  selectedModelId,
   themeMode,
 }: DashboardHeaderProps) {
-  const [serverInfo, setServerInfo] = useState<ServerInfo | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [instructions, setInstructions] = useState(() => localStorage.getItem(INSTRUCTIONS_KEY) ?? "");
   const meta = STATUS_META[agentStatus];
-
-  useEffect(() => {
-    getServerInfo().then(setServerInfo).catch(() => {});
-  }, []);
+  const selectedModel = serverInfo?.models.find((model) => model.id === selectedModelId);
 
   const handleSaveInstructions = () => {
     const trimmed = instructions.trim();
@@ -83,8 +81,8 @@ export function DashboardHeader({
             {serverInfo ? (
               <>
                 <span className="text-muted-foreground/40 text-xs">&middot;</span>
-                <span className="truncate text-muted-foreground/70 text-xs" title={serverInfo.provider + " / " + serverInfo.model}>
-                  {serverInfo.model}
+                <span className="truncate text-muted-foreground/70 text-xs" title={(selectedModel?.provider ?? serverInfo.provider) + " / " + (selectedModel?.model ?? serverInfo.model)}>
+                  {selectedModel?.label ?? serverInfo.model}
                 </span>
               </>
             ) : null}
@@ -126,16 +124,17 @@ export function DashboardHeader({
             </div>
             {serverInfo ? (
               <div className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2.5 text-xs space-y-1">
-                <p><span className="text-muted-foreground">Model:</span> <span className="font-mono">{serverInfo.model}</span></p>
-                <p><span className="text-muted-foreground">Provider:</span> <span className="font-mono">{serverInfo.provider}</span></p>
-                <p><span className="text-muted-foreground">Embed model:</span> <span className="font-mono">{serverInfo.embedModel}</span></p>
+                <p><span className="text-muted-foreground">Model:</span> <span className="font-mono">{selectedModel?.model ?? serverInfo.model}</span></p>
+                <p><span className="text-muted-foreground">Provider:</span> <span className="font-mono">{selectedModel?.provider ?? serverInfo.provider}</span></p>
+                <p><span className="text-muted-foreground">Configured models:</span> {serverInfo.models.length}</p>
+                <p><span className="text-muted-foreground">Embed model:</span> <span className="font-mono">{serverInfo.embedProvider} / {serverInfo.embedModel}</span></p>
                 <p><span className="text-muted-foreground">Summary trigger:</span> {serverInfo.summaryTriggerTokens.toLocaleString()} tokens</p>
                 <p>
                   <span className="text-muted-foreground">Context window:</span>{' '}
-                  {serverInfo.contextWindowTokens
-                    ? `${serverInfo.contextWindowTokens.toLocaleString()} tokens`
+                  {selectedModel?.contextWindowTokens
+                    ? `${selectedModel.contextWindowTokens.toLocaleString()} tokens`
                     : 'Provider metadata unavailable'}
-                  <span className="text-muted-foreground"> ({serverInfo.summaryTriggerSource})</span>
+                  <span className="text-muted-foreground"> ({selectedModel?.contextWindowSource ?? serverInfo.summaryTriggerSource})</span>
                 </p>
               </div>
             ) : null}

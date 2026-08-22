@@ -1,6 +1,6 @@
 import { generateText } from 'ai';
-import { languageModel } from '../agent/model.ts';
-import { config } from '../config.ts';
+import { getLanguageModel } from '../agent/model.ts';
+import { config, getModelDefinition } from '../config.ts';
 import type {
   ConversationMessageRecord,
   ConversationSummaryRecord,
@@ -16,6 +16,7 @@ import {
 
 export const maybeSummarizeConversation = async (args: {
   conversationId: string;
+  modelId?: string;
   messages: ConversationMessageRecord[];
   onSummarizing?: (details: {
     contextWindowTokens: number | null;
@@ -26,10 +27,12 @@ export const maybeSummarizeConversation = async (args: {
   }) => void;
 }): Promise<ConversationSummaryRecord | null> => {
   const latestSummary = getLatestSummary(args.conversationId);
+  const model = getModelDefinition(args.modelId);
   const summaryContext = await getEffectiveSummaryContext({
-    baseUrl: config.LLM_BASE_URL,
+    baseUrl: model.baseUrl,
+    configuredContextWindowTokens: model.contextWindowTokens,
     fallbackTriggerTokens: config.SUMMARY_TRIGGER_TOKENS,
-    modelId: config.VLM_MODEL,
+    modelId: model.model,
   });
   const plan = buildSummarizationPlan({
     keepRecentMessages: config.SUMMARY_KEEP_RECENT_MESSAGES,
@@ -53,7 +56,7 @@ export const maybeSummarizeConversation = async (args: {
   const transcript = toTranscript(plan.targetMessages);
 
   const result = await generateText({
-    model: languageModel,
+    model: getLanguageModel(model.id),
     prompt: [
       'Summarize this desktop automation conversation for future context reuse.',
       'Capture: user goal, confirmed state observations, actions attempted, outcomes, and unresolved blockers.',

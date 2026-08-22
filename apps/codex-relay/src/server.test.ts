@@ -97,6 +97,7 @@ describe('codex relay app', () => {
     assert.deepEqual(receivedWithoutSignal, {
       developerInstructions: 'Be concise.',
       input: [{ text: 'USER:\nHello', type: 'text' }],
+      model: 'codex',
     });
   });
 
@@ -141,5 +142,16 @@ describe('codex relay app', () => {
 
     assert.equal(invalid.status, 400);
     assert.equal(oversized.status, 413);
+  });
+
+  it('allows protected endpoints when no relay token is configured', async () => {
+    const app = createApp({
+      maxBodyBytes: 1_024,
+      relay: { runTurn: async () => 'unused' },
+    });
+    const response = await app.request('/v1/models');
+
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).object, 'list');
   });
 });

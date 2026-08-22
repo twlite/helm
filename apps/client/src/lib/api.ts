@@ -86,8 +86,28 @@ export interface ServerInfo {
   model: string;
   provider: string;
   embedModel: string;
+  embedProvider: string;
+  defaultModelId: string;
+  models: ModelOption[];
   contextWindowTokens: number | null;
   summaryTriggerSource: 'provider' | 'fallback';
+  summaryTriggerTokens: number;
+}
+
+export interface ModelOption {
+  capabilities?: string[];
+  contextWindowSource: 'provider' | 'fallback';
+  contextWindowTokens: number | null;
+  description?: string;
+  favorite: boolean;
+  id: string;
+  label: string;
+  maxOutputTokens: number | null;
+  model: string;
+  provider: string;
+  providerLabel: string;
+  reasoning?: boolean;
+  shortcut?: string;
   summaryTriggerTokens: number;
 }
 
@@ -291,6 +311,7 @@ export const startConversationRun = async (args: {
   attachments?: RunAttachmentInput[];
   reasoning?: RunReasoningSetting;
   instructions?: string;
+  modelId?: string;
 }): Promise<{
   run: ConversationRunRecord;
   userMessage: ConversationMessageRecord;
@@ -305,6 +326,7 @@ export const startConversationRun = async (args: {
         attachments: args.attachments ?? [],
         input: args.input ?? '',
         instructions: args.instructions ?? '',
+        modelId: args.modelId,
         reasoning: args.reasoning,
       }),
       method: 'POST',
