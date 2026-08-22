@@ -9,7 +9,9 @@
           "model": "google/gemma-4-e4b",
           "label": "Gemma 4 E4B",
           "embedding": false,
-          "favorite": true
+          "favorite": true,
+          "reasoning": true,
+          "contextWindowTokens": 8192
         }
       ]
     },
