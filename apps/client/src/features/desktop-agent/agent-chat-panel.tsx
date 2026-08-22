@@ -168,22 +168,36 @@ interface ScreenshotData {
   mediaType: string;
 }
 
-const toScreenshotData = (output: Record<string, unknown>): ScreenshotData | null => {
+const toScreenshotData = (
+  output: Record<string, unknown>,
+): ScreenshotData | null => {
   const base64 = getText(output.imageBase64);
   if (!base64) return null;
   const cursorRecord = asRecord(output.cursor);
   const cursorX = Number(cursorRecord.x);
   const cursorY = Number(cursorRecord.y);
   const cursor =
-    Number.isFinite(cursorX) && Number.isFinite(cursorY) ? { x: cursorX, y: cursorY } : null;
+    Number.isFinite(cursorX) && Number.isFinite(cursorY)
+      ? { x: cursorX, y: cursorY }
+      : null;
   const geometryRecord = asRecord(output.geometry);
   const gw = Number(geometryRecord.width);
   const gh = Number(geometryRecord.height);
-  const geometry = Number.isFinite(gw) && Number.isFinite(gh) ? { height: gh, width: gw } : null;
-  return { base64, cursor, geometry, mediaType: getText(output.mimeType) || 'image/png' };
+  const geometry =
+    Number.isFinite(gw) && Number.isFinite(gh)
+      ? { height: gh, width: gw }
+      : null;
+  return {
+    base64,
+    cursor,
+    geometry,
+    mediaType: getText(output.mimeType) || 'image/png',
+  };
 };
 
-const toDisplayOutput = (output: Record<string, unknown>): Record<string, unknown> => {
+const toDisplayOutput = (
+  output: Record<string, unknown>,
+): Record<string, unknown> => {
   const screenshot = toScreenshotData(output);
   if (!screenshot) return output;
   const kb = Math.round(screenshot.base64.length / 1024);
@@ -230,7 +244,10 @@ const splitReasoningSteps = (text: string): string[] => {
     .filter(Boolean);
 };
 
-const getToolResultSummary = (toolName: string, output: Record<string, unknown>): string => {
+const getToolResultSummary = (
+  toolName: string,
+  output: Record<string, unknown>,
+): string => {
   const error = getText(output.error);
   if (error) return error;
   if (toolName === 'capture_screenshot') {
@@ -238,14 +255,16 @@ const getToolResultSummary = (toolName: string, output: Record<string, unknown>)
     const w = Number(geometry.width);
     const h = Number(geometry.height);
     const imageSummary = getText(output.imageSummary);
-    const size = Number.isFinite(w) && Number.isFinite(h) ? `${w}x${h}` : 'unknown size';
+    const size =
+      Number.isFinite(w) && Number.isFinite(h) ? `${w}x${h}` : 'unknown size';
     return imageSummary || `Captured desktop screenshot (${size}).`;
   }
   if (toolName === 'move_mouse' || toolName === 'click_mouse') {
     const target = asRecord(output.resolvedTarget);
     const x = Number(target.x);
     const y = Number(target.y);
-    if (Number.isFinite(x) && Number.isFinite(y)) return `Target resolved to (${x}, ${y}).`;
+    if (Number.isFinite(x) && Number.isFinite(y))
+      return `Target resolved to (${x}, ${y}).`;
   }
   if (toolName === 'open_application') {
     const app = getText(output.app) || 'application';
@@ -291,7 +310,13 @@ const ReasoningStepList = ({ text }: { text: string }) => {
   );
 };
 
-const ToolResultSummary = ({ output, toolName }: { output: Record<string, unknown>; toolName: string }) => {
+const ToolResultSummary = ({
+  output,
+  toolName,
+}: {
+  output: Record<string, unknown>;
+  toolName: string;
+}) => {
   const isError = output.ok === false || Boolean(getText(output.error));
   return (
     <div
@@ -318,10 +343,16 @@ const buildToolEntriesFromParts = (
 ): ToolActivityEntry[] => {
   const calls = parts
     .filter((p) => p.partType === 'tool_call')
-    .map((p) => ({ input: asRecord(p.content.input), toolName: getText(p.content.toolName) || 'tool' }));
+    .map((p) => ({
+      input: asRecord(p.content.input),
+      toolName: getText(p.content.toolName) || 'tool',
+    }));
   const results = parts
     .filter((p) => p.partType === 'tool_result')
-    .map((p) => ({ output: asRecord(p.content.output), toolName: getText(p.content.toolName) || 'tool' }));
+    .map((p) => ({
+      output: asRecord(p.content.output),
+      toolName: getText(p.content.toolName) || 'tool',
+    }));
   const count = Math.max(calls.length, results.length);
   return Array.from({ length: count }, (_, i) => ({
     input: calls[i]?.input ?? {},
@@ -330,15 +361,25 @@ const buildToolEntriesFromParts = (
   }));
 };
 
-const ToolActivityGroup = ({ entries, isStreaming = false }: { entries: ToolActivityEntry[]; isStreaming?: boolean }) => {
+const ToolActivityGroup = ({
+  entries,
+  isStreaming = false,
+}: {
+  entries: ToolActivityEntry[];
+  isStreaming?: boolean;
+}) => {
   if (entries.length === 0) return null;
   const latestCompleted = [...entries].reverse().find((e) => e.output);
-  const latestScreenshot = latestCompleted?.output ? toScreenshotData(latestCompleted.output) : null;
+  const latestScreenshot = latestCompleted?.output
+    ? toScreenshotData(latestCompleted.output)
+    : null;
   const counts = entries.reduce<Record<string, number>>((acc, e) => {
     acc[e.toolName] = (acc[e.toolName] ?? 0) + 1;
     return acc;
   }, {});
-  const countsText = Object.entries(counts).map(([n, c]) => `${n} x${c}`).join(', ');
+  const countsText = Object.entries(counts)
+    .map(([n, c]) => `${n} x${c}`)
+    .join(', ');
 
   return (
     <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
@@ -359,7 +400,10 @@ const ToolActivityGroup = ({ entries, isStreaming = false }: { entries: ToolActi
       </div>
       {latestCompleted?.output ? (
         <div className="mt-3 space-y-2">
-          <ToolResultSummary output={latestCompleted.output} toolName={latestCompleted.toolName} />
+          <ToolResultSummary
+            output={latestCompleted.output}
+            toolName={latestCompleted.toolName}
+          />
           {latestScreenshot ? (
             <ScreenshotPreview
               base64={latestScreenshot.base64}
@@ -384,9 +428,14 @@ const ToolActivityGroup = ({ entries, isStreaming = false }: { entries: ToolActi
                 type="dynamic-tool"
               />
               <ToolContent>
-                {Object.keys(entry.input).length > 0 ? <ToolInput input={entry.input} /> : null}
+                {Object.keys(entry.input).length > 0 ? (
+                  <ToolInput input={entry.input} />
+                ) : null}
                 {entry.output ? (
-                  <ToolOutput errorText={undefined} output={toDisplayOutput(entry.output)} />
+                  <ToolOutput
+                    errorText={undefined}
+                    output={toDisplayOutput(entry.output)}
+                  />
                 ) : null}
               </ToolContent>
             </Tool>
@@ -418,7 +467,11 @@ const ComposerAttachments = () => {
   return (
     <Attachments className="w-full" variant="list">
       {attachments.files.map((file) => (
-        <Attachment data={file} key={file.id} onRemove={() => attachments.remove(file.id)}>
+        <Attachment
+          data={file}
+          key={file.id}
+          onRemove={() => attachments.remove(file.id)}
+        >
           <AttachmentPreview />
           <AttachmentInfo showMediaType={true} />
           <AttachmentRemove />
@@ -428,23 +481,45 @@ const ComposerAttachments = () => {
   );
 };
 
-const SummaryContextIcon = ({ hasSummary, percent }: { hasSummary: boolean; percent: number }) => {
+const SummaryContextIcon = ({
+  hasSummary,
+  percent,
+}: {
+  hasSummary: boolean;
+  percent: number;
+}) => {
   const bounded = Math.max(0, Math.min(100, percent));
   const circumference = 2 * Math.PI * CONTEXT_ICON_RADIUS;
   const dashOffset = circumference * (1 - bounded / 100);
   return (
     <svg
       aria-label="Context summary coverage"
-      className={cn('size-5', hasSummary ? 'text-primary' : 'text-muted-foreground')}
+      className={cn(
+        'size-5',
+        hasSummary ? 'text-primary' : 'text-muted-foreground',
+      )}
       role="img"
       viewBox={`0 0 ${CONTEXT_ICON_SIZE} ${CONTEXT_ICON_SIZE}`}
     >
-      <circle cx={CONTEXT_ICON_SIZE / 2} cy={CONTEXT_ICON_SIZE / 2} fill="none" opacity="0.28" r={CONTEXT_ICON_RADIUS} stroke="currentColor" strokeWidth={CONTEXT_ICON_STROKE} />
       <circle
-        cx={CONTEXT_ICON_SIZE / 2} cy={CONTEXT_ICON_SIZE / 2} fill="none" opacity="0.95"
-        r={CONTEXT_ICON_RADIUS} stroke="currentColor"
+        cx={CONTEXT_ICON_SIZE / 2}
+        cy={CONTEXT_ICON_SIZE / 2}
+        fill="none"
+        opacity="0.28"
+        r={CONTEXT_ICON_RADIUS}
+        stroke="currentColor"
+        strokeWidth={CONTEXT_ICON_STROKE}
+      />
+      <circle
+        cx={CONTEXT_ICON_SIZE / 2}
+        cy={CONTEXT_ICON_SIZE / 2}
+        fill="none"
+        opacity="0.95"
+        r={CONTEXT_ICON_RADIUS}
+        stroke="currentColor"
         strokeDasharray={`${circumference} ${circumference}`}
-        strokeDashoffset={dashOffset} strokeLinecap="round"
+        strokeDashoffset={dashOffset}
+        strokeLinecap="round"
         strokeWidth={CONTEXT_ICON_STROKE}
         style={{ transform: 'rotate(-90deg)', transformOrigin: 'center' }}
       />
@@ -452,13 +527,7 @@ const SummaryContextIcon = ({ hasSummary, percent }: { hasSummary: boolean; perc
   );
 };
 
-const ContextMetric = ({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) => (
+const ContextMetric = ({ label, value }: { label: string; value: string }) => (
   <div className="min-w-0 rounded-md border border-border/55 bg-background/70 px-2.5 py-2">
     <p className="truncate text-[11px] text-muted-foreground">{label}</p>
     <p className="mt-0.5 truncate font-medium text-sm">{value}</p>
@@ -485,7 +554,11 @@ const ContextProgress = ({
         <div
           className={cn(
             'h-full rounded-full transition-[width]',
-            bounded >= 80 ? 'bg-amber-500' : bounded >= 55 ? 'bg-blue-500' : 'bg-emerald-500',
+            bounded >= 80
+              ? 'bg-amber-500'
+              : bounded >= 55
+                ? 'bg-blue-500'
+                : 'bg-emerald-500',
           )}
           style={{ width: `${bounded}%` }}
         />
@@ -501,7 +574,10 @@ const fallbackContextSummary = (args: {
 }): ContextSummaryStats => {
   const summarizedMessageCount = args.latestSummary?.upToMessageCount ?? 0;
   return {
-    activeMessageCount: Math.max(0, args.totalMessageCount - summarizedMessageCount),
+    activeMessageCount: Math.max(
+      0,
+      args.totalMessageCount - summarizedMessageCount,
+    ),
     activeTokenEstimate: 0,
     compressionPercent:
       args.totalMessageCount > 0
@@ -562,7 +638,11 @@ const ContextSummaryHoverCard = ({
               : 'No summary has been created yet. The active context is still raw message history.'}
           </p>
         </div>
-        <Badge variant={isSummarizing ? 'default' : hasSummary ? 'secondary' : 'outline'}>
+        <Badge
+          variant={
+            isSummarizing ? 'default' : hasSummary ? 'secondary' : 'outline'
+          }
+        >
           {stateLabel}
         </Badge>
       </div>
@@ -628,7 +708,9 @@ const ContextSummaryHoverCard = ({
             {latestSummary.summaryText}
           </p>
           <div className="mt-2 flex flex-wrap gap-1.5">
-            <Badge variant="outline">covers {latestSummary.upToMessageCount} messages</Badge>
+            <Badge variant="outline">
+              covers {latestSummary.upToMessageCount} messages
+            </Badge>
             <Badge variant="outline">
               {formatTokenCount(contextSummary.latestSummaryTokenEstimate)}
             </Badge>
@@ -674,7 +756,10 @@ const ContextSummaryHoverCard = ({
   );
 };
 
-const renderMessage = (message: ConversationMessageRecord, options: { showReasoning: boolean }) => {
+const renderMessage = (
+  message: ConversationMessageRecord,
+  options: { showReasoning: boolean },
+) => {
   const from = message.role === 'user' ? 'user' : 'assistant';
   const toolParts = message.parts.filter(
     (p) => p.partType === 'tool_call' || p.partType === 'tool_result',
@@ -694,7 +779,10 @@ const renderMessage = (message: ConversationMessageRecord, options: { showReason
               </Reasoning>
             );
           }
-          if (part.partType === 'tool_call' || part.partType === 'tool_result') {
+          if (
+            part.partType === 'tool_call' ||
+            part.partType === 'tool_result'
+          ) {
             if (renderedToolActivity) return null;
             renderedToolActivity = true;
             return (
@@ -717,9 +805,17 @@ const renderMessage = (message: ConversationMessageRecord, options: { showReason
             );
           }
           if (part.partType === 'status') {
-            return <Badge key={`${part.id}-${index}`} variant="secondary">{partText(part)}</Badge>;
+            return (
+              <Badge key={`${part.id}-${index}`} variant="secondary">
+                {partText(part)}
+              </Badge>
+            );
           }
-          return <MessageResponse key={`${part.id}-${index}`}>{partText(part)}</MessageResponse>;
+          return (
+            <MessageResponse key={`${part.id}-${index}`}>
+              {partText(part)}
+            </MessageResponse>
+          );
         })}
       </MessageContent>
     </Message>
@@ -738,86 +834,116 @@ interface HistoricalConversationContentProps {
   onRenderOlderLoaded: () => void;
 }
 
-const HistoricalConversationContent = memo(function HistoricalConversationContent({
-  timeline,
-  hasMoreMessages,
-  loadingOlderMessages,
-  hiddenLoadedCount,
-  messagesCount,
-  visibleMessages,
-  showReasoning,
-  onLoadOlderMessages,
-  onRenderOlderLoaded,
-}: HistoricalConversationContentProps) {
-  return (
-    <>
-      {timeline?.latestSummary ? (
-        <Card className="bg-muted/40 ring-border/60" size="sm">
-          <CardHeader>
-            <CardTitle className="text-sm">Compressed Context Summary</CardTitle>
-            <CardDescription>
-              Covers first {timeline.latestSummary.upToMessageCount} messages
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <MessageResponse>{timeline.latestSummary.summaryText}</MessageResponse>
-          </CardContent>
-        </Card>
-      ) : null}
+const HistoricalConversationContent = memo(
+  function HistoricalConversationContent({
+    timeline,
+    hasMoreMessages,
+    loadingOlderMessages,
+    hiddenLoadedCount,
+    messagesCount,
+    visibleMessages,
+    showReasoning,
+    onLoadOlderMessages,
+    onRenderOlderLoaded,
+  }: HistoricalConversationContentProps) {
+    return (
+      <>
+        {timeline?.latestSummary ? (
+          <Card className="bg-muted/40 ring-border/60" size="sm">
+            <CardHeader>
+              <CardTitle className="text-sm">
+                Compressed Context Summary
+              </CardTitle>
+              <CardDescription>
+                Covers first {timeline.latestSummary.upToMessageCount} messages
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <MessageResponse>
+                {timeline.latestSummary.summaryText}
+              </MessageResponse>
+            </CardContent>
+          </Card>
+        ) : null}
 
-      {hasMoreMessages ? (
-        <div className="flex justify-center">
-          <Button disabled={loadingOlderMessages} onClick={() => { void onLoadOlderMessages(); }} size="sm" variant="outline">
-            {loadingOlderMessages ? 'Loading older messages...' : 'Load older messages'}
-          </Button>
-        </div>
-      ) : null}
-
-      {hiddenLoadedCount > 0 ? (
-        <div className="flex items-center justify-between rounded-xl border border-border/60 bg-muted/35 px-3 py-2 text-xs">
-          <span>Virtualized view: showing latest {visibleMessages.length} of {messagesCount} loaded messages</span>
-          <Button onClick={onRenderOlderLoaded} size="sm" variant="ghost">Render older loaded</Button>
-        </div>
-      ) : null}
-
-      {messagesCount ? (
-        visibleMessages.map((message) => (
-          <div className="[contain-intrinsic-size:220px] [content-visibility:auto]" key={message.id}>
-            {renderMessage(message, { showReasoning })}
+        {hasMoreMessages ? (
+          <div className="flex justify-center">
+            <Button
+              disabled={loadingOlderMessages}
+              onClick={() => {
+                void onLoadOlderMessages();
+              }}
+              size="sm"
+              variant="outline"
+            >
+              {loadingOlderMessages
+                ? 'Loading older messages...'
+                : 'Load older messages'}
+            </Button>
           </div>
-        ))
-      ) : (
-        <ConversationEmptyState
-          description="Send a goal and Helm will observe, reason, and act through tool calls."
-          title="No agent messages yet"
-        />
-      )}
-    </>
-  );
-});
+        ) : null}
+
+        {hiddenLoadedCount > 0 ? (
+          <div className="flex items-center justify-between rounded-xl border border-border/60 bg-muted/35 px-3 py-2 text-xs">
+            <span>
+              Virtualized view: showing latest {visibleMessages.length} of{' '}
+              {messagesCount} loaded messages
+            </span>
+            <Button onClick={onRenderOlderLoaded} size="sm" variant="ghost">
+              Render older loaded
+            </Button>
+          </div>
+        ) : null}
+
+        {messagesCount ? (
+          visibleMessages.map((message) => (
+            <div
+              className="[contain-intrinsic-size:220px] [content-visibility:auto]"
+              key={message.id}
+            >
+              {renderMessage(message, { showReasoning })}
+            </div>
+          ))
+        ) : (
+          <ConversationEmptyState
+            description="Send a goal and Helm will observe, reason, and act through tool calls."
+            title="No agent messages yet"
+          />
+        )}
+      </>
+    );
+  },
+);
 
 // ─── Status Chip with expandable detail ───────────────────────────────────────
 
-const STATUS_META: Record<LiveStatusKind, { label: string; icon: string; className: string }> = {
+const STATUS_META: Record<
+  LiveStatusKind,
+  { label: string; icon: string; className: string }
+> = {
   memory_reading: {
     label: 'Reading memory',
     icon: '🧠',
-    className: 'border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400',
+    className:
+      'border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400',
   },
   memory_saved: {
     label: 'Memory saved',
     icon: '💾',
-    className: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+    className:
+      'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
   },
   context_summarizing: {
     label: 'Compressing context',
     icon: '📦',
-    className: 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
+    className:
+      'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400',
   },
   context_summarized: {
     label: 'Context compressed',
     icon: '✅',
-    className: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+    className:
+      'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
   },
 };
 
@@ -830,11 +956,14 @@ const StatusChipDetail = ({ event }: { event: StatusEvent }) => {
       <div className="space-y-1">
         {typeof count === 'number' ? (
           <p className="text-xs">
-            <span className="font-semibold">{count}</span>{' '}
-            relevant {count === 1 ? 'memory' : 'memories'} retrieved via RAG similarity search.
+            <span className="font-semibold">{count}</span> relevant{' '}
+            {count === 1 ? 'memory' : 'memories'} retrieved via RAG similarity
+            search.
           </p>
         ) : null}
-        {query ? <p className="text-xs italic opacity-75">Query: "{query}"</p> : null}
+        {query ? (
+          <p className="text-xs italic opacity-75">Query: "{query}"</p>
+        ) : null}
       </div>
     );
   }
@@ -843,7 +972,10 @@ const StatusChipDetail = ({ event }: { event: StatusEvent }) => {
     return (
       <p className="text-xs">
         Episodic run memory and semantic embeddings persisted to ChromaDB
-        {typeof toolCallCount === 'number' ? ` (${toolCallCount} tool call${toolCallCount === 1 ? '' : 's'} recorded)` : ''}.
+        {typeof toolCallCount === 'number'
+          ? ` (${toolCallCount} tool call${toolCallCount === 1 ? '' : 's'} recorded)`
+          : ''}
+        .
       </p>
     );
   }
@@ -858,7 +990,8 @@ const StatusChipDetail = ({ event }: { event: StatusEvent }) => {
     return (
       <div className="space-y-2 text-xs">
         <p>
-          Older messages are being compressed before the active context exceeds the model budget.
+          Older messages are being compressed before the active context exceeds
+          the model budget.
         </p>
         <div className="grid grid-cols-2 gap-1.5">
           <div>
@@ -871,26 +1004,35 @@ const StatusChipDetail = ({ event }: { event: StatusEvent }) => {
           </div>
           <div>
             <p className="opacity-70">Context window</p>
-            <p className="font-semibold">{formatTokenCount(contextWindowTokens)}</p>
+            <p className="font-semibold">
+              {formatTokenCount(contextWindowTokens)}
+            </p>
           </div>
           <div>
             <p className="opacity-70">Covers through</p>
             <p className="font-semibold">
-              {typeof upToMessageCount === 'number' ? `${upToMessageCount} messages` : 'N/A'}
+              {typeof upToMessageCount === 'number'
+                ? `${upToMessageCount} messages`
+                : 'N/A'}
             </p>
           </div>
         </div>
-        {source ? <p className="opacity-70">Threshold source: {source}</p> : null}
+        {source ? (
+          <p className="opacity-70">Threshold source: {source}</p>
+        ) : null}
       </div>
     );
   }
   if (event.kind === 'context_summarized') {
-    const { summaryTokenEstimate, tokenEstimate, upToMessageCount } = event.payload;
+    const { summaryTokenEstimate, tokenEstimate, upToMessageCount } =
+      event.payload;
     return (
       <div className="space-y-2 text-xs">
         <p>
           Conversation summary stored
-          {typeof upToMessageCount === 'number' ? `, covering the first ${upToMessageCount} messages.` : '.'}
+          {typeof upToMessageCount === 'number'
+            ? `, covering the first ${upToMessageCount} messages.`
+            : '.'}
         </p>
         <div className="grid grid-cols-2 gap-1.5">
           <div>
@@ -899,7 +1041,9 @@ const StatusChipDetail = ({ event }: { event: StatusEvent }) => {
           </div>
           <div>
             <p className="opacity-70">Summary size</p>
-            <p className="font-semibold">{formatTokenCount(summaryTokenEstimate)}</p>
+            <p className="font-semibold">
+              {formatTokenCount(summaryTokenEstimate)}
+            </p>
           </div>
         </div>
       </div>
@@ -912,7 +1056,12 @@ const StatusChip = ({ event }: { event: StatusEvent }) => {
   const [expanded, setExpanded] = useState(false);
   const meta = STATUS_META[event.kind];
   return (
-    <div className={cn('rounded-lg border text-xs font-medium overflow-hidden', meta.className)}>
+    <div
+      className={cn(
+        'rounded-lg border text-xs font-medium overflow-hidden',
+        meta.className,
+      )}
+    >
       <button
         className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left hover:opacity-80 transition-opacity"
         onClick={() => setExpanded((p) => !p)}
@@ -920,9 +1069,11 @@ const StatusChip = ({ event }: { event: StatusEvent }) => {
       >
         <span aria-hidden="true">{meta.icon}</span>
         <span className="flex-1">{meta.label}</span>
-        {expanded
-          ? <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
-          : <ChevronRightIcon className="size-3 shrink-0 opacity-60" />}
+        {expanded ? (
+          <ChevronDownIcon className="size-3 shrink-0 opacity-60" />
+        ) : (
+          <ChevronRightIcon className="size-3 shrink-0 opacity-60" />
+        )}
       </button>
       {expanded ? (
         <div className="border-t border-current/20 px-2.5 py-2 opacity-90">
@@ -937,31 +1088,55 @@ const StatusChip = ({ event }: { event: StatusEvent }) => {
 
 type LiveSegment =
   | { kind: 'reasoning'; text: string; isLast: boolean }
-  | { kind: 'tool_pair'; call: { toolName: string; input: Record<string, unknown> }; result: { toolName: string; output: Record<string, unknown> } | null; isLast: boolean }
+  | {
+      kind: 'tool_pair';
+      call: { toolName: string; input: Record<string, unknown> };
+      result: { toolName: string; output: Record<string, unknown> } | null;
+      isLast: boolean;
+    }
   | { kind: 'text'; text: string }
   | { kind: 'status'; event: StatusEvent };
 
-const buildLiveSegments = (events: LiveEvent[], isStreaming: boolean): LiveSegment[] => {
+const buildLiveSegments = (
+  events: LiveEvent[],
+  isStreaming: boolean,
+): LiveSegment[] => {
   const segments: LiveSegment[] = [];
   let i = 0;
   while (i < events.length) {
     const ev = events[i];
     if (ev.type === 'reasoning') {
-      segments.push({ kind: 'reasoning', text: ev.text, isLast: isStreaming && i === events.length - 1 });
+      segments.push({
+        kind: 'reasoning',
+        text: ev.text,
+        isLast: isStreaming && i === events.length - 1,
+      });
       i++;
       continue;
     }
     if (ev.type === 'tool_call') {
       const next = events[i + 1];
-      const result = next?.type === 'tool_result'
-        ? { toolName: next.toolName, output: next.output } : null;
+      const result =
+        next?.type === 'tool_result'
+          ? { toolName: next.toolName, output: next.output }
+          : null;
       const consumed = result ? 2 : 1;
-      segments.push({ kind: 'tool_pair', call: { toolName: ev.toolName, input: ev.input }, result, isLast: isStreaming && i + consumed - 1 === events.length - 1 });
+      segments.push({
+        kind: 'tool_pair',
+        call: { toolName: ev.toolName, input: ev.input },
+        result,
+        isLast: isStreaming && i + consumed - 1 === events.length - 1,
+      });
       i += consumed;
       continue;
     }
     if (ev.type === 'tool_result') {
-      segments.push({ kind: 'tool_pair', call: { toolName: ev.toolName, input: {} }, result: { toolName: ev.toolName, output: ev.output }, isLast: isStreaming && i === events.length - 1 });
+      segments.push({
+        kind: 'tool_pair',
+        call: { toolName: ev.toolName, input: {} },
+        result: { toolName: ev.toolName, output: ev.output },
+        isLast: isStreaming && i === events.length - 1,
+      });
       i++;
       continue;
     }
@@ -981,8 +1156,16 @@ const buildLiveSegments = (events: LiveEvent[], isStreaming: boolean): LiveSegme
 };
 
 const LiveConversationContent = memo(function LiveConversationContent({
-  liveRunId, liveEvents, showReasoning, streamState,
-}: { liveRunId: string | null; liveEvents: LiveEvent[]; showReasoning: boolean; streamState: StreamState }) {
+  liveRunId,
+  liveEvents,
+  showReasoning,
+  streamState,
+}: {
+  liveRunId: string | null;
+  liveEvents: LiveEvent[];
+  showReasoning: boolean;
+  streamState: StreamState;
+}) {
   const isStreaming = streamState === 'streaming';
   if (!liveRunId || liveEvents.length === 0) return null;
   const segments = buildLiveSegments(liveEvents, isStreaming);
@@ -993,7 +1176,11 @@ const LiveConversationContent = memo(function LiveConversationContent({
           if (seg.kind === 'reasoning') {
             if (!showReasoning) return null;
             return (
-              <Reasoning defaultOpen={true} isStreaming={seg.isLast} key={`reasoning-${idx}`}>
+              <Reasoning
+                defaultOpen={true}
+                isStreaming={seg.isLast}
+                key={`reasoning-${idx}`}
+              >
                 <ReasoningTrigger />
                 <ReasoningStepList text={seg.text} />
               </Reasoning>
@@ -1002,17 +1189,30 @@ const LiveConversationContent = memo(function LiveConversationContent({
           if (seg.kind === 'tool_pair') {
             return (
               <ToolActivityGroup
-                entries={[{ input: seg.call.input, output: seg.result?.output ?? null, toolName: seg.result?.toolName ?? seg.call.toolName }]}
+                entries={[
+                  {
+                    input: seg.call.input,
+                    output: seg.result?.output ?? null,
+                    toolName: seg.result?.toolName ?? seg.call.toolName,
+                  },
+                ]}
                 isStreaming={seg.isLast}
                 key={`tool-${idx}`}
               />
             );
           }
           if (seg.kind === 'text' && seg.text.trim()) {
-            return <MessageResponse key={`text-${idx}`}>{seg.text}</MessageResponse>;
+            return (
+              <MessageResponse key={`text-${idx}`}>{seg.text}</MessageResponse>
+            );
           }
           if (seg.kind === 'status') {
-            return <StatusChip event={seg.event} key={`status-${idx}-${seg.event.kind}`} />;
+            return (
+              <StatusChip
+                event={seg.event}
+                key={`status-${idx}-${seg.event.kind}`}
+              />
+            );
           }
           return null;
         })}
@@ -1024,7 +1224,11 @@ const LiveConversationContent = memo(function LiveConversationContent({
 // ─── Message Queue Panel ──────────────────────────────────────────────────────
 
 const MessageQueuePanel = memo(function MessageQueuePanel({
-  queue, isBusy, onSteer, onRemove, onReorder,
+  queue,
+  isBusy,
+  onSteer,
+  onRemove,
+  onReorder,
 }: {
   queue: QueuedMessage[];
   isBusy: boolean;
@@ -1048,22 +1252,31 @@ const MessageQueuePanel = memo(function MessageQueuePanel({
             className="group flex items-center gap-1.5 rounded-lg border border-border/50 bg-muted/25 px-2 py-1.5 transition-colors hover:bg-muted/40"
             draggable
             key={msg.id}
-            onDragEnd={() => { dragIndexRef.current = null; }}
+            onDragEnd={() => {
+              dragIndexRef.current = null;
+            }}
             onDragOver={(e) => {
               e.preventDefault();
               const from = dragIndexRef.current;
-              if (from !== null && from !== index) { onReorder(from, index); dragIndexRef.current = index; }
+              if (from !== null && from !== index) {
+                onReorder(from, index);
+                dragIndexRef.current = index;
+              }
             }}
-            onDragStart={() => { dragIndexRef.current = index; }}
+            onDragStart={() => {
+              dragIndexRef.current = index;
+            }}
           >
             <GripVerticalIcon className="size-3.5 shrink-0 cursor-grab text-muted-foreground/40 group-hover:text-muted-foreground/70 active:cursor-grabbing" />
             <span className="min-w-0 flex-1 truncate text-xs">{msg.text}</span>
             <div className="flex shrink-0 items-center gap-0.5">
               <Button
                 className="size-6 p-0 text-blue-500 hover:bg-blue-500/10"
-                onClick={() => { void onSteer(msg.id); }}
+                onClick={() => {
+                  void onSteer(msg.id);
+                }}
                 size="icon-sm"
-                title={isBusy ? "Steer active run" : "Send now"}
+                title={isBusy ? 'Steer active run' : 'Send now'}
                 variant="ghost"
               >
                 <ArrowRightIcon className="size-3" />
@@ -1117,7 +1330,9 @@ export function AgentChatPanel({
   serverInfo,
 }: AgentChatPanelProps) {
   const [renderWindow, setRenderWindow] = useState(MESSAGE_VIRTUAL_WINDOW);
-  const [reasoningMode, setReasoningMode] = useState<RunReasoningSetting>(readStoredReasoningMode);
+  const [reasoningMode, setReasoningMode] = useState<RunReasoningSetting>(
+    readStoredReasoningMode,
+  );
   const showReasoning = reasoningMode !== 'off';
 
   const handleReasoningModeChange = useCallback((mode: RunReasoningSetting) => {
@@ -1143,7 +1358,8 @@ export function AgentChatPanel({
   const latestSummaryEvent = liveEvents.findLast(
     (event) =>
       event.type === 'status' &&
-      (event.kind === 'context_summarizing' || event.kind === 'context_summarized'),
+      (event.kind === 'context_summarizing' ||
+        event.kind === 'context_summarized'),
   );
   const isSummarizing =
     latestSummaryEvent?.type === 'status' &&
@@ -1156,18 +1372,30 @@ export function AgentChatPanel({
     return messages.slice(messages.length - renderWindow);
   }, [messages, renderWindow]);
 
-  const hiddenLoadedCount = Math.max(0, messages.length - visibleMessages.length);
+  const hiddenLoadedCount = Math.max(
+    0,
+    messages.length - visibleMessages.length,
+  );
   const handleRenderOlderLoaded = useCallback(() => {
     setRenderWindow((prev) => prev + MESSAGE_VIRTUAL_WINDOW);
   }, []);
 
   return (
-    <Card className="flex h-full min-h-0 flex-col overflow-hidden border-border/70 bg-card/80" size="sm">
+    <Card
+      className="flex h-full min-h-0 flex-col overflow-hidden border-border/70 bg-card/80"
+      size="sm"
+    >
       <CardHeader className="border-b border-border/70 pb-2.5">
         <CardTitle className="flex items-center justify-between text-sm">
           <div className="flex items-center gap-1.5">
             {onViewChats ? (
-              <Button onClick={onViewChats} size="icon-sm" title="Back to all chats" type="button" variant="ghost">
+              <Button
+                onClick={onViewChats}
+                size="icon-sm"
+                title="Back to all chats"
+                type="button"
+                variant="ghost"
+              >
                 <ListIcon className="size-4" />
               </Button>
             ) : null}
@@ -1245,21 +1473,21 @@ export function AgentChatPanel({
                   <PromptInputTextarea
                     className="max-h-40 min-h-12"
                     disabled={isCancelling}
-                    placeholder={isBusy ? 'Type to queue a follow-up message…' : 'Describe what to do on the desktop…'}
+                    placeholder={
+                      isBusy
+                        ? 'Type to queue a follow-up message…'
+                        : 'Describe what to do on the desktop…'
+                    }
                   />
                 </PromptInputBody>
                 <PromptInputFooter className="items-end gap-1.5">
                   <div className="flex min-w-0 items-center gap-1">
-                    <ModelSelector
-                      contextSummary={contextSummary}
-                      disabled={isBusy || isCancelling}
-                      modelId={selectedModelId}
-                      onSelect={onSelectModel}
-                      serverInfo={serverInfo}
-                    />
                     <PromptInputTools className="gap-1.5">
                       <PromptInputActionMenu>
-                        <PromptInputActionMenuTrigger disabled={composerDisabled || isBusy} tooltip="Attach files" />
+                        <PromptInputActionMenuTrigger
+                          disabled={composerDisabled || isBusy}
+                          tooltip="Attach files"
+                        />
                         <PromptInputActionMenuContent>
                           <PromptInputActionAddAttachments />
                           <PromptInputActionAddScreenshot />
@@ -1272,6 +1500,13 @@ export function AgentChatPanel({
                         value={reasoningMode}
                       />
                     </PromptInputTools>
+                    <ModelSelector
+                      contextSummary={contextSummary}
+                      disabled={isBusy || isCancelling}
+                      modelId={selectedModelId}
+                      onSelect={onSelectModel}
+                      serverInfo={serverInfo}
+                    />
                   </div>
                   <div className="flex items-center gap-1">
                     <PromptInputSubmit
@@ -1296,7 +1531,9 @@ export function AgentChatPanel({
                         aria-label="Cancel run"
                         className="size-8 shrink-0 bg-destructive p-0 text-destructive-foreground hover:bg-destructive/90"
                         disabled={isCancelling}
-                        onClick={() => { void onCancelRun(); }}
+                        onClick={() => {
+                          void onCancelRun();
+                        }}
                         size="icon-xs"
                         type="button"
                       >
@@ -1310,8 +1547,19 @@ export function AgentChatPanel({
               <div className="mt-1.5 flex justify-end">
                 <PromptInputHoverCard>
                   <PromptInputHoverCardTrigger>
-                    <Button aria-label="View context summary details" className="size-5 p-0" size="icon-xs" type="button" variant="ghost">
-                      <SummaryContextIcon hasSummary={hasSummary || isSummarizing} percent={contextSummary.usagePercent || contextCoveragePercent} />
+                    <Button
+                      aria-label="View context summary details"
+                      className="size-5 p-0"
+                      size="icon-xs"
+                      type="button"
+                      variant="ghost"
+                    >
+                      <SummaryContextIcon
+                        hasSummary={hasSummary || isSummarizing}
+                        percent={
+                          contextSummary.usagePercent || contextCoveragePercent
+                        }
+                      />
                     </Button>
                   </PromptInputHoverCardTrigger>
                   <PromptInputHoverCardContent align="end" className="w-96 p-3">
@@ -1328,8 +1576,12 @@ export function AgentChatPanel({
                 </PromptInputHoverCard>
               </div>
 
-              {streamError ? <p className="mt-2 text-destructive text-xs">{streamError}</p> : null}
-              {error ? <p className="mt-2 text-destructive text-xs">{error}</p> : null}
+              {streamError ? (
+                <p className="mt-2 text-destructive text-xs">{streamError}</p>
+              ) : null}
+              {error ? (
+                <p className="mt-2 text-destructive text-xs">{error}</p>
+              ) : null}
             </div>
           </>
         )}
