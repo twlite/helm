@@ -10,10 +10,10 @@ try {
 
 const relay = new CodexAppServer({
   bin: config.codexBin,
-  cwd: config.codexCwd,
   model: config.codexModel,
 });
 const sessions = new RelaySessionStore({
+  onSessionRemoved: (sessionId) => relay.cancelSession(sessionId),
   sweepIntervalMs: Math.min(config.sessionTtlMs, 60_000),
   ttlMs: config.sessionTtlMs,
 });

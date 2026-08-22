@@ -7,13 +7,20 @@ import {
   parseChatCompletionRequest,
   RelayValidationError,
 } from './compat.ts';
+import type { RelayHistoryPart, RelayTurnResult } from './compat.ts';
 import type { CodexAppServer, RunTurnOptions } from './relay.ts';
 import {
   RelaySessionError,
   RelaySessionStore,
 } from './session-store.ts';
 
-type RelayService = Pick<CodexAppServer, 'runTurn'>;
+type RelayService = Pick<CodexAppServer, 'runTurn'> & {
+  cancelSession?: (sessionId: string) => void;
+};
+
+type RequestTurnOptions = RunTurnOptions & {
+  history: RelayHistoryPart[];
+};
 
 type AppOptions = {
   maxBodyBytes: number;
@@ -48,12 +55,25 @@ const parseBody = async (request: Request): Promise<unknown> => {
 
 const createCompletionId = () => `chatcmpl-${randomUUID()}`;
 
+const toOpenAIToolCalls = (result: RelayTurnResult) =>
+  result.toolCalls.map((call) => ({
+    id: call.id,
+    type: 'function' as const,
+    function: {
+      arguments: call.arguments,
+      name: call.name,
+    },
+  }));
+
 const createApp = ({
   maxBodyBytes,
   modelId = 'codex',
   relay,
   sessionTtlMs = 30 * 60 * 1000,
-  sessions = new RelaySessionStore({ ttlMs: sessionTtlMs }),
+  sessions = new RelaySessionStore({
+    onSessionRemoved: (sessionId) => relay.cancelSession?.(sessionId),
+    ttlMs: sessionTtlMs,
+  }),
   token,
 }: AppOptions) => {
   const app = new Hono();
@@ -94,6 +114,7 @@ const createApp = ({
       throw new RelayValidationError('Session id must not be empty.');
     }
 
+    relay.cancelSession?.(sessionId);
     return c.json({ deleted: sessions.delete(sessionId) });
   });
 
@@ -122,14 +143,19 @@ const createApp = ({
 
       const id = createCompletionId();
       const created = Math.floor(Date.now() / 1000);
-      const turn: RunTurnOptions = {
+      const turn: RequestTurnOptions = {
         developerInstructions: request.developerInstructions,
+        history: request.history,
         input: request.input,
         model: request.model,
         signal: c.req.raw.signal,
+        ...(request.toolResults.length > 0
+          ? { toolResults: request.toolResults }
+          : {}),
+        ...(request.tools ? { tools: request.tools } : {}),
       };
       const runTurn = (onDelta?: RunTurnOptions['onDelta']) => {
-        const options: RunTurnOptions = {
+        const options: RequestTurnOptions = {
           ...turn,
           ...(onDelta ? { onDelta } : {}),
         };
@@ -142,16 +168,18 @@ const createApp = ({
       };
 
       if (!request.stream) {
-        const text = await runTurn();
+        const result = await runTurn();
+        const toolCalls = toOpenAIToolCalls(result);
 
         return c.json({
           choices: [
             {
-              finish_reason: 'stop',
+              finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
               index: 0,
               message: {
-                content: text,
+                content: result.text || null,
                 role: 'assistant',
+                ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
               },
             },
           ],
@@ -181,11 +209,14 @@ const createApp = ({
 
         const enqueue = (data: unknown) => enqueueRaw(JSON.stringify(data));
 
-        const chunk = (delta: Record<string, unknown>) => ({
+        const chunk = (
+          delta: Record<string, unknown>,
+          finishReason: string | null = null,
+        ) => ({
           choices: [
             {
               delta,
-              finish_reason: null,
+              finish_reason: finishReason,
               index: 0,
             },
           ],
@@ -198,12 +229,36 @@ const createApp = ({
         await enqueue(chunk({ role: 'assistant' }));
 
         try {
-          await runTurn((delta) => enqueue(chunk({ content: delta })));
+          const result = await runTurn((delta) =>
+            enqueue(chunk({ content: delta })),
+          );
+
+          const toolCalls = toOpenAIToolCalls(result);
+
+          for (const [index, toolCall] of toolCalls.entries()) {
+            await enqueue(
+              chunk({
+                tool_calls: [
+                  {
+                    function: toolCall.function,
+                    id: toolCall.id,
+                    index,
+                    type: toolCall.type,
+                  },
+                ],
+              }),
+            );
+          }
 
           await writeChain;
 
           if (!signal.aborted) {
-            await enqueue(chunk({}));
+            await enqueue(
+              chunk(
+                {},
+                toolCalls.length > 0 ? 'tool_calls' : 'stop',
+              ),
+            );
             await enqueueRaw('[DONE]');
           }
         } catch (error) {

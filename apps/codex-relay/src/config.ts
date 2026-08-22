@@ -24,7 +24,9 @@ const readOptionalString = (name: string): string | undefined => {
 
 export const config = {
   codexBin: process.env.CODEX_BIN?.trim() || 'codex',
-  codexCwd: process.env.CODEX_CWD?.trim() || '/tmp',
+  debug:
+    process.env.RELAY_DEBUG === '1' ||
+    process.env.RELAY_DEBUG?.trim().toLowerCase() === 'true',
   codexModel: readOptionalString('CODEX_MODEL') ?? 'gpt-5.6-luna',
   host: process.env.HOST?.trim() || '127.0.0.1',
   maxBodyBytes: readPositiveInt('RELAY_MAX_BODY_BYTES', DEFAULT_MAX_BODY_BYTES),
