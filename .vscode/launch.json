@@ -1,0 +1,24 @@
+{
+  "configurations": [
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:helm}/native/helm-vm-host",
+      "name": "Debug helm-vm-host (native/helm-vm-host)",
+      "target": "helm-vm-host",
+      "configuration": "debug",
+      "preLaunchTask": "swift: Build Debug helm-vm-host (native/helm-vm-host)"
+    },
+    {
+      "type": "swift",
+      "request": "launch",
+      "args": [],
+      "cwd": "${workspaceFolder:helm}/native/helm-vm-host",
+      "name": "Release helm-vm-host (native/helm-vm-host)",
+      "target": "helm-vm-host",
+      "configuration": "release",
+      "preLaunchTask": "swift: Build Release helm-vm-host (native/helm-vm-host)"
+    }
+  ]
+}
