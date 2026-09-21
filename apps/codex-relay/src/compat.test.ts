@@ -88,4 +88,63 @@ describe('OpenAI compatibility translation', () => {
       },
     ]);
   });
+
+  it('preserves Helm screenshot context for stateless callers', () => {
+    const request = parseChatCompletionRequest({
+      messages: [
+        { content: 'Inspect the screen.', role: 'user' },
+        {
+          content: null,
+          role: 'assistant',
+          tool_calls: [
+            {
+              function: { arguments: '{}', name: 'screenshot' },
+              id: 'call-screenshot',
+              type: 'function',
+            },
+          ],
+        },
+        {
+          content: JSON.stringify([
+            { text: 'Screenshot captured.' },
+            { data: 'AQ==', mediaType: 'image/png', type: 'media' },
+          ]),
+          role: 'tool',
+          tool_call_id: 'call-screenshot',
+        },
+        {
+          content: [
+            {
+              text: 'Latest desktop screenshot image for visual inspection. Use this image to read visible page text and UI state.',
+              type: 'text',
+            },
+            {
+              image_url: { url: 'data:image/png;base64,AQ==' },
+              type: 'image_url',
+            },
+          ],
+          role: 'user',
+        },
+      ],
+    });
+
+    assert.equal(request.history.length, 5);
+    assert.deepEqual(request.history.slice(-2), [
+      {
+        kind: 'input',
+        part: {
+          text: 'USER:\nLatest desktop screenshot image for visual inspection. Use this image to read visible page text and UI state.',
+          type: 'text',
+        },
+      },
+      { kind: 'input', part: { type: 'image', url: 'data:image/png;base64,AQ==' } },
+    ]);
+    assert.deepEqual(request.input.slice(-2), [
+      {
+        text: 'USER:\nLatest desktop screenshot image for visual inspection. Use this image to read visible page text and UI state.',
+        type: 'text',
+      },
+      { type: 'image', url: 'data:image/png;base64,AQ==' },
+    ]);
+  });
 });

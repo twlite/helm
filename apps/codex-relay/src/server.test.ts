@@ -229,6 +229,19 @@ describe('codex relay app', () => {
             role: 'tool',
             tool_call_id: 'call-screenshot',
           },
+          {
+            content: [
+              {
+                text: 'Latest desktop screenshot image for visual inspection. Use this image to read visible page text and UI state.',
+                type: 'text',
+              },
+              {
+                image_url: { url: 'data:image/png;base64,AQ==' },
+                type: 'image_url',
+              },
+            ],
+            role: 'user',
+          },
         ],
         tools,
       }),
@@ -250,6 +263,120 @@ describe('codex relay app', () => {
         ],
         toolCallId: 'call-screenshot',
       },
+    ]);
+  });
+
+  it('resumes when a Codex tool-call response also contains assistant text', async () => {
+    const received: RunTurnOptions[] = [];
+    const sessions = new RelaySessionStore({ ttlMs: 60_000 });
+    const app = makeApp(async (options) => {
+      received.push(options);
+
+      if (!options.threadId) {
+        options.onThreadCreated?.('thread-text-and-tool');
+        return {
+          text: 'I will inspect the screen first.',
+          threadId: 'thread-text-and-tool',
+          toolCalls: [
+            {
+              arguments: '{}',
+              id: 'call-screen',
+              name: 'screenshot',
+            },
+          ],
+          turnId: 'turn-text-and-tool',
+        };
+      }
+
+      return { text: 'The screen is ready.', toolCalls: [] };
+    }, sessions);
+
+    const tools = [
+      {
+        function: {
+          name: 'screenshot',
+          parameters: { properties: {}, type: 'object' },
+        },
+        type: 'function',
+      },
+    ];
+
+    const first = await request(app, '/v1/chat/completions', {
+      body: JSON.stringify({
+        messages: [{ content: 'Inspect the screen.', role: 'user' }],
+        tools,
+      }),
+      headers: { 'X-Helm-Session': 'helm-text-and-tool' },
+      method: 'POST',
+    });
+    const second = await request(app, '/v1/chat/completions', {
+      body: JSON.stringify({
+        messages: [
+          { content: 'Inspect the screen.', role: 'user' },
+          {
+            content: 'I will inspect the screen first.',
+            role: 'assistant',
+            tool_calls: [
+              {
+                function: { arguments: '{}', name: 'screenshot' },
+                id: 'call-screen',
+                type: 'function',
+              },
+            ],
+          },
+          {
+            content: 'Screenshot captured.',
+            role: 'tool',
+            tool_call_id: 'call-screen',
+          },
+        ],
+        tools,
+      }),
+      headers: { 'X-Helm-Session': 'helm-text-and-tool' },
+      method: 'POST',
+    });
+    const third = await request(app, '/v1/chat/completions', {
+      body: JSON.stringify({
+        messages: [
+          { content: 'Inspect the screen.', role: 'user' },
+          {
+            content: 'I will inspect the screen first.',
+            role: 'assistant',
+            tool_calls: [
+              {
+                function: { arguments: '{}', name: 'screenshot' },
+                id: 'call-screen',
+                type: 'function',
+              },
+            ],
+          },
+          {
+            content: 'Screenshot captured.',
+            role: 'tool',
+            tool_call_id: 'call-screen',
+          },
+          { content: 'The screen is ready.', role: 'assistant' },
+          { content: 'Continue with the task.', role: 'user' },
+        ],
+        tools,
+      }),
+      headers: { 'X-Helm-Session': 'helm-text-and-tool' },
+      method: 'POST',
+    });
+
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal(third.status, 200);
+    assert.equal(received.length, 3);
+    assert.equal(received[1]?.continuationTurnId, 'turn-text-and-tool');
+    assert.deepEqual(received[1]?.toolResults, [
+      {
+        content: [{ text: 'Screenshot captured.', type: 'text' }],
+        toolCallId: 'call-screen',
+      },
+    ]);
+    assert.deepEqual(received[2]?.input, [
+      { text: 'USER:\nContinue with the task.', type: 'text' },
     ]);
   });
 

@@ -7,6 +7,9 @@ import type {
 } from './compat.ts';
 import type { RunTurnOptions } from './relay.ts';
 
+const HELM_SCREENSHOT_CONTEXT_MARKER =
+  'USER:\nLatest desktop screenshot image for visual inspection.';
+
 type SessionState = {
   activeTurns: number;
   developerInstructions?: string;
@@ -48,11 +51,19 @@ const sameJson = (left: unknown, right: unknown): boolean => {
   }
 };
 
+const normalizeArguments = (value: string): string => {
+  try {
+    return JSON.stringify(JSON.parse(value)) ?? value;
+  } catch {
+    return value;
+  }
+};
+
 const sameInputPart = (left: RelayInputPart, right: RelayInputPart): boolean =>
   left.type === right.type &&
   (left.type === 'text'
     ? right.type === 'text' && left.text === right.text
-    : right.type === 'image' && left.url === right.url);
+    : right.type === 'image');
 
 const sameHistoryPart = (
   left: RelayHistoryPart,
@@ -70,16 +81,60 @@ const sameHistoryPart = (
     return (
       left.id === right.id &&
       left.name === right.name &&
-      left.arguments === right.arguments
+      normalizeArguments(left.arguments) === normalizeArguments(right.arguments)
     );
   }
 
   return (
     left.kind === 'tool-result' &&
     right.kind === 'tool-result' &&
-    left.id === right.id &&
-    sameJson(left.content, right.content)
+    left.id === right.id
   );
+};
+
+const canonicalizeSessionHistory = (
+  history: RelayHistoryPart[],
+): RelayHistoryPart[] => {
+  const next: RelayHistoryPart[] = [];
+
+  for (let index = 0; index < history.length; index += 1) {
+    const part = history[index];
+
+    if (
+      part?.kind === 'input' &&
+      part.part.type === 'text' &&
+      part.part.text.startsWith(HELM_SCREENSHOT_CONTEXT_MARKER)
+    ) {
+      // Helm re-injects this provider-only vision message on every step. The
+      // screenshot itself is already delivered to Codex as the dynamic tool
+      // result, so it must not become part of the persistent session history.
+      const nextPart = history[index + 1];
+      if (nextPart?.kind === 'input' && nextPart.part.type === 'image') {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (part.kind === 'tool-result') {
+      // Tool results are already stored in the Codex thread. Keep only their
+      // IDs for session-prefix validation so screenshot pruning/re-encoding
+      // cannot make an otherwise valid continuation look like a new history.
+      next.push({ ...part, content: [] });
+      continue;
+    }
+
+    if (part.kind === 'input' && part.part.type === 'image') {
+      // Image data can be re-encoded by an OpenAI-compatible client. The
+      // position/type is enough to identify the prior input, and avoids
+      // retaining large base64 payloads in the in-memory session state.
+      next.push({ kind: 'input', part: { type: 'image', url: '' } });
+      continue;
+    }
+
+    next.push(part);
+  }
+
+  return next;
 };
 
 const isPrefix = (
@@ -135,6 +190,20 @@ const appendAssistantResult = (
 ): RelayHistoryPart[] => {
   const next = [...history];
 
+  // The OpenAI-compatible provider serializes assistant content by emitting
+  // tool_calls before the assistant text in the relay's normalized history.
+  // Keep the in-memory session history in that same order so the next AI SDK
+  // step remains an exact prefix of it when an assistant message contains
+  // both text and tool calls.
+  for (const call of result.toolCalls) {
+    next.push({
+      arguments: call.arguments,
+      id: call.id,
+      kind: 'tool-call',
+      name: call.name,
+    });
+  }
+
   if (result.text.trim()) {
     next.push({
       kind: 'input',
@@ -142,15 +211,6 @@ const appendAssistantResult = (
         text: `ASSISTANT:\n${result.text}`,
         type: 'text',
       },
-    });
-  }
-
-  for (const call of result.toolCalls) {
-    next.push({
-      arguments: call.arguments,
-      id: call.id,
-      kind: 'tool-call',
-      name: call.name,
     });
   }
 
@@ -228,9 +288,10 @@ export class RelaySessionStore {
         );
       }
 
+      const sessionHistory = canonicalizeSessionHistory(request.history);
       const incrementalHistory = getIncrementalHistory(
         state.history,
-        request.history,
+        sessionHistory,
       );
       const incrementalInput = historyInput(incrementalHistory);
       const incrementalToolCallIds = new Set(
@@ -341,7 +402,10 @@ export class RelaySessionStore {
         state.lastActivityAt = this.clock();
       }
 
-      state.history = appendAssistantResult(request.history, result);
+      state.history = appendAssistantResult(
+        sessionHistory,
+        result,
+      );
       state.pendingTurn =
         result.toolCalls.length > 0
           ? result.turnId
