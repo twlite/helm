@@ -17,6 +17,7 @@ export type IconName =
   | 'flask'
   | 'folder'
   | 'memory'
+  | 'menu'
   | 'message'
   | 'monitor'
   | 'pause'
@@ -56,6 +57,7 @@ const paths: Record<IconName, string[]> = {
   flask: ['M9 3h6', 'M10 3v6l-5 8a3 3 0 0 0 2.6 4.5h8.8A3 3 0 0 0 19 17l-5-8V3', 'M8 16h8'],
   folder: ['M3 6h6l2 2h10v10H3z'],
   memory: ['M6 6h12v12H6z', 'M9 3v3', 'M15 3v3', 'M9 18v3', 'M15 18v3', 'M3 9h3', 'M3 15h3', 'M18 9h3', 'M18 15h3'],
+  menu: ['M4 6h16', 'M4 12h16', 'M4 18h16'],
   message: ['M4 5h16v11H8l-4 4z', 'M8 9h8', 'M8 12h5'],
   monitor: ['M4 4h16v12H4z', 'M8 20h8', 'M12 16v4'],
   pause: ['M8 5v14', 'M16 5v14'],

@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { helmApi, parseError } from './api';
-import { ActivityRail } from './components/ActivityRail';
-import { Conversation } from './components/Conversation';
+import { ActivityDrawer } from './components/ActivityDrawer';
+import { Conversation, type ConversationNotice } from './components/Conversation';
+import { MemoryDialog } from './components/MemoryDialog';
+import { SettingsDialog } from './components/SettingsDialog';
 import { ThreadSidebar } from './components/ThreadSidebar';
 import { useHelmWebSocket } from './hooks/useHelmWebSocket';
 import type {
@@ -17,11 +19,6 @@ import type {
   VmAction,
   VmStatus,
 } from './types';
-
-type Notice = {
-  tone: 'error' | 'info';
-  message: string;
-};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -82,7 +79,11 @@ function App() {
   const [memoryQuery, setMemoryQuery] = useState('');
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryActionId, setMemoryActionId] = useState<string | null>(null);
-  const [notice, setNotice] = useState<Notice | null>(null);
+  const [notice, setNotice] = useState<ConversationNotice | null>(null);
+  const [isActivityOpen, setIsActivityOpen] = useState(false);
+  const [isMemoryOpen, setIsMemoryOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
 
   const selectedThreadIdRef = useRef<string | null>(null);
   const runRequestRef = useRef(0);
@@ -134,6 +135,7 @@ function App() {
       }
     }
     if (event.runId && event.type.startsWith('run.')) {
+      setIsActivityOpen(true);
       void refreshRun(event.runId);
     }
   }, [refreshRun]);
@@ -219,6 +221,7 @@ function App() {
   const handleSelectThread = useCallback((threadId: string) => {
     setSelectedThreadId(threadId);
     setRun(null);
+    setIsActivityOpen(false);
     setDraft('');
     setNotice(null);
   }, []);
@@ -231,6 +234,7 @@ function App() {
       setThreads((current) => [thread, ...current.filter((item) => item.id !== thread.id)]);
       setSelectedThreadId(thread.id);
       setMessages([]);
+      setIsActivityOpen(false);
       return true;
     } catch (error) {
       showError(error);
@@ -253,6 +257,7 @@ function App() {
         setSelectedThreadId(remaining[0]?.id ?? null);
         setMessages([]);
         setRun(null);
+        setIsActivityOpen(false);
       }
     } catch (error) {
       showError(error);
@@ -284,6 +289,7 @@ function App() {
       return;
     }
     setIsRunStarting(true);
+    setIsActivityOpen(true);
     setNotice(null);
     try {
       const nextRun = await helmApi.runScriptedDemo(threadId);
@@ -375,52 +381,76 @@ function App() {
   const connectionState: ConnectionState = socket.state;
 
   return (
-    <div className="helm-app">
+    <div className="flex h-dvh min-h-0 w-full overflow-hidden bg-[#0b0d10] font-sans text-[#f1f3f5]">
       <ThreadSidebar
+        connectionState={connectionState}
         isCreating={isCreatingThread}
         onCreateThread={handleCreateThread}
         onDeleteThread={handleDeleteThread}
+        onMobileOpenChange={setIsMobileSidebarOpen}
+        onOpenMemory={() => {
+          setIsActivityOpen(false);
+          setIsMemoryOpen(true);
+        }}
+        onOpenSettings={() => {
+          setIsActivityOpen(false);
+          setIsSettingsOpen(true);
+        }}
         onSelectThread={handleSelectThread}
+        reconnectAttempt={socket.attempt}
         selectedThreadId={selectedThreadId}
         threads={threads}
+        mobileOpen={isMobileSidebarOpen}
       />
       <Conversation
+        activityOpen={isActivityOpen}
         draft={draft}
         isLoading={messageState === 'loading'}
         isRunStarting={isRunStarting}
         isSending={messageState === 'saving'}
         messages={messages}
         onDraftChange={setDraft}
+        onDismissNotice={() => setNotice(null)}
+        onOpenMobileSidebar={() => setIsMobileSidebarOpen(true)}
         onRunDemo={handleRunDemo}
         onSend={handleSendMessage}
+        onToggleActivity={() => setIsActivityOpen((current) => !current)}
+        notice={notice}
+        run={run}
         thread={selectedThread}
       />
-      <ActivityRail
-        connectionState={connectionState}
-        health={health}
-        memoryActionId={memoryActionId}
-        memories={memories}
-        memoryLoading={memoryLoading}
-        memoryQuery={memoryQuery}
-        onAddMemory={handleAddMemory}
+      <ActivityDrawer
+        isRunStarting={isRunStarting}
         onCancelRun={handleCancelRun}
-        onDeleteMemory={handleDeleteMemory}
-        onMemoryQueryChange={setMemoryQuery}
-        onRefreshDiagnostics={handleRefreshDiagnostics}
-        onSearchMemories={handleMemorySearch}
+        onOpenChange={setIsActivityOpen}
+        onRunDemo={handleRunDemo}
         onVmAction={handleVmAction}
-        reconnectAttempt={socket.attempt}
+        open={isActivityOpen}
         run={run}
         screenshot={screenshot}
         vm={vm}
         vmAction={vmAction}
       />
-      {notice ? (
-        <div className={`helm-toast helm-toast-${notice.tone}`} role="status">
-          <span>{notice.message}</span>
-          <button aria-label="Dismiss notification" className="helm-icon-button" onClick={() => setNotice(null)} type="button"><span aria-hidden="true">×</span></button>
-        </div>
-      ) : null}
+      <MemoryDialog
+        memoryActionId={memoryActionId}
+        memories={memories}
+        memoryLoading={memoryLoading}
+        memoryQuery={memoryQuery}
+        onAddMemory={handleAddMemory}
+        onDeleteMemory={handleDeleteMemory}
+        onMemoryQueryChange={setMemoryQuery}
+        onOpenChange={setIsMemoryOpen}
+        onSearchMemories={handleMemorySearch}
+        open={isMemoryOpen}
+      />
+      <SettingsDialog
+        connectionState={connectionState}
+        health={health}
+        onOpenChange={setIsSettingsOpen}
+        onRefreshDiagnostics={handleRefreshDiagnostics}
+        open={isSettingsOpen}
+        reconnectAttempt={socket.attempt}
+      />
     </div>
   );
 }

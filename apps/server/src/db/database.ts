@@ -2,8 +2,11 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import { Database } from 'bun:sqlite';
-
-import { getDatabaseDiagnostics, type DatabaseDiagnostics } from './diagnostics';
+import * as sqliteVec from 'sqlite-vec';
+import {
+  getDatabaseDiagnostics,
+  type DatabaseDiagnostics,
+} from './diagnostics';
 import { runMigrations, type MigrationResult } from './migrations';
 import {
   MessageRepository,
@@ -39,15 +42,17 @@ export class PersistenceDatabase {
       create: !(options.readonly ?? false),
       strict: true,
     });
+    sqliteVec.load(this.sqlite);
     this.db = this.sqlite;
 
     if (options.foreignKeys ?? true) {
       this.sqlite.exec('PRAGMA foreign_keys = ON');
     }
     this.sqlite.exec('PRAGMA busy_timeout = 5000');
-    this.migrations = options.migrate === false
-      ? { applied: [], currentVersion: 0 }
-      : runMigrations(this.sqlite);
+    this.migrations =
+      options.migrate === false
+        ? { applied: [], currentVersion: 0 }
+        : runMigrations(this.sqlite);
 
     this.threads = new ThreadRepository(this.sqlite);
     this.messages = new MessageRepository(this.sqlite);
@@ -67,14 +72,20 @@ export class PersistenceDatabase {
 export class HelmDatabase extends PersistenceDatabase {}
 export class DatabaseService extends PersistenceDatabase {}
 
-export function createDatabase(filename = ':memory:', options: DatabaseOpenOptions = {}): PersistenceDatabase {
+export function createDatabase(
+  filename = ':memory:',
+  options: DatabaseOpenOptions = {},
+): PersistenceDatabase {
   return new PersistenceDatabase(filename, options);
 }
 
 export const createPersistenceDatabase = createDatabase;
 
 /** Open a migrated raw Bun database for callers that own their repositories. */
-export function openDatabase(filename = ':memory:', options: DatabaseOpenOptions = {}): Database {
+export function openDatabase(
+  filename = ':memory:',
+  options: DatabaseOpenOptions = {},
+): Database {
   const persistence = new PersistenceDatabase(filename, options);
   return persistence.sqlite;
 }
