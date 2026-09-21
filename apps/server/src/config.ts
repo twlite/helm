@@ -134,6 +134,10 @@ export interface HelmConfig {
   baseImagePath: string;
   workingImagePath: string;
   efiVariablesPath: string;
+  machineIdentifierPath: string;
+  provisioningImagePath: string;
+  provisioningEfiVariablesPath: string;
+  provisioningLockPath: string;
   vmHelperPath: string;
   vmMemoryMb: number;
   vmCpus: number;
@@ -162,6 +166,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HelmConfig {
     baseImagePath: expandHome(env.HELM_VM_BASE_IMAGE ?? join(vmDir, 'base.img')),
     workingImagePath: expandHome(env.HELM_VM_WORKING_IMAGE ?? join(vmDir, 'disk.img')),
     efiVariablesPath: expandHome(env.HELM_VM_EFI_VARS ?? join(vmDir, 'efi-vars.bin')),
+    machineIdentifierPath: expandHome(env.HELM_VM_MACHINE_ID ?? join(vmDir, 'machine-id.bin')),
+    provisioningImagePath: expandHome(
+      env.HELM_VM_PROVISIONING_IMAGE ?? join(vmDir, 'provisioning.img'),
+    ),
+    provisioningEfiVariablesPath: expandHome(
+      env.HELM_VM_PROVISIONING_EFI_VARS ?? join(vmDir, 'provisioning-efi-vars.bin'),
+    ),
+    provisioningLockPath: expandHome(
+      env.HELM_VM_PROVISIONING_LOCK ?? join(vmDir, 'provisioning.lock'),
+    ),
     vmHelperPath: expandHome(
       env.HELM_VM_HELPER ?? join(repositoryRoot, 'native', 'helm-vm-host', '.build', 'release', 'helm-vm-host'),
     ),

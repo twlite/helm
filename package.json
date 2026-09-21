@@ -23,6 +23,8 @@
     "guest:bridge:build": "bash guest/helm-guest/bridge/build.sh",
     "vm:build": "bash scripts/vm-build.sh",
     "vm:doctor": "bun scripts/vm-doctor.ts",
+    "vm:provision": "bun scripts/vm-provision.ts",
+    "vm:seal": "bun scripts/vm-seal.ts",
     "vm:start": "bun scripts/vm-command.ts start",
     "vm:stop": "bun scripts/vm-command.ts stop",
     "vm:reset": "bun scripts/vm-command.ts reset",

@@ -10,7 +10,7 @@ package.
 - Apple Silicon Mac (`arm64`)
 - macOS 14 or newer
 - Swift/Xcode toolchain with the matching macOS SDK
-- A locally prepared ARM64 Linux raw disk image
+- An official Ubuntu 24.04 LTS ARM64 installer ISO for first-run provisioning
 - A code-signed helper carrying
   `com.apple.security.virtualization`
 
@@ -43,17 +43,31 @@ The default root is:
 ```text
 ~/Library/Application Support/Helm/
 ├── vm/
-│   ├── base.img          # prepared, never modified by this host
+│   ├── base.img          # sealed Ubuntu installation, never modified by host
 │   ├── disk.img          # mutable working copy
 │   ├── efi-vars.bin      # EFI variable store
-│   └── machine-id.bin    # persistent generic VM identifier
+│   ├── machine-id.bin    # persistent generic VM identifier
+│   ├── provisioning.img  # interactive installer disk
+│   ├── provisioning-efi-vars.bin
+│   └── provisioning.lock # transient; owned by bun run vm:provision
 └── runtime/              # shared into the guest read-only
 ```
 
-`base.img` must exist before `vm.start` or `vm.reset`. If `disk.img` is
-missing, the host copies `base.img` to it. `vm.reset` stops the VM, replaces
-the working image from the base image, and clears the EFI variable store and
-generic machine identifier. It never writes to `base.img`.
+`base.img` must exist before `vm.start` or `vm.reset`. The repository-level
+`bun run vm:provision /path/to/ubuntu-24.04-arm64.iso` command creates a
+separate sparse 24 GiB installation disk, a fresh provisioning EFI store, and
+an AppKit window containing `VZVirtualMachineView`. The ISO is attached
+read-only through `VZUSBMassStorageDeviceConfiguration`; the writable disk is
+attached through Virtio. After the interactive installation shuts down, run
+`bun run vm:seal` to atomically copy the retained installation disk to
+`base.img` and promote the provisioning EFI state to the normal EFI path.
+
+If `disk.img` is missing, the normal host copies `base.img` to it. If
+`efi-vars.bin` is missing, the normal host creates it with
+`VZEFIVariableStore(creatingVariableStoreAt:options:)`. `vm.reset` stops the
+VM, replaces the working image from the base image, preserves the EFI boot
+state, and clears the generic machine identifier. It never writes to
+`base.img`.
 
 Override paths with the command-line options shown by `--help`, or with the
 corresponding `HELM_VM_*` environment variables. The runtime VirtioFS tag is
@@ -107,11 +121,13 @@ and returns the guest JSON unchanged.
 
 - This first host slice supports Apple Silicon only; it does not boot x86
   guests or Windows.
-- It does not provision or install Linux images. The ARM64 image, VirtioFS
-  mount setup, XFCE/X11 session, AF_VSOCK bridge, and guest runtime must be
-  prepared separately.
-- It does not contain a VM viewer, screenshot pipeline, guest RPC business
-  logic, Bun controller, or automatic display-readiness retry loop.
+- Provisioning is intentionally manual: Helm does not download an OS image or
+  automate the Ubuntu installer. The user must supply the official ARM64 ISO
+  and complete the native VM window. The VirtioFS mount setup, XFCE/X11
+  session, AF_VSOCK bridge, and guest runtime remain guest-image concerns.
+- It does not contain a runtime screenshot pipeline, guest RPC business logic,
+  Bun controller, or automatic display-readiness retry loop; the only native
+  viewer is the manual provisioning window.
 - `vm.stop` is the framework's destructive stop operation. The host does not
   currently request a graceful guest shutdown.
 - Real start/stop/guest-RPC integration needs a valid image, the entitlement,

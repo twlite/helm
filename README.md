@@ -65,12 +65,18 @@ Build the native helper and inspect the environment with:
 ```sh
 bun run vm:build
 bun run vm:doctor
+bun run vm:provision /path/to/ubuntu-24.04-arm64.iso
+bun run vm:seal
 bun run vm:start
 bun run vm:stop
 bun run vm:reset
 ```
 
-The native helper expects a prepared ARM64 Linux image. `vm:doctor` reports missing images or helpers rather than treating configuration as proof that a VM is available. See [docs/vm-setup.md](docs/vm-setup.md).
+The first-run provisioning command opens a native Virtualization.framework
+window for an official Ubuntu 24.04 LTS ARM64 installer. After the guest is
+installed and shut down, `vm:seal` promotes the retained installation disk to
+`base.img`. `vm:doctor` reports lazy first-run artifacts as `WAIT`; see
+[docs/vm-setup.md](docs/vm-setup.md).
 
 ## Documentation
 
@@ -81,4 +87,4 @@ The native helper expects a prepared ARM64 Linux image. `vm:doctor` reports miss
 
 ## Current limitations
 
-This implementation does not extract memories automatically, provide unrestricted shell access, support Windows/Linux-host virtualization, or implement remote desktop streaming. VM tests require a prepared guest image and are guarded by `HELM_VM_INTEGRATION=1`. The LM Studio provider plans tasks and proposes actions, while Helm's runtime remains authoritative for tool execution and verification.
+This implementation does not extract memories automatically, provide unrestricted shell access, support Windows/Linux-host virtualization, or implement remote desktop streaming. VM tests require a sealed guest image and are guarded by `HELM_VM_INTEGRATION=1`. The LM Studio provider plans tasks and proposes actions, while Helm's runtime remains authoritative for tool execution and verification.

@@ -26,4 +26,15 @@ describe('Helm model configuration', () => {
     expect(config.models.languageModel).toBe('local/test-model');
     expect(config.models.embeddingDimensions).toBe(4);
   });
+
+  it('derives separate provisioning artifacts from the VM data directory', () => {
+    const config = loadConfig({
+      HELM_DATA_DIR: '/tmp/helm-test-data',
+    });
+
+    expect(config.provisioningImagePath).toBe('/tmp/helm-test-data/vm/provisioning.img');
+    expect(config.provisioningEfiVariablesPath).toBe('/tmp/helm-test-data/vm/provisioning-efi-vars.bin');
+    expect(config.provisioningLockPath).toBe('/tmp/helm-test-data/vm/provisioning.lock');
+    expect(config.machineIdentifierPath).toBe('/tmp/helm-test-data/vm/machine-id.bin');
+  });
 });

@@ -46,7 +46,6 @@ struct VMPaths {
         }
 
         try copyFileAtomically(from: baseImageURL, to: workingImageURL)
-        try removeIfPresent(efiVariablesURL)
         try removeIfPresent(machineIdentifierURL)
     }
 

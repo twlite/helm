@@ -6,7 +6,19 @@ import HelmVMHostCore
 struct HelmVMHostMain {
     static func main() {
         do {
-            guard let options = try HostOptions.parse(arguments: Array(CommandLine.arguments.dropFirst())) else {
+            let arguments = Array(CommandLine.arguments.dropFirst())
+            if arguments.first == "--provision" || arguments.first == "--interactive-provision" {
+                guard let options = try ProvisioningOptions.parse(arguments: Array(arguments.dropFirst())) else {
+                    return
+                }
+                let exitCode = try ProvisioningHost.run(options: options)
+                if exitCode != 0 {
+                    Darwin.exit(Int32(exitCode))
+                }
+                return
+            }
+
+            guard let options = try HostOptions.parse(arguments: arguments) else {
                 return
             }
             VMHost(options: options).run()
