@@ -119,7 +119,7 @@ export function Conversation({
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const content = draft.trim();
-    if (!content || isSending || !thread) {
+    if (!content || isSending) {
       return;
     }
     await onSend(content);
@@ -202,22 +202,20 @@ export function Conversation({
               <label className="sr-only" htmlFor="message-composer">Message</label>
               <Textarea
                 className="min-h-[78px] resize-none rounded-none border-0 bg-transparent px-4 pb-2 pt-4 shadow-none focus:border-0 focus:ring-0"
-                disabled={!thread || isSending}
+                disabled={isSending}
                 id="message-composer"
                 onChange={(event) => onDraftChange(event.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder={thread ? 'Ask Helm to do something…' : 'Create a thread to begin…'}
+                placeholder="Ask Helm to do something…"
                 rows={2}
                 value={draft}
               />
               <div className="flex items-center justify-between gap-3 px-3 pb-3">
-                {thread ? (
-                  <Button aria-label="Connected model" className="h-7 px-2 text-[11px] text-[#aeb7c1]" disabled={isSending} size="sm" variant="ghost">
-                    <Icon name="spark" size={13} />
-                    Gemma
-                  </Button>
-                ) : <span className="truncate text-xs text-[#606975]">No thread selected</span>}
-                <Button aria-label="Send message" disabled={!thread || !draft.trim() || isSending} size="icon-sm" type="submit">
+                <Button aria-label="Connected model" className="h-7 px-2 text-[11px] text-[#aeb7c1]" disabled={isSending} size="sm" variant="ghost">
+                  <Icon name="spark" size={13} />
+                  Gemma
+                </Button>
+                <Button aria-label="Send message" disabled={!draft.trim() || isSending} size="icon-sm" type="submit">
                   {isSending ? <Icon className="animate-spin" name="refresh" size={15} /> : <Icon name="arrow-up" size={16} />}
                 </Button>
               </div>

@@ -10,7 +10,7 @@ import type {
   ToolResult,
   WebSocketEvent,
 } from '@helm/shared';
-import { createLmStudioModels } from './ai';
+import { createLmStudioModels, fallbackThreadTitle } from './ai';
 import { MockGuestTransport } from './tools/mock-guest-transport';
 import { createGuestToolRegistry } from './tools/guest-tools';
 import { CriterionVerifierRegistry } from './tools/criterion-verifier';
@@ -47,6 +47,9 @@ const memoryInputSchema = z.object({
 const scriptedDemoInputSchema = z.object({ threadId: z.string().min(1).optional() });
 const agentRunInputSchema = z.object({
   threadId: z.string().min(1),
+  sourceMessageId: z.string().min(1),
+});
+const threadTitleInputSchema = z.object({
   sourceMessageId: z.string().min(1),
 });
 
@@ -413,6 +416,23 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
           if (!database.threads.delete(threadId)) return notFound('Thread not found.');
           return jsonResponse({ ok: true });
         }
+      }
+      if (request.method === 'POST' && segments[0] === 'api' && segments[1] === 'threads' && segments.length === 4 && segments[3] === 'title') {
+        const threadId = segments[2];
+        const thread = database.threads.getById(threadId);
+        if (!thread) return notFound('Thread not found.');
+        const input = threadTitleInputSchema.parse(await parseBody(request));
+        const sourceMessage = database.messages.getById(input.sourceMessageId);
+        if (!sourceMessage || sourceMessage.threadId !== threadId || sourceMessage.role !== 'user') {
+          throw new ApiFailure('MESSAGE_NOT_FOUND', 'The source message was not found in this thread.', 404);
+        }
+        const fallbackTitle = fallbackThreadTitle(sourceMessage.content);
+        if (thread.title !== fallbackTitle) {
+          return jsonResponse({ thread });
+        }
+        const generatedTitle = await models.titleGenerator.generate(sourceMessage.content);
+        const updatedThread = database.threads.updateTitle(threadId, generatedTitle || fallbackTitle);
+        return jsonResponse({ thread: updatedThread ?? thread });
       }
       if (segments[0] === 'api' && segments[1] === 'threads' && segments[3] === 'messages') {
         const threadId = segments[2];

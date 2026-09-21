@@ -3,7 +3,12 @@ import type { EmbeddingModel, LanguageModel } from 'ai';
 
 import type { HelmConfig } from '../config';
 import type { ToolDefinition } from '../tools/registry';
-import { AiSdkDecisionProvider, AiSdkEmbeddingProvider, AiSdkTaskPlanner } from './adapter';
+import {
+  AiSdkDecisionProvider,
+  AiSdkEmbeddingProvider,
+  AiSdkTaskPlanner,
+  AiSdkThreadTitleGenerator,
+} from './adapter';
 
 export interface HelmAiModels {
   provider: OpenAICompatibleProvider;
@@ -11,6 +16,7 @@ export interface HelmAiModels {
   embeddingModel: EmbeddingModel;
   decisionProvider: AiSdkDecisionProvider;
   taskPlanner: AiSdkTaskPlanner;
+  titleGenerator: AiSdkThreadTitleGenerator;
   embeddingProvider: AiSdkEmbeddingProvider;
 }
 
@@ -41,6 +47,7 @@ export function createLmStudioModels(config: HelmConfig, toolDefinitions: readon
       toolDefinitions,
     }),
     taskPlanner: new AiSdkTaskPlanner(sharedGenerationOptions),
+    titleGenerator: new AiSdkThreadTitleGenerator(sharedGenerationOptions),
     embeddingProvider: new AiSdkEmbeddingProvider({
       model: embeddingModel,
       dimensions: config.models.embeddingDimensions,

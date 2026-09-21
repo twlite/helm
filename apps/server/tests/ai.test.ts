@@ -2,7 +2,7 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { embed, type EmbeddingModel } from 'ai';
 import { describe, expect, it } from 'bun:test';
 
-import { AiSdkEmbeddingProvider } from '../src/ai/adapter';
+import { AiSdkEmbeddingProvider, AiSdkThreadTitleGenerator } from '../src/ai/adapter';
 
 function fakeEmbeddingModel(values: number[]): EmbeddingModel {
   return {
@@ -65,5 +65,64 @@ describe('LM Studio AI adapters', () => {
       model: 'text-embedding-nomic-embed-text-v1.5',
       input: ['hello Helm'],
     });
+  });
+
+  it('generates a thread title through the configured language model', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requestBody = JSON.parse(await request.text()) as Record<string, unknown>;
+        return Response.json({
+          id: 'chatcmpl-title',
+          object: 'chat.completion',
+          created: 1,
+          model: 'google/gemma-4-e2b',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: JSON.stringify({ title: 'Research twlite.dev' }),
+            },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      },
+    });
+
+    const generator = new AiSdkThreadTitleGenerator({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+    });
+
+    await expect(generator.generate('  Research twlite.dev and save the page  ')).resolves.toBe('Research twlite.dev');
+    expect(requestBody).toMatchObject({
+      model: 'google/gemma-4-e2b',
+      response_format: { type: 'json_schema' },
+    });
+  });
+
+  it('falls back to the trimmed input when title generation fails', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      fetch: async () => {
+        throw new Error('LM Studio is unavailable');
+      },
+    });
+    const generator = new AiSdkThreadTitleGenerator({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+    });
+
+    await expect(generator.generate('  Save this page to a file  ')).resolves.toBe('Save this page to a file');
   });
 });

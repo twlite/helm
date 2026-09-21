@@ -474,6 +474,14 @@ export const helmApi = {
     return parseSingle(payload, 'thread', parseThread);
   },
 
+  async generateThreadTitle(threadId: string, sourceMessageId: string): Promise<Thread> {
+    const payload = await request(
+      `/api/threads/${encodeURIComponent(threadId)}/title`,
+      jsonBody({ sourceMessageId }),
+    );
+    return parseSingle(payload, 'thread', parseThread);
+  },
+
   async deleteThread(threadId: string): Promise<void> {
     await request(`/api/threads/${encodeURIComponent(threadId)}`, { method: 'DELETE' });
   },

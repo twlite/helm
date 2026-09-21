@@ -87,6 +87,13 @@ export interface AiSdkTaskPlannerOptions {
   requestTimeoutMs: number;
 }
 
+export interface AiSdkThreadTitleGeneratorOptions {
+  model: LanguageModel;
+  maxOutputTokens: number;
+  temperature: number;
+  requestTimeoutMs: number;
+}
+
 const criterionSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('browser.url'), url: z.string().min(1) }),
   z.object({ type: z.literal('file.exists'), path: z.string().min(1) }),
@@ -126,6 +133,20 @@ export const aiDecisionSchema = z.discriminatedUnion('type', [
     reasoningSummary: z.string().max(400).optional(),
   }),
 ]);
+
+export const aiThreadTitleSchema = z.object({
+  title: z.string().trim().min(1).max(80),
+});
+
+const MAX_THREAD_TITLE_LENGTH = 200;
+
+/** Keep a useful title visible even when the model is unavailable. */
+export function fallbackThreadTitle(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed.length === 0) return 'New thread';
+  if (trimmed.length <= MAX_THREAD_TITLE_LENGTH) return trimmed;
+  return `${trimmed.slice(0, MAX_THREAD_TITLE_LENGTH - 3).trimEnd()}...`;
+}
 
 function toolCatalog(definitions: readonly ToolDefinition[]): Array<Record<string, unknown>> {
   return definitions.map(definition => {
@@ -219,6 +240,33 @@ export class AiSdkTaskPlanner implements TaskPlanner {
       criteria: plan.criteria as CompletionCriterion[],
       ...(plan.maxSteps === undefined ? {} : { maxSteps: plan.maxSteps }),
     };
+  }
+}
+
+export class AiSdkThreadTitleGenerator {
+  constructor(public readonly options: AiSdkThreadTitleGeneratorOptions) {}
+
+  async generate(input: string): Promise<string> {
+    const fallback = fallbackThreadTitle(input);
+    try {
+      const result = await generateStructured({
+        model: this.options.model,
+        maxOutputTokens: this.options.maxOutputTokens,
+        temperature: this.options.temperature,
+        requestTimeoutMs: this.options.requestTimeoutMs,
+        schema: aiThreadTitleSchema,
+        system: [
+          'You generate concise conversation titles for Helm.',
+          'Return a short human-readable title for the user request, not a sentence or explanation.',
+          'Use at most 80 characters, preserve the user intent, and do not use markdown or quotation marks.',
+        ].join(' '),
+        prompt: `User request:\n${promptJson(input, 8_000)}`,
+      });
+      const title = result.title.trim().replace(/\s+/gu, ' ');
+      return title.length > 0 ? title.slice(0, MAX_THREAD_TITLE_LENGTH).trimEnd() : fallback;
+    } catch {
+      return fallback;
+    }
   }
 }
 

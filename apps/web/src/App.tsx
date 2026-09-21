@@ -28,6 +28,12 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+function fallbackThreadTitle(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed.length <= 200) return trimmed;
+  return `${trimmed.slice(0, 197).trimEnd()}...`;
+}
+
 function mergeVmStatus(payload: unknown, previous: VmStatus | null): VmStatus | null {
   const source = isRecord(payload) && isRecord(payload.vm) ? payload.vm : payload;
   if (!isRecord(source)) {
@@ -271,18 +277,33 @@ function App() {
   }, [showError, threads]);
 
   const handleSendMessage = useCallback(async (content: string) => {
-    const threadId = selectedThreadIdRef.current;
-    if (!threadId) {
-      return;
-    }
     setMessageState('saving');
     setNotice(null);
     try {
+      let threadId = selectedThreadIdRef.current;
+      const shouldGenerateTitle = !threadId;
+      if (!threadId) {
+        const thread = await helmApi.createThread(fallbackThreadTitle(content));
+        threadId = thread.id;
+        selectedThreadIdRef.current = thread.id;
+        setThreads((current) => [thread, ...current.filter((item) => item.id !== thread.id)]);
+        setSelectedThreadId(thread.id);
+        setMessages([]);
+        setRun(null);
+        setIsActivityOpen(false);
+      }
       const message = await helmApi.createMessage(threadId, content);
       setMessages((current) => [...current, message]);
       setThreads((current) => current.map((thread) => thread.id === threadId ? { ...thread, updatedAt: message.createdAt } : thread));
       setDraft('');
       setMessageState('idle');
+      if (shouldGenerateTitle) {
+        void helmApi.generateThreadTitle(threadId, message.id)
+          .then((updatedThread) => {
+            setThreads((current) => current.map((thread) => thread.id === updatedThread.id ? updatedThread : thread));
+          })
+          .catch(() => undefined);
+      }
       try {
         const nextRun = await helmApi.runAgent(threadId, message.id);
         setRun(nextRun);
