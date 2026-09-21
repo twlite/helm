@@ -4,3 +4,4 @@ dist/
 .env.*
 *.db*
 helm-old
+PLAN.md
