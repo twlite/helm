@@ -211,6 +211,7 @@ export class AgentRuntime {
           memories: clone(memories),
           stepIndex,
           previousResults: clone(previousResults),
+          signal: cancellation.signal,
         };
         const decision = await this.decisionProvider.next(context);
         await this.persistStep(steps, {
@@ -387,7 +388,11 @@ export class AgentRuntime {
 
   private async createTask(input: RunTaskInput): Promise<TaskDefinition> {
     if (!this.taskPlanner) throw new Error('A task planner is required when no task is supplied');
-    return this.taskPlanner.createTask({ threadId: input.threadId, userMessage: input.userMessage });
+    return this.taskPlanner.createTask({
+      threadId: input.threadId,
+      userMessage: input.userMessage,
+      signal: input.signal,
+    });
   }
 
   private async loadMemories(): Promise<Memory[]> {

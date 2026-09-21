@@ -137,6 +137,12 @@ function App() {
     if (event.runId && event.type.startsWith('run.')) {
       setIsActivityOpen(true);
       void refreshRun(event.runId);
+      if (['run.completed', 'run.failed', 'run.cancelled'].includes(event.type)) {
+        const currentThreadId = selectedThreadIdRef.current;
+        if (currentThreadId) {
+          void helmApi.listMessages(currentThreadId).then(setMessages).catch(() => undefined);
+        }
+      }
     }
   }, [refreshRun]);
 
@@ -277,6 +283,13 @@ function App() {
       setThreads((current) => current.map((thread) => thread.id === threadId ? { ...thread, updatedAt: message.createdAt } : thread));
       setDraft('');
       setMessageState('idle');
+      try {
+        const nextRun = await helmApi.runAgent(threadId, message.id);
+        setRun(nextRun);
+        setIsActivityOpen(true);
+      } catch (error) {
+        showError(error);
+      }
     } catch (error) {
       setMessageState('error');
       showError(error);

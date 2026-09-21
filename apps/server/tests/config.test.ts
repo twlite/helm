@@ -1,0 +1,29 @@
+import { describe, expect, it } from 'bun:test';
+
+import { loadConfig } from '../src/config';
+
+describe('Helm model configuration', () => {
+  it('loads the checked-in LM Studio models', () => {
+    const config = loadConfig({});
+
+    expect(config.models).toMatchObject({
+      providerName: 'lmstudio',
+      baseUrl: 'http://localhost:1234/v1',
+      languageModel: 'google/gemma-4-e2b',
+      embeddingModel: 'text-embedding-nomic-embed-text-v1.5',
+      embeddingDimensions: 768,
+    });
+  });
+
+  it('allows environment overrides without changing the checked-in model file', () => {
+    const config = loadConfig({
+      HELM_LLM_BASE_URL: 'http://localhost:4321/v1/',
+      HELM_LANGUAGE_MODEL: 'local/test-model',
+      HELM_EMBEDDING_DIMENSIONS: '4',
+    });
+
+    expect(config.models.baseUrl).toBe('http://localhost:4321/v1');
+    expect(config.models.languageModel).toBe('local/test-model');
+    expect(config.models.embeddingDimensions).toBe(4);
+  });
+});

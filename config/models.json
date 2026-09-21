@@ -1,0 +1,11 @@
+{
+  "providerName": "lmstudio",
+  "baseUrl": "http://localhost:1234/v1",
+  "languageModel": "google/gemma-4-e2b",
+  "embeddingModel": "text-embedding-nomic-embed-text-v1.5",
+  "embeddingDimensions": 768,
+  "maxOutputTokens": 2048,
+  "temperature": 0,
+  "requestTimeoutMs": 120000,
+  "supportsStructuredOutputs": true
+}

@@ -197,9 +197,6 @@ export function Conversation({
               </Button>
             </Alert>
           ) : null}
-          {thread && !isRunStarting ? (
-            <p className="mb-2 px-1 text-[11px] text-[#606975]">No model configured · messages are saved to this thread.</p>
-          ) : null}
           <form onSubmit={(event) => void handleSubmit(event)}>
             <div className="rounded-2xl border border-white/[0.1] bg-[#11151b] shadow-xl shadow-black/10 transition-colors focus-within:border-teal-400/45">
               <label className="sr-only" htmlFor="message-composer">Message</label>
@@ -215,9 +212,9 @@ export function Conversation({
               />
               <div className="flex items-center justify-between gap-3 px-3 pb-3">
                 {thread ? (
-                  <Button aria-label="Model selector, no model configured" className="h-7 px-2 text-[11px] text-[#606975]" disabled size="sm" variant="ghost">
+                  <Button aria-label="Connected model" className="h-7 px-2 text-[11px] text-[#aeb7c1]" disabled={isSending} size="sm" variant="ghost">
                     <Icon name="spark" size={13} />
-                    No model
+                    Gemma
                   </Button>
                 ) : <span className="truncate text-xs text-[#606975]">No thread selected</span>}
                 <Button aria-label="Send message" disabled={!thread || !draft.trim() || isSending} size="icon-sm" type="submit">

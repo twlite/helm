@@ -1,6 +1,6 @@
 import { startHelmServer } from './server';
 
-export * from './ai/adapter';
+export * from './ai';
 export * from './config';
 export * from './events';
 export * from './server';

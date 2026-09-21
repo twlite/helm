@@ -150,6 +150,7 @@ export interface AgentTurnContext {
   memories: Memory[];
   stepIndex: number;
   previousResults: ToolResult[];
+  signal?: AbortSignal;
 }
 
 export interface Run {

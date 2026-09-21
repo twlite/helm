@@ -10,7 +10,7 @@ Helm is a small, explainable computer-use agent harness for a final-year univers
 - Zod-validated host/guest protocol
 - Playwright with visible Chromium in an XFCE/X11 Linux guest
 - Swift and Apple Virtualization.framework on Apple Silicon macOS
-- No model provider is configured in this version
+- LM Studio through the Vercel AI SDK OpenAI-compatible provider
 
 ## Architecture
 
@@ -39,11 +39,14 @@ bun test
 bun run build
 bun run guest:build
 bun dev
+# or: ./start-helm.sh
 ```
 
 The server listens on `http://127.0.0.1:8787` and Vite normally listens on `http://127.0.0.1:5173`.
 
-The application boots without an API key. Messages persist even when no model is configured, and the UI labels that state explicitly.
+By default Helm reads [`config/models.json`](config/models.json) and connects to an OpenAI-compatible LM Studio server at `http://localhost:1234/v1`. Load the configured language model and embedding model in LM Studio before sending a task. The server does not require an API key for this local connection.
+
+`./start-helm.sh` is the shortcut launcher. It resolves the repository root and delegates to `bun dev`, which starts the Bun backend and Vite frontend in parallel. The VM remains an explicit lifecycle operation and LM Studio is an external service.
 
 ## Scripted demo
 
@@ -53,7 +56,7 @@ Start the server, then run:
 bun run demo
 ```
 
-The scripted provider uses the same runtime, tool registry, verifier, persistence, and event stream as a future model provider. The local fixture is opened, extracted text is carried into `fs.write`, the file is opened in the allowlisted editor, and Helm verifies every criterion before completing the run. Tests use a mock guest transport; VM integration is opt-in.
+The scripted provider uses the same runtime, tool registry, verifier, persistence, and event stream as the LM Studio provider. The local fixture is opened, extracted text is carried into `fs.write`, the file is opened in the allowlisted editor, and Helm verifies every criterion before completing the run. Tests use a mock guest transport; VM integration is opt-in.
 
 ## VM lifecycle
 
@@ -78,4 +81,4 @@ The native helper expects a prepared ARM64 Linux image. `vm:doctor` reports miss
 
 ## Current limitations
 
-This implementation deliberately does not connect to a real AI provider, plan tasks from arbitrary natural language, extract memories automatically, provide unrestricted shell access, support Windows/Linux-host virtualization, or implement remote desktop streaming. VM tests require a prepared guest image and are guarded by `HELM_VM_INTEGRATION=1`.
+This implementation does not extract memories automatically, provide unrestricted shell access, support Windows/Linux-host virtualization, or implement remote desktop streaming. VM tests require a prepared guest image and are guarded by `HELM_VM_INTEGRATION=1`. The LM Studio provider plans tasks and proposes actions, while Helm's runtime remains authoritative for tool execution and verification.

@@ -3,17 +3,19 @@ import { mkdirSync } from 'node:fs';
 import { z } from 'zod';
 import type {
   JsonValue,
+  GuestMethod,
   MessageRole,
   Run,
   RunStep,
   ToolResult,
   WebSocketEvent,
 } from '@helm/shared';
+import { createLmStudioModels } from './ai';
 import { MockGuestTransport } from './tools/mock-guest-transport';
 import { createGuestToolRegistry } from './tools/guest-tools';
 import { CriterionVerifierRegistry } from './tools/criterion-verifier';
 import { AgentRuntime, createScriptedDemoDecisions, createScriptedDemoTask, ScriptedDecisionProvider, ScriptedTaskPlanner } from './agent';
-import type { RuntimeEvent, RuntimeEventSink, RuntimeRepository } from './agent';
+import type { AgentRuntimeResult, RuntimeEvent, RuntimeEventSink, RuntimeRepository } from './agent';
 import { PersistenceDatabase } from './db/database';
 import type { CreateMemoryInput } from './memory/repository';
 import { MemoryService } from './memory/service';
@@ -22,6 +24,12 @@ import { loadConfig, type HelmConfig } from './config';
 import { logger } from './logger';
 import { HttpGuestTransport } from './vm/transport';
 import { VmController } from './vm/vm-controller';
+import type {
+  GuestMethodParams,
+  GuestMethodResult,
+  GuestRequestOptions,
+  GuestTransport,
+} from './tools/guest-transport';
 
 const messageInputSchema = z.object({
   role: z.enum(['user', 'assistant', 'system', 'tool']).default('user'),
@@ -37,6 +45,10 @@ const memoryInputSchema = z.object({
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
 const scriptedDemoInputSchema = z.object({ threadId: z.string().min(1).optional() });
+const agentRunInputSchema = z.object({
+  threadId: z.string().min(1),
+  sourceMessageId: z.string().min(1),
+});
 
 function jsonValue(value: unknown): JsonValue {
   try {
@@ -202,7 +214,6 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
   mkdirSync(config.dataDir, { recursive: true });
   mkdirSync(config.runtimeDir, { recursive: true });
   const database = new PersistenceDatabase(config.databasePath);
-  const memory = new MemoryService(database.sqlite);
   const events = new EventHub();
   const envelopeGuest = new HttpGuestTransport({
     baseUrl: `http://${config.guestHost}:${config.guestPort}`,
@@ -212,6 +223,23 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
   const activeRuns = new Map<string, { runtime: AgentRuntime; cancellation: AbortController }>();
   const runAdapter = new RuntimeDatabaseAdapter(database);
   const runtimeEvents = new RuntimeEvents(events);
+  const realToolOptions = { defaultTimeoutMs: config.toolTimeoutMs };
+  const agentGuest: GuestTransport = {
+    request: async <M extends GuestMethod>(
+      method: M,
+      params: GuestMethodParams[M],
+      options?: GuestRequestOptions,
+    ): Promise<GuestMethodResult[M]> => envelopeGuest.request<GuestMethodResult[M]>(
+      { id: `guest_${Date.now()}_${Math.random().toString(36).slice(2)}`, method, params },
+      options?.signal,
+    ),
+  };
+  const realToolDefinitions = createGuestToolRegistry(agentGuest, realToolOptions).list();
+  const models = createLmStudioModels(config, realToolDefinitions);
+  const memory = new MemoryService(database.sqlite, {
+    embeddingProvider: models.embeddingProvider,
+    sqliteVec: { dimensions: config.models.embeddingDimensions },
+  });
 
   const runScriptedDemo = async (threadId: string, sourceMessageId?: string): Promise<Run> => {
     const guest = new MockGuestTransport();
@@ -250,6 +278,96 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
     } finally {
       activeRuns.delete(runId);
     }
+  };
+
+  const createAiRuntime = (): AgentRuntime => {
+    const tools = createGuestToolRegistry(agentGuest, realToolOptions);
+    return new AgentRuntime({
+      guestTransport: agentGuest,
+      toolRegistry: tools,
+      verifier: new CriterionVerifierRegistry(agentGuest),
+      decisionProvider: models.decisionProvider,
+      taskPlanner: models.taskPlanner,
+      repository: runAdapter,
+      events: runtimeEvents,
+      memories: async () => memory.list(),
+      budgets: {
+        maxSteps: config.maxSteps,
+        maxRepeatedAction: config.maxRepeatedAction,
+        maxConsecutiveFailures: config.maxConsecutiveFailures,
+        toolTimeoutMs: config.toolTimeoutMs,
+      },
+    });
+  };
+
+  const assistantMessageForResult = (result: AgentRuntimeResult): string => {
+    if (result.status === 'completed') {
+      return result.finalVerification?.summary ?? 'Task completed and verified.';
+    }
+    return result.run.error?.message ?? `Task ended with status: ${result.status}.`;
+  };
+
+  const startAiRun = (threadId: string, sourceMessageId: string): Run => {
+    const sourceMessage = database.messages.getById(sourceMessageId);
+    if (!sourceMessage || sourceMessage.threadId !== threadId) {
+      throw new ApiFailure('MESSAGE_NOT_FOUND', 'The source message was not found in this thread.', 404);
+    }
+
+    const runId = `run-${randomUUID()}`;
+    const pendingRun = database.runs.create({
+      id: runId,
+      threadId,
+      sourceMessageId,
+      goal: sourceMessage.content,
+      criteria: [],
+      status: 'pending',
+    });
+    const runtime = createAiRuntime();
+    const cancellation = new AbortController();
+    activeRuns.set(runId, { runtime, cancellation });
+    void runtime.run({
+      threadId,
+      userMessage: sourceMessage.content,
+      runId,
+      sourceMessageId,
+      signal: cancellation.signal,
+    }).then(result => {
+      const persistedRun = database.runs.getById(result.run.id) ?? result.run;
+      database.messages.create({
+        threadId,
+        role: 'assistant',
+        content: assistantMessageForResult(result),
+        metadata: {
+          source: 'ai-run',
+          runId: persistedRun.id,
+          status: persistedRun.status,
+        },
+      });
+    }).catch(error => {
+      const normalized = errorDetails(error);
+      const runError = { code: normalized.code, message: normalized.message };
+      const cancelled = cancellation.signal.aborted;
+      if (cancelled) {
+        database.runs.cancel(runId, { code: 'RUN_CANCELLED', message: 'Run was cancelled.' });
+      } else {
+        database.runs.fail(runId, runError);
+      }
+      database.messages.create({
+        threadId,
+        role: 'assistant',
+        content: cancelled ? 'Run was cancelled.' : normalized.message,
+        metadata: { source: 'ai-run', runId, status: cancelled ? 'cancelled' : 'failed' },
+      });
+      runtimeEvents.emit({
+        type: cancelled ? 'run.cancelled' : 'run.failed',
+        timestamp: new Date().toISOString(),
+        runId,
+        payload: cancelled ? { code: 'RUN_CANCELLED', message: 'Run was cancelled.' } : runError,
+      });
+    }).finally(() => {
+      activeRuns.delete(runId);
+    });
+    return pendingRun;
   };
 
   const handle = async (request: Request, server?: { upgrade(request: Request, options?: unknown): boolean }): Promise<Response | undefined> => {
@@ -320,6 +438,12 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
         const message = database.messages.create({ threadId: selectedThread.id, role: 'user', content: task.goal, metadata: { source: 'scripted-demo' } });
         const run = await runScriptedDemo(selectedThread.id, message.id);
         return jsonResponse({ run: { ...run, steps: database.runSteps.listByRun(run.id) } }, 201);
+      }
+      if (request.method === 'POST' && url.pathname === '/api/runs/agent') {
+        const input = agentRunInputSchema.parse(await parseBody(request));
+        if (!database.threads.getById(input.threadId)) return notFound('Thread not found.');
+        const run = startAiRun(input.threadId, input.sourceMessageId);
+        return jsonResponse({ run: { ...run, steps: [] } }, 202);
       }
       if (request.method === 'POST' && segments[0] === 'api' && segments[1] === 'runs' && segments[3] === 'cancel') {
         const runId = segments[2];

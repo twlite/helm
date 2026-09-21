@@ -33,6 +33,7 @@ export type {
 export interface TaskPlannerInput {
   threadId: string;
   userMessage: string;
+  signal?: AbortSignal;
 }
 
 export interface TaskPlanner {

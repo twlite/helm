@@ -42,7 +42,12 @@ export class PersistenceDatabase {
       create: !(options.readonly ?? false),
       strict: true,
     });
-    sqliteVec.load(this.sqlite);
+    try {
+      sqliteVec.load(this.sqlite);
+    } catch {
+      // sqlite-vec is optional. The memory vector adapter records the
+      // capability failure and keeps FTS5 available as the fallback.
+    }
     this.db = this.sqlite;
 
     if (options.foreignKeys ?? true) {

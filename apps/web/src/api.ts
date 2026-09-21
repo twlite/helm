@@ -504,6 +504,11 @@ export const helmApi = {
     return parseSingle(payload, 'run', parseRun);
   },
 
+  async runAgent(threadId: string, sourceMessageId: string): Promise<RunDetails> {
+    const payload = await request('/api/runs/agent', jsonBody({ threadId, sourceMessageId }));
+    return parseSingle(payload, 'run', parseRun);
+  },
+
   async cancelRun(runId: string): Promise<void> {
     await request(`/api/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
   },
