@@ -1,0 +1,93 @@
+import { z } from 'zod';
+
+const pathSchema = z.string().min(1);
+
+export const completionCriterionSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('browser.url'), url: z.string().url().or(z.string().startsWith('file://')) }),
+  z.object({ type: z.literal('file.exists'), path: pathSchema }),
+  z.object({ type: z.literal('file.contains'), path: pathSchema, expected: z.string() }),
+  z.object({
+    type: z.literal('window.open'),
+    application: z.string().optional(),
+    titleIncludes: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal('window.focused'),
+    application: z.string().optional(),
+    titleIncludes: z.string().optional(),
+  }),
+  z.object({ type: z.literal('custom'), id: z.string().min(1), description: z.string().min(1) }),
+]);
+
+const coordinateSchema = z.object({ x: z.number().finite(), y: z.number().finite() });
+
+export const guestMethodSchemas = {
+  'guest.handshake': z.object({}),
+  'fs.read': z.object({ path: pathSchema }),
+  'fs.write': z.object({ path: pathSchema, content: z.string() }),
+  'fs.exists': z.object({ path: pathSchema }),
+  'fs.list': z.object({ path: pathSchema }),
+  'fs.stat': z.object({ path: pathSchema }),
+  'browser.navigate': z.object({ url: z.string().min(1) }),
+  'browser.getState': z.object({}),
+  'browser.snapshot': z.object({}),
+  'browser.extractText': z.object({}),
+  'browser.click': z.object({
+    ref: z.string().min(1).optional(),
+    x: z.number().finite().optional(),
+    y: z.number().finite().optional(),
+  }).refine(
+    value => {
+      const hasX = value.x !== undefined;
+      const hasY = value.y !== undefined;
+      const hasCoordinates = hasX && hasY;
+      return hasX === hasY && Boolean(value.ref) !== hasCoordinates;
+    },
+    'Provide either ref or both x and y',
+  ),
+  'browser.type': z.object({ ref: z.string().min(1), text: z.string() }),
+  'app.launch': z.object({ application: z.enum(['browser', 'text-editor', 'file-manager']) }),
+  'app.openFile': z.object({ path: pathSchema, application: z.enum(['text-editor', 'file-manager']).optional() }),
+  'desktop.getState': z.object({}),
+  'desktop.listWindows': z.object({}),
+  'desktop.focusWindow': z.object({ application: z.string().optional(), titleIncludes: z.string().optional() }),
+  'desktop.hotkey': z.object({ keys: z.array(z.string().min(1)).min(1).max(8) }),
+  'desktop.type': z.object({ text: z.string() }),
+  'desktop.click': coordinateSchema,
+  'desktop.screenshot': z.object({}),
+} as const;
+
+export const guestRequestEnvelopeSchema = z.object({
+  id: z.string().min(1),
+  method: z.string().min(1),
+  params: z.unknown(),
+});
+
+export const guestResponseSchema = z.object({
+  id: z.string().min(1),
+  ok: z.boolean(),
+  result: z.unknown().optional(),
+  error: z
+    .object({ code: z.string(), message: z.string(), details: z.unknown().optional() })
+    .optional(),
+});
+
+export function parseGuestRequest(input: unknown) {
+  const envelope = guestRequestEnvelopeSchema.parse(input);
+  const schema = guestMethodSchemas[envelope.method as keyof typeof guestMethodSchemas];
+  if (!schema) {
+    throw new Error(`Unknown guest method: ${envelope.method}`);
+  }
+  return {
+    id: envelope.id,
+    method: envelope.method as keyof typeof guestMethodSchemas,
+    params: schema.parse(envelope.params),
+  };
+}
+
+export const webSocketEventSchema = z.object({
+  type: z.string().min(1),
+  timestamp: z.string().datetime(),
+  runId: z.string().optional(),
+  payload: z.unknown(),
+});

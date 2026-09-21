@@ -5,3 +5,6 @@ dist/
 *.db*
 helm-old
 PLAN.md
+runtime/guest/*
+!runtime/guest/.gitkeep
+guest/helm-guest/bridge/vsock-tcp-bridge

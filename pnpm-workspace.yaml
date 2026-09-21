@@ -1,5 +1,6 @@
 packages:
   - apps/*
   - packages/*
+  - guest/*
 catalog:
   '@types/node': ^25.5.0

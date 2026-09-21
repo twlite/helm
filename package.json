@@ -1,9 +1,41 @@
 {
   "name": "@helm/monorepo",
   "private": true,
-  "scripts": {},
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "guest/*"
+  ],
+  "scripts": {
+    "dev": "bun scripts/dev.ts",
+    "test": "bun test",
+    "build": "bun run build:shared && bun run build:server && bun run build:web",
+    "build:shared": "bun run --cwd packages/shared build",
+    "build:server": "bun run --cwd apps/server build",
+    "build:web": "bun run --cwd apps/web build",
+    "typecheck": "bun run typecheck:shared && bun run typecheck:server && bun run typecheck:web && bun run typecheck:guest",
+    "typecheck:shared": "bun run --cwd packages/shared typecheck",
+    "typecheck:server": "bun run --cwd apps/server typecheck",
+    "typecheck:web": "bun run --cwd apps/web typecheck",
+    "typecheck:guest": "bun run --cwd guest/helm-guest check",
+    "guest:build": "bun scripts/guest-build.ts",
+    "guest:bridge:build": "bash guest/helm-guest/bridge/build.sh",
+    "vm:build": "bash scripts/vm-build.sh",
+    "vm:doctor": "bun scripts/vm-doctor.ts",
+    "vm:start": "bun scripts/vm-command.ts start",
+    "vm:stop": "bun scripts/vm-command.ts stop",
+    "vm:reset": "bun scripts/vm-command.ts reset",
+    "demo": "bun scripts/demo.ts"
+  },
   "devDependencies": {
-    "@types/node": "^24.6.1"
+    "@types/node": "^24.6.1",
+    "bun-types": "^1.4.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "ai": "^7.0.107",
+    "zod": "^4.1.12"
   },
   "author": "Twilight <hello@twlite.dev>",
   "license": "MIT",
