@@ -16,8 +16,9 @@ package.
 
 The host configures a generic EFI Linux VM with Virtio block storage, Virtio
 graphics, USB keyboard, absolute USB pointing, NAT networking, entropy,
-traditional Virtio memory ballooning, a read-only VirtioFS runtime share, and
-one Virtio socket device. The configuration is passed through
+traditional Virtio memory ballooning, a read-only VirtioFS runtime share, a
+SPICE agent Virtio console for clipboard sharing, and one Virtio socket device.
+The configuration is passed through
 `VZVirtualMachineConfiguration.validate()` before a VM object is created.
 
 ## Build and sign
@@ -46,7 +47,7 @@ The default root is:
 │   ├── base.img          # sealed Ubuntu installation, never modified by host
 │   ├── disk.img          # mutable working copy
 │   ├── efi-vars.bin      # EFI variable store
-│   ├── machine-id.bin    # persistent generic VM identifier
+│   ├── machine-id.bin    # persistent provisioning/normal VM identifier
 │   ├── provisioning.img  # interactive installer disk
 │   ├── provisioning-efi-vars.bin
 │   └── provisioning.lock # transient; owned by bun run vm:provision
@@ -54,13 +55,19 @@ The default root is:
 ```
 
 `base.img` must exist before `vm.start` or `vm.reset`. The repository-level
-`bun run vm:provision /path/to/ubuntu-24.04-arm64.iso` command creates a
+`bun run vm:provision --iso /path/to/ubuntu-24.04-arm64.iso` command creates a
 separate sparse 24 GiB installation disk, a fresh provisioning EFI store, and
 an AppKit window containing `VZVirtualMachineView`. The ISO is attached
 read-only through `VZUSBMassStorageDeviceConfiguration`; the writable disk is
 attached through Virtio. After the interactive installation shuts down, run
 `bun run vm:seal` to atomically copy the retained installation disk to
 `base.img` and promote the provisioning EFI state to the normal EFI path.
+
+If the installer VM is stopped before installation completes, resume it with
+`bun run vm:provision --resume`. Resume requires the existing provisioning disk
+and EFI store, never recreates or truncates them, and may optionally receive
+`--iso /path/to/ubuntu-24.04-arm64.iso` to attach installer media again. Fresh
+provisioning refuses existing provisioning state unless `--force` is supplied.
 
 If `disk.img` is missing, the normal host copies `base.img` to it. If
 `efi-vars.bin` is missing, the normal host creates it with
@@ -81,7 +88,9 @@ sudo mount -t virtiofs helm-runtime /opt/helm-runtime
 
 The prepared guest image remains responsible for mounting the share at boot,
 starting the AF_VSOCK-to-loopback bridge from `guest/helm-guest/bridge`, and
-starting `helm-guest` after its graphical session is ready.
+starting `helm-guest` after its graphical session is ready. For host clipboard
+support, install Ubuntu's `spice-vdagent` package and run it in the logged-in
+graphical session. See `docs/vm-setup.md` for the guest setup command.
 
 ## JSON Lines protocol
 

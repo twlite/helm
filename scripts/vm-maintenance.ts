@@ -32,6 +32,7 @@ const helper = Bun.spawn([
   '--efi-vars', config.efiVariablesPath,
   '--machine-id', config.machineIdentifierPath,
   '--runtime-share', config.runtimeDir,
+  '--runtime-tag', config.runtimeTag,
   '--guest-port', String(config.guestPort),
   '--memory-mib', String(config.vmMemoryMb),
   '--cpus', String(config.vmCpus),

@@ -58,7 +58,7 @@ add(
   baseState === 'valid'
     ? config.baseImagePath
     : baseState === 'missing'
-      ? `run bun run vm:provision /path/to/ubuntu-24.04-arm64.iso, then bun run vm:seal (${config.baseImagePath})`
+      ? `run bun run vm:provision --iso /path/to/ubuntu-24.04-arm64.iso, then bun run vm:seal (${config.baseImagePath})`
       : `missing or invalid: ${config.baseImagePath}`,
   baseState === 'invalid',
 );

@@ -24,6 +24,7 @@ interface PlaywrightPage {
   on(event: string, listener: (...args: unknown[]) => void): void;
   waitForLoadState(state?: WaitUntil, options?: { timeout?: number }): Promise<void>;
   close(): Promise<void>;
+  isClosed?(): boolean;
 }
 
 interface PlaywrightContext {
@@ -135,6 +136,13 @@ function browserLaunchError(error: unknown): GuestRpcError {
   return new GuestRpcError("BROWSER_START_FAILED", message);
 }
 
+function isClosedBrowserError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:target page|page|browser|context).*(?:closed|crashed)|(?:browser|context|connection) has been closed|target closed/iu.test(
+    message,
+  );
+}
+
 export class BrowserController {
   private context: PlaywrightContext | undefined;
   private page: PlaywrightPage | undefined;
@@ -169,11 +177,26 @@ export class BrowserController {
     this.loading = true;
 
     try {
-      await page.goto(url, { waitUntil, timeout: timeoutMs });
-      this.loading = false;
-      await this.readTitle(page);
-      return await this.getState();
+      return await this.navigatePage(page, url, waitUntil, timeoutMs);
     } catch (error) {
+      // Chromium can be closed from the guest desktop while the controller
+      // still holds the old Playwright page object. Recreate the persistent
+      // context once so the next agent action can recover instead of
+      // repeating the same stale-page failure until the runtime loop guard
+      // stops the task.
+      if (isClosedBrowserError(error)) {
+        await this.resetContext();
+        try {
+          const reopenedPage = await this.ensurePage();
+          return await this.navigatePage(reopenedPage, url, waitUntil, timeoutMs);
+        } catch (retryError) {
+          throw new GuestRpcError(
+            "BROWSER_NAVIGATION_FAILED",
+            retryError instanceof Error ? retryError.message.slice(0, 500) : "The page could not be loaded.",
+            { details: await this.stateWithoutThrowing(this.page ?? page) },
+          );
+        }
+      }
       throw new GuestRpcError(
         "BROWSER_NAVIGATION_FAILED",
         error instanceof Error ? error.message.slice(0, 500) : "The page could not be loaded.",
@@ -419,7 +442,12 @@ export class BrowserController {
 
   private async ensurePage(): Promise<PlaywrightPage> {
     if (this.context !== undefined && this.page !== undefined) {
-      return this.page;
+      try {
+        if (!this.page.isClosed?.()) return this.page;
+      } catch {
+        // Treat an unusable page exactly like a closed browser session.
+      }
+      await this.resetContext();
     }
 
     const module = await loadPlaywright();
@@ -481,6 +509,26 @@ export class BrowserController {
     this.references.clear();
   }
 
+  private async navigatePage(
+    page: PlaywrightPage,
+    url: string,
+    waitUntil: WaitUntil,
+    timeoutMs: number,
+  ): Promise<BrowserState> {
+    await page.goto(url, { waitUntil, timeout: timeoutMs });
+    this.loading = false;
+    await this.readTitle(page);
+    return this.getState();
+  }
+
+  private async resetContext(): Promise<void> {
+    const context = this.context;
+    this.context = undefined;
+    this.page = undefined;
+    this.invalidateReferences();
+    await context?.close().catch(() => undefined);
+  }
+
   private async readTitle(page: PlaywrightPage): Promise<string> {
     try {
       return (await page.title()).slice(0, 1_000);
@@ -490,10 +538,17 @@ export class BrowserController {
   }
 
   private async stateWithoutThrowing(page: PlaywrightPage): Promise<BrowserState> {
+    let url = "";
+    try {
+      url = page.url();
+    } catch {
+      // The browser may have disappeared between the tool failure and this
+      // diagnostic snapshot.
+    }
     return {
-      ready: true,
+      ready: this.context !== undefined && this.page !== undefined,
       visible: true,
-      url: page.url(),
+      url,
       title: await this.readTitle(page),
       loading: this.loading,
     };

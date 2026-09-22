@@ -517,6 +517,25 @@ export const helmApi = {
     return parseSingle(payload, 'run', parseRun);
   },
 
+  async queueAgent(threadId: string, sourceMessageId: string): Promise<{ queued: boolean; position: number; run?: RunDetails }> {
+    const payload = await request('/api/runs/queue', jsonBody({ threadId, sourceMessageId }));
+    const record = isRecord(payload) ? payload : {};
+    const run = parseRun(record.run);
+    return {
+      queued: asBoolean(record.queued),
+      position: asNumber(record.position),
+      ...(run ? { run } : {}),
+    };
+  },
+
+  async steerRun(runId: string, messageId: string): Promise<Message> {
+    const payload = await request(
+      `/api/runs/${encodeURIComponent(runId)}/steer`,
+      jsonBody({ messageId }),
+    );
+    return parseSingle(payload, 'message', parseMessage);
+  },
+
   async cancelRun(runId: string): Promise<void> {
     await request(`/api/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
   },

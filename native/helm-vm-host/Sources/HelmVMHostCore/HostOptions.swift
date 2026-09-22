@@ -23,7 +23,7 @@ public struct HostOptions {
         var efiVariablesPath: String?
         var machineIdentifierPath: String?
         var runtimeSharePath: String?
-        var runtimeTag = environmentValue("HELM_VM_RUNTIME_TAG") ?? "helm-runtime"
+        var runtimeTag = environmentValue("HELM_VM_RUNTIME_TAG") ?? HelmRuntimeShareConfiguration.defaultTag
         var guestPort = try parseUInt32(
             environmentValue("HELM_VM_GUEST_PORT") ?? "4242",
             option: "HELM_VM_GUEST_PORT"
@@ -115,25 +115,25 @@ public struct HostOptions {
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/Helm", isDirectory: true)
                 .path
-        let rootURL = resolvePath(rootPath ?? defaultRoot)
+        let rootURL = resolveHelmPath(rootPath ?? defaultRoot)
         let vmDirectoryURL = rootURL.appendingPathComponent("vm", isDirectory: true)
-        let resolvedBaseImageURL = resolvePath(
+        let resolvedBaseImageURL = resolveHelmPath(
             baseImagePath ?? environmentValue("HELM_VM_BASE_IMAGE")
                 ?? vmDirectoryURL.appendingPathComponent("base.img").path
         )
-        let resolvedWorkingImageURL = resolvePath(
+        let resolvedWorkingImageURL = resolveHelmPath(
             workingImagePath ?? environmentValue("HELM_VM_WORKING_IMAGE")
                 ?? vmDirectoryURL.appendingPathComponent("disk.img").path
         )
-        let resolvedEFIURL = resolvePath(
+        let resolvedEFIURL = resolveHelmPath(
             efiVariablesPath ?? environmentValue("HELM_VM_EFI_VARS")
                 ?? vmDirectoryURL.appendingPathComponent("efi-vars.bin").path
         )
-        let resolvedMachineIdentifierURL = resolvePath(
+        let resolvedMachineIdentifierURL = resolveHelmPath(
             machineIdentifierPath ?? environmentValue("HELM_VM_MACHINE_ID")
                 ?? vmDirectoryURL.appendingPathComponent("machine-id.bin").path
         )
-        let resolvedRuntimeURL = resolvePath(
+        let resolvedRuntimeURL = resolveHelmPath(
             runtimeSharePath ?? environmentValue("HELM_VM_RUNTIME_SHARE")
                 ?? rootURL.appendingPathComponent("runtime", isDirectory: true).path
         )
@@ -199,29 +199,6 @@ public struct HostOptions {
             throw HostFailure(code: "invalid_argument", message: "Invalid integer for \(option): \(value).")
         }
         return parsed
-    }
-
-    private static func resolvePath(_ value: String) -> URL {
-        let expanded: String
-        if value == "~" {
-            expanded = FileManager.default.homeDirectoryForCurrentUser.path
-        } else if value.hasPrefix("~/") {
-            expanded = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(String(value.dropFirst(2)))
-                .path
-        } else {
-            expanded = value
-        }
-
-        if expanded.hasPrefix("/") {
-            return URL(fileURLWithPath: expanded).standardizedFileURL
-        }
-        let currentDirectoryURL = URL(
-            fileURLWithPath: FileManager.default.currentDirectoryPath,
-            isDirectory: true
-        )
-        return URL(fileURLWithPath: expanded, relativeTo: currentDirectoryURL)
-            .standardizedFileURL
     }
 
     private static func printUsage() {

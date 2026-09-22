@@ -33,6 +33,8 @@ describe('Helm model configuration', () => {
       HELM_DATA_DIR: '/tmp/helm-test-data',
     });
 
+    expect(config.vmDir).toBe('/tmp/helm-test-data/vm');
+    expect(config.runtimeTag).toBe('helm-runtime');
     expect(config.provisioningImagePath).toBe('/tmp/helm-test-data/vm/provisioning.img');
     expect(config.provisioningEfiVariablesPath).toBe('/tmp/helm-test-data/vm/provisioning-efi-vars.bin');
     expect(config.provisioningLockPath).toBe('/tmp/helm-test-data/vm/provisioning.lock');

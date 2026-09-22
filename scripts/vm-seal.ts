@@ -142,7 +142,7 @@ try {
 const sourceState = await inspectFile(sourcePath);
 if (sourceState !== 'valid') {
   console.error(`No valid installed provisioning disk was found at ${sourcePath}`);
-  console.error('Run `bun run vm:provision /path/to/ubuntu-24.04-arm64.iso` first.');
+  console.error('Run `bun run vm:provision --iso /path/to/ubuntu-24.04-arm64.iso` first.');
   process.exit(1);
 }
 
@@ -179,7 +179,13 @@ for (const artifact of normalArtifacts) {
   }
   if (state === 'valid') existingNormalArtifacts.push(artifact.path);
 }
-if (existingNormalArtifacts.length > 0 && !force) {
+const normalStateOtherThanMachineIdentifier = existingNormalArtifacts.filter(
+  path => path !== resolve(config.machineIdentifierPath),
+);
+// Fresh provisioning persists the VM identity so --resume can use the same
+// hardware identity. Before the first seal, that lone file is provisioning
+// state rather than an initialized normal VM artifact.
+if (normalStateOtherThanMachineIdentifier.length > 0 && !force) {
   console.error('Normal VM state already exists. Refusing to seal over it without resetting the state.');
   console.error('Stop the normal VM, then rerun `bun run vm:seal --force` to replace the base and clear stale working state.');
   process.exit(1);

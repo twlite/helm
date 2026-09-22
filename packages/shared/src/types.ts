@@ -250,6 +250,9 @@ export interface WebSocketEvent {
     | 'run.completed'
     | 'run.failed'
     | 'run.cancelled'
+    | 'assistant.message.started'
+    | 'assistant.message.delta'
+    | 'assistant.message.finished'
     | 'message.created'
     | 'desktop.screenshot';
   timestamp: string;

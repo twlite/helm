@@ -75,6 +75,7 @@ struct VMConfigurationBuilder {
         configuration.graphicsDevices = [graphics]
         configuration.keyboards = [VZUSBKeyboardConfiguration()]
         configuration.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        configuration.consoleDevices = [makeHelmSpiceAgentConsoleDeviceConfiguration()]
 
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()
@@ -83,12 +84,10 @@ struct VMConfigurationBuilder {
         configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         configuration.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
 
-        try VZVirtioFileSystemDeviceConfiguration.validateTag(options.runtimeTag)
-        let runtimeDirectory = VZSharedDirectory(url: paths.runtimeShareURL, readOnly: true)
-        let runtimeShare = VZSingleDirectoryShare(directory: runtimeDirectory)
-        let fileSystem = VZVirtioFileSystemDeviceConfiguration(tag: options.runtimeTag)
-        fileSystem.share = runtimeShare
-        configuration.directorySharingDevices = [fileSystem]
+        _ = try HelmRuntimeShareConfiguration(
+            directoryURL: paths.runtimeShareURL,
+            tag: options.runtimeTag
+        ).appendDevice(to: configuration)
 
         // The guest listens on this device using AF_VSOCK. The actual port is
         // selected by the host at request time, so the configuration only needs

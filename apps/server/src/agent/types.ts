@@ -139,6 +139,12 @@ export interface RunTaskInput {
   threadId: string;
   userMessage: string;
   conversation?: readonly Message[];
+  /**
+   * Returns user steering messages that arrived while the run was active.
+   * The runtime consumes them before its next decision so steering changes
+   * the current run instead of starting an unrelated concurrent run.
+   */
+  drainSteering?: () => Message[];
   task?: TaskDefinition;
   runId?: string;
   sourceMessageId?: string;

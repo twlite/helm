@@ -44,6 +44,14 @@ export type LiveActivity = {
   reasoningSummary?: string;
 };
 
+export type StreamingAssistantMessage = {
+  threadId: string;
+  runId: string;
+  messageId: string;
+  content: string;
+  status: 'writing' | 'finished';
+};
+
 export type WebSocketEventType = WebSocketEvent['type'];
 
 export type HelmEvent = {

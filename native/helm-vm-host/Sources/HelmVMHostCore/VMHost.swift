@@ -401,7 +401,7 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             "efiVariables": .object(paths.fileInfo(for: paths.efiVariablesURL)),
             "machineIdentifier": .object(paths.fileInfo(for: paths.machineIdentifierURL)),
             "runtimeShare": .object(paths.fileInfo(for: paths.runtimeShareURL)),
-            "runtimeShareReadOnly": .boolean(true),
+            "runtimeShareReadOnly": .boolean(HelmRuntimeShareConfiguration.isReadOnly),
             "runtimeTag": .string(options.runtimeTag),
             "guestTransport": .string("virtio-socket"),
             "guestPort": .number(Double(options.guestPort)),

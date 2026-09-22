@@ -29,6 +29,13 @@ bun run vm:build
 bun run vm:doctor
 ```
 
+Provisioning exposes the same read-only runtime share as normal Helm runtime.
+Ensure the host directory exists before starting the installer:
+
+```sh
+mkdir -p "$HOME/Library/Application Support/Helm/runtime"
+```
+
 Before the first image is sealed, `vm:doctor` may report `WAIT` for `base.img`,
 `disk.img`, and `efi-vars.bin`. Those files are created by the workflow below;
 their absence alone does not make doctor exit non-zero. `MISS` is reserved for
@@ -39,7 +46,7 @@ Start the interactive installer with the path to the downloaded official ARM64
 ISO:
 
 ```sh
-bun run vm:provision /path/to/ubuntu-24.04-arm64.iso
+bun run vm:provision --iso /path/to/ubuntu-24.04-arm64.iso
 ```
 
 This command:
@@ -75,6 +82,30 @@ bun run vm:seal --force
 Use `--force` only when intentionally replacing the current base image. When
 forced, Helm clears the existing normal working disk and machine identifier;
 the promoted EFI state is retained for boot.
+
+### Resume an interrupted installation
+
+If the installer VM is stopped before Ubuntu installation is complete, resume
+the existing provisioning disk without recreating it:
+
+```sh
+bun run vm:provision --resume
+```
+
+Resume requires both `vm/provisioning.img` and
+`vm/provisioning-efi-vars.bin` to already exist. It reuses those files, the
+persistent machine identifier, the runtime VirtioFS share, graphics, keyboard,
+and pointer configuration. No storage preparation, formatting, truncation, or
+installer ISO is performed. If installer media is needed again, attach it
+explicitly:
+
+```sh
+bun run vm:provision --resume --iso /path/to/ubuntu-24.04-arm64.iso
+```
+
+Fresh provisioning refuses to overwrite an existing `provisioning.img` or EFI
+store. Use `--force` with a fresh `--iso` command only when intentionally
+discarding that provisioning state.
 
 ## Normal VM lifecycle
 
@@ -125,6 +156,18 @@ entry captured during provisioning remains available; if the EFI store is
 absent, the next start creates it automatically. Reset never modifies
 `base.img`.
 
+To remove the active, sealed, and provisioning VM state so Helm can be
+provisioned from a fresh Ubuntu ISO, use the guarded deletion command:
+
+```sh
+bun run vm:delete
+```
+
+It refuses to run while the VM or native VM host is active, deletes only the
+known VM state filenames, preserves manual backups and runtime files, and
+requires typing `delete`. Use `bun run vm:delete -- --dry-run` to inspect the
+plan or `bun run vm:delete -- --yes` for deliberate non-interactive use.
+
 ## Data layout
 
 By default Helm keeps VM state under:
@@ -135,7 +178,7 @@ By default Helm keeps VM state under:
 │   ├── base.img                       # sealed Ubuntu installation
 │   ├── disk.img                       # mutable normal-run copy
 │   ├── efi-vars.bin                   # lazily-created normal EFI state
-│   ├── machine-id.bin                 # lazily-created normal VM identity
+│   ├── machine-id.bin                 # persistent provisioning/normal VM identity
 │   ├── provisioning.img               # interactive installer disk
 │   ├── provisioning-efi-vars.bin      # provisioning-only EFI state
 │   └── provisioning.lock              # transient while installer is open
@@ -162,6 +205,30 @@ the bridge and then `helm-guest` after the graphical session, retrying until
 The runtime directory is exposed read-only through VirtioFS at
 `/opt/helm-runtime`. Rebuilding the guest bundle therefore does not require
 rebuilding the disk image.
+
+## Enable host clipboard sharing
+
+The native VM configuration exposes Apple's SPICE clipboard channel in both
+normal runtime and the graphical provisioning/maintenance viewers. Ubuntu also
+needs its guest-side SPICE agent installed in the graphical session:
+
+```sh
+sudo apt update
+sudo apt install spice-vdagent
+```
+
+Sign out and back in, or restart the guest, after installing it. The Ubuntu
+package normally starts `spice-vdagent` through the desktop session. To check
+that the agent is running as the logged-in desktop user:
+
+```sh
+pgrep -a spice-vdagent
+```
+
+After both sides are running, text and supported clipboard image data can be
+copied between macOS and the Linux desktop while a `VZVirtualMachineView` is
+open. This is desktop clipboard sharing, not file transfer; use the existing
+shared runtime directory or guest filesystem tools for files.
 
 ## Install Playwright Chromium in the guest
 
@@ -216,7 +283,7 @@ navigation target is `https://twlite.dev`.
 Normal runtime configures a generic Linux platform with EFI boot, a writable
 Virtio block disk, Virtio graphics, USB keyboard, absolute pointing, NAT
 networking, entropy, a traditional memory balloon, a read-only VirtioFS runtime
-share, and a Virtio socket device. Provisioning uses the same hardware where
-useful, replacing the normal runtime disk with the fresh installation disk and
-adding the read-only USB installer media required by Apple's GUI Linux
-installation pattern.
+share, a SPICE agent Virtio console for clipboard sharing, and a Virtio socket
+device. Provisioning uses the same hardware where useful, replacing the normal
+runtime disk with the fresh installation disk and adding the read-only USB
+installer media required by Apple's GUI Linux installation pattern.

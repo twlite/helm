@@ -147,6 +147,62 @@ describe('AgentRuntime', () => {
     expect(contextMemories).toEqual([memory]);
   });
 
+  it('injects steering messages into the next decision context of an active run', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    const contexts: string[][] = [];
+    let drainCalls = 0;
+    const steering = {
+      id: 'steer-1',
+      threadId: 'steering-thread',
+      role: 'user' as const,
+      content: 'Use the existing workspace file name.',
+      metadata: { source: 'steer' },
+      createdAt: '2026-01-01T00:00:01.000Z',
+    };
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: {
+        next: async context => {
+          contexts.push((context.conversation ?? []).map(message => message.content));
+          return contexts.length === 1
+            ? { type: 'action', tool: 'fs.write', input: { path: '/home/helm/workspace/steered.txt', content: 'done' } }
+            : { type: 'complete' };
+        },
+      },
+    });
+
+    const result = await runtime.run({
+      threadId: 'steering-thread',
+      userMessage: 'Create a file.',
+      conversation: [{
+        id: 'user-1',
+        threadId: 'steering-thread',
+        role: 'user',
+        content: 'Create a file.',
+        metadata: {},
+        createdAt: '2026-01-01T00:00:00.000Z',
+      }],
+      task: {
+        id: 'steering-task',
+        threadId: 'steering-thread',
+        goal: 'Create a file.',
+        criteria: [{ type: 'file.exists', path: '/home/helm/workspace/steered.txt' }],
+      },
+      drainSteering: () => {
+        drainCalls += 1;
+        return drainCalls === 2 ? [steering] : [];
+      },
+    });
+
+    expect(result.status).toBe('completed');
+    expect(contexts[0]).toEqual(['Create a file.']);
+    expect(contexts[1]).toEqual(['Create a file.', 'Use the existing workspace file name.']);
+  });
+
   it('completes the scripted demo only after final verification passes', async () => {
     const demo = createScriptedDemo();
     const result = await demo.runtime.run(demo.task);

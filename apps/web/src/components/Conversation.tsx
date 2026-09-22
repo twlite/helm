@@ -1,6 +1,6 @@
-import { memo } from 'react';
+import { memo, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
-import type { LiveActivity, Message, RunDetails, Thread } from '../types';
+import type { LiveActivity, Message, RunDetails, StreamingAssistantMessage, Thread } from '../types';
 import { formatTime } from '../format';
 import { Icon } from './Icon';
 import { RunErrorCard } from './RunErrorCard';
@@ -15,6 +15,8 @@ export type ConversationNotice = {
   message: string;
 };
 
+export type ConversationSendMode = 'start' | 'queue' | 'steer';
+
 type ConversationProps = {
   thread: Thread | null;
   messages: Message[];
@@ -22,7 +24,7 @@ type ConversationProps = {
   draft: string;
   isSending: boolean;
   onDraftChange: (value: string) => void;
-  onSend: (content: string) => Promise<void>;
+  onSend: (content: string, mode: ConversationSendMode) => Promise<void>;
   onRunDemo: () => Promise<void>;
   isRunStarting: boolean;
   run: RunDetails | null;
@@ -34,6 +36,9 @@ type ConversationProps = {
   onOpenMobileSidebar: () => void;
   notice: ConversationNotice | null;
   onDismissNotice: () => void;
+  isRunActive: boolean;
+  isStoppingRun?: boolean;
+  streamingAssistant?: StreamingAssistantMessage | null;
 };
 
 function roleLabel(role: Message['role']): string {
@@ -109,6 +114,45 @@ const MessageRow = memo(function MessageRow({ message }: { message: Message }) {
   );
 });
 
+function TypingIndicator({ label }: { label: string }) {
+  return (
+    <div className="flex items-center gap-2 text-sm text-[#929aa5]" role="status" aria-live="polite">
+      <span className="flex size-5 items-center justify-center rounded-full bg-teal-400/10 text-teal-300">
+        <Icon className="animate-pulse" name="spark" size={13} />
+      </span>
+      <span>{label}</span>
+      <span className="flex items-center gap-0.5" aria-hidden="true">
+        <span className="size-1 animate-bounce rounded-full bg-teal-300 [animation-delay:-0.2s]" />
+        <span className="size-1 animate-bounce rounded-full bg-teal-300 [animation-delay:-0.1s]" />
+        <span className="size-1 animate-bounce rounded-full bg-teal-300" />
+      </span>
+    </div>
+  );
+}
+
+function StreamingMessage({ message }: { message: StreamingAssistantMessage }) {
+  return (
+    <article className="flex min-w-0 w-full justify-start" aria-live="polite">
+      <div className="min-w-0 max-w-[780px]">
+        <div className="mb-2 flex items-center gap-2 text-xs text-[#79838f]">
+          <span className="flex size-5 items-center justify-center rounded-full bg-teal-400/10 text-teal-300">
+            <Icon name="spark" size={14} />
+          </span>
+          <span className="font-medium">Helm</span>
+          <span className="text-[11px] text-teal-300">{message.status === 'writing' ? 'writing…' : 'ready'}</span>
+        </div>
+        {message.content ? (
+          <p className="whitespace-pre-wrap break-words text-sm leading-6 text-[#d7dde3]">
+            {message.content}<span className="ml-1 inline-block h-4 w-0.5 animate-pulse bg-teal-300 align-[-2px]" aria-hidden="true" />
+          </p>
+        ) : (
+          <TypingIndicator label="Helm is writing…" />
+        )}
+      </div>
+    </article>
+  );
+}
+
 export function Conversation({
   thread,
   messages,
@@ -128,14 +172,19 @@ export function Conversation({
   onOpenMobileSidebar,
   notice,
   onDismissNotice,
+  isRunActive,
+  isStoppingRun = false,
+  streamingAssistant = null,
 }: ConversationProps) {
+  const [sendMode, setSendMode] = useState<Exclude<ConversationSendMode, 'start'>>('queue');
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const content = draft.trim();
     if (!content || isSending) {
       return;
     }
-    await onSend(content);
+    await onSend(content, isRunActive ? sendMode : 'start');
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -223,7 +272,11 @@ export function Conversation({
                     title={runErrorTitle(run.status)}
                   />
                 ) : null}
-                {run ? (
+                {streamingAssistant?.threadId === thread.id ? <StreamingMessage message={streamingAssistant} /> : null}
+                {isRunActive && !streamingAssistant ? (
+                  <TypingIndicator label={run?.criteria.length ? 'Helm is working…' : 'Helm is thinking…'} />
+                ) : null}
+                {run && (run.criteria.length > 0 || run.status !== 'completed') ? (
                   <div className="min-w-0 max-w-[780px]">
                     <RunActivityFeed
                       isRetryingRun={isRetryingRun}
@@ -264,14 +317,44 @@ export function Conversation({
                 rows={2}
                 value={draft}
               />
-              <div className="flex items-center justify-between gap-3 px-3 pb-3">
+              <div className="flex flex-wrap items-center justify-between gap-3 px-3 pb-3">
                 <Button aria-label="Connected model" className="h-7 px-2 text-[11px] text-[#aeb7c1]" disabled={isSending} size="sm" variant="ghost">
                   <Icon name="spark" size={13} />
                   Gemma
                 </Button>
-                <Button aria-label="Send message" disabled={!draft.trim() || isSending} size="icon-sm" type="submit">
-                  {isSending ? <Icon className="animate-spin" name="refresh" size={15} /> : <Icon name="arrow-up" size={16} />}
-                </Button>
+                <div className="ml-auto flex items-center gap-1.5">
+                  {isRunActive ? (
+                    <div className="flex items-center rounded-md bg-white/[0.04] p-0.5" role="group" aria-label="Message delivery mode">
+                      <Button
+                        aria-pressed={sendMode === 'queue'}
+                        className={sendMode === 'queue' ? 'bg-white/[0.08] text-[#f1f3f5]' : 'text-[#79838f]'}
+                        onClick={() => setSendMode('queue')}
+                        size="sm"
+                        variant="ghost"
+                      >
+                        Queue
+                      </Button>
+                      <Button
+                        aria-pressed={sendMode === 'steer'}
+                        className={sendMode === 'steer' ? 'bg-white/[0.08] text-[#f1f3f5]' : 'text-[#79838f]'}
+                        onClick={() => setSendMode('steer')}
+                        size="sm"
+                        variant="ghost"
+                      >
+                        Steer
+                      </Button>
+                    </div>
+                  ) : null}
+                  {isRunActive && run ? (
+                    <Button aria-label="Stop run" disabled={isStoppingRun} onClick={() => void onCancelRun(run.id)} size="sm" variant="ghost">
+                      <Icon name="square" size={11} />
+                      {isStoppingRun ? 'Stopping…' : 'Stop'}
+                    </Button>
+                  ) : null}
+                  <Button aria-label={isRunActive ? (sendMode === 'steer' ? 'Steer Helm' : 'Queue message') : 'Send message'} disabled={!draft.trim() || isSending} size="icon-sm" type="submit">
+                    {isSending ? <Icon className="animate-spin" name="refresh" size={15} /> : <Icon name="arrow-up" size={16} />}
+                  </Button>
+                </div>
               </div>
             </div>
           </form>

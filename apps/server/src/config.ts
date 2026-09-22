@@ -141,8 +141,10 @@ export interface HelmConfig {
   host: string;
   port: number;
   dataDir: string;
+  vmDir: string;
   databasePath: string;
   runtimeDir: string;
+  runtimeTag: string;
   baseImagePath: string;
   workingImagePath: string;
   efiVariablesPath: string;
@@ -169,12 +171,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HelmConfig {
     host: env.HELM_HOST ?? '127.0.0.1',
     port: numberFromEnv(env, 'HELM_PORT', 8787),
     dataDir,
+    vmDir,
     databasePath: env.HELM_DATABASE_PATH
       ? expandHome(env.HELM_DATABASE_PATH)
       : join(dataDir, 'helm.sqlite'),
     runtimeDir: env.HELM_RUNTIME_DIR
       ? expandHome(env.HELM_RUNTIME_DIR)
       : join(dataDir, 'runtime'),
+    runtimeTag: env.HELM_VM_RUNTIME_TAG ?? 'helm-runtime',
     baseImagePath: expandHome(env.HELM_VM_BASE_IMAGE ?? join(vmDir, 'base.img')),
     workingImagePath: expandHome(env.HELM_VM_WORKING_IMAGE ?? join(vmDir, 'disk.img')),
     efiVariablesPath: expandHome(env.HELM_VM_EFI_VARS ?? join(vmDir, 'efi-vars.bin')),

@@ -11,17 +11,40 @@ function expandPath(value: string): string {
 }
 
 function usage(): never {
-  console.error('Usage: bun run vm:provision [--force] path-to-ubuntu-24.04-arm64.iso');
+  console.error('Usage: bun run vm:provision [--iso path-to-ubuntu-24.04-arm64.iso]');
+  console.error('       bun run vm:provision --resume [--iso path-to-ubuntu-24.04-arm64.iso]');
+  console.error('       bun run vm:provision --force --iso path-to-ubuntu-24.04-arm64.iso');
   process.exit(1);
 }
 
 const argumentsList = Bun.argv.slice(2);
 let force = false;
+let resume = false;
 let isoInput: string | undefined;
 
-for (const argument of argumentsList) {
+for (let index = 0; index < argumentsList.length; index += 1) {
+  const argument = argumentsList[index];
+  if (argument === '--') continue;
   if (argument === '--force') {
     force = true;
+    continue;
+  }
+  if (argument === '--resume') {
+    resume = true;
+    continue;
+  }
+  if (argument === '--iso' || argument === '--installer-iso') {
+    const value = argumentsList[index + 1];
+    if (!value || value === '--') {
+      console.error(`${argument} requires an installer ISO path.`);
+      usage();
+    }
+    index += 1;
+    if (isoInput) {
+      console.error('Only one installer ISO path may be supplied.');
+      usage();
+    }
+    isoInput = value;
     continue;
   }
   if (argument === '--help' || argument === '-h') usage();
@@ -36,7 +59,14 @@ for (const argument of argumentsList) {
   isoInput = argument;
 }
 
-if (!isoInput) usage();
+if (!resume && !isoInput) {
+  console.error('Fresh provisioning requires an Ubuntu 24.04 LTS ARM64 installer ISO.');
+  usage();
+}
+if (resume && force) {
+  console.error('Cannot combine --resume with --force. Resume never replaces provisioning state.');
+  process.exit(1);
+}
 
 if (process.platform !== 'darwin') {
   console.error('VM provisioning requires macOS and Apple Virtualization.framework.');
@@ -48,18 +78,39 @@ if (process.arch !== 'arm64') {
 }
 
 const config = loadConfig();
-const isoPath = expandPath(isoInput);
+const isoPath = isoInput ? expandPath(isoInput) : undefined;
 
-let isoStats;
-try {
-  isoStats = await stat(isoPath);
-} catch {
-  console.error(`Installer ISO does not exist or is not readable: ${isoPath}`);
-  process.exit(1);
+if (isoPath) {
+  let isoStats;
+  try {
+    isoStats = await stat(isoPath);
+  } catch {
+    console.error(`Installer ISO does not exist or is not readable: ${isoPath}`);
+    process.exit(1);
+  }
+  if (!isoStats.isFile() || isoStats.size === 0) {
+    console.error(`Installer ISO must be a non-empty regular file: ${isoPath}`);
+    process.exit(1);
+  }
 }
-if (!isoStats.isFile() || isoStats.size === 0) {
-  console.error(`Installer ISO must be a non-empty regular file: ${isoPath}`);
-  process.exit(1);
+
+if (resume) {
+  for (const [label, path] of [
+    ['provisioning disk', config.provisioningImagePath],
+    ['provisioning EFI store', config.provisioningEfiVariablesPath],
+  ] as const) {
+    let state;
+    try {
+      state = await stat(path);
+    } catch {
+      console.error(`Cannot resume provisioning: ${label} does not exist at ${path}`);
+      process.exit(1);
+    }
+    if (!state.isFile() || state.size === 0) {
+      console.error(`Cannot resume provisioning: ${label} must be a non-empty regular file at ${path}`);
+      process.exit(1);
+    }
+  }
 }
 
 if (!virtualizationHelperAvailable(config.vmHelperPath)) {
@@ -90,15 +141,27 @@ try {
   process.exit(1);
 }
 
-console.error('Helm provisioning contract: Ubuntu 24.04 LTS ARM64 installer ISO.');
-console.error('The ISO architecture is intentionally not introspected; provide the official ARM64 image.');
-console.error('A native macOS VM window will open. Install Ubuntu into the empty Helm disk, shut down the VM, close the window, then run `bun run vm:seal`.');
+if (resume) {
+  console.error('Helm provisioning resume: existing provisioning disk and EFI state will be reused.');
+  if (isoPath) {
+    console.error('The supplied Ubuntu ARM64 ISO will be attached read-only as optional installer media.');
+  }
+  console.error('A native macOS VM window will open. Continue the installation, shut down the VM, close the window, then run `bun run vm:seal`.');
+} else {
+  console.error('Helm provisioning contract: Ubuntu 24.04 LTS ARM64 installer ISO.');
+  console.error('The ISO architecture is intentionally not introspected; provide the official ARM64 image.');
+  console.error('A native macOS VM window will open. Install Ubuntu into the empty Helm disk, shut down the VM, close the window, then run `bun run vm:seal`.');
+}
 
 const helperArguments = [
   '--provision',
-  '--installer-iso', isoPath,
+  ...(resume ? ['--resume'] : []),
+  ...(isoPath ? ['--installer-iso', isoPath] : []),
   '--installation-image', config.provisioningImagePath,
   '--efi-vars', config.provisioningEfiVariablesPath,
+  '--machine-id', config.machineIdentifierPath,
+  '--runtime-share', config.runtimeDir,
+  '--runtime-tag', config.runtimeTag,
   '--cpus', String(config.vmCpus),
   '--memory-mib', String(config.vmMemoryMb),
   '--display-width', '1280',

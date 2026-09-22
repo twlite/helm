@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type {
   JsonValue,
   GuestMethod,
+  Message,
   MessageRole,
   Run,
   RunStep,
@@ -47,6 +48,9 @@ const scriptedDemoInputSchema = z.object({ threadId: z.string().min(1).optional(
 const agentRunInputSchema = z.object({
   threadId: z.string().min(1),
   sourceMessageId: z.string().min(1),
+});
+const steerRunInputSchema = z.object({
+  messageId: z.string().min(1),
 });
 const threadTitleInputSchema = z.object({
   sourceMessageId: z.string().min(1),
@@ -202,6 +206,15 @@ class RuntimeEvents implements RuntimeEventSink {
   }
 }
 
+type ActiveRun = {
+  runtime: AgentRuntime;
+  cancellation: AbortController;
+  threadId: string;
+  conversation: Message[];
+  steeringQueue: Message[];
+  steeringHistory: Message[];
+};
+
 export interface HelmApplication {
   readonly config: HelmConfig;
   readonly database: PersistenceDatabase;
@@ -218,7 +231,10 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
   const database = new PersistenceDatabase(config.databasePath);
   const events = new EventHub();
   const vm = new VmController(config, events);
-  const activeRuns = new Map<string, { runtime: AgentRuntime; cancellation: AbortController }>();
+  const activeRuns = new Map<string, ActiveRun>();
+  const activeThreadRuns = new Map<string, string>();
+  const queuedAgentMessages = new Map<string, string[]>();
+  let startNextQueuedRun: (threadId: string) => Promise<void> = async () => undefined;
   const runAdapter = new RuntimeDatabaseAdapter(database);
   const runtimeEvents = new RuntimeEvents(events);
   const realToolOptions = { defaultTimeoutMs: config.toolTimeoutMs };
@@ -263,20 +279,36 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
     });
     const cancellation = new AbortController();
     const runId = `run-${randomUUID()}`;
-    activeRuns.set(runId, { runtime, cancellation });
+    const conversation = database.messages.listByThread(threadId);
+    activeRuns.set(runId, {
+      runtime,
+      cancellation,
+      threadId,
+      conversation,
+      steeringQueue: [],
+      steeringHistory: [],
+    });
+    activeThreadRuns.set(threadId, runId);
     try {
       const result = await runtime.run({
         threadId,
         userMessage: task.goal,
-        conversation: database.messages.listByThread(threadId),
+        conversation,
         task,
         runId,
         sourceMessageId,
         signal: cancellation.signal,
+        drainSteering: () => {
+          const active = activeRuns.get(runId);
+          if (!active) return [];
+          return active.steeringQueue.splice(0);
+        },
       });
       return database.runs.getById(result.run.id) ?? result.run;
     } finally {
       activeRuns.delete(runId);
+      if (activeThreadRuns.get(threadId) === runId) activeThreadRuns.delete(threadId);
+      await startNextQueuedRun(threadId);
     }
   };
 
@@ -301,6 +333,9 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
   };
 
   const startAiRun = (threadId: string, sourceMessageId: string): Run => {
+    if (activeThreadRuns.has(threadId)) {
+      throw new ApiFailure('RUN_ALREADY_ACTIVE', 'A run is already active in this thread.', 409);
+    }
     const sourceMessage = database.messages.getById(sourceMessageId);
     if (!sourceMessage || sourceMessage.threadId !== threadId) {
       throw new ApiFailure('MESSAGE_NOT_FOUND', 'The source message was not found in this thread.', 404);
@@ -318,7 +353,15 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
     const runtime = createAiRuntime();
     const cancellation = new AbortController();
     const conversation = database.messages.listByThread(threadId);
-    activeRuns.set(runId, { runtime, cancellation });
+    activeRuns.set(runId, {
+      runtime,
+      cancellation,
+      threadId,
+      conversation,
+      steeringQueue: [],
+      steeringHistory: [],
+    });
+    activeThreadRuns.set(threadId, runId);
     void runtime.run({
       threadId,
       userMessage: sourceMessage.content,
@@ -326,17 +369,42 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       runId,
       sourceMessageId,
       signal: cancellation.signal,
+      drainSteering: () => {
+        const active = activeRuns.get(runId);
+        if (!active) return [];
+        return active.steeringQueue.splice(0);
+      },
     }).then(async result => {
       const persistedRun = database.runs.getById(result.run.id) ?? result.run;
       const fallbackResponse = assistantMessageForResult(result);
-      const generatedResponse = result.status === 'completed'
-        ? await models.responseGenerator.generate({
+      const active = activeRuns.get(runId);
+      const responseConversation = active
+        ? [...active.conversation, ...active.steeringHistory]
+        : conversation;
+      let generatedResponse = '';
+      let responseMessageId: string | undefined;
+      if (result.status === 'completed') {
+        responseMessageId = `message-${randomUUID()}`;
+        events.publish('assistant.message.started', jsonValue({
+          threadId,
+          messageId: responseMessageId,
+        }), { runId });
+        generatedResponse = await models.responseGenerator.stream({
           userMessage: sourceMessage.content,
-          conversation,
+          conversation: responseConversation,
           result,
-        })
-        : '';
+          signal: cancellation.signal,
+          onDelta: delta => {
+            events.publish('assistant.message.delta', jsonValue({
+              threadId,
+              messageId: responseMessageId,
+              delta,
+            }), { runId });
+          },
+        });
+      }
       const message = database.messages.create({
+        ...(responseMessageId ? { id: responseMessageId } : {}),
         threadId,
         role: 'assistant',
         content: generatedResponse || fallbackResponse,
@@ -346,6 +414,13 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
           status: persistedRun.status,
         },
       });
+      if (responseMessageId) {
+        events.publish('assistant.message.finished', jsonValue({
+          threadId,
+          messageId: responseMessageId,
+          status: cancellation.signal.aborted ? 'cancelled' : 'completed',
+        }), { runId });
+      }
       // run.completed is emitted by the runtime before this asynchronous
       // response-generation pass. This event lets clients refresh only after
       // the conversational assistant message is durably persisted.
@@ -354,9 +429,11 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       const normalized = errorDetails(error);
       const runError = { code: normalized.code, message: normalized.message };
       const cancelled = cancellation.signal.aborted;
-      if (cancelled) {
+      const currentRun = database.runs.getById(runId);
+      const canTransition = currentRun !== undefined && ['pending', 'running'].includes(currentRun.status);
+      if (cancelled && canTransition) {
         database.runs.cancel(runId, { code: 'RUN_CANCELLED', message: 'Run was cancelled.' });
-      } else {
+      } else if (!cancelled && canTransition) {
         database.runs.fail(runId, runError);
       }
       const message = database.messages.create({
@@ -366,16 +443,73 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
         metadata: { source: 'ai-run', runId, status: cancelled ? 'cancelled' : 'failed' },
       });
       events.publish('message.created', jsonValue(message), { runId });
-      runtimeEvents.emit({
-        type: cancelled ? 'run.cancelled' : 'run.failed',
-        timestamp: new Date().toISOString(),
-        runId,
-        payload: cancelled ? { code: 'RUN_CANCELLED', message: 'Run was cancelled.' } : runError,
-      });
+      if (canTransition) {
+        runtimeEvents.emit({
+          type: cancelled ? 'run.cancelled' : 'run.failed',
+          timestamp: new Date().toISOString(),
+          runId,
+          payload: cancelled ? { code: 'RUN_CANCELLED', message: 'Run was cancelled.' } : runError,
+        });
+      }
     }).finally(() => {
       activeRuns.delete(runId);
+      if (activeThreadRuns.get(threadId) === runId) activeThreadRuns.delete(threadId);
+      void startNextQueuedRun(threadId);
     });
     return pendingRun;
+  };
+
+  const queueAiRun = (threadId: string, sourceMessageId: string): { queued: boolean; position: number; run?: Run } => {
+    const sourceMessage = database.messages.getById(sourceMessageId);
+    if (!sourceMessage || sourceMessage.threadId !== threadId || sourceMessage.role !== 'user') {
+      throw new ApiFailure('MESSAGE_NOT_FOUND', 'The source message was not found in this thread.', 404);
+    }
+    if (!activeThreadRuns.has(threadId)) {
+      return { queued: false, position: 0, run: startAiRun(threadId, sourceMessageId) };
+    }
+    const queue = queuedAgentMessages.get(threadId) ?? [];
+    queue.push(sourceMessageId);
+    queuedAgentMessages.set(threadId, queue);
+    return { queued: true, position: queue.length };
+  };
+
+  startNextQueuedRun = async (threadId: string): Promise<void> => {
+    if (activeThreadRuns.has(threadId)) return;
+    const queue = queuedAgentMessages.get(threadId);
+    const sourceMessageId = queue?.shift();
+    if (queue === undefined || sourceMessageId === undefined) {
+      queuedAgentMessages.delete(threadId);
+      return;
+    }
+    if (queue.length === 0) queuedAgentMessages.delete(threadId);
+    try {
+      startAiRun(threadId, sourceMessageId);
+    } catch (error) {
+      const normalized = errorDetails(error);
+      const message = database.messages.create({
+        threadId,
+        role: 'assistant',
+        content: normalized.message,
+        metadata: { source: 'ai-run', status: 'failed', code: normalized.code },
+      });
+      events.publish('message.created', jsonValue(message));
+      await startNextQueuedRun(threadId);
+    }
+  };
+
+  const steerAiRun = (runId: string, messageId: string): Message => {
+    const active = activeRuns.get(runId);
+    if (!active || !active.runtime.running) {
+      throw new ApiFailure('RUN_NOT_ACTIVE', 'This run is no longer accepting steering messages.', 409);
+    }
+    const message = database.messages.getById(messageId);
+    if (!message || message.threadId !== active.threadId || message.role !== 'user') {
+      throw new ApiFailure('MESSAGE_NOT_FOUND', 'The steering message was not found in this run’s thread.', 404);
+    }
+    active.steeringQueue.push(message);
+    active.steeringHistory.push(message);
+    events.publish('message.created', jsonValue(message), { runId });
+    return message;
   };
 
   const handle = async (request: Request, server?: { upgrade(request: Request, options?: unknown): boolean }): Promise<Response | undefined> => {
@@ -470,6 +604,21 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
         const run = startAiRun(input.threadId, input.sourceMessageId);
         return jsonResponse({ run: { ...run, steps: [] } }, 202);
       }
+      if (request.method === 'POST' && url.pathname === '/api/runs/queue') {
+        const input = agentRunInputSchema.parse(await parseBody(request));
+        if (!database.threads.getById(input.threadId)) return notFound('Thread not found.');
+        const queued = queueAiRun(input.threadId, input.sourceMessageId);
+        return jsonResponse({
+          queued: queued.queued,
+          position: queued.position,
+          ...(queued.run ? { run: { ...queued.run, steps: [] } } : {}),
+        }, 202);
+      }
+      if (request.method === 'POST' && segments[0] === 'api' && segments[1] === 'runs' && segments[3] === 'steer') {
+        const input = steerRunInputSchema.parse(await parseBody(request));
+        const message = steerAiRun(segments[2], input.messageId);
+        return jsonResponse({ message });
+      }
       if (request.method === 'POST' && segments[0] === 'api' && segments[1] === 'runs' && segments[3] === 'cancel') {
         const runId = segments[2];
         const active = activeRuns.get(runId);
@@ -519,6 +668,10 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
     vm,
     handle,
     async close() {
+      for (const active of activeRuns.values()) {
+        active.cancellation.abort('Helm server is shutting down');
+      }
+      queuedAgentMessages.clear();
       await vm.close();
       database.close();
     },

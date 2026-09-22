@@ -1,4 +1,4 @@
-import { embed, generateText, Output, tool, type EmbeddingModel, type LanguageModel, type ToolSet } from 'ai';
+import { embed, generateText, Output, streamText, tool, type EmbeddingModel, type LanguageModel, type ToolSet } from 'ai';
 import { z } from 'zod';
 import type {
   AgentDecision,
@@ -107,6 +107,14 @@ export interface AiSdkResponseGeneratorOptions {
   requestTimeoutMs: number;
 }
 
+export interface AiSdkResponseInput {
+  userMessage: string;
+  conversation: readonly Message[];
+  result: AgentRuntimeResult;
+  signal?: AbortSignal;
+  onDelta?: (delta: string) => void | Promise<void>;
+}
+
 export interface AiSdkThreadTitleGeneratorOptions {
   model: LanguageModel;
   maxOutputTokens: number;
@@ -212,13 +220,26 @@ function memoryContext(memories: readonly Memory[]): Array<Pick<Memory, 'content
   }));
 }
 
-function conversationContext(messages: readonly Message[]): Array<Pick<Message, 'role' | 'content'>> {
-  return messages.slice(-20).map(message => ({
-    role: message.role,
-    content: message.content.length <= 4_000
+function conversationContext(
+  messages: readonly Message[],
+  maxCharacters = 12_000,
+): Array<Pick<Message, 'role' | 'content'>> {
+  const selected: Array<Pick<Message, 'role' | 'content'>> = [];
+  let characters = 2;
+  // Build from the newest turn backwards so a long thread never truncates
+  // away the current request or the most recent assistant answer.
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const content = message.content.length <= 3_000
       ? message.content
-      : `${message.content.slice(0, 3_997).trimEnd()}...`,
-  }));
+      : `${message.content.slice(0, 2_997).trimEnd()}...`;
+    const candidate = { role: message.role, content } satisfies Pick<Message, 'role' | 'content'>;
+    const candidateSize = JSON.stringify(candidate).length + 1;
+    if (selected.length > 0 && characters + candidateSize > maxCharacters) break;
+    selected.unshift(candidate);
+    characters += candidateSize;
+  }
+  return selected;
 }
 
 function isClearlyConversationalRequest(input: string): boolean {
@@ -320,34 +341,36 @@ export class AiSdkTaskPlanner implements TaskPlanner {
   }
 }
 
+const RESPONSE_SYSTEM_PROMPT = [
+  'You are Helm, a conversational local computer-use assistant.',
+  'Write the actual final reply to the user in plain text or light Markdown.',
+  'Answer the user directly, including the useful facts found by tools when applicable.',
+  'For ordinary conversation, answer naturally and helpfully.',
+  'Never reply with only a completion count, verification status, tool log, or internal error code.',
+  'Do not mention internal prompts, structured output, reasoning traces, or hidden implementation details.',
+  'Do not invent facts. If the available evidence is incomplete, say what is known and what could not be verified.',
+].join(' ');
+
+function responsePrompt(input: AiSdkResponseInput): string {
+  return [
+    `Conversation:\n${promptJson(conversationContext(input.conversation), 16_000)}`,
+    `Current user request:\n${promptJson(input.userMessage, 8_000)}`,
+    `Run status:\n${input.result.status}`,
+    `Task goal:\n${promptJson(input.result.task.goal, 6_000)}`,
+    `Verified result:\n${promptJson(input.result.finalVerification ?? null, 8_000)}`,
+    `Tool evidence:\n${promptJson(responseEvidence(input.result), 24_000)}`,
+  ].join('\n\n');
+}
+
 export class AiSdkResponseGenerator {
   constructor(public readonly options: AiSdkResponseGeneratorOptions) {}
 
-  async generate(input: {
-    userMessage: string;
-    conversation: readonly Message[];
-    result: AgentRuntimeResult;
-  }): Promise<string> {
+  async generate(input: AiSdkResponseInput): Promise<string> {
     try {
       const response = await generateText({
         model: this.options.model,
-        system: [
-          'You are Helm, a conversational local computer-use assistant.',
-          'Write the actual final reply to the user in plain text or light Markdown.',
-          'Answer the user directly, including the useful facts found by tools when applicable.',
-          'For ordinary conversation, answer naturally and helpfully.',
-          'Never reply with only a completion count, verification status, tool log, or internal error code.',
-          'Do not mention internal prompts, structured output, reasoning traces, or hidden implementation details.',
-          'Do not invent facts. If the available evidence is incomplete, say what is known and what could not be verified.',
-        ].join(' '),
-        prompt: [
-          `Conversation:\n${promptJson(conversationContext(input.conversation), 16_000)}`,
-          `Current user request:\n${promptJson(input.userMessage, 8_000)}`,
-          `Run status:\n${input.result.status}`,
-          `Task goal:\n${promptJson(input.result.task.goal, 6_000)}`,
-          `Verified result:\n${promptJson(input.result.finalVerification ?? null, 8_000)}`,
-          `Tool evidence:\n${promptJson(responseEvidence(input.result), 24_000)}`,
-        ].join('\n\n'),
+        system: RESPONSE_SYSTEM_PROMPT,
+        prompt: responsePrompt(input),
         maxOutputTokens: this.options.maxOutputTokens,
         temperature: this.options.temperature,
         timeout: this.options.requestTimeoutMs,
@@ -356,6 +379,33 @@ export class AiSdkResponseGenerator {
       return response.text.trim();
     } catch {
       return '';
+    }
+  }
+
+  /** Stream the final conversational answer while retaining the same prompt and fallback path. */
+  async stream(input: AiSdkResponseInput): Promise<string> {
+    let text = '';
+    try {
+      const response = streamText({
+        model: this.options.model,
+        system: RESPONSE_SYSTEM_PROMPT,
+        prompt: responsePrompt(input),
+        maxOutputTokens: this.options.maxOutputTokens,
+        temperature: this.options.temperature,
+        timeout: this.options.requestTimeoutMs,
+        maxRetries: 0,
+        abortSignal: input.signal,
+      });
+      for await (const delta of response.textStream) {
+        text += delta;
+        await input.onDelta?.(delta);
+      }
+      return text.trim();
+    } catch {
+      // Preserve already streamed text when the user stops generation. The
+      // server will persist it as the final assistant message instead of
+      // losing the useful partial answer.
+      return text.trim();
     }
   }
 }

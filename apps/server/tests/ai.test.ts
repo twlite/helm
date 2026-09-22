@@ -264,6 +264,76 @@ describe('LM Studio AI adapters', () => {
     expect(JSON.stringify(requestBody)).toContain('Who are you?');
   });
 
+  it('streams conversational response deltas in order', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      fetch: async () => {
+        const chunks = [
+          {
+            id: 'chatcmpl-stream',
+            object: 'chat.completion.chunk',
+            created: 1,
+            model: 'google/gemma-4-e2b',
+            choices: [{ index: 0, delta: { role: 'assistant', content: 'I am ' }, finish_reason: null }],
+          },
+          {
+            id: 'chatcmpl-stream',
+            object: 'chat.completion.chunk',
+            created: 1,
+            model: 'google/gemma-4-e2b',
+            choices: [{ index: 0, delta: { content: 'Helm.' }, finish_reason: null }],
+          },
+          {
+            id: 'chatcmpl-stream',
+            object: 'chat.completion.chunk',
+            created: 1,
+            model: 'google/gemma-4-e2b',
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          },
+        ];
+        const body = `${chunks.map(chunk => `data: ${JSON.stringify(chunk)}`).join('\n\n')}\n\ndata: [DONE]\n\n`;
+        return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+      },
+    });
+    const generator = new AiSdkResponseGenerator({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+    });
+    const result = {
+      run: {
+        id: 'run-stream',
+        threadId: 'thread-stream',
+        goal: 'Answer the user directly.',
+        status: 'completed' as const,
+        criteria: [],
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+      task: {
+        id: 'task-stream',
+        threadId: 'thread-stream',
+        goal: 'Answer the user directly.',
+        criteria: [],
+      },
+      history: [],
+      steps: [],
+      observations: [],
+      finalVerification: { complete: true, criteria: [], summary: 'Response ready.' },
+      status: 'completed' as const,
+    } satisfies AgentRuntimeResult;
+    const deltas: string[] = [];
+
+    await expect(generator.stream({
+      userMessage: 'Who are you?',
+      conversation: [],
+      result,
+      onDelta: delta => deltas.push(delta),
+    })).resolves.toBe('I am Helm.');
+    expect(deltas).toEqual(['I am ', 'Helm.']);
+  });
+
   it('converts AI SDK embeddings to the runtime Float32Array boundary', async () => {
     const provider = new AiSdkEmbeddingProvider({
       model: fakeEmbeddingModel([0.25, -0.5, 0.75]),

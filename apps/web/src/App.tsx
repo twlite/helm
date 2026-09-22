@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { helmApi, parseError } from './api';
-import { Conversation, type ConversationNotice } from './components/Conversation';
+import { Conversation, type ConversationNotice, type ConversationSendMode } from './components/Conversation';
 import { DesktopPanel } from './components/DesktopPanel';
 import { MemoryDialog } from './components/MemoryDialog';
 import { SettingsDialog } from './components/SettingsDialog';
@@ -16,6 +16,7 @@ import type {
   MemoryKind,
   Message,
   RunDetails,
+  StreamingAssistantMessage,
   Thread,
   VmAction,
   VmStatus,
@@ -125,6 +126,8 @@ function App() {
   const [isRetryingRun, setIsRetryingRun] = useState(false);
   const [run, setRun] = useState<RunDetails | null>(null);
   const [liveActivity, setLiveActivity] = useState<LiveActivity | null>(null);
+  const [streamingAssistant, setStreamingAssistant] = useState<StreamingAssistantMessage | null>(null);
+  const [stoppingRunId, setStoppingRunId] = useState<string | null>(null);
   const [vm, setVm] = useState<VmStatus | null>(null);
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [screenshot, setScreenshot] = useState<string | null>(null);
@@ -140,7 +143,9 @@ function App() {
 
   const selectedThreadIdRef = useRef<string | null>(null);
   const runRequestRef = useRef(0);
+  const streamingAssistantRef = useRef<StreamingAssistantMessage | null>(null);
   selectedThreadIdRef.current = selectedThreadId;
+  streamingAssistantRef.current = streamingAssistant;
 
   const selectedThread = threads.find((thread) => thread.id === selectedThreadId) ?? null;
 
@@ -187,9 +192,44 @@ function App() {
         setVm((current) => current ? { ...current, screenshot: nextScreenshot } : current);
       }
     }
+    if (event.type === 'assistant.message.started') {
+      const payload = isRecord(event.payload) ? event.payload : undefined;
+      const threadId = asString(payload?.threadId);
+      const messageId = asString(payload?.messageId);
+      if (threadId && messageId && threadId === selectedThreadIdRef.current && event.runId) {
+        setStreamingAssistant({
+          threadId,
+          runId: event.runId,
+          messageId,
+          content: '',
+          status: 'writing',
+        });
+      }
+    }
+    if (event.type === 'assistant.message.delta') {
+      const payload = isRecord(event.payload) ? event.payload : undefined;
+      const messageId = asString(payload?.messageId);
+      const delta = asString(payload?.delta);
+      if (messageId && delta) {
+        setStreamingAssistant((current) => current?.messageId === messageId
+          ? { ...current, content: `${current.content}${delta}`, status: 'writing' }
+          : current);
+      }
+    }
+    if (event.type === 'assistant.message.finished') {
+      const payload = isRecord(event.payload) ? event.payload : undefined;
+      const messageId = asString(payload?.messageId);
+      if (messageId) {
+        setStreamingAssistant((current) => current?.messageId === messageId ? { ...current, status: 'finished' } : current);
+      }
+    }
     if (event.type === 'message.created') {
       const payload = isRecord(event.payload) ? event.payload : undefined;
       const threadId = asString(payload?.threadId);
+      const messageId = asString(payload?.id);
+      if (messageId && streamingAssistantRef.current?.messageId === messageId) {
+        setStreamingAssistant(null);
+      }
       if (threadId && threadId === selectedThreadIdRef.current) {
         void helmApi.listMessages(threadId)
           .then((nextMessages) => {
@@ -204,6 +244,9 @@ function App() {
       setLiveActivity((current) => liveActivityFromEvent(event, current));
       void refreshRun(event.runId);
       if (['run.completed', 'run.failed', 'run.cancelled'].includes(event.type)) {
+        if (event.type !== 'run.completed' && streamingAssistantRef.current?.runId === event.runId) {
+          setStreamingAssistant(null);
+        }
         const currentThreadId = selectedThreadIdRef.current;
         if (currentThreadId) {
           void helmApi.listMessages(currentThreadId).then(setMessages).catch(() => undefined);
@@ -294,6 +337,7 @@ function App() {
     setSelectedThreadId(threadId);
     setRun(null);
     setLiveActivity(null);
+    setStreamingAssistant(null);
     setDraft('');
     setNotice(null);
   }, []);
@@ -305,6 +349,7 @@ function App() {
     setDraft('');
     setRun(null);
     setLiveActivity(null);
+    setStreamingAssistant(null);
     setNotice(null);
     setMessageState('idle');
   }, []);
@@ -323,18 +368,23 @@ function App() {
         setMessages([]);
         setRun(null);
         setLiveActivity(null);
+        setStreamingAssistant(null);
       }
     } catch (error) {
       showError(error);
     }
   }, [showError, threads]);
 
-  const handleSendMessage = useCallback(async (content: string) => {
+  const handleSendMessage = useCallback(async (content: string, mode: ConversationSendMode) => {
     setMessageState('saving');
     setNotice(null);
     try {
       let threadId = selectedThreadIdRef.current;
       const shouldGenerateTitle = !threadId;
+      const currentRun = run;
+      const runIsActive = currentRun?.status === 'pending'
+        || currentRun?.status === 'running'
+        || streamingAssistant?.status === 'writing';
       if (!threadId) {
         const thread = await helmApi.createThread(fallbackThreadTitle(content));
         threadId = thread.id;
@@ -344,6 +394,7 @@ function App() {
         setMessages([]);
         setRun(null);
         setLiveActivity(null);
+        setStreamingAssistant(null);
       }
       const message = await helmApi.createMessage(threadId, content);
       setMessages((current) => [...current, message]);
@@ -358,6 +409,24 @@ function App() {
           .catch(() => undefined);
       }
       try {
+        if (mode === 'steer' && currentRun && ['pending', 'running'].includes(currentRun.status)) {
+          await helmApi.steerRun(currentRun.id, message.id);
+          setNotice({ tone: 'info', message: 'Steering added. Helm will use it before the next action.' });
+          return;
+        }
+        if (mode === 'queue' && runIsActive) {
+          const queued = await helmApi.queueAgent(threadId, message.id);
+          const queuedRun = queued.run;
+          if (queuedRun) {
+            setRun((current) => current && current.id === queuedRun.id && current.steps.length > queuedRun.steps.length ? current : queuedRun);
+            setLiveActivity((current) => current && current.runId === queuedRun.id && current.phase !== 'starting' ? current : { runId: queuedRun.id, phase: 'starting' });
+          }
+          setNotice({
+            tone: 'info',
+            message: queued.queued ? `Queued behind the current run${queued.position > 0 ? ` · position ${queued.position}` : ''}.` : 'Helm started the queued message.',
+          });
+          return;
+        }
         const nextRun = await helmApi.runAgent(threadId, message.id);
         setRun((current) => current?.id === nextRun.id && current.steps.length > nextRun.steps.length ? current : nextRun);
         setLiveActivity((current) => current?.runId === nextRun.id && current.phase !== 'starting' ? current : { runId: nextRun.id, phase: 'starting' });
@@ -368,7 +437,7 @@ function App() {
       setMessageState('error');
       showError(error);
     }
-  }, [showError]);
+  }, [run, showError, streamingAssistant]);
 
   const handleRunDemo = useCallback(async () => {
     const threadId = selectedThreadIdRef.current;
@@ -389,11 +458,14 @@ function App() {
   }, [showError]);
 
   const handleCancelRun = useCallback(async (runId: string) => {
+    setStoppingRunId(runId);
     try {
       await helmApi.cancelRun(runId);
       await refreshRun(runId);
     } catch (error) {
       showError(error);
+    } finally {
+      setStoppingRunId((current) => current === runId ? null : current);
     }
   }, [refreshRun, showError]);
 
@@ -506,6 +578,9 @@ function App() {
   }, [showError]);
 
   const connectionState: ConnectionState = socket.state;
+  const isRunActive = run?.status === 'pending'
+    || run?.status === 'running'
+    || streamingAssistant?.status === 'writing';
 
   return (
     <div className="flex h-dvh min-h-0 w-full overflow-hidden bg-[#0b0d10] font-sans text-[#f1f3f5]">
@@ -532,7 +607,9 @@ function App() {
           isLoading={messageState === 'loading'}
           isRunStarting={isRunStarting}
           isRetryingRun={isRetryingRun}
+          isRunActive={isRunActive}
           isSending={messageState === 'saving'}
+          isStoppingRun={stoppingRunId !== null && stoppingRunId === run?.id}
           liveActivity={liveActivity ?? undefined}
           messages={messages}
           onCancelRun={handleCancelRun}
@@ -545,6 +622,7 @@ function App() {
           onSend={handleSendMessage}
           notice={notice}
           run={run}
+          streamingAssistant={streamingAssistant}
           thread={selectedThread}
         />
         <DesktopPanel

@@ -363,6 +363,7 @@ export class VmController {
       '--working-image', this.config.workingImagePath,
       '--efi-vars', this.config.efiVariablesPath,
       '--runtime-share', this.config.runtimeDir,
+      '--runtime-tag', this.config.runtimeTag,
       '--memory-mib', String(this.config.vmMemoryMb),
       '--cpus', String(this.config.vmCpus),
       ...(showWindow ? ['--show-window'] : []),

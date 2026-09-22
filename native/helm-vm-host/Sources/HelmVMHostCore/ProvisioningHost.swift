@@ -35,6 +35,10 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
         let application = NSApplication.shared
         let host = ProvisioningHost(options: options, configuration: configuration)
         activeHost = host
+        host.writeDiagnostic("resolved runtime directory: \(options.runtimeShareURL.path)")
+        host.writeDiagnostic("VirtioFS tag: \(options.runtimeTag)")
+        host.writeDiagnostic("readOnly=\(HelmRuntimeShareConfiguration.isReadOnly)")
+        host.writeDiagnostic("directorySharingDevices=\(configuration.directorySharingDevices.count)")
         application.setActivationPolicy(.regular)
         application.delegate = host
         application.run()
@@ -49,8 +53,12 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
         virtualMachine = newVM
         makeWindow(for: newVM)
 
-        statusField?.stringValue = "Starting Ubuntu 24.04 LTS installer…"
-        writeDiagnostic("Provisioning mode started. Install Ubuntu into the empty 24 GiB disk.")
+        statusField?.stringValue = options.resume
+            ? "Resuming the existing Ubuntu provisioning disk…"
+            : "Starting Ubuntu 24.04 LTS installer…"
+        writeDiagnostic(options.resume
+            ? "Resume mode started. The existing provisioning disk and EFI state will be retained."
+            : "Provisioning mode started. Install Ubuntu into the empty 24 GiB disk.")
         newVM.start { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -60,7 +68,9 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
                     )
                     return
                 }
-                self.statusField?.stringValue = "Running. Complete the Ubuntu installation in this window."
+                self.statusField?.stringValue = self.options.resume
+                    ? "Running. Continue the Ubuntu installation in this window."
+                    : "Running. Complete the Ubuntu installation in this window."
                 self.writeDiagnostic("The VM is running. Shut it down from Ubuntu, close this window, then run `bun run vm:seal`.")
             }
         }
@@ -141,13 +151,18 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
         title.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         title.textColor = .secondaryLabelColor
 
-        let subtitle = NSTextField(labelWithString: "Ubuntu 24.04 LTS ARM64 installer")
+        let subtitle = NSTextField(
+            labelWithString: options.resume
+                ? "Resume Ubuntu 24.04 LTS provisioning"
+                : "Ubuntu 24.04 LTS ARM64 installer"
+        )
         subtitle.font = NSFont.systemFont(ofSize: 20, weight: .semibold)
         subtitle.textColor = .labelColor
 
-        let instructions = NSTextField(
-            wrappingLabelWithString: "Install Ubuntu into the empty Helm disk. When installation is complete, shut down the guest, close this window, and run bun run vm:seal."
-        )
+        let instructionsText = options.resume
+            ? "Continue the existing Ubuntu installation. When finished, shut down the guest, close this window, and run bun run vm:seal."
+            : "Install Ubuntu into the empty Helm disk. When installation is complete, shut down the guest, close this window, and run bun run vm:seal."
+        let instructions = NSTextField(wrappingLabelWithString: instructionsText)
         instructions.font = NSFont.systemFont(ofSize: 13)
         instructions.textColor = .secondaryLabelColor
 

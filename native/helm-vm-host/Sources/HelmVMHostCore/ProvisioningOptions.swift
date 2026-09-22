@@ -1,27 +1,36 @@
 import Darwin
 import Foundation
 
-/// Options for the interactive first-run Ubuntu installer.
+/// Options for the interactive first-run Ubuntu installer and resumable
+/// provisioning sessions.
 ///
-/// The provisioning contract is intentionally fixed to an official Ubuntu
-/// 24.04 LTS ARM64 installer ISO. The host validates the path and file, but it
+/// Fresh provisioning accepts an official Ubuntu 24.04 LTS ARM64 installer
+/// ISO. Resume mode may omit the ISO and reuses the existing provisioning disk
+/// and EFI state. The host validates any supplied ISO path and file, but it
 /// does not attempt to infer the ISO architecture from its bytes.
 public struct ProvisioningOptions {
     public static let installationDiskSizeBytes: UInt64 = 24 * 1024 * 1024 * 1024
 
-    let installerISOURL: URL
+    let installerISOURL: URL?
     let installationImageURL: URL
     let efiVariablesURL: URL
+    let machineIdentifierURL: URL
+    let runtimeShareURL: URL
+    let runtimeTag: String
     let cpuCount: Int
     let memorySize: UInt64
     let displayWidth: Int
     let displayHeight: Int
     let force: Bool
+    let resume: Bool
 
     public static func parse(arguments: [String]) throws -> ProvisioningOptions? {
         var installerISOPath: String?
         var installationImagePath: String?
         var efiVariablesPath: String?
+        var machineIdentifierPath: String?
+        var runtimeSharePath: String?
+        var runtimeTag = environmentValue("HELM_VM_RUNTIME_TAG") ?? HelmRuntimeShareConfiguration.defaultTag
         var cpuCount = try parseInt(
             environmentValue("HELM_VM_CPUS") ?? "4",
             option: "HELM_VM_CPUS"
@@ -33,6 +42,7 @@ public struct ProvisioningOptions {
         var displayWidth = 1280
         var displayHeight = 800
         var force = false
+        var resume = false
         var positionalISOSeen = false
         var index = 0
 
@@ -50,6 +60,12 @@ public struct ProvisioningOptions {
                 installationImagePath = try nextArgument(arguments, index: &index, option: argument)
             case "--efi-vars":
                 efiVariablesPath = try nextArgument(arguments, index: &index, option: argument)
+            case "--machine-id":
+                machineIdentifierPath = try nextArgument(arguments, index: &index, option: argument)
+            case "--runtime-share":
+                runtimeSharePath = try nextArgument(arguments, index: &index, option: argument)
+            case "--runtime-tag":
+                runtimeTag = try nextArgument(arguments, index: &index, option: argument)
             case "--cpus":
                 cpuCount = try parseInt(
                     nextArgument(arguments, index: &index, option: argument),
@@ -72,6 +88,8 @@ public struct ProvisioningOptions {
                 )
             case "--force":
                 force = true
+            case "--resume":
+                resume = true
             default:
                 if argument.hasPrefix("-") || positionalISOSeen {
                     throw HostFailure(code: "invalid_argument", message: "Unknown argument: \(argument)")
@@ -81,10 +99,22 @@ public struct ProvisioningOptions {
             }
         }
 
-        guard let installerISOPath, !installerISOPath.isEmpty else {
+        if let installerISOPath, installerISOPath.isEmpty {
+            throw HostFailure(
+                code: "invalid_argument",
+                message: "The installer ISO path must not be empty."
+            )
+        }
+        guard resume || (installerISOPath != nil && !installerISOPath!.isEmpty) else {
             throw HostFailure(
                 code: "invalid_argument",
                 message: "Provisioning requires an Ubuntu 24.04 LTS ARM64 installer ISO path."
+            )
+        }
+        guard !(resume && force) else {
+            throw HostFailure(
+                code: "invalid_argument",
+                message: "Cannot combine --resume with --force. Resume never replaces provisioning state."
             )
         }
         guard cpuCount > 0 else {
@@ -96,37 +126,59 @@ public struct ProvisioningOptions {
         guard displayWidth > 0, displayHeight > 0 else {
             throw HostFailure(code: "invalid_argument", message: "Display dimensions must be positive.")
         }
+        guard !runtimeTag.isEmpty else {
+            throw HostFailure(code: "invalid_argument", message: "Runtime VirtioFS tag must not be empty.")
+        }
 
         let defaultRoot = environmentValue("HELM_VM_HOME")
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/Helm", isDirectory: true)
                 .path
-        let rootURL = resolvePath(defaultRoot)
+        let rootURL = resolveHelmPath(defaultRoot)
         let vmDirectoryURL = rootURL.appendingPathComponent("vm", isDirectory: true)
-        let resolvedInstallationImageURL = resolvePath(
+        let resolvedInstallationImageURL = resolveHelmPath(
             installationImagePath ?? environmentValue("HELM_VM_PROVISIONING_IMAGE")
                 ?? vmDirectoryURL.appendingPathComponent("provisioning.img").path
         )
-        let resolvedEFIURL = resolvePath(
+        let resolvedEFIURL = resolveHelmPath(
             efiVariablesPath ?? environmentValue("HELM_VM_PROVISIONING_EFI_VARS")
                 ?? vmDirectoryURL.appendingPathComponent("provisioning-efi-vars.bin").path
         )
+        let resolvedMachineIdentifierURL = resolveHelmPath(
+            machineIdentifierPath ?? environmentValue("HELM_VM_MACHINE_ID")
+                ?? vmDirectoryURL.appendingPathComponent("machine-id.bin").path
+        )
+
+        let resolvedRuntimeURL = resolveHelmPath(
+            runtimeSharePath ?? environmentValue("HELM_VM_RUNTIME_SHARE")
+                ?? rootURL.appendingPathComponent("runtime", isDirectory: true).path
+        )
 
         let options = ProvisioningOptions(
-            installerISOURL: resolvePath(installerISOPath),
+            installerISOURL: installerISOPath.map(resolveHelmPath),
             installationImageURL: resolvedInstallationImageURL,
             efiVariablesURL: resolvedEFIURL,
+            machineIdentifierURL: resolvedMachineIdentifierURL,
+            runtimeShareURL: resolvedRuntimeURL,
+            runtimeTag: runtimeTag,
             cpuCount: cpuCount,
             memorySize: memoryMiB * 1024 * 1024,
             displayWidth: displayWidth,
             displayHeight: displayHeight,
-            force: force
+            force: force,
+            resume: resume
         )
         try options.validatePaths()
         return options
     }
 
     func prepareStorage() throws {
+        guard !resume else {
+            throw HostFailure(
+                code: "invalid_argument",
+                message: "Resume mode does not prepare or replace provisioning storage."
+            )
+        }
         let fileManager = FileManager.default
         try createParentDirectory(for: installationImageURL, fileManager: fileManager)
         try createParentDirectory(for: efiVariablesURL, fileManager: fileManager)
@@ -156,12 +208,45 @@ public struct ProvisioningOptions {
 
     private func validatePaths() throws {
         let fileManager = FileManager.default
-        try requireRegularNonEmptyFile(installerISOURL, label: "Ubuntu 24.04 LTS ARM64 installer ISO", fileManager: fileManager)
-        guard installerISOURL.standardizedFileURL != installationImageURL.standardizedFileURL else {
-            throw HostFailure(
-                code: "invalid_storage",
-                message: "The installer ISO and writable installation disk must be different files."
+        if let installerISOURL {
+            try requireRegularNonEmptyFile(
+                installerISOURL,
+                label: "Ubuntu 24.04 LTS ARM64 installer ISO",
+                fileManager: fileManager
             )
+            guard installerISOURL.standardizedFileURL != installationImageURL.standardizedFileURL else {
+                throw HostFailure(
+                    code: "invalid_storage",
+                    message: "The installer ISO and writable installation disk must be different files."
+                )
+            }
+        }
+        if resume {
+            try requireRegularNonEmptyFile(
+                installationImageURL,
+                label: "existing provisioning disk",
+                fileManager: fileManager
+            )
+            try requireRegularNonEmptyFile(
+                efiVariablesURL,
+                label: "existing provisioning EFI store",
+                fileManager: fileManager
+            )
+        }
+        try requireDirectory(runtimeShareURL, label: "Helm runtime directory", fileManager: fileManager)
+    }
+
+    private func requireDirectory(
+        _ url: URL,
+        label: String,
+        fileManager: FileManager
+    ) throws {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            throw HostFailure(code: "missing_resource", message: "The \(label) is missing: \(url.path)")
+        }
+        guard isDirectory.boolValue else {
+            throw HostFailure(code: "invalid_resource", message: "The \(label) is not a directory: \(url.path)")
         }
     }
 
@@ -270,42 +355,23 @@ public struct ProvisioningOptions {
         return parsed
     }
 
-    private static func resolvePath(_ value: String) -> URL {
-        let expanded: String
-        if value == "~" {
-            expanded = FileManager.default.homeDirectoryForCurrentUser.path
-        } else if value.hasPrefix("~/") {
-            expanded = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(String(value.dropFirst(2)))
-                .path
-        } else {
-            expanded = value
-        }
-
-        if expanded.hasPrefix("/") {
-            return URL(fileURLWithPath: expanded).standardizedFileURL
-        }
-        let currentDirectoryURL = URL(
-            fileURLWithPath: FileManager.default.currentDirectoryPath,
-            isDirectory: true
-        )
-        return URL(fileURLWithPath: expanded, relativeTo: currentDirectoryURL)
-            .standardizedFileURL
-    }
-
     private static func printUsage() {
         let usage = """
         helm-vm-host --provision: interactive Ubuntu 24.04 LTS ARM64 installer
 
         Options:
-          --installer-iso PATH    Official Ubuntu ARM64 installer ISO (required)
+          --installer-iso PATH    Official Ubuntu ARM64 installer ISO (fresh mode or optional resume media)
           --installation-image PATH
                                   New sparse raw installation disk
           --efi-vars PATH         Fresh provisioning EFI variable store
+          --machine-id PATH       Persistent provisioning machine identifier
+          --runtime-share PATH    Read-only VirtioFS host directory
+          --runtime-tag TAG       VirtioFS tag (default: helm-runtime)
           --cpus N                Guest CPU count (default: 4)
           --memory-mib N          Guest memory (default: 4096)
           --display-width N       VM display width (default: 1280)
           --display-height N      VM display height (default: 800)
+          --resume                Reuse existing provisioning disk and EFI state
           --force                 Replace an interrupted provisioning attempt
 
         The ISO architecture is not introspected. Supply the official Ubuntu

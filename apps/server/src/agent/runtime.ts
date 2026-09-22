@@ -159,7 +159,10 @@ export class AgentRuntime {
       userMessage: input.userMessage,
       signal: input.signal,
     });
-    const conversation = input.conversation ?? [];
+    // Keep a mutable per-run conversation window. The server can inject
+    // steering messages between tool turns without changing the persisted
+    // thread or starting a second runtime against the same desktop.
+    const conversation = [...(input.conversation ?? [])];
     const task = input.task ?? await this.createTask(input, memories);
     const cancellation = new RunCancellation();
     const removeExternalAbort = this.attachExternalCancellation(cancellation, input.signal);
@@ -213,6 +216,10 @@ export class AgentRuntime {
 
       while (!this.isTerminal(run.status)) {
         cancellation.throwIfCancelled();
+        const steering = input.drainSteering?.() ?? [];
+        if (steering.length > 0) {
+          conversation.push(...steering.map(message => clone(message)));
+        }
         if (!budget.canStartStep()) {
           await this.fail(run, error('STEP_BUDGET_EXCEEDED', `Run exceeded its ${budget.maxSteps}-step budget.`));
           break;
