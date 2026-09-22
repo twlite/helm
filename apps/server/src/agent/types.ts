@@ -5,6 +5,7 @@ import type {
   CompletionCriterion,
   EnvironmentObservation,
   Memory,
+  Message,
   Run,
   RunStep,
   TaskDefinition,
@@ -33,6 +34,7 @@ export type {
 export interface TaskPlannerInput {
   threadId: string;
   userMessage: string;
+  conversation?: readonly Message[];
   memories?: Memory[];
   signal?: AbortSignal;
 }
@@ -136,6 +138,7 @@ export interface AgentRuntimeOptions {
 export interface RunTaskInput {
   threadId: string;
   userMessage: string;
+  conversation?: readonly Message[];
   task?: TaskDefinition;
   runId?: string;
   sourceMessageId?: string;

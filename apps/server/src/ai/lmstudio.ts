@@ -6,6 +6,7 @@ import type { ToolDefinition } from '../tools/registry';
 import {
   AiSdkDecisionProvider,
   AiSdkEmbeddingProvider,
+  AiSdkResponseGenerator,
   AiSdkTaskPlanner,
   AiSdkThreadTitleGenerator,
 } from './adapter';
@@ -16,6 +17,7 @@ export interface HelmAiModels {
   embeddingModel: EmbeddingModel;
   decisionProvider: AiSdkDecisionProvider;
   taskPlanner: AiSdkTaskPlanner;
+  responseGenerator: AiSdkResponseGenerator;
   titleGenerator: AiSdkThreadTitleGenerator;
   embeddingProvider: AiSdkEmbeddingProvider;
 }
@@ -48,6 +50,12 @@ export function createLmStudioModels(config: HelmConfig, toolDefinitions: readon
       toolDefinitions,
     }),
     taskPlanner: new AiSdkTaskPlanner(sharedGenerationOptions),
+    responseGenerator: new AiSdkResponseGenerator({
+      model: languageModel,
+      maxOutputTokens: config.models.maxOutputTokens,
+      temperature: config.models.temperature,
+      requestTimeoutMs: config.models.requestTimeoutMs,
+    }),
     titleGenerator: new AiSdkThreadTitleGenerator(sharedGenerationOptions),
     embeddingProvider: new AiSdkEmbeddingProvider({
       model: embeddingModel,

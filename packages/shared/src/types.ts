@@ -148,6 +148,8 @@ export interface AgentTurnContext {
   observation: EnvironmentObservation;
   history: AgentStep[];
   memories: Memory[];
+  /** Earlier messages in the thread, including the current user request. */
+  conversation?: readonly Message[];
   stepIndex: number;
   previousResults: ToolResult[];
   signal?: AbortSignal;
@@ -248,6 +250,7 @@ export interface WebSocketEvent {
     | 'run.completed'
     | 'run.failed'
     | 'run.cancelled'
+    | 'message.created'
     | 'desktop.screenshot';
   timestamp: string;
   runId?: string;

@@ -14,6 +14,82 @@ import { createScriptedDemo } from '../../src/agent/demo';
 import { ToolRegistry } from '../../src/tools/tool-registry';
 
 describe('AgentRuntime', () => {
+  it('answers conversational plans without executing computer-use tools', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    let decisionCalls = 0;
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      taskPlanner: {
+        createTask: async input => ({
+          id: 'conversation-task',
+          threadId: input.threadId,
+          goal: input.userMessage,
+          criteria: [],
+        }),
+      },
+      decisionProvider: {
+        next: async () => {
+          decisionCalls += 1;
+          return { type: 'complete', reasoningSummary: 'Answer directly.' };
+        },
+      },
+    });
+
+    const result = await runtime.run({
+      threadId: 'conversation-thread',
+      userMessage: 'Who are you?',
+      conversation: [{
+        id: 'message-1',
+        threadId: 'conversation-thread',
+        role: 'user',
+        content: 'Who are you?',
+        metadata: {},
+        createdAt: '2026-01-01T00:00:00.000Z',
+      }],
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.finalVerification).toEqual({ complete: true, criteria: [], summary: 'Response ready.' });
+    expect(result.steps.some(step => step.phase === 'act')).toBe(false);
+    expect(decisionCalls).toBe(0);
+  });
+
+  it('stops repeated rejected completion decisions before the step budget', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: new ScriptedDecisionProvider([
+        { type: 'complete' },
+        { type: 'complete' },
+        { type: 'complete' },
+      ]),
+      budgets: { maxSteps: 12, maxRepeatedAction: 3 },
+    });
+
+    const result = await runtime.run({
+      threadId: 'completion-loop',
+      userMessage: 'Finish the task.',
+      task: {
+        id: 'completion-loop-task',
+        threadId: 'completion-loop',
+        goal: 'Finish the task.',
+        criteria: [{ type: 'file.exists', path: '/home/helm/workspace/missing.txt' }],
+      },
+    });
+
+    expect(result.status).toBe('failed');
+    expect(result.run.error?.code).toBe('COMPLETION_REJECTED');
+    expect(result.steps.filter(step => step.phase === 'complete')).toHaveLength(3);
+  });
+
   it('loads recalled memories for the new thread before asking the decision provider', async () => {
     const guest = new MockGuestTransport();
     const tools = createGuestToolRegistry(guest);
@@ -118,11 +194,12 @@ describe('AgentRuntime', () => {
     expect(result.history[1]?.verification?.criteria.every(criterion => !criterion.passed)).toBe(true);
   });
 
-  it('completes immediately when an action satisfies every criterion', async () => {
+  it('does not execute a successful action again when the model repeats it', async () => {
     const guest = new MockGuestTransport();
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
     const provider = new ScriptedDecisionProvider([
+      { type: 'action', tool: 'browser.navigate', input: { url: 'https://twlite.dev' } },
       { type: 'action', tool: 'browser.navigate', input: { url: 'https://twlite.dev' } },
     ]);
     const runtime = new AgentRuntime({
@@ -142,7 +219,129 @@ describe('AgentRuntime', () => {
     expect(result.status).toBe('completed');
     expect(result.finalVerification?.complete).toBe(true);
     expect(result.history).toHaveLength(1);
-    expect(provider.index).toBe(1);
+    expect(provider.index).toBe(2);
+  });
+
+  it('allows useful follow-up work after navigation verification passes', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    const provider = new ScriptedDecisionProvider([
+      { type: 'action', tool: 'browser.navigate', input: { url: 'https://twlite.dev' } },
+      { type: 'action', tool: 'browser.extractText', input: {} },
+      { type: 'complete' },
+    ]);
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: provider,
+    });
+
+    const result = await runtime.run({
+      id: 'follow-up',
+      threadId: 'thread',
+      goal: 'Read the page after navigating to it.',
+      criteria: [{ type: 'browser.url', url: 'twlite.dev' }],
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(true);
+  });
+
+  it('does not complete a page-information task from URL verification alone', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    const provider = new ScriptedDecisionProvider([
+      { type: 'action', tool: 'browser.navigate', input: { url: 'https://twlite.dev' } },
+      { type: 'complete' },
+      { type: 'action', tool: 'browser.extractText', input: {} },
+      { type: 'complete' },
+    ]);
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: provider,
+    });
+
+    const result = await runtime.run({
+      id: 'page-information',
+      threadId: 'thread',
+      goal: 'Visit the page and extract information from it.',
+      criteria: [{ type: 'browser.url', url: 'twlite.dev' }],
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(true);
+  });
+
+  it('automatically reads an open page when the model completes before extracting it', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    const provider = new ScriptedDecisionProvider([
+      { type: 'action', tool: 'browser.navigate', input: { url: 'https://twlite.dev' } },
+      { type: 'complete' },
+      { type: 'complete' },
+    ]);
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: provider,
+    });
+
+    const result = await runtime.run({
+      id: 'page-information-auto-read',
+      threadId: 'thread',
+      userMessage: 'Go to twlite.dev and tell me what is on the page.',
+      goal: 'Go to twlite.dev and tell me what is on the page.',
+      criteria: [{ type: 'browser.url', url: 'twlite.dev' }],
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(true);
+    expect(result.steps.filter(step => step.phase === 'act' && step.toolName === 'browser.navigate')).toHaveLength(1);
+  });
+
+  it('detects repeated actions even when the observed browser state changes', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    let observationCount = 0;
+    const provider = new ScriptedDecisionProvider([
+      { type: 'action', tool: 'fs.exists', input: { path: '/home/helm/workspace/missing.txt' } },
+      { type: 'action', tool: 'fs.exists', input: { path: '/home/helm/workspace/missing.txt' } },
+    ]);
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: provider,
+      budgets: { maxSteps: 4, maxRepeatedAction: 2 },
+      observe: {
+        observe: async input => ({
+          timestamp: observationCount++,
+          browser: { url: `https://changing-${observationCount}.test`, loaded: true },
+          task: {
+            completedCriteria: input.completedCriteria,
+            remainingCriteria: input.remainingCriteria,
+          },
+        }),
+      },
+    });
+
+    const result = await runtime.run({
+      id: 'changing-observation-loop',
+      threadId: 'thread',
+      goal: 'Do not loop.',
+      criteria: [{ type: 'file.exists', path: '/home/helm/workspace/never.txt' }],
+    });
+
+    expect(result.status).toBe('failed');
+    expect(result.run.error?.code).toBe('TOOL_LOOP_DETECTED');
   });
 
   it('enforces the step budget and detects repeated action/state loops', async () => {

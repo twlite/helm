@@ -1,11 +1,22 @@
 const command = Bun.argv[2];
 if (!command || !['start', 'stop', 'reset'].includes(command)) {
-  console.error('Usage: bun run vm:start|vm:stop|vm:reset');
+  console.error('Usage: bun run vm:start [--gui] | bun run vm:stop | bun run vm:reset');
+  process.exit(1);
+}
+
+const commandArguments = Bun.argv.slice(3);
+const showWindow = command === 'start' && commandArguments.includes('--gui');
+const hasUnknownArgument = commandArguments.some(argument => argument !== '--gui')
+  || (command !== 'start' && commandArguments.length > 0);
+if (hasUnknownArgument) {
+  console.error('Usage: bun run vm:start [--gui] | bun run vm:stop | bun run vm:reset');
   process.exit(1);
 }
 
 const baseUrl = process.env.HELM_SERVER_URL ?? 'http://127.0.0.1:8787';
-const response = await fetch(`${baseUrl}/api/vm/${command}`, { method: 'POST' }).catch(error => {
+const endpoint = new URL(`/api/vm/${command}`, baseUrl);
+if (showWindow) endpoint.searchParams.set('gui', 'true');
+const response = await fetch(endpoint, { method: 'POST' }).catch(error => {
   console.error(`Could not reach Helm server at ${baseUrl}: ${String(error)}`);
   process.exit(1);
 });

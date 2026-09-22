@@ -68,6 +68,7 @@ bun run vm:doctor
 bun run vm:provision /path/to/ubuntu-24.04-arm64.iso
 bun run vm:seal
 bun run vm:start
+bun run vm:start --gui
 bun run vm:stop
 bun run vm:reset
 ```
@@ -77,6 +78,11 @@ window for an official Ubuntu 24.04 LTS ARM64 installer. After the guest is
 installed and shut down, `vm:seal` promotes the retained installation disk to
 `base.img`. `vm:doctor` reports lazy first-run artifacts as `WAIT`; see
 [docs/vm-setup.md](docs/vm-setup.md).
+
+`vm:start --gui` starts the normal VM through the server with a resizable
+Virtualization.framework viewer window attached. Plain `vm:start` remains
+headless. If the helper is already running headlessly, stop it before retrying
+with `--gui`.
 
 ## Documentation
 

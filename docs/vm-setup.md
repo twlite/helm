@@ -84,8 +84,15 @@ commands:
 ```sh
 bun run vm:doctor
 bun run vm:start
+bun run vm:start --gui
 bun run vm:stop
 ```
+
+Use `vm:start --gui` when debugging the agent loop. It launches the normal
+working VM with the native `VZVirtualMachineView` window attached while the
+server and JSONL guest path continue to operate normally. Plain `vm:start`
+remains headless. If a helper is already running headlessly, stop it first so
+Helm can relaunch it with the viewer enabled.
 
 For maintenance work that only needs the native desktop viewer, start the
 helper directly. This boots the working image and does not wait for

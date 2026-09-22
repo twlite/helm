@@ -1,9 +1,10 @@
 import { memo } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
-import type { Message, RunDetails, Thread } from '../types';
+import type { LiveActivity, Message, RunDetails, Thread } from '../types';
 import { formatTime } from '../format';
 import { Icon } from './Icon';
 import { RunErrorCard } from './RunErrorCard';
+import { RunActivityFeed } from './RunActivityFeed';
 import { Alert } from './ui/alert';
 import { Button } from './ui/button';
 import { ScrollArea } from './ui/scroll-area';
@@ -25,11 +26,11 @@ type ConversationProps = {
   onRunDemo: () => Promise<void>;
   isRunStarting: boolean;
   run: RunDetails | null;
+  liveActivity?: LiveActivity;
   isRetryingRun: boolean;
+  onCancelRun: (runId: string) => Promise<void>;
   onRetryRun: (runId?: string) => Promise<void>;
   onOpenActivity: (runId?: string) => void;
-  activityOpen: boolean;
-  onToggleActivity: () => void;
   onOpenMobileSidebar: () => void;
   notice: ConversationNotice | null;
   onDismissNotice: () => void;
@@ -82,7 +83,7 @@ const MessageRow = memo(function MessageRow({ message }: { message: Message }) {
   const isUser = message.role === 'user';
   const isAssistant = message.role === 'assistant';
   return (
-    <article className={`flex w-full ${isUser ? 'justify-end' : 'justify-start'}`}>
+    <article className={`flex min-w-0 w-full ${isUser ? 'justify-end' : 'justify-start'}`}>
       <div
         className={[
           'min-w-0',
@@ -108,29 +109,6 @@ const MessageRow = memo(function MessageRow({ message }: { message: Message }) {
   );
 });
 
-function RunStatus({ run, open, onToggle }: { run: RunDetails | null; open: boolean; onToggle: () => void }) {
-  const statusDot = run?.status === 'failed' || run?.status === 'blocked'
-    ? 'bg-red-300'
-    : run?.status === 'completed'
-      ? 'bg-emerald-300'
-      : run
-        ? 'bg-amber-300'
-        : undefined;
-  return (
-    <Button
-      aria-label="Open agent activity"
-      className={open ? 'bg-white/[0.08] text-[#f1f3f5]' : undefined}
-      onClick={onToggle}
-      size="sm"
-      variant="ghost"
-    >
-      <Icon name="activity" size={15} />
-      <span className="hidden sm:inline">Activity</span>
-      {statusDot ? <span className={`size-1.5 rounded-full ${statusDot}`} /> : null}
-    </Button>
-  );
-}
-
 export function Conversation({
   thread,
   messages,
@@ -142,11 +120,11 @@ export function Conversation({
   onRunDemo,
   isRunStarting,
   run,
+  liveActivity,
   isRetryingRun,
+  onCancelRun,
   onRetryRun,
   onOpenActivity,
-  activityOpen,
-  onToggleActivity,
   onOpenMobileSidebar,
   notice,
   onDismissNotice,
@@ -168,7 +146,7 @@ export function Conversation({
   }
 
   return (
-    <main className="flex min-w-0 flex-1 flex-col bg-[#0b0d10]">
+    <main className="flex min-w-0 flex-1 flex-col overflow-hidden bg-[#0b0d10]">
       <header className="flex h-16 shrink-0 items-center justify-between gap-3 border-b border-white/[0.06] px-4 sm:px-7">
         <div className="flex min-w-0 items-center gap-2.5">
           <Button aria-label="Open threads" className="md:hidden" onClick={onOpenMobileSidebar} size="icon-sm" variant="ghost">
@@ -186,13 +164,12 @@ export function Conversation({
               <span className="hidden sm:inline">{isRunStarting ? 'Starting…' : 'Demo'}</span>
             </Button>
           ) : null}
-          <RunStatus onToggle={onToggleActivity} open={activityOpen} run={run} />
         </div>
       </header>
 
-      <div className="min-h-0 flex-1">
+      <div className="min-h-0 min-w-0 flex-1">
         <ScrollArea className="h-full">
-          <div className="mx-auto flex min-h-full w-full max-w-[950px] flex-col px-5 py-8 sm:px-10 sm:py-10">
+          <div className="mx-auto flex min-h-full min-w-0 w-full max-w-[950px] flex-col px-5 py-8 sm:px-10 sm:py-10">
             {!thread ? (
               <div className="flex flex-1 items-center justify-center py-16">
                 <div className="max-w-md text-center">
@@ -202,7 +179,7 @@ export function Conversation({
                 </div>
               </div>
             ) : (
-              <div className="flex flex-col gap-8">
+              <div className="flex min-w-0 flex-col gap-8">
                 {isLoading ? (
                   <div className="flex items-center gap-2 text-sm text-[#79838f]">
                     <span className="size-1.5 animate-pulse rounded-full bg-teal-300" />
@@ -245,6 +222,18 @@ export function Conversation({
                     onRetry={() => onRetryRun(run.id)}
                     title={runErrorTitle(run.status)}
                   />
+                ) : null}
+                {run ? (
+                  <div className="min-w-0 max-w-[780px]">
+                    <RunActivityFeed
+                      isRetryingRun={isRetryingRun}
+                      liveActivity={liveActivity}
+                      onCancelRun={onCancelRun}
+                      onRetryRun={onRetryRun}
+                      run={run}
+                      showError={false}
+                    />
+                  </div>
                 ) : null}
               </div>
             )}

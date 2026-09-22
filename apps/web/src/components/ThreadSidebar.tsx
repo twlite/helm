@@ -43,6 +43,11 @@ function isToday(value: string) {
   return date.toDateString() === now.toDateString();
 }
 
+function visibleThreadTitle(title: string): string {
+  const normalized = title.trim().replace(/\s+/gu, ' ');
+  return normalized.length <= 72 ? normalized : `${normalized.slice(0, 69).trimEnd()}…`;
+}
+
 function ThreadRow({
   thread,
   selected,
@@ -69,15 +74,15 @@ function ThreadRow({
   return (
     <div
       aria-current={selected ? 'page' : undefined}
-      className={`group flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-left transition-colors ${selected ? 'bg-white/[0.08] text-[#f1f3f5]' : 'text-[#9ba4af] hover:bg-white/[0.045] hover:text-[#e7ebef]'}`}
+      className={`group flex w-full min-w-0 max-w-full cursor-pointer items-center gap-2 overflow-hidden rounded-md px-2.5 py-2 text-left transition-colors ${selected ? 'bg-white/[0.08] text-[#f1f3f5]' : 'text-[#9ba4af] hover:bg-white/[0.045] hover:text-[#e7ebef]'}`}
       onClick={onSelect}
       onKeyDown={handleKeyDown}
       role="button"
       tabIndex={0}
     >
       <Icon className="shrink-0 opacity-60" name="message" size={15} />
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-[13px] font-medium">{thread.title}</span>
+      <span className="min-w-0 flex-1 overflow-hidden">
+        <span className="block max-w-full truncate text-[13px] font-medium" title={thread.title}>{visibleThreadTitle(thread.title)}</span>
         <span className="mt-0.5 block truncate text-[11px] text-[#606975]">{isToday(thread.updatedAt) ? formatTime(thread.updatedAt) : formatDate(thread.updatedAt)}</span>
       </span>
       <button
@@ -111,7 +116,7 @@ function ThreadGroup({
     return null;
   }
   return (
-    <section className="space-y-1">
+    <section className="min-w-0 space-y-1">
       <h2 className="px-2.5 text-[11px] font-medium text-[#606975]">{label}</h2>
       <div className="space-y-0.5">
         {threads.map((thread) => (
@@ -148,7 +153,7 @@ function SidebarContent({
   const connection = connectionCopy(connectionState, reconnectAttempt);
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[#0d1015]">
+    <div className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden bg-[#0d1015]">
       <div className="flex items-center gap-2.5 px-4 py-4">
         <div className="flex size-7 items-center justify-center rounded-lg bg-teal-400/10 text-xs font-semibold text-teal-300">H</div>
         <div className="min-w-0">
@@ -172,8 +177,8 @@ function SidebarContent({
         </Button>
       </div>
 
-      <ScrollArea className="mt-6 min-h-0 flex-1 px-3">
-        <div className="space-y-6 pb-4">
+      <ScrollArea className="mt-6 min-h-0 w-full min-w-0 flex-1 overflow-x-hidden px-3">
+        <div className="min-w-0 max-w-full space-y-6 overflow-hidden pb-4">
           <div className="flex items-center justify-between px-2.5">
             <h2 className="text-xs font-medium text-[#aeb7c1]">Threads</h2>
             {threads.length > 0 ? <span className="text-[11px] text-[#606975]">{threads.length}</span> : null}
@@ -214,7 +219,7 @@ export function ThreadSidebar(props: ThreadSidebarProps) {
 
   return (
     <>
-      <aside aria-label="Threads" className="hidden h-full w-[248px] shrink-0 border-r border-white/[0.07] lg:flex">
+      <aside aria-label="Threads" className="hidden h-full w-[248px] min-w-0 shrink-0 overflow-hidden border-r border-white/[0.07] lg:flex">
         <SidebarContent {...contentProps} onCloseMobile={() => undefined} />
       </aside>
       <Sheet onOpenChange={onMobileOpenChange} open={mobileOpen}>

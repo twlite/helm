@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { helmApi, parseError } from './api';
-import { ActivityDrawer } from './components/ActivityDrawer';
 import { Conversation, type ConversationNotice } from './components/Conversation';
 import { DesktopPanel } from './components/DesktopPanel';
 import { MemoryDialog } from './components/MemoryDialog';
@@ -12,6 +11,7 @@ import type {
   ConnectionState,
   HelmEvent,
   HealthStatus,
+  LiveActivity,
   Memory,
   MemoryKind,
   Message,
@@ -69,6 +69,52 @@ function extractScreenshot(payload: unknown): string | undefined {
   return `data:image/png;base64,${candidate}`;
 }
 
+function liveActivityFromEvent(event: HelmEvent, previous: LiveActivity | null): LiveActivity | null {
+  if (!event.runId) return previous;
+  const payload = isRecord(event.payload) ? event.payload : undefined;
+  const stepIndex = typeof payload?.stepIndex === 'number' ? payload.stepIndex : undefined;
+  const action = isRecord(payload?.action) ? payload.action : undefined;
+  const toolName = typeof action?.tool === 'string'
+    ? action.tool
+    : typeof payload?.toolName === 'string'
+      ? payload.toolName
+      : undefined;
+  const reasoningSummary = typeof payload?.reasoningSummary === 'string' ? payload.reasoningSummary : undefined;
+
+  switch (event.type) {
+    case 'run.started':
+      return { runId: event.runId, phase: 'starting' };
+    case 'run.step.started':
+      return {
+        runId: event.runId,
+        phase: 'thinking',
+        ...(stepIndex === undefined ? {} : { stepIndex }),
+      };
+    case 'run.verification':
+      return {
+        runId: event.runId,
+        phase: 'verifying',
+        ...(previous?.runId === event.runId && previous.stepIndex !== undefined ? { stepIndex: previous.stepIndex } : {}),
+      };
+    case 'run.step.completed':
+      return {
+        runId: event.runId,
+        phase: 'recorded',
+        ...(stepIndex === undefined && previous?.runId === event.runId && previous.stepIndex !== undefined ? { stepIndex: previous.stepIndex } : stepIndex === undefined ? {} : { stepIndex }),
+        ...(toolName ? { toolName } : {}),
+        ...(reasoningSummary ? { reasoningSummary } : {}),
+      };
+    case 'run.completed':
+      return { runId: event.runId, phase: 'completed' };
+    case 'run.failed':
+      return { runId: event.runId, phase: 'failed' };
+    case 'run.cancelled':
+      return { runId: event.runId, phase: 'cancelled' };
+    default:
+      return previous;
+  }
+}
+
 function App() {
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
@@ -78,6 +124,7 @@ function App() {
   const [isRunStarting, setIsRunStarting] = useState(false);
   const [isRetryingRun, setIsRetryingRun] = useState(false);
   const [run, setRun] = useState<RunDetails | null>(null);
+  const [liveActivity, setLiveActivity] = useState<LiveActivity | null>(null);
   const [vm, setVm] = useState<VmStatus | null>(null);
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [screenshot, setScreenshot] = useState<string | null>(null);
@@ -87,7 +134,6 @@ function App() {
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryActionId, setMemoryActionId] = useState<string | null>(null);
   const [notice, setNotice] = useState<ConversationNotice | null>(null);
-  const [isActivityOpen, setIsActivityOpen] = useState(false);
   const [isMemoryOpen, setIsMemoryOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
@@ -141,8 +187,21 @@ function App() {
         setVm((current) => current ? { ...current, screenshot: nextScreenshot } : current);
       }
     }
+    if (event.type === 'message.created') {
+      const payload = isRecord(event.payload) ? event.payload : undefined;
+      const threadId = asString(payload?.threadId);
+      if (threadId && threadId === selectedThreadIdRef.current) {
+        void helmApi.listMessages(threadId)
+          .then((nextMessages) => {
+            if (selectedThreadIdRef.current === threadId) {
+              setMessages(nextMessages);
+            }
+          })
+          .catch(() => undefined);
+      }
+    }
     if (event.runId && event.type.startsWith('run.')) {
-      setIsActivityOpen(true);
+      setLiveActivity((current) => liveActivityFromEvent(event, current));
       void refreshRun(event.runId);
       if (['run.completed', 'run.failed', 'run.cancelled'].includes(event.type)) {
         const currentThreadId = selectedThreadIdRef.current;
@@ -234,7 +293,7 @@ function App() {
   const handleSelectThread = useCallback((threadId: string) => {
     setSelectedThreadId(threadId);
     setRun(null);
-    setIsActivityOpen(false);
+    setLiveActivity(null);
     setDraft('');
     setNotice(null);
   }, []);
@@ -245,7 +304,7 @@ function App() {
     setMessages([]);
     setDraft('');
     setRun(null);
-    setIsActivityOpen(false);
+    setLiveActivity(null);
     setNotice(null);
     setMessageState('idle');
   }, []);
@@ -263,7 +322,7 @@ function App() {
         setSelectedThreadId(remaining[0]?.id ?? null);
         setMessages([]);
         setRun(null);
-        setIsActivityOpen(false);
+        setLiveActivity(null);
       }
     } catch (error) {
       showError(error);
@@ -284,7 +343,7 @@ function App() {
         setSelectedThreadId(thread.id);
         setMessages([]);
         setRun(null);
-        setIsActivityOpen(false);
+        setLiveActivity(null);
       }
       const message = await helmApi.createMessage(threadId, content);
       setMessages((current) => [...current, message]);
@@ -300,8 +359,8 @@ function App() {
       }
       try {
         const nextRun = await helmApi.runAgent(threadId, message.id);
-        setRun(nextRun);
-        setIsActivityOpen(true);
+        setRun((current) => current?.id === nextRun.id && current.steps.length > nextRun.steps.length ? current : nextRun);
+        setLiveActivity((current) => current?.runId === nextRun.id && current.phase !== 'starting' ? current : { runId: nextRun.id, phase: 'starting' });
       } catch (error) {
         showError(error);
       }
@@ -317,11 +376,11 @@ function App() {
       return;
     }
     setIsRunStarting(true);
-    setIsActivityOpen(true);
     setNotice(null);
     try {
       const nextRun = await helmApi.runScriptedDemo(threadId);
-      setRun(nextRun);
+      setRun((current) => current?.id === nextRun.id && current.steps.length > nextRun.steps.length ? current : nextRun);
+      setLiveActivity((current) => current?.runId === nextRun.id && current.phase !== 'starting' ? current : { runId: nextRun.id, phase: 'starting' });
     } catch (error) {
       showError(error);
     } finally {
@@ -358,8 +417,8 @@ function App() {
       }
 
       const nextRun = await helmApi.runAgent(threadId, sourceMessageId);
-      setRun(nextRun);
-      setIsActivityOpen(true);
+      setRun((current) => current?.id === nextRun.id && current.steps.length > nextRun.steps.length ? current : nextRun);
+      setLiveActivity((current) => current?.runId === nextRun.id && current.phase !== 'starting' ? current : { runId: nextRun.id, phase: 'starting' });
     } catch (error) {
       showError(error);
     } finally {
@@ -368,7 +427,6 @@ function App() {
   }, [isRetryingRun, messages, run, showError]);
 
   const handleOpenActivity = useCallback(async (runId?: string) => {
-    setIsActivityOpen(true);
     if (!runId || run?.id === runId) {
       return;
     }
@@ -457,11 +515,9 @@ function App() {
         onDeleteThread={handleDeleteThread}
         onMobileOpenChange={setIsMobileSidebarOpen}
         onOpenMemory={() => {
-          setIsActivityOpen(false);
           setIsMemoryOpen(true);
         }}
         onOpenSettings={() => {
-          setIsActivityOpen(false);
           setIsSettingsOpen(true);
         }}
         onSelectThread={handleSelectThread}
@@ -470,15 +526,16 @@ function App() {
         threads={threads}
         mobileOpen={isMobileSidebarOpen}
       />
-      <section className="flex min-w-0 flex-1">
+      <section className="flex min-w-0 flex-1 overflow-hidden">
         <Conversation
-          activityOpen={isActivityOpen}
           draft={draft}
           isLoading={messageState === 'loading'}
           isRunStarting={isRunStarting}
           isRetryingRun={isRetryingRun}
           isSending={messageState === 'saving'}
+          liveActivity={liveActivity ?? undefined}
           messages={messages}
+          onCancelRun={handleCancelRun}
           onDraftChange={setDraft}
           onDismissNotice={() => setNotice(null)}
           onOpenMobileSidebar={() => setIsMobileSidebarOpen(true)}
@@ -486,23 +543,22 @@ function App() {
           onRunDemo={handleRunDemo}
           onRetryRun={handleRetryRun}
           onSend={handleSendMessage}
-          onToggleActivity={() => setIsActivityOpen((current) => !current)}
           notice={notice}
           run={run}
           thread={selectedThread}
         />
-        <DesktopPanel onVmAction={handleVmAction} screenshot={screenshot} vm={vm} vmAction={vmAction} />
+        <DesktopPanel
+          isRetryingRun={isRetryingRun}
+          liveActivity={liveActivity ?? undefined}
+          onCancelRun={handleCancelRun}
+          onRetryRun={handleRetryRun}
+          onVmAction={handleVmAction}
+          run={run}
+          screenshot={screenshot}
+          vm={vm}
+          vmAction={vmAction}
+        />
       </section>
-      <ActivityDrawer
-        isRunStarting={isRunStarting}
-        onCancelRun={handleCancelRun}
-        onRetryRun={handleRetryRun}
-        isRetryingRun={isRetryingRun}
-        onOpenChange={setIsActivityOpen}
-        onRunDemo={handleRunDemo}
-        open={isActivityOpen}
-        run={run}
-      />
       <MemoryDialog
         memoryActionId={memoryActionId}
         memories={memories}

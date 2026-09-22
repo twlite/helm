@@ -1,8 +1,9 @@
 import { useState } from 'react';
-import type { VmAction, VmStatus } from '../types';
+import type { LiveActivity, RunDetails, VmAction, VmStatus } from '../types';
 import { humanize } from '../format';
 import { Icon } from './Icon';
 import { DesktopViewer } from './DesktopViewer';
+import { RunActivityFeed } from './RunActivityFeed';
 import { Button } from './ui/button';
 import { ScrollArea } from './ui/scroll-area';
 
@@ -11,6 +12,11 @@ type DesktopPanelProps = {
   vm: VmStatus | null;
   vmAction: VmAction | null;
   onVmAction: (action: VmAction) => Promise<void>;
+  run: RunDetails | null;
+  liveActivity?: LiveActivity;
+  onCancelRun: (runId: string) => Promise<void>;
+  onRetryRun: (runId?: string) => Promise<void>;
+  isRetryingRun: boolean;
 };
 
 function statusClasses(status: string) {
@@ -26,7 +32,17 @@ function statusClasses(status: string) {
   return { text: 'text-[#79838f]', dot: 'bg-[#606975]' };
 }
 
-export function DesktopPanel({ screenshot, vm, vmAction, onVmAction }: DesktopPanelProps) {
+export function DesktopPanel({
+  screenshot,
+  vm,
+  vmAction,
+  onVmAction,
+  run,
+  liveActivity,
+  onCancelRun,
+  onRetryRun,
+  isRetryingRun,
+}: DesktopPanelProps) {
   const [viewerOpen, setViewerOpen] = useState(false);
   const state = vm?.state ?? 'unavailable';
   const status = statusClasses(state);
@@ -35,7 +51,7 @@ export function DesktopPanel({ screenshot, vm, vmAction, onVmAction }: DesktopPa
     <>
       <aside
         aria-label="Controlled desktop"
-        className="hidden min-h-0 w-[38%] shrink-0 border-l border-white/[0.06] bg-[#0d1015] md:flex md:flex-col xl:w-[42%]"
+        className="hidden min-h-0 w-[38%] min-w-0 shrink-0 border-l border-white/[0.06] bg-[#0d1015] lg:flex lg:flex-col xl:w-[42%]"
       >
         <header className="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-white/[0.06] px-5">
           <div className="min-w-0">
@@ -48,8 +64,8 @@ export function DesktopPanel({ screenshot, vm, vmAction, onVmAction }: DesktopPa
           </span>
         </header>
 
-        <ScrollArea className="min-h-0 flex-1">
-          <div className="space-y-6 p-5">
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="shrink-0 space-y-4 p-5 pb-4">
             <button
               aria-label={screenshot ? 'Open desktop screenshot' : 'Desktop screenshot unavailable'}
               className="block w-full overflow-hidden rounded-lg bg-black text-left outline-none transition hover:bg-[#050607] focus-visible:ring-2 focus-visible:ring-teal-400/50 disabled:cursor-default"
@@ -69,7 +85,7 @@ export function DesktopPanel({ screenshot, vm, vmAction, onVmAction }: DesktopPa
               </div>
             </button>
 
-            <div className="flex items-center justify-between gap-3 text-xs text-[#79838f]">
+            <div className="flex min-w-0 items-center justify-between gap-3 text-xs text-[#79838f]">
               <span className="flex items-center gap-2">
                 <span className={`size-1.5 rounded-full ${vm?.guestConnected ? 'bg-emerald-400' : 'bg-[#606975]'}`} />
                 {vm?.guestConnected ? 'Guest connected' : 'Guest not connected'}
@@ -104,7 +120,28 @@ export function DesktopPanel({ screenshot, vm, vmAction, onVmAction }: DesktopPa
               </Button>
             </div>
           </div>
-        </ScrollArea>
+
+          <section aria-label="Agent activity" className="flex min-h-0 flex-1 flex-col border-t border-white/[0.06]">
+            <div className="flex shrink-0 items-center justify-between gap-3 px-5 py-3">
+              <div className="flex items-center gap-2">
+                <Icon className="text-[#79838f]" name="activity" size={14} />
+                <h3 className="text-xs font-medium text-[#d7dde3]">Activity</h3>
+              </div>
+              {run ? <span className="text-[10px] text-[#606975]">Live</span> : null}
+            </div>
+            <ScrollArea className="min-h-0 flex-1">
+              <div className="px-5 pb-5">
+                <RunActivityFeed
+                  isRetryingRun={isRetryingRun}
+                  liveActivity={liveActivity}
+                  onCancelRun={onCancelRun}
+                  onRetryRun={onRetryRun}
+                  run={run}
+                />
+              </div>
+            </ScrollArea>
+          </section>
+        </div>
       </aside>
 
       <DesktopViewer onOpenChange={setViewerOpen} open={viewerOpen} screenshot={screenshot} vm={vm} />

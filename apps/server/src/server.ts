@@ -14,8 +14,8 @@ import { createLmStudioModels, fallbackThreadTitle } from './ai';
 import { MockGuestTransport } from './tools/mock-guest-transport';
 import { createGuestToolRegistry } from './tools/guest-tools';
 import { CriterionVerifierRegistry } from './tools/criterion-verifier';
-import { AgentRuntime, createScriptedDemoDecisions, createScriptedDemoTask, ScriptedDecisionProvider, ScriptedTaskPlanner } from './agent';
-import type { AgentRuntimeResult, RuntimeEvent, RuntimeEventSink, RuntimeRepository } from './agent';
+import { AgentRuntime, assistantMessageForResult, createScriptedDemoDecisions, createScriptedDemoTask, ScriptedDecisionProvider, ScriptedTaskPlanner } from './agent';
+import type { RuntimeEvent, RuntimeEventSink, RuntimeRepository } from './agent';
 import { PersistenceDatabase } from './db/database';
 import type { CreateMemoryInput } from './memory/repository';
 import { MemoryService } from './memory/service';
@@ -268,6 +268,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       const result = await runtime.run({
         threadId,
         userMessage: task.goal,
+        conversation: database.messages.listByThread(threadId),
         task,
         runId,
         sourceMessageId,
@@ -299,13 +300,6 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
     });
   };
 
-  const assistantMessageForResult = (result: AgentRuntimeResult): string => {
-    if (result.status === 'completed') {
-      return result.finalVerification?.summary ?? 'Task completed and verified.';
-    }
-    return result.run.error?.message ?? `Task ended with status: ${result.status}.`;
-  };
-
   const startAiRun = (threadId: string, sourceMessageId: string): Run => {
     const sourceMessage = database.messages.getById(sourceMessageId);
     if (!sourceMessage || sourceMessage.threadId !== threadId) {
@@ -323,25 +317,39 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
     });
     const runtime = createAiRuntime();
     const cancellation = new AbortController();
+    const conversation = database.messages.listByThread(threadId);
     activeRuns.set(runId, { runtime, cancellation });
     void runtime.run({
       threadId,
       userMessage: sourceMessage.content,
+      conversation,
       runId,
       sourceMessageId,
       signal: cancellation.signal,
-    }).then(result => {
+    }).then(async result => {
       const persistedRun = database.runs.getById(result.run.id) ?? result.run;
-      database.messages.create({
+      const fallbackResponse = assistantMessageForResult(result);
+      const generatedResponse = result.status === 'completed'
+        ? await models.responseGenerator.generate({
+          userMessage: sourceMessage.content,
+          conversation,
+          result,
+        })
+        : '';
+      const message = database.messages.create({
         threadId,
         role: 'assistant',
-        content: assistantMessageForResult(result),
+        content: generatedResponse || fallbackResponse,
         metadata: {
           source: 'ai-run',
           runId: persistedRun.id,
           status: persistedRun.status,
         },
       });
+      // run.completed is emitted by the runtime before this asynchronous
+      // response-generation pass. This event lets clients refresh only after
+      // the conversational assistant message is durably persisted.
+      events.publish('message.created', jsonValue(message), { runId });
     }).catch(error => {
       const normalized = errorDetails(error);
       const runError = { code: normalized.code, message: normalized.message };
@@ -351,12 +359,13 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       } else {
         database.runs.fail(runId, runError);
       }
-      database.messages.create({
+      const message = database.messages.create({
         threadId,
         role: 'assistant',
         content: cancelled ? 'Run was cancelled.' : normalized.message,
         metadata: { source: 'ai-run', runId, status: cancelled ? 'cancelled' : 'failed' },
       });
+      events.publish('message.created', jsonValue(message), { runId });
       runtimeEvents.emit({
         type: cancelled ? 'run.cancelled' : 'run.failed',
         timestamp: new Date().toISOString(),
@@ -484,7 +493,10 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
 
       if (request.method === 'GET' && url.pathname === '/api/vm/status') return jsonResponse(await vm.status());
       if (request.method === 'POST' && segments[0] === 'api' && segments[1] === 'vm') {
-        if (segments[2] === 'start') await vm.start();
+        if (segments[2] === 'start') {
+          const showWindow = url.searchParams.get('gui') === 'true' || url.searchParams.get('gui') === '1';
+          await vm.start({ showWindow });
+        }
         else if (segments[2] === 'stop') await vm.stop();
         else if (segments[2] === 'reset') await vm.reset();
         else return notFound('Unknown VM action.');

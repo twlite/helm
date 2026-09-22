@@ -53,6 +53,19 @@ function criterionKey(criterion: CompletionCriterion): string {
   return JSON.stringify(criterion);
 }
 
+function taskRequiresPageContent(task: TaskDefinition, userMessage = ''): boolean {
+  const goal = `${task.goal}\n${userMessage}`.toLowerCase();
+  const referencesWebContent = /\b(page|site|website|web|profile|url|browser|github|http)\b/u.test(goal);
+  const requestsContent = /\b(read|extract|tell|summari[sz]e|report|content|information|details|what)\b/u.test(goal);
+  return referencesWebContent && requestsContent;
+}
+
+function canExtractOpenPage(observation: EnvironmentObservation, lastToolResult?: ToolResult): boolean {
+  if (!observation.browser?.url || observation.browser.url === 'about:blank') return false;
+  if (!/^https?:\/\//iu.test(observation.browser.url)) return false;
+  return lastToolResult?.ok === true || observation.browser.loaded === true;
+}
+
 function error(code: string, message: string): ToolError {
   return { code, message };
 }
@@ -146,6 +159,7 @@ export class AgentRuntime {
       userMessage: input.userMessage,
       signal: input.signal,
     });
+    const conversation = input.conversation ?? [];
     const task = input.task ?? await this.createTask(input, memories);
     const cancellation = new RunCancellation();
     const removeExternalAbort = this.attachExternalCancellation(cancellation, input.signal);
@@ -170,6 +184,15 @@ export class AgentRuntime {
     let completedCriteria: string[] = [];
     let remainingCriteria = task.criteria.map(criterionKey);
     let lastToolResult: ToolResult | undefined;
+    let completionCandidate: {
+      actionFingerprint: string;
+      verification: VerificationResult;
+    } | undefined;
+    const pageContentRequired = taskRequiresPageContent(task, input.userMessage);
+    const conversationalTask = task.criteria.length === 0;
+    let pageContentRead = false;
+    let prematureCompletionAttempts = 0;
+    let rejectedCompletionAttempts = 0;
     const configuredMaxSteps = this.budgetOptions?.maxSteps ?? DEFAULT_RUNTIME_BUDGETS.maxSteps;
     const budget = new RunBudget({
       ...DEFAULT_RUNTIME_BUDGETS,
@@ -178,7 +201,9 @@ export class AgentRuntime {
         ? {}
         : { maxSteps: Math.min(configuredMaxSteps, task.maxSteps) }),
     });
-    const loopDetector = new LoopDetector(this.budgetOptions?.maxRepeatedAction ?? DEFAULT_RUNTIME_BUDGETS.maxRepeatedAction);
+    const maxRepeatedAction = this.budgetOptions?.maxRepeatedAction ?? DEFAULT_RUNTIME_BUDGETS.maxRepeatedAction;
+    const actionLoopDetector = new LoopDetector(maxRepeatedAction);
+    const stateLoopDetector = new LoopDetector(maxRepeatedAction);
 
     try {
       run.status = 'running';
@@ -193,13 +218,22 @@ export class AgentRuntime {
           break;
         }
         const stepIndex = budget.startStep();
-        const observation = await this.observationProvider.observe({
-          task,
-          completedCriteria,
-          remainingCriteria,
-          lastToolResult,
-          signal: cancellation.signal,
-        });
+        const observation: EnvironmentObservation = conversationalTask
+          ? {
+            timestamp: this.now(),
+            ...(lastToolResult ? { lastToolResult } : {}),
+            task: {
+              completedCriteria: [],
+              remainingCriteria: [],
+            },
+          }
+          : await this.observationProvider.observe({
+            task,
+            completedCriteria,
+            remainingCriteria,
+            lastToolResult,
+            signal: cancellation.signal,
+          });
         observations.push(clone(observation));
         await this.persistStep(steps, {
           runId: run.id,
@@ -214,11 +248,59 @@ export class AgentRuntime {
           observation,
           history: clone(history),
           memories: clone(memories),
+          conversation: clone(conversation),
           stepIndex,
           previousResults: clone(previousResults),
           signal: cancellation.signal,
         };
-        const decision = await this.decisionProvider.next(context);
+        let decision: AgentDecision = conversationalTask
+          ? { type: 'complete', reasoningSummary: 'Responding to the conversation.' }
+          : await this.decisionProvider.next(context);
+
+        // A page-information task must return page contents, even when the
+        // model incorrectly asks to complete immediately after navigation.
+        // Turn that premature completion into the one safe, deterministic
+        // read operation the user asked for; the normal tool/verification
+        // path still records and bounds the operation.
+        if (
+          !conversationalTask
+          && pageContentRequired
+          && !pageContentRead
+          && decision.type === 'complete'
+          && canExtractOpenPage(observation, lastToolResult)
+        ) {
+          decision = {
+            type: 'action',
+            tool: 'browser.extractText',
+            input: {},
+            reasoningSummary: 'Reading the open page before answering.',
+          };
+        }
+
+        // Give the model one final turn after a successful action, but do not
+        // execute the same already-verified action again if it repeats it.
+        if (
+          completionCandidate &&
+          decision.type === 'action' &&
+          (!pageContentRequired || pageContentRead) &&
+          fingerprintAction(decision.tool, decision.input) === completionCandidate.actionFingerprint
+        ) {
+          await this.complete(run, completionCandidate.verification);
+          await this.emit('run.step.completed', {
+            observation,
+            verification: completionCandidate.verification,
+          }, run.id);
+          break;
+        }
+        if (completionCandidate && decision.type === 'blocked' && (!pageContentRequired || pageContentRead)) {
+          await this.complete(run, completionCandidate.verification);
+          await this.emit('run.step.completed', {
+            observation,
+            verification: completionCandidate.verification,
+          }, run.id);
+          break;
+        }
+
         await this.persistStep(steps, {
           runId: run.id,
           stepIndex,
@@ -226,6 +308,34 @@ export class AgentRuntime {
           decision,
           observation,
         });
+
+        // A conversational plan has no machine-verifiable criteria and must
+        // never execute a computer-use action accidentally. The final answer
+        // is generated from the thread conversation after the run completes.
+        if (conversationalTask && decision.type === 'action') {
+          const entry: AgentStep = {
+            reasoningSummary: decision.reasoningSummary,
+            observation,
+          };
+          history.push(entry);
+          finalVerification = {
+            complete: true,
+            criteria: [],
+            summary: 'Response ready.',
+          };
+          await this.persistStep(steps, {
+            runId: run.id,
+            stepIndex,
+            phase: 'complete',
+            decision: { type: 'complete', reasoningSummary: decision.reasoningSummary },
+            observation,
+            verification: finalVerification,
+          });
+          await this.emit('run.verification', finalVerification, run.id);
+          await this.complete(run, finalVerification);
+          await this.emit('run.step.completed', entry, run.id);
+          break;
+        }
 
         if (decision.type === 'blocked') {
           const entry: AgentStep = {
@@ -246,7 +356,17 @@ export class AgentRuntime {
         }
 
         if (decision.type === 'complete') {
-          const verification = await this.verify(task, observation, lastToolResult);
+          let verification = conversationalTask
+            ? { complete: true, criteria: [], summary: 'Response ready.' }
+            : await this.verify(task, observation, lastToolResult);
+          if (!conversationalTask && verification.complete && pageContentRequired && !pageContentRead) {
+            prematureCompletionAttempts += 1;
+            verification = {
+              ...verification,
+              complete: false,
+              summary: 'The page is open, but its contents have not been read yet. Read the page before completing.',
+            };
+          }
           finalVerification = verification;
           const entry: AgentStep = {
             reasoningSummary: decision.reasoningSummary,
@@ -276,6 +396,19 @@ export class AgentRuntime {
           if (verification.complete) {
             await this.complete(run, verification);
           } else {
+            completionCandidate = undefined;
+            rejectedCompletionAttempts += 1;
+            if (rejectedCompletionAttempts >= maxRepeatedAction) {
+              await this.fail(
+                run,
+                error(
+                  'COMPLETION_REJECTED',
+                  `Helm stopped after ${rejectedCompletionAttempts} completion attempts while verification was still incomplete.`,
+                ),
+              );
+              await this.emit('run.step.completed', entry, run.id);
+              break;
+            }
             lastToolResult = completionRejection(verification);
           }
           await this.emit('run.step.completed', entry, run.id);
@@ -294,8 +427,13 @@ export class AgentRuntime {
           previousResults,
           timeoutMs: this.budgetOptions?.toolTimeoutMs,
         });
+        rejectedCompletionAttempts = 0;
         previousResults.push(clone(result));
         lastToolResult = result;
+        if (decision.tool === 'browser.extractText' && result.ok) {
+          pageContentRead = true;
+          prematureCompletionAttempts = 0;
+        }
         const postActionObservation = await this.observationProvider.observe({
           task,
           completedCriteria,
@@ -334,27 +472,78 @@ export class AgentRuntime {
         });
         await this.emit('run.verification', verification, run.id);
 
-        // Verification is authoritative. Once an action has satisfied every
-        // criterion, finish the run immediately instead of asking the model
-        // for another turn that could repeat the same action.
-        if (verification.complete) {
-          await this.complete(run, verification);
+        if (pageContentRequired && !pageContentRead && prematureCompletionAttempts >= maxRepeatedAction) {
+          await this.fail(
+            run,
+            error('PAGE_CONTENT_NOT_READ', 'Helm could not complete the task because the requested page contents were not read.'),
+          );
           await this.emit('run.step.completed', entry, run.id);
           break;
         }
 
-        const loop = loopDetector.record(fingerprintAction(
+        if (verification.complete && result.ok) {
+          if (pageContentRequired && !pageContentRead) {
+            const repeatedCompletedAction = actionLoopDetector.record(fingerprintAction(
+              decision.tool,
+              decision.input,
+            ));
+            if (repeatedCompletedAction.loopDetected) {
+              await this.fail(
+                run,
+                error(
+                  'TOOL_LOOP_DETECTED',
+                  `Helm stopped after repeating ${decision.tool} ${repeatedCompletedAction.count} times without reading the requested page contents.`,
+                ),
+              );
+              await this.emit('run.step.completed', entry, run.id);
+              break;
+            }
+            await this.emit('run.step.completed', entry, run.id);
+            continue;
+          }
+
+          completionCandidate = {
+            actionFingerprint: fingerprintAction(decision.tool, decision.input),
+            verification,
+          };
+          await this.emit('run.step.completed', entry, run.id);
+          continue;
+        }
+
+        completionCandidate = undefined;
+
+        // Detect an identical tool call independently from the observation.
+        // Browser state can legitimately change between reads (loading flags,
+        // window focus, and screenshot IDs), but repeating the same call with
+        // the same input is still a reliable signal that the model is stuck.
+        const repeatedAction = actionLoopDetector.record(fingerprintAction(
+          decision.tool,
+          decision.input,
+        ));
+        if (repeatedAction.loopDetected) {
+          await this.fail(
+            run,
+            error(
+              'TOOL_LOOP_DETECTED',
+              `Helm stopped after repeating ${decision.tool} ${repeatedAction.count} times without making progress.`,
+            ),
+          );
+          await this.emit('run.step.completed', entry, run.id);
+          break;
+        }
+
+        const repeatedState = stateLoopDetector.record(fingerprintAction(
           decision.tool,
           decision.input,
           postActionObservation,
           result,
         ));
-        if (loop.loopDetected) {
+        if (repeatedState.loopDetected) {
           await this.fail(
             run,
             error(
               'TOOL_LOOP_DETECTED',
-              `The same action produced the same state ${loop.count} times.`,
+              `The same action produced the same state ${repeatedState.count} times.`,
             ),
           );
           await this.emit('run.step.completed', entry, run.id);
@@ -405,6 +594,7 @@ export class AgentRuntime {
     return this.taskPlanner.createTask({
       threadId: input.threadId,
       userMessage: input.userMessage,
+      conversation: clone(input.conversation ?? []),
       memories: clone(memories),
       signal: input.signal,
     });

@@ -3,10 +3,14 @@ import { asSchema, embed, type EmbeddingModel } from 'ai';
 import { describe, expect, it } from 'bun:test';
 import type { AgentTurnContext } from '@helm/shared';
 
+import type { AgentRuntimeResult } from '../src/agent/types';
 import {
   AiSdkDecisionProvider,
   AiSdkEmbeddingProvider,
+  AiSdkResponseGenerator,
+  AiSdkTaskPlanner,
   AiSdkThreadTitleGenerator,
+  aiTaskPlanSchema,
   aiDecisionSchema,
 } from '../src/ai/adapter';
 import { adaptStructuredOutputJsonSchema } from '../src/ai/structured-output';
@@ -125,6 +129,139 @@ describe('LM Studio AI adapters', () => {
     const modelSchema = ((responseFormat?.json_schema as Record<string, unknown>)?.schema) as Record<string, unknown>;
     expect(JSON.stringify(modelSchema)).not.toContain('propertyNames');
     expect(modelSchema.oneOf).toHaveLength(3);
+  });
+
+  it('plans ordinary conversation without inventing a browser criterion', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requestBody = JSON.parse(await request.text()) as Record<string, unknown>;
+        return Response.json({
+          id: 'chatcmpl-plan',
+          object: 'chat.completion',
+          created: 1,
+          model: 'google/gemma-4-e2b',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: JSON.stringify({ mode: 'conversation', goal: 'Answer the user directly.', criteria: [] }),
+            },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      },
+    });
+    const planner = new AiSdkTaskPlanner({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+
+    await expect(planner.createTask({
+      threadId: 'thread-chat',
+      userMessage: 'Please answer this question about Helm: who are you?',
+      conversation: [{
+        id: 'message-1',
+        threadId: 'thread-chat',
+        role: 'user',
+        content: 'Who are you?',
+        metadata: {},
+        createdAt: '2026-01-01T00:00:00.000Z',
+      }],
+    })).resolves.toMatchObject({ criteria: [], goal: 'Answer the user directly.' });
+
+    expect(aiTaskPlanSchema.safeParse({ mode: 'conversation', goal: 'Answer directly.', criteria: [] }).success).toBe(true);
+    expect(JSON.stringify(requestBody)).toContain('Who are you?');
+  });
+
+  it('short-circuits clear identity chat before task planning', async () => {
+    const planner = new AiSdkTaskPlanner({
+      model: {} as never,
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+    });
+
+    await expect(planner.createTask({
+      threadId: 'thread-chat',
+      userMessage: 'Who are you?',
+    })).resolves.toMatchObject({
+      goal: 'Who are you?',
+      criteria: [],
+    });
+  });
+
+  it('generates a conversational final answer from the thread and tool evidence', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requestBody = JSON.parse(await request.text()) as Record<string, unknown>;
+        return Response.json({
+          id: 'chatcmpl-response',
+          object: 'chat.completion',
+          created: 1,
+          model: 'google/gemma-4-e2b',
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: 'I am Helm, your local desktop agent.' },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      },
+    });
+    const generator = new AiSdkResponseGenerator({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+    });
+    const result = {
+      run: {
+        id: 'run-chat',
+        threadId: 'thread-chat',
+        goal: 'Answer the user directly.',
+        status: 'completed' as const,
+        criteria: [],
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+      task: {
+        id: 'task-chat',
+        threadId: 'thread-chat',
+        goal: 'Answer the user directly.',
+        criteria: [],
+      },
+      history: [],
+      steps: [],
+      observations: [],
+      finalVerification: { complete: true, criteria: [], summary: 'Response ready.' },
+      status: 'completed' as const,
+    } satisfies AgentRuntimeResult;
+
+    await expect(generator.generate({
+      userMessage: 'Who are you?',
+      conversation: [{
+        id: 'message-1',
+        threadId: 'thread-chat',
+        role: 'user',
+        content: 'Who are you?',
+        metadata: {},
+        createdAt: '2026-01-01T00:00:00.000Z',
+      }],
+      result,
+    })).resolves.toBe('I am Helm, your local desktop agent.');
+    expect(JSON.stringify(requestBody)).toContain('Who are you?');
   });
 
   it('converts AI SDK embeddings to the runtime Float32Array boundary', async () => {

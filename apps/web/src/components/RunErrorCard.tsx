@@ -35,10 +35,10 @@ export function RunErrorCard({
   return (
     <section
       aria-label={title}
-      className="w-full max-w-[780px] rounded-xl border border-red-400/25 bg-red-400/[0.07] px-4 py-4 text-red-100"
+      className="min-w-0 max-w-full overflow-hidden rounded-xl border border-red-400/25 bg-red-400/[0.07] px-4 py-4 text-red-100"
       role="alert"
     >
-      <div className="flex items-start gap-3">
+      <div className="flex min-w-0 items-start gap-3">
         <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-red-400/15 text-red-300">
           <Icon name="triangle" size={15} />
         </span>

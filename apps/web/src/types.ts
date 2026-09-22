@@ -27,6 +27,23 @@ export type RunDetails = Run & {
   steps: RunStep[];
 };
 
+export type LiveActivityPhase =
+  | 'starting'
+  | 'thinking'
+  | 'verifying'
+  | 'recorded'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export type LiveActivity = {
+  runId: string;
+  phase: LiveActivityPhase;
+  stepIndex?: number;
+  toolName?: string;
+  reasoningSummary?: string;
+};
+
 export type WebSocketEventType = WebSocketEvent['type'];
 
 export type HelmEvent = {

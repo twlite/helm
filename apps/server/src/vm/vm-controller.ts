@@ -20,6 +20,17 @@ interface PendingHostRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface GuestRequestBehavior {
+  preserveConnectionOnError?: boolean;
+  publishScreenshot?: boolean;
+}
+
+export interface VmStartOptions {
+  showWindow?: boolean;
+}
+
+const DESKTOP_SCREENSHOT_POLL_INTERVAL_MS = 750;
+
 function normalizeVmState(value: unknown, fallback: VmStatus['state']): VmStatus['state'] {
   switch (value) {
     case 'stopped':
@@ -97,6 +108,10 @@ export class VmController {
   private stdoutBuffer = '';
   private stderrBuffer = '';
   private readonly pending = new Map<string, PendingHostRequest>();
+  private screenshotPollTimer?: ReturnType<typeof setInterval>;
+  private screenshotPollInFlight = false;
+  private screenshotPollingEnabled = false;
+  private helperShowsWindow = false;
   private currentStatus: VmStatus = {
     state: 'stopped',
     helperAvailable: false,
@@ -111,8 +126,24 @@ export class VmController {
     this.currentStatus.helperAvailable = virtualizationHelperAvailable(config.vmHelperPath);
   }
 
-  async start(): Promise<void> {
-    if (this.currentStatus.state === 'running' && this.currentStatus.guestConnected) return;
+  async start(options: VmStartOptions = {}): Promise<void> {
+    const showWindow = options.showWindow === true;
+    if (this.currentStatus.state === 'running' && this.currentStatus.guestConnected) {
+      if (!showWindow || this.helperShowsWindow) return;
+      throw new VmControllerError(
+        'VM_HELPER_MODE_MISMATCH',
+        'The VM is already running headlessly. Stop it before restarting with --gui.',
+      );
+    }
+    if (showWindow && this.child && !this.helperShowsWindow) {
+      if (this.currentStatus.state === 'running' || this.currentStatus.state === 'starting') {
+        throw new VmControllerError(
+          'VM_HELPER_MODE_MISMATCH',
+          'The VM helper is already running headlessly. Stop the VM before starting with --gui.',
+        );
+      }
+      await this.terminateChild();
+    }
     this.setStatus({ state: 'starting', message: 'Starting the VM helper' });
     if (!this.currentStatus.helperAvailable) {
       this.setStatus({
@@ -123,7 +154,7 @@ export class VmController {
     }
 
     try {
-      this.ensureChild();
+      this.ensureChild(showWindow);
       await this.sendHostCommand('vm.start', {});
       await this.connectGuestWithRetry();
       try {
@@ -136,6 +167,7 @@ export class VmController {
       }
       this.setStatus({ state: 'running', guestConnected: true });
       this.events.publish('guest.connected', { connected: true });
+      this.startScreenshotPolling();
     } catch (error) {
       const normalized = structuredVmError(error);
       logger.error('VM start failed', { component: 'vm', ...loggedVmError(error) });
@@ -145,6 +177,7 @@ export class VmController {
   }
 
   async stop(): Promise<void> {
+    this.stopScreenshotPolling();
     if (this.child) {
       try {
         await this.sendHostCommand('vm.stop', {});
@@ -158,6 +191,7 @@ export class VmController {
   }
 
   async reset(): Promise<void> {
+    this.stopScreenshotPolling();
     if (!this.currentStatus.helperAvailable) {
       this.setStatus({ state: 'unavailable', message: `VM helper not found at ${this.config.vmHelperPath}` });
       return;
@@ -188,7 +222,12 @@ export class VmController {
     return { ...this.currentStatus };
   }
 
-  async guestRequest<T>(method: GuestMethod, params: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
+  async guestRequest<T>(
+    method: GuestMethod,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+    behavior: GuestRequestBehavior = {},
+  ): Promise<T> {
     const request: GuestRequest = { id: `guest_${Date.now()}_${Math.random().toString(36).slice(2)}`, method, params };
     if (this.child) {
       try {
@@ -205,15 +244,21 @@ export class VmController {
           );
         }
         const result = parsed.data.result as T;
-        this.publishScreenshot(result);
+        if (behavior.publishScreenshot !== false) {
+          this.publishScreenshot(result);
+        }
         return result;
       } catch (error) {
         if (error instanceof VmControllerError) {
-          this.setStatus({ guestConnected: false });
+          if (!behavior.preserveConnectionOnError) {
+            this.setStatus({ guestConnected: false });
+          }
           throw error;
         }
         const normalized = asToolError(error);
-        this.setStatus({ guestConnected: false });
+        if (!behavior.preserveConnectionOnError) {
+          this.setStatus({ guestConnected: false });
+        }
         throw new VmControllerError(normalized.code, normalized.message, normalized.details);
       }
     }
@@ -222,24 +267,28 @@ export class VmController {
     }
     try {
       const result = await this.guestTransport.request<T>(request, signal);
-      this.publishScreenshot(result);
+      if (behavior.publishScreenshot !== false) {
+        this.publishScreenshot(result);
+      }
       return result;
     } catch (error) {
-      this.setStatus({ guestConnected: false });
+      if (!behavior.preserveConnectionOnError) {
+        this.setStatus({ guestConnected: false });
+      }
       const normalized = asToolError(error);
       throw new VmControllerError(normalized.code, normalized.message, normalized.details);
     }
   }
 
   async close(): Promise<void> {
+    this.stopScreenshotPolling();
     await this.stop();
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(new Error('VM controller closed'));
     }
     this.pending.clear();
-    this.child?.kill();
-    this.child = undefined;
+    await this.terminateChild();
   }
 
   private setStatus(update: Partial<VmStatus>): void {
@@ -264,34 +313,98 @@ export class VmController {
     });
   }
 
-  private ensureChild(): void {
+  private startScreenshotPolling(): void {
+    this.stopScreenshotPolling();
+    this.screenshotPollingEnabled = true;
+    this.screenshotPollTimer = setInterval(() => {
+      void this.captureDesktopScreenshot();
+    }, DESKTOP_SCREENSHOT_POLL_INTERVAL_MS);
+    void this.captureDesktopScreenshot();
+  }
+
+  private stopScreenshotPolling(): void {
+    this.screenshotPollingEnabled = false;
+    if (this.screenshotPollTimer !== undefined) {
+      clearInterval(this.screenshotPollTimer);
+      this.screenshotPollTimer = undefined;
+    }
+  }
+
+  private async captureDesktopScreenshot(): Promise<void> {
+    if (!this.screenshotPollingEnabled || this.screenshotPollInFlight || !this.currentStatus.guestConnected) return;
+    this.screenshotPollInFlight = true;
+    try {
+      const result = await this.guestRequest('desktop.screenshot', {}, undefined, {
+        preserveConnectionOnError: true,
+        publishScreenshot: false,
+      });
+      if (this.screenshotPollingEnabled) {
+        this.publishScreenshot(result);
+      }
+    } catch (error) {
+      // Screenshot capture is a best-effort UI stream. A missing helper or a
+      // transient capture failure must not make a healthy guest look offline.
+      logger.debug('Desktop screenshot poll failed', {
+        component: 'vm',
+        ...loggedVmError(error),
+      });
+    } finally {
+      this.screenshotPollInFlight = false;
+    }
+  }
+
+  private ensureChild(showWindow = false): void {
     if (this.child) return;
     if (!this.currentStatus.helperAvailable) {
       throw new VmControllerError('VM_HELPER_MISSING', `VM helper not found at ${this.config.vmHelperPath}`);
     }
-    this.child = spawn(this.config.vmHelperPath, [
+    const helperArguments = [
       '--base-image', this.config.baseImagePath,
       '--working-image', this.config.workingImagePath,
       '--efi-vars', this.config.efiVariablesPath,
       '--runtime-share', this.config.runtimeDir,
       '--memory-mib', String(this.config.vmMemoryMb),
       '--cpus', String(this.config.vmCpus),
-    ], { stdio: 'pipe' });
-    this.child.stdout.setEncoding('utf8');
-    this.child.stderr.setEncoding('utf8');
+      ...(showWindow ? ['--show-window'] : []),
+    ];
+    const child = spawn(this.config.vmHelperPath, helperArguments, { stdio: 'pipe' });
+    this.child = child;
+    this.helperShowsWindow = showWindow;
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
     this.stderrBuffer = '';
-    this.child.stdout.on('data', (chunk: string) => this.consumeHostOutput(chunk));
-    this.child.stderr.on('data', (chunk: string) => this.consumeHostStderr(chunk));
-    this.child.stderr.on('end', () => this.flushHostStderr());
-    this.child.on('exit', (code, signal) => {
+    child.stdout.on('data', (chunk: string) => this.consumeHostOutput(chunk));
+    child.stderr.on('data', (chunk: string) => this.consumeHostStderr(chunk));
+    child.stderr.on('end', () => this.flushHostStderr());
+    child.on('exit', (code, signal) => {
+      if (this.child !== child) return;
       logger.info('VM helper exited', { component: 'vm-host', code, signal });
       this.child = undefined;
+      this.helperShowsWindow = false;
+      this.stopScreenshotPolling();
       this.setStatus({ state: 'stopped', guestConnected: false });
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timer);
         pending.reject(new Error('VM helper exited'));
       }
       this.pending.clear();
+    });
+  }
+
+  private async terminateChild(): Promise<void> {
+    const child = this.child;
+    if (!child) return;
+    this.child = undefined;
+    this.helperShowsWindow = false;
+    if (child.exitCode !== null || child.signalCode !== null) return;
+
+    await new Promise<void>(resolve => {
+      const timeout = setTimeout(resolve, 1_000);
+      child.once('exit', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      child.kill();
     });
   }
 
