@@ -544,6 +544,79 @@ describe('LM Studio AI adapters', () => {
     );
   });
 
+  it('compiles a page-to-file request and a later text-viewer request from the conversation', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-page-to-file-plan',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({
+              mode: 'task',
+              goal: 'Complete the requested file operation.',
+              criteria: [],
+            }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const planner = new AiSdkTaskPlanner({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 256,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    const firstRequest = 'go to https://twlite.dev and save the contents in a twlite.txt file';
+    const firstTask = await planner.createTask({ threadId: 'page-to-file-thread', userMessage: firstRequest });
+    expect(firstTask.requirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'browserResearch', target: { factId: 'pageContent' } }),
+      expect.objectContaining({
+        id: 'outputFile',
+        target: { path: 'twlite.txt', mode: 'contains-facts', factIds: ['pageContent'] },
+      }),
+    ]));
+
+    const followUp = await planner.createTask({
+      threadId: 'page-to-file-thread',
+      userMessage: 'show me that text file using text viewer',
+      conversation: [
+        {
+          id: 'message-page-to-file-request',
+          threadId: 'page-to-file-thread',
+          role: 'user',
+          content: firstRequest,
+          metadata: {},
+          createdAt: '2026-01-01T00:00:00.000Z',
+        },
+        {
+          id: 'message-page-to-file-result',
+          threadId: 'page-to-file-thread',
+          role: 'assistant',
+          content: 'Saved twlite.txt.',
+          metadata: {},
+          createdAt: '2026-01-01T00:00:01.000Z',
+        },
+      ],
+    });
+    expect(followUp.requirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'openFile',
+        type: 'desktop',
+        target: { path: 'twlite.txt', content: 'twlite.txt' },
+      }),
+    ]));
+  });
+
   it('turns a procedural browserResearch blocker into the next orchestrator objective', async () => {
     const provider = createOpenAICompatible({
       name: 'lmstudio',

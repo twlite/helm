@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { assistantMessageForResult } from '../../src/agent/result-message';
+import { assistantMessageForResult, isUnsubstantiatedPlaceholder } from '../../src/agent/result-message';
 import type { AgentRuntimeResult } from '../../src/agent/types';
 
 function completedResult(steps: AgentRuntimeResult['steps']): AgentRuntimeResult {
@@ -70,5 +70,43 @@ describe('assistant result messages', () => {
     expect(message).toContain('I read Twilight (https://twlite.dev/).');
     expect(message).toContain('Helm makes local computer use useful.');
     expect(message).not.toBe('1/1 completion criteria passed.');
+  });
+
+  it('reports verified file writes and text-viewer opens from action receipts', () => {
+    const written = assistantMessageForResult(completedResult([{
+      id: 'step-write',
+      runId: 'run-1',
+      stepIndex: 0,
+      phase: 'act',
+      toolName: 'fs.write',
+      toolInput: { path: 'twlite.txt', content: 'hello' },
+      toolResult: {
+        ok: true,
+        data: { path: '/home/helm/workspace/twlite.txt', size: 5 },
+      },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      completedAt: '2026-01-01T00:00:01.000Z',
+    }]));
+    expect(written).toBe('Saved /home/helm/workspace/twlite.txt (5 bytes).');
+
+    const opened = assistantMessageForResult(completedResult([{
+      id: 'step-open',
+      runId: 'run-1',
+      stepIndex: 0,
+      phase: 'act',
+      toolName: 'app.openFile',
+      toolInput: { path: 'twlite.txt' },
+      toolResult: {
+        ok: true,
+        data: { path: '/home/helm/workspace/twlite.txt', application: 'text-editor' },
+      },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      completedAt: '2026-01-01T00:00:01.000Z',
+    }]));
+    expect(opened).toBe('Opened /home/helm/workspace/twlite.txt in the text viewer.');
+  });
+
+  it('recognizes the ungrounded artifact placeholder shown by the failed flow', () => {
+    expect(isUnsubstantiatedPlaceholder('(Content of twlite.txt would be displayed here if the artifact were available.)')).toBe(true);
   });
 });

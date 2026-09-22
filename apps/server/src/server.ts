@@ -16,7 +16,17 @@ import { createLmStudioModels, fallbackThreadTitle } from './ai';
 import { MockGuestTransport } from './tools/mock-guest-transport';
 import { createGuestToolRegistry } from './tools/guest-tools';
 import { CriterionVerifierRegistry } from './tools/criterion-verifier';
-import { AgentRuntime, assistantMessageForResult, createScriptedDemoDecisions, createScriptedDemoTask, ScriptedDecisionProvider, ScriptedTaskPlanner } from './agent';
+import {
+  AgentRuntime,
+  assistantMessageForResult,
+  createScriptedDemoDecisions,
+  createScriptedDemoTask,
+  hasDeterministicFileEvidence,
+  hasVerifiedActionEvidence,
+  isUnsubstantiatedPlaceholder,
+  ScriptedDecisionProvider,
+  ScriptedTaskPlanner,
+} from './agent';
 import type { RuntimeEvent, RuntimeEventSink, RuntimeRepository } from './agent';
 import { PersistenceDatabase } from './db/database';
 import type { CreateMemoryInput } from './memory/repository';
@@ -507,7 +517,11 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
         : conversation;
       let generatedResponse = '';
       let responseMessageId: string | undefined;
-      if (result.status === 'completed') {
+      const hasRequirements = result.task.criteria.length > 0 || (result.task.requirements?.length ?? 0) > 0;
+      const canGenerateResponse = result.status === 'completed'
+        && !hasDeterministicFileEvidence(result)
+        && (!hasRequirements || hasVerifiedActionEvidence(result));
+      if (canGenerateResponse) {
         responseMessageId = `message-${randomUUID()}`;
         events.publish('assistant.message.started', jsonValue({
           threadId,
@@ -526,6 +540,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
             }), { runId });
           },
         });
+        if (isUnsubstantiatedPlaceholder(generatedResponse)) generatedResponse = '';
       }
       const message = database.messages.create({
         ...(responseMessageId ? { id: responseMessageId } : {}),

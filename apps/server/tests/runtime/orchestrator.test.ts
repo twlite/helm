@@ -314,7 +314,7 @@ describe('orchestrated agent loop', () => {
     expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining(['outputFile', 'releaseUrl']));
   });
 
-  it('rejects worker completion until the real requirement is present', async () => {
+  it('does not declare completion when the worker makes no progress', async () => {
     const guest = new MockGuestTransport();
     const target = objective('missing', 'filesystem', 'Create the missing file.', 'outputFile');
     const worker = new FunctionalWorker([async context => ({
@@ -328,8 +328,47 @@ describe('orchestrated agent loop', () => {
     });
 
     expect(result.status).toBe('failed');
-    expect(result.run.error?.code).toBe('COMPLETION_REJECTED');
+    expect(result.run.error?.code).toBe('RECOVERY_BUDGET_EXHAUSTED');
     expect(result.run.state?.blockers.some(item => item.code === 'COMPLETION_REJECTED')).toBe(true);
+  });
+
+  it('executes the pending objective when the orchestrator proposes completion too early', async () => {
+    const guest = new MockGuestTransport();
+    const worker = new FunctionalWorker([async context => {
+      const write = await executeAction(context, 'fs.write', {
+        path: '/home/helm/workspace/twlite.txt',
+        content: 'Helm makes local computer use useful.',
+      }, 'write');
+      return {
+        status: 'completed',
+        worker: 'filesystem',
+        objectiveId: context.objective.id,
+        actions: [write],
+        facts: [],
+        evidence: [],
+        artifacts: [],
+        blockers: [],
+        environmentChanged: true,
+      };
+    }]);
+    const result = await runtimeFor(guest, [{ type: 'complete' }], worker, { maxSteps: 2 }).run({
+      threadId: 'premature-success-thread',
+      userMessage: 'Save the page contents to twlite.txt.',
+      task: taskWithRequirements({
+        id: 'premature-success-task',
+        requirements: [{
+          id: 'outputFile',
+          description: 'Create the output file.',
+          type: 'filesystem',
+          mandatory: true,
+          target: { path: '/home/helm/workspace/twlite.txt', mode: 'exists' },
+        }],
+      }),
+    });
+
+    expect(result.status).toBe('completed');
+    expect(guest.getFile('/home/helm/workspace/twlite.txt')).toContain('Helm makes local computer use useful.');
+    expect(result.run.error).toBeUndefined();
   });
 
   it('uses recovery state instead of a tool-name loop error when actions do not change state', async () => {

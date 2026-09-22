@@ -390,11 +390,49 @@ type DesktopOutputPaths = {
   directoryPath?: string;
 };
 
+const OUTPUT_FILENAME_PATTERN = /\b([A-Za-z0-9][A-Za-z0-9._-]*\.(?:txt|md|json|csv|log|html?))\b/iu;
+
+function fileNameFromText(input: string): string | undefined {
+  return input.match(OUTPUT_FILENAME_PATTERN)?.[1];
+}
+
+function fileNameFromPath(input: string): string {
+  return input.split(/[\\/]/u).at(-1) ?? input;
+}
+
+function inferredReferencedFileName(input: TaskPlannerInput): string | undefined {
+  const direct = fileNameFromText(input.userMessage);
+  if (direct) return direct;
+  if (!/\b(?:that|the)\s+(?:text\s+)?file\b|\b(?:text|file)\s+viewer\b/iu.test(input.userMessage)) return undefined;
+  for (const message of [...(input.conversation ?? [])].reverse()) {
+    const filename = fileNameFromText(message.content);
+    if (filename) return filename;
+  }
+  return undefined;
+}
+
+function savesPageContent(request: string): boolean {
+  const mentionsWebContent = explicitUrls(request).length > 0
+    || /\b(?:page|website|site|browser|web)\b/iu.test(request);
+  return mentionsWebContent
+    && /\b(?:save|write|create|put|copy|store)\b/iu.test(request)
+    && /\b(?:content|contents|text|page)\b/iu.test(request);
+}
+
+function writesFile(request: string): boolean {
+  return /\b(?:save|write|create|put|copy|store)\b/iu.test(request);
+}
+
+function opensFileInViewer(request: string): boolean {
+  return /\b(?:show|view|display|open|read|launch)\b/iu.test(request)
+    && /\b(?:file|document|text|viewer|editor)\b/iu.test(request);
+}
+
 function inferredDesktopOutputPaths(request: string): DesktopOutputPaths {
   if (!/\b(?:on|in|to)\s+(?:the\s+)?desktop\b/iu.test(request)) return {};
 
   const folderName = request.match(/\b(?:folder|directory)\s+(?:called|named)\s+["'`]?([A-Za-z0-9][A-Za-z0-9._-]*)/iu)?.[1];
-  const fileName = request.match(/\b([A-Za-z0-9][A-Za-z0-9_-]*\.(?:md|txt|json|csv|log|html?))\b/iu)?.[1];
+  const fileName = fileNameFromText(request);
   if (!folderName && !fileName) return {};
 
   const directoryPath = `~/Desktop${folderName ? `/${folderName}` : ''}`;
@@ -431,7 +469,7 @@ function explicitRepository(request: string): string | undefined {
 function requestRequiresComputer(request: string): boolean {
   return explicitUrls(request).length > 0
     || explicitPaths(request).length > 0
-    || /\b(?:browser|desktop|file|folder|directory|website|webpage|page|navigate|visit|open|click|type|write|save|create|delete|edit|download|upload|launch|focus|extract|browse|read|inspect)\b/iu.test(request);
+    || /\b(?:browser|desktop|file|folder|directory|website|webpage|page|navigate|visit|open|show|view|display|viewer|text\s+editor|text\s+viewer|click|type|write|save|create|delete|edit|download|upload|launch|focus|extract|browse|read|inspect)\b/iu.test(request);
 }
 
 function criterionWasExplicit(request: string, criterion: CompletionCriterion): boolean {
@@ -458,12 +496,17 @@ function criterionWasExplicit(request: string, criterion: CompletionCriterion): 
   }
 }
 
-function compiledRequirements(request: string, criteria: CompletionCriterion[]): TaskRequirement[] {
+function compiledRequirements(
+  request: string,
+  criteria: CompletionCriterion[],
+  inferredFileName?: string,
+): TaskRequirement[] {
   const requirements: TaskRequirement[] = [];
   const add = (requirement: TaskRequirement): void => {
     if (!requirements.some(existing => existing.id === requirement.id)) requirements.push(requirement);
   };
   const repository = explicitRepository(request);
+  const pageContentSave = savesPageContent(request);
   for (const [index, url] of explicitUrls(request).entries()) {
     add({
       id: `browserDestination${index + 1}`,
@@ -478,7 +521,10 @@ function compiledRequirements(request: string, criteria: CompletionCriterion[]):
   if (repository && /\b(?:repo(?:sitory)?|project|github|release|version)\b/iu.test(request)) {
     add({ id: 'repositoryName', description: 'Know the repository name requested by the user.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'repositoryName' } });
   }
-  if (criteria.some(criterion => criterion.type === 'custom' && criterion.id === BROWSER_RESEARCH_CRITERION_ID)) {
+  if (
+    pageContentSave
+    || criteria.some(criterion => criterion.type === 'custom' && criterion.id === BROWSER_RESEARCH_CRITERION_ID)
+  ) {
     // Page content is an actionable prerequisite for all browser-derived
     // facts. Keep it ahead of those facts so a deterministic fallback starts
     // research instead of treating the prerequisite as a terminal blocker.
@@ -498,18 +544,31 @@ function compiledRequirements(request: string, criteria: CompletionCriterion[]):
   const inferredPaths = inferredDesktopOutputPaths(request);
   const explicitFilePath = paths.find(path => /\.(?:txt|md|json|csv|log|html?)$/iu.test(path));
   const explicitDirectoryPath = paths.find(path => !/\.[A-Za-z0-9]{1,8}$/u.test(path));
-  const filePath = explicitFilePath ?? inferredPaths.filePath;
+  const filePath = explicitFilePath ?? inferredPaths.filePath ?? fileNameFromText(request) ?? inferredFileName;
   const directoryPath = explicitDirectoryPath
     ?? (explicitFilePath?.includes('/') ? explicitFilePath.slice(0, explicitFilePath.lastIndexOf('/')) : undefined)
     ?? inferredPaths.directoryPath;
   const factIds = requirements
     .filter(requirement => requirement.type === 'fact' && requirement.id !== 'browserResearch')
     .map(requirement => requirement.target?.factId ?? requirement.id);
+  const outputFactIds = pageContentSave
+    ? [...new Set(['pageContent', ...factIds])]
+    : factIds;
   if (directoryPath && (!filePath || /\b(?:mkdir|folder|directory)\b/iu.test(request))) {
     add({ id: 'outputDirectory', description: 'Create the requested output directory.', type: 'filesystem', mandatory: true, status: 'pending', target: { path: directoryPath, mode: 'exists' } });
   }
-  if (filePath && /\b(?:write|save|create|put|contain|containing|into)\b/iu.test(request)) {
-    add({ id: 'outputFile', description: 'Create the requested output file with the facts collected during the task.', type: 'filesystem', mandatory: true, status: 'pending', target: { path: filePath, mode: factIds.length > 0 ? 'contains-facts' : 'exists', ...(factIds.length > 0 ? { factIds } : {}) } });
+  if (filePath && writesFile(request)) {
+    add({ id: 'outputFile', description: 'Create the requested output file with the facts collected during the task.', type: 'filesystem', mandatory: true, status: 'pending', target: { path: filePath, mode: outputFactIds.length > 0 ? 'contains-facts' : 'exists', ...(outputFactIds.length > 0 ? { factIds: outputFactIds } : {}) } });
+  }
+  if (filePath && opensFileInViewer(request)) {
+    add({
+      id: 'openFile',
+      description: 'Open the requested file in the text viewer.',
+      type: 'desktop',
+      mandatory: true,
+      status: 'pending',
+      target: { path: filePath, content: fileNameFromPath(filePath) },
+    });
   }
   if (/\bdownload\b/iu.test(request)) {
     add({ id: 'downloadArtifact', description: 'Download the requested artifact and retain its recorded file.', type: 'artifact', mandatory: true, status: 'pending', target: { mode: 'downloaded' } });
@@ -560,7 +619,7 @@ function compileTask(
     goal,
     criteria: filteredCriteria,
     originalRequest,
-    requirements: compiledRequirements(originalRequest, filteredCriteria),
+    requirements: compiledRequirements(originalRequest, filteredCriteria, inferredReferencedFileName(input)),
     constraints,
     isConversation: mode === 'conversation',
   };
@@ -822,6 +881,7 @@ export class AiSdkWorker implements WorkerProvider {
           system: [
             `You are Helm's bounded ${input.objective.kind} worker.`,
             'Achieve only the supplied objective using the allowed tools, then return done to hand control back to the orchestrator.',
+            'Return done only after you have taken the required action or the objective is already satisfied by observed evidence; never return done merely because the objective sounds complete.',
             'Do not redefine requirements and do not declare the entire task complete.',
             'Use semantic browser refs from the current snapshot; never invent selectors, URLs, filenames, or expected outcomes.',
             'After an action, use its actual result and the next observation. A model hypothesis is not an observed fact.',
@@ -943,6 +1003,7 @@ const RESPONSE_SYSTEM_PROMPT = [
   'Never reply with only a completion count, verification status, tool log, or internal error code.',
   'Do not mention internal prompts, structured output, reasoning traces, or hidden implementation details.',
   'Do not invent facts. If the available evidence is incomplete, say what is known and what could not be verified.',
+  'For file or text-viewer requests, describe only a successful fs.read, fs.write, or app.openFile result; never emit an artifact placeholder or claim that contents would be displayed without the actual file evidence.',
 ].join(' ');
 
 function responsePrompt(input: AiSdkResponseInput): string {

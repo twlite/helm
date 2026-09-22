@@ -7,6 +7,7 @@ import type {
   EnvironmentObservation,
   Memory,
   Message,
+  OrchestratorDecision,
   Run,
   RunStep,
   TaskDefinition,
@@ -28,7 +29,7 @@ import {
 import { fingerprintAction, LoopDetector } from './fingerprint';
 import { DEFAULT_RUNTIME_BUDGETS, RunBudget, RunCancellation } from './limits';
 import { GuestObservationProvider } from './observation';
-import { allowedWorkerTool, FallbackOrchestrator, objectiveForRequirement, recoverOrchestratorBlocker } from './orchestrator';
+import { allowedWorkerTool, fallbackObjective, FallbackOrchestrator, objectiveForRequirement, recoverOrchestratorBlocker } from './orchestrator';
 import {
   addFailedStrategy,
   artifactsFromResult,
@@ -879,7 +880,7 @@ export class AgentRuntime {
         const stepIndex = budget.startStep();
         await this.emit('run.step.started', { stepIndex, observation, verification }, run.id);
 
-        let decision;
+        let decision: OrchestratorDecision;
         try {
           decision = await this.orchestrator!.next({
             task: clone(task),
@@ -948,13 +949,26 @@ export class AgentRuntime {
             reason: 'Completion was rejected by deterministic verification.',
           };
           await persistState();
-          if (completionRejected > maxRecoveryAttempts) {
+          const fallback = fallbackObjective(state, observation);
+          if (fallback) {
+            // Completion is a proposal, not a terminal decision. If the model
+            // proposes it before verification passes, continue with the next
+            // deterministic requirement objective in this same runtime turn.
+            // Asking the same model for another completion proposal is the
+            // failure mode that can strand otherwise actionable tasks.
+            decision = {
+              type: 'objective',
+              objective: fallback,
+              reasoningSummary: 'Completion was rejected; executing the next unmet requirement instead.',
+            };
+          } else if (completionRejected > maxRecoveryAttempts) {
             await this.fail(run, error('COMPLETION_REJECTED', `Completion was proposed ${completionRejected} times before all mandatory requirements were satisfied.`));
             await this.emit('run.step.completed', { stepIndex, decision, verification }, run.id);
             break;
+          } else {
+            await this.emit('run.step.completed', { stepIndex, decision, verification }, run.id);
+            continue;
           }
-          await this.emit('run.step.completed', { stepIndex, decision, verification }, run.id);
-          continue;
         }
 
         if (decision.type === 'blocked') {

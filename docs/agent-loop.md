@@ -33,6 +33,15 @@ left for the model to invent.
 Concrete URLs, filenames, and expected text are retained only when they are
 explicit in the user request or are subsequently observed.
 
+Page-to-file requests are compiled as a dependency chain rather than a single
+optimistic action. For example, `go to https://twlite.dev and save the
+contents in a twlite.txt file` produces a browser destination, a readable
+`pageContent` fact, and an output-file requirement whose contents must include
+that observed fact. A later request such as `show me that text file using text
+viewer` resolves `that file` from the conversation and produces a desktop
+`app.openFile` requirement. The filename and the open operation therefore do
+not depend on a model remembering an earlier assistant claim.
+
 Model-produced legacy criteria are filtered against the original request before
 they can be used. This prevents a model-generated `file.contains` value or
 `browser.url` from becoming a hidden acceptance condition. The compiler also
@@ -130,11 +139,27 @@ criterion is incomplete. The run reaches `completed` only after all mandatory
 requirements pass. This prevents a successful navigation or a worker's
 optimistic `done` result from ending the task early.
 
+Completion rejection is an executable recovery transition. If unmet
+requirements remain, the runtime immediately selects the next deterministic
+fallback objective in the same loop iteration. It does not ask the same
+orchestrator for another completion proposal, which prevents the repeated
+`Completion was proposed ... times` failure mode when a model is stuck. If the
+fallback worker makes no progress, normal no-progress recovery and its bounded
+budget produce an honest failure instead of a fabricated success.
+
 An orchestrator response such as “cannot proceed until the browser research
 requirement is complete” is treated as procedural guidance when it references
 an unmet actionable requirement. Helm records that response for diagnostics and
 continues with the deterministic fallback objective. Missing user input,
 permission, safety, and policy blockers remain terminal.
+
+Final replies are evidence-grounded. Successful `fs.read`, `fs.write`, and
+`app.openFile` actions are rendered directly from their receipts, so a missing
+artifact cannot turn into prose such as “the contents would be displayed
+here.” Tasks with unmet requirements or no trusted action evidence do not invoke
+the response generator. Browser research can still use the response generator
+after verified browser evidence exists, but file/viewer operations keep their
+deterministic receipt-based response.
 
 ## 6. Progress and recovery
 
