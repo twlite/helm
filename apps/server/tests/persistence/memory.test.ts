@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 
 import { MemoryService } from '../../src/memory/service';
+import { extractExplicitMemory, shouldAttemptModelMemoryExtraction } from '../../src/memory/remember';
 import {
   DeterministicFakeEmbeddingProvider,
   InMemoryMemoryVectorIndex,
@@ -24,6 +25,35 @@ class FixedRecallIndex implements MemoryVectorIndex {
 }
 
 describe('persistent memory service', () => {
+  it('persists explicit user corrections once and recalls them for future requests', async () => {
+    const persistence = testDatabase();
+    try {
+      const service = new MemoryService(persistence.sqlite);
+      const input = extractExplicitMemory(
+        'Oops, it is actually https://www.nrb.org.np/forex/; remember this for the future so you do not open the wrong site.',
+        ['Find the Nepali exchange rate defined by Nepal Rastra Bank today.'],
+      );
+
+      expect(input?.kind).toBe('instruction');
+      expect(input?.importance).toBe(0.95);
+      expect(input?.content).toContain('https://www.nrb.org.np/forex/');
+      expect(input?.content).not.toContain('User correction to remember');
+      expect(input?.content).not.toContain('Related request context');
+      expect(shouldAttemptModelMemoryExtraction('Find the exchange rate today.')).toBe(false);
+      expect(extractExplicitMemory('Open https://twlite.dev and tell me what is on the page.')).toBeUndefined();
+      if (!input) throw new Error('Expected an explicit memory candidate');
+
+      const memory = await service.saveIfNew(input);
+      const duplicate = await service.saveIfNew(input);
+
+      expect(duplicate).toEqual(memory);
+      expect(service.repository.count()).toBe(1);
+      await expect(service.recall('Find the exchange rate defined by Nepal Rastra Bank today')).resolves.toEqual([memory]);
+    } finally {
+      persistence.close();
+    }
+  });
+
   it('falls back to FTS when no embedding provider is configured', async () => {
     const persistence = testDatabase();
     try {

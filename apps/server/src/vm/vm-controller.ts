@@ -176,6 +176,58 @@ export class VmController {
     }
   }
 
+  async reconnect(): Promise<void> {
+    if (this.currentStatus.guestConnected) return;
+    if (!this.currentStatus.helperAvailable) {
+      this.setStatus({
+        state: 'unavailable',
+        message: `VM helper not found at ${this.config.vmHelperPath}`,
+      });
+      return;
+    }
+
+    this.stopScreenshotPolling();
+    this.setStatus({ state: 'starting', message: 'Reconnecting to the Linux guest' });
+    try {
+      if (!this.child) {
+        await this.start({ showWindow: this.helperShowsWindow });
+        return;
+      }
+
+      let hostState = this.currentStatus.state;
+      try {
+        const response = await this.sendHostCommand('vm.status', {});
+        const result = recordFrom(response.result);
+        hostState = normalizeVmState(result?.state, hostState);
+      } catch {
+        // If status cannot be read, vm.start below gives the helper a chance to
+        // restore a stopped VM. A running VM can still be reached directly.
+      }
+      if (hostState !== 'running') {
+        await this.sendHostCommand('vm.start', {});
+      }
+
+      await this.connectGuestWithRetry();
+      try {
+        await this.guestRequest('desktop.screenshot', {});
+      } catch (error) {
+        this.setStatus({ guestConnected: true });
+        logger.warn('Initial VM screenshot unavailable after reconnect', {
+          component: 'vm',
+          ...loggedVmError(error),
+        });
+      }
+      this.setStatus({ state: 'running', guestConnected: true, message: undefined });
+      this.events.publish('guest.connected', { connected: true });
+      this.startScreenshotPolling();
+    } catch (error) {
+      const normalized = structuredVmError(error);
+      logger.error('VM reconnect failed', { component: 'vm', ...loggedVmError(error) });
+      this.setStatus({ state: 'error', guestConnected: false, message: normalized.message });
+      throw error;
+    }
+  }
+
   async stop(): Promise<void> {
     this.stopScreenshotPolling();
     if (this.child) {

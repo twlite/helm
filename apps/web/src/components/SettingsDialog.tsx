@@ -57,16 +57,14 @@ export function SettingsDialog({
   return (
     <Sheet onOpenChange={onOpenChange} open={open}>
       <SheetContent className="w-[min(100vw,400px)] p-0 sm:max-w-[400px]" side="right">
-        <SheetHeader className="border-b border-white/[0.06] pr-14">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <SheetTitle>Settings</SheetTitle>
-              <SheetDescription>Helm environment and developer diagnostics.</SheetDescription>
-            </div>
-            <Button aria-label="Refresh diagnostics" className="-mr-2" disabled={isRefreshing} onClick={() => void refresh()} size="icon-sm" variant="ghost">
+        <SheetHeader className="border-b border-[var(--border)]">
+          <div className="flex h-7 items-center gap-1 pr-7">
+            <SheetTitle className="min-w-0 flex-1">Settings</SheetTitle>
+            <Button aria-label="Refresh diagnostics" disabled={isRefreshing} onClick={() => void refresh()} size="icon-sm" variant="ghost">
               <Icon className={isRefreshing ? 'animate-spin' : undefined} name="refresh" size={15} />
             </Button>
           </div>
+          <SheetDescription className="max-w-[290px]">Helm environment and developer diagnostics.</SheetDescription>
         </SheetHeader>
         <ScrollArea className="min-h-0 flex-1">
           <div className="space-y-8 px-5 pb-8 pt-5">

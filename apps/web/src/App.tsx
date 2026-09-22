@@ -124,6 +124,7 @@ function App() {
   const [messageState, setMessageState] = useState<AsyncState>('idle');
   const [isRunStarting, setIsRunStarting] = useState(false);
   const [isRetryingRun, setIsRetryingRun] = useState(false);
+  const [regeneratingTitleThreadId, setRegeneratingTitleThreadId] = useState<string | null>(null);
   const [run, setRun] = useState<RunDetails | null>(null);
   const [liveActivity, setLiveActivity] = useState<LiveActivity | null>(null);
   const [streamingAssistant, setStreamingAssistant] = useState<StreamingAssistantMessage | null>(null);
@@ -239,6 +240,9 @@ function App() {
           })
           .catch(() => undefined);
       }
+      // The server generates a new thread's title after the run finishes, so
+      // refresh the lightweight thread list when the durable reply arrives.
+      void helmApi.listThreads().then(setThreads).catch(() => undefined);
     }
     if (event.runId && event.type.startsWith('run.')) {
       setLiveActivity((current) => liveActivityFromEvent(event, current));
@@ -375,12 +379,33 @@ function App() {
     }
   }, [showError, threads]);
 
+  const handleRegenerateThreadTitle = useCallback(async (threadId: string) => {
+    if (regeneratingTitleThreadId === threadId) return;
+    setRegeneratingTitleThreadId(threadId);
+    setNotice(null);
+    try {
+      const threadMessages = selectedThreadIdRef.current === threadId
+        ? messages
+        : await helmApi.listMessages(threadId);
+      const sourceMessage = threadMessages.find((message) => message.role === 'user');
+      if (!sourceMessage) {
+        setNotice({ tone: 'info', message: 'This thread has no user message to use for a title.' });
+        return;
+      }
+      const updatedThread = await helmApi.generateThreadTitle(threadId, sourceMessage.id, true);
+      setThreads((current) => current.map((thread) => thread.id === updatedThread.id ? updatedThread : thread));
+    } catch (error) {
+      showError(error);
+    } finally {
+      setRegeneratingTitleThreadId((current) => current === threadId ? null : current);
+    }
+  }, [messages, regeneratingTitleThreadId, showError]);
+
   const handleSendMessage = useCallback(async (content: string, mode: ConversationSendMode) => {
     setMessageState('saving');
     setNotice(null);
     try {
       let threadId = selectedThreadIdRef.current;
-      const shouldGenerateTitle = !threadId;
       const currentRun = run;
       const runIsActive = currentRun?.status === 'pending'
         || currentRun?.status === 'running'
@@ -401,13 +426,9 @@ function App() {
       setThreads((current) => current.map((thread) => thread.id === threadId ? { ...thread, updatedAt: message.createdAt } : thread));
       setDraft('');
       setMessageState('idle');
-      if (shouldGenerateTitle) {
-        void helmApi.generateThreadTitle(threadId, message.id)
-          .then((updatedThread) => {
-            setThreads((current) => current.map((thread) => thread.id === updatedThread.id ? updatedThread : thread));
-          })
-          .catch(() => undefined);
-      }
+      // The server captures explicit and model-selected durable memories
+      // before this request returns. Refresh an open Memory view immediately.
+      void helmApi.listMemories(memoryQuery || undefined).then(setMemories).catch(() => undefined);
       try {
         if (mode === 'steer' && currentRun && ['pending', 'running'].includes(currentRun.status)) {
           await helmApi.steerRun(currentRun.id, message.id);
@@ -437,7 +458,7 @@ function App() {
       setMessageState('error');
       showError(error);
     }
-  }, [run, showError, streamingAssistant]);
+  }, [memoryQuery, run, showError, streamingAssistant]);
 
   const handleRunDemo = useCallback(async () => {
     const threadId = selectedThreadIdRef.current;
@@ -583,11 +604,13 @@ function App() {
     || streamingAssistant?.status === 'writing';
 
   return (
-    <div className="flex h-dvh min-h-0 w-full overflow-hidden bg-[#0b0d10] font-sans text-[#f1f3f5]">
+    <div className="flex h-dvh min-h-0 w-full overflow-hidden bg-[var(--app-bg)] font-sans text-[var(--text)]">
       <ThreadSidebar
         connectionState={connectionState}
         onCreateThread={handleCreateThread}
         onDeleteThread={handleDeleteThread}
+        onRegenerateThreadTitle={handleRegenerateThreadTitle}
+        regeneratingTitleThreadId={regeneratingTitleThreadId}
         onMobileOpenChange={setIsMobileSidebarOpen}
         onOpenMemory={() => {
           setIsMemoryOpen(true);
@@ -610,7 +633,6 @@ function App() {
           isRunActive={isRunActive}
           isSending={messageState === 'saving'}
           isStoppingRun={stoppingRunId !== null && stoppingRunId === run?.id}
-          liveActivity={liveActivity ?? undefined}
           messages={messages}
           onCancelRun={handleCancelRun}
           onDraftChange={setDraft}

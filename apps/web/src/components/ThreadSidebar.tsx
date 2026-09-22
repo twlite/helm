@@ -1,4 +1,4 @@
-import type { KeyboardEvent, MouseEvent } from 'react';
+import { useEffect, useState, type KeyboardEvent, type MouseEvent } from 'react';
 import type { Thread } from '../types';
 import { formatDate, formatTime } from '../format';
 import { Icon } from './Icon';
@@ -12,6 +12,8 @@ type ThreadSidebarProps = {
   onSelectThread: (threadId: string) => void;
   onCreateThread: () => void;
   onDeleteThread: (threadId: string) => Promise<void>;
+  onRegenerateThreadTitle: (threadId: string) => Promise<void>;
+  regeneratingTitleThreadId: string | null;
   connectionState: 'connecting' | 'connected' | 'reconnecting' | 'offline';
   reconnectAttempt: number;
   mobileOpen: boolean;
@@ -45,19 +47,20 @@ function isToday(value: string) {
 
 function visibleThreadTitle(title: string): string {
   const normalized = title.trim().replace(/\s+/gu, ' ');
-  return normalized.length <= 72 ? normalized : `${normalized.slice(0, 69).trimEnd()}…`;
+  const maxLength = 30;
+  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 3).trimEnd()}...`;
 }
 
 function ThreadRow({
   thread,
   selected,
   onSelect,
-  onDelete,
+  onContextMenu,
 }: {
   thread: Thread;
   selected: boolean;
   onSelect: () => void;
-  onDelete: () => void;
+  onContextMenu: (event: MouseEvent<HTMLDivElement>) => void;
 }) {
   function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key === 'Enter' || event.key === ' ') {
@@ -66,33 +69,20 @@ function ThreadRow({
     }
   }
 
-  function handleDelete(event: MouseEvent<HTMLButtonElement>) {
-    event.stopPropagation();
-    onDelete();
-  }
-
   return (
     <div
       aria-current={selected ? 'page' : undefined}
-      className={`group flex w-full min-w-0 max-w-full cursor-pointer items-center gap-2 overflow-hidden rounded-md px-2.5 py-2 text-left transition-colors ${selected ? 'bg-white/[0.08] text-[#f1f3f5]' : 'text-[#9ba4af] hover:bg-white/[0.045] hover:text-[#e7ebef]'}`}
+      aria-haspopup="menu"
+      className={`group box-border flex h-7 w-full min-w-0 max-w-full cursor-pointer items-center gap-2 overflow-hidden rounded-[4px] px-2 text-left transition-colors duration-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent)] ${selected ? 'bg-[var(--selected-bg)] text-[var(--text)]' : 'text-[var(--text-secondary)] hover:bg-[var(--hover-bg)] hover:text-[var(--text)]'}`}
       onClick={onSelect}
+      onContextMenu={onContextMenu}
       onKeyDown={handleKeyDown}
       role="button"
       tabIndex={0}
     >
-      <Icon className="shrink-0 opacity-60" name="message" size={15} />
-      <span className="min-w-0 flex-1 overflow-hidden">
-        <span className="block max-w-full truncate text-[13px] font-medium" title={thread.title}>{visibleThreadTitle(thread.title)}</span>
-        <span className="mt-0.5 block truncate text-[11px] text-[#606975]">{isToday(thread.updatedAt) ? formatTime(thread.updatedAt) : formatDate(thread.updatedAt)}</span>
-      </span>
-      <button
-        aria-label={`Delete ${thread.title}`}
-        className="invisible rounded p-1 text-[#606975] opacity-0 transition hover:bg-red-500/10 hover:text-red-300 group-hover:visible group-hover:opacity-100 focus-visible:visible focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/50"
-        onClick={handleDelete}
-        type="button"
-      >
-        <Icon name="trash" size={13} />
-      </button>
+      <Icon className="shrink-0 text-[var(--text-muted)]" name="message" size={13} />
+      <span className="min-w-0 flex-1 truncate text-xs" title={thread.title}>{visibleThreadTitle(thread.title)}</span>
+      <span className="shrink-0 text-[10px] tabular-nums text-[var(--text-muted)]">{isToday(thread.updatedAt) ? formatTime(thread.updatedAt) : formatDate(thread.updatedAt)}</span>
     </div>
   );
 }
@@ -102,14 +92,14 @@ function ThreadGroup({
   threads,
   selectedThreadId,
   onSelectThread,
-  onDeleteThread,
+  onContextMenu,
   onCloseMobile,
 }: {
   label: string;
   threads: Thread[];
   selectedThreadId: string | null;
   onSelectThread: (threadId: string) => void;
-  onDeleteThread: (threadId: string) => Promise<void>;
+  onContextMenu: (thread: Thread, event: MouseEvent<HTMLDivElement>) => void;
   onCloseMobile: () => void;
 }) {
   if (threads.length === 0) {
@@ -117,12 +107,12 @@ function ThreadGroup({
   }
   return (
     <section className="min-w-0 space-y-1">
-      <h2 className="px-2.5 text-[11px] font-medium text-[#606975]">{label}</h2>
-      <div className="space-y-0.5">
+      <h2 className="px-2 text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--text-muted)]">{label}</h2>
+      <div>
         {threads.map((thread) => (
           <ThreadRow
             key={thread.id}
-            onDelete={() => void onDeleteThread(thread.id)}
+            onContextMenu={(event) => onContextMenu(thread, event)}
             onSelect={() => {
               onSelectThread(thread.id);
               onCloseMobile();
@@ -142,56 +132,82 @@ function SidebarContent({
   onSelectThread,
   onCreateThread,
   onDeleteThread,
+  onRegenerateThreadTitle,
+  regeneratingTitleThreadId,
   connectionState,
   reconnectAttempt,
   onCloseMobile,
   onOpenMemory,
   onOpenSettings,
 }: SidebarContentProps) {
+  const [contextMenu, setContextMenu] = useState<{ thread: Thread; x: number; y: number } | null>(null);
   const todayThreads = threads.filter((thread) => isToday(thread.updatedAt));
   const previousThreads = threads.filter((thread) => !isToday(thread.updatedAt));
   const connection = connectionCopy(connectionState, reconnectAttempt);
 
+  useEffect(() => {
+    if (!contextMenu) return undefined;
+    const handleEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') setContextMenu(null);
+    };
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [contextMenu]);
+
+  function openContextMenu(thread: Thread, event: MouseEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    const menuWidth = 208;
+    const menuHeight = 104;
+    setContextMenu({
+      thread,
+      x: Math.min(event.clientX, Math.max(8, window.innerWidth - menuWidth - 8)),
+      y: Math.min(event.clientY, Math.max(8, window.innerHeight - menuHeight - 8)),
+    });
+  }
+
+  function closeContextMenu() {
+    setContextMenu(null);
+  }
+
   return (
-    <div className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden bg-[#0d1015]">
-      <div className="flex items-center gap-2.5 px-4 py-4">
-        <div className="flex size-7 items-center justify-center rounded-lg bg-teal-400/10 text-xs font-semibold text-teal-300">H</div>
-        <div className="min-w-0">
-          <p className="text-sm font-semibold text-[#f1f3f5]">Helm</p>
-          <p className="text-[11px] text-[#606975]">Local agent</p>
-        </div>
+    <div className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden bg-[var(--pane-bg)]">
+      <div className="flex h-11 items-center gap-2 border-b border-[var(--border)] px-3">
+        <div className="flex size-5 items-center justify-center rounded-[4px] bg-[var(--accent)] text-[10px] font-bold text-[#07110f]">H</div>
+        <p className="min-w-0 flex-1 truncate text-xs font-semibold text-[var(--text)]">Helm</p>
+        <span className={`size-1.5 rounded-full ${connection.dot}`} title={connection.label} />
       </div>
 
-      <div className="px-3">
+      <div className="px-2 py-2">
         <Button
-          className="w-full justify-start"
+          className="w-full justify-start font-normal"
           onClick={() => {
             onCreateThread();
             onCloseMobile();
           }}
           size="sm"
-          variant="secondary"
+          variant="ghost"
         >
           <Icon name="plus" size={15} />
           New thread
         </Button>
       </div>
 
-      <ScrollArea className="mt-6 min-h-0 w-full min-w-0 flex-1 overflow-x-hidden px-3">
-        <div className="min-w-0 max-w-full space-y-6 overflow-hidden pb-4">
-          <div className="flex items-center justify-between px-2.5">
-            <h2 className="text-xs font-medium text-[#aeb7c1]">Threads</h2>
-            {threads.length > 0 ? <span className="text-[11px] text-[#606975]">{threads.length}</span> : null}
+      <ScrollArea className="min-h-0 w-full min-w-0 flex-1 overflow-x-hidden">
+        <div className="box-border min-w-0 max-w-full space-y-4 overflow-hidden px-2 pb-3 pt-2">
+          <div className="flex items-center justify-between px-2">
+            <h2 className="text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--text-muted)]">Threads</h2>
+            {threads.length > 0 ? <span className="text-[10px] text-[var(--text-muted)]">{threads.length}</span> : null}
           </div>
-          <ThreadGroup label="Today" onCloseMobile={onCloseMobile} onDeleteThread={onDeleteThread} onSelectThread={onSelectThread} selectedThreadId={selectedThreadId} threads={todayThreads} />
-          <ThreadGroup label="Previous" onCloseMobile={onCloseMobile} onDeleteThread={onDeleteThread} onSelectThread={onSelectThread} selectedThreadId={selectedThreadId} threads={previousThreads} />
+          <ThreadGroup label="Today" onCloseMobile={onCloseMobile} onContextMenu={openContextMenu} onSelectThread={onSelectThread} selectedThreadId={selectedThreadId} threads={todayThreads} />
+          <ThreadGroup label="Previous" onCloseMobile={onCloseMobile} onContextMenu={openContextMenu} onSelectThread={onSelectThread} selectedThreadId={selectedThreadId} threads={previousThreads} />
           {threads.length === 0 ? (
-            <p className="px-2.5 text-xs leading-5 text-[#606975]">Your saved conversations will appear here.</p>
+            <p className="px-2 text-xs leading-5 text-[var(--text-muted)]">Saved conversations appear here.</p>
           ) : null}
         </div>
       </ScrollArea>
 
-      <div className="space-y-1 border-t border-white/[0.06] px-3 py-3">
+      <div className="border-t border-[var(--border)] px-2 py-2">
         <Button className="w-full justify-start" onClick={() => { onOpenMemory(); onCloseMobile(); }} size="sm" variant="ghost">
           <Icon name="memory" size={15} />
           Memory
@@ -201,14 +217,61 @@ function SidebarContent({
           Settings
         </Button>
         <button
-          className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs transition-colors hover:bg-white/[0.045]"
+          className="flex h-7 w-full items-center gap-2 rounded-[4px] px-2 text-left text-[11px] transition-colors hover:bg-[var(--hover-bg)]"
           onClick={() => { onOpenSettings(); onCloseMobile(); }}
           type="button"
         >
           <span className={`size-1.5 rounded-full ${connection.dot}`} />
-          <span className={`truncate ${connection.tone}`}>{connection.label}</span>
+          <span className="truncate text-[var(--text-muted)]">{connection.label}</span>
         </button>
       </div>
+      {contextMenu ? (
+        <>
+          <button
+            aria-label="Close thread menu"
+            className="fixed inset-0 z-40 cursor-default"
+            onClick={closeContextMenu}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              closeContextMenu();
+            }}
+            type="button"
+          />
+          <div
+            className="fixed z-[60] min-w-52 overflow-hidden rounded-md border border-[var(--border-strong)] bg-[var(--pane-raised)] p-1 text-[var(--text)] shadow-xl shadow-black/30"
+            onPointerDown={(event) => event.stopPropagation()}
+            role="menu"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+          >
+            <button
+              className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs transition-colors hover:bg-white/[0.07] disabled:cursor-wait disabled:opacity-50"
+              disabled={regeneratingTitleThreadId === contextMenu.thread.id}
+              onClick={() => {
+                closeContextMenu();
+                void onRegenerateThreadTitle(contextMenu.thread.id);
+              }}
+              role="menuitem"
+              type="button"
+            >
+              <Icon name="refresh" size={14} />
+              {regeneratingTitleThreadId === contextMenu.thread.id ? 'Regenerating title…' : 'Regenerate title'}
+            </button>
+            <div className="my-1 h-px bg-white/[0.08]" />
+            <button
+              className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs text-red-300 transition-colors hover:bg-red-500/10"
+              onClick={() => {
+                closeContextMenu();
+                void onDeleteThread(contextMenu.thread.id);
+              }}
+              role="menuitem"
+              type="button"
+            >
+              <Icon name="trash" size={14} />
+              Delete thread
+            </button>
+          </div>
+        </>
+      ) : null}
     </div>
   );
 }
@@ -219,7 +282,7 @@ export function ThreadSidebar(props: ThreadSidebarProps) {
 
   return (
     <>
-      <aside aria-label="Threads" className="hidden h-full w-[248px] min-w-0 shrink-0 overflow-hidden border-r border-white/[0.07] lg:flex">
+      <aside aria-label="Threads" className="hidden h-full w-[220px] min-w-0 shrink-0 overflow-hidden border-r border-[var(--border)] md:flex xl:w-[232px]">
         <SidebarContent {...contentProps} onCloseMobile={() => undefined} />
       </aside>
       <Sheet onOpenChange={onMobileOpenChange} open={mobileOpen}>

@@ -61,7 +61,7 @@ export function MemoryDialog({
   return (
     <Sheet onOpenChange={onOpenChange} open={open}>
       <SheetContent className="w-[min(100vw,400px)] p-0 sm:max-w-[400px]" side="right">
-        <SheetHeader className="border-b border-white/[0.06] pr-14">
+        <SheetHeader className="border-b border-[var(--border)] pr-12">
           <SheetTitle>Memory</SheetTitle>
           <SheetDescription>Durable context Helm can use across threads.</SheetDescription>
         </SheetHeader>

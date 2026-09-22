@@ -4,9 +4,11 @@ import { describe, expect, it } from 'bun:test';
 import type { AgentTurnContext } from '@helm/shared';
 
 import type { AgentRuntimeResult } from '../src/agent/types';
+import { BROWSER_RESEARCH_CRITERION_ID, browserResearchStartUrl, isBrowserResearchRequest } from '../src/agent/browser-research';
 import {
   AiSdkDecisionProvider,
   AiSdkEmbeddingProvider,
+  AiSdkMemoryExtractor,
   AiSdkResponseGenerator,
   AiSdkTaskPlanner,
   AiSdkThreadTitleGenerator,
@@ -30,6 +32,49 @@ function fakeEmbeddingModel(values: number[]): EmbeddingModel {
 }
 
 describe('LM Studio AI adapters', () => {
+  it('extracts durable user context while preserving corrected URLs', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-memory',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({
+              remember: true,
+              content: 'For Nepal Rastra Bank forex requests, use https://www.nrb.org.np/forex/.',
+              kind: 'instruction',
+              importance: 0.95,
+            }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const extractor = new AiSdkMemoryExtractor({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+
+    await expect(extractor.extract({
+      userMessage: 'Oops, remember the correct Nepal Rastra Bank URL for future requests.',
+    })).resolves.toEqual({
+      content: 'For Nepal Rastra Bank forex requests, use https://www.nrb.org.np/forex/.',
+      kind: 'instruction',
+      importance: 0.95,
+    });
+  });
+
   it('keeps arbitrary action input keys while adapting the MLX schema', async () => {
     const nativeSchema = await asSchema(aiDecisionSchema).jsonSchema;
     const compatibleSchema = adaptStructuredOutputJsonSchema(nativeSchema, 'lmstudio-mlx');
@@ -131,6 +176,82 @@ describe('LM Studio AI adapters', () => {
     expect(modelSchema.oneOf).toHaveLength(3);
   });
 
+  it('starts browser research when the decision model refuses before using the browser', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-research-decision',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({
+              type: 'blocked',
+              reason: 'I cannot access current financial data.',
+            }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const decisionProvider = new AiSdkDecisionProvider({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      toolDefinitions: [],
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    const context: AgentTurnContext = {
+      task: {
+        id: 'research-task',
+        threadId: 'thread-research',
+        goal: 'Use the browser to research current public information.',
+        criteria: [{
+          type: 'custom',
+          id: BROWSER_RESEARCH_CRITERION_ID,
+          description: 'Read current public web information with the browser before answering.',
+        }],
+      },
+      observation: {
+        timestamp: 1,
+        task: { completedCriteria: [], remainingCriteria: ['browser research'] },
+      },
+      history: [],
+      memories: [{
+        id: 'memory-nrb-source',
+        content: 'User correction to remember: for the Nepal Rastra Bank exchange rate, use https://www.nrb.org.np/forex/.',
+        kind: 'instruction',
+        importance: 0.95,
+        metadata: {},
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      }],
+      conversation: [{
+        id: 'message-research',
+        threadId: 'thread-research',
+        role: 'user',
+        content: 'Find the Nepali exchange rate defined by Nepal Rastra Bank today.',
+        metadata: {},
+        createdAt: '2026-01-01T00:00:00.000Z',
+      }],
+      stepIndex: 0,
+      previousResults: [],
+    };
+
+    await expect(decisionProvider.next(context)).resolves.toMatchObject({
+      type: 'action',
+      tool: 'browser.navigate',
+      input: { url: 'https://www.nrb.org.np/forex/' },
+    });
+  });
+
   it('plans ordinary conversation without inventing a browser criterion', async () => {
     let requestBody: Record<string, unknown> | undefined;
     const provider = createOpenAICompatible({
@@ -180,6 +301,63 @@ describe('LM Studio AI adapters', () => {
 
     expect(aiTaskPlanSchema.safeParse({ mode: 'conversation', goal: 'Answer directly.', criteria: [] }).success).toBe(true);
     expect(JSON.stringify(requestBody)).toContain('Who are you?');
+  });
+
+  it('routes current public web questions to browser research instead of accepting a conversational refusal', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requestBody = JSON.parse(await request.text()) as Record<string, unknown>;
+        return Response.json({
+          id: 'chatcmpl-research-plan',
+          object: 'chat.completion',
+          created: 1,
+          model: 'google/gemma-4-e2b',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: JSON.stringify({
+                mode: 'conversation',
+                goal: 'I cannot access live financial data.',
+                criteria: [],
+              }),
+            },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      },
+    });
+    const planner = new AiSdkTaskPlanner({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    const userMessage = 'Find the Nepali exchange rate defined by Nepal Rastra Bank today.';
+
+    expect(isBrowserResearchRequest(userMessage)).toBe(true);
+    expect(isBrowserResearchRequest("What's today's exchange rate?")).toBe(true);
+    expect(isBrowserResearchRequest('Who are you?')).toBe(false);
+    expect(browserResearchStartUrl('nrb.org.np')).toBe('https://nrb.org.np');
+    await expect(planner.createTask({
+      threadId: 'thread-research',
+      userMessage,
+    })).resolves.toMatchObject({
+      goal: expect.stringContaining("Use Helm's browser"),
+      criteria: [{
+        type: 'custom',
+        id: BROWSER_RESEARCH_CRITERION_ID,
+      }],
+    });
+    expect(JSON.stringify(requestBody)).toContain('current or publicly available web information are tasks, not conversation');
+    expect(JSON.stringify(requestBody)).toContain('browser.extractText');
   });
 
   it('short-circuits clear identity chat before task planning', async () => {

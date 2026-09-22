@@ -148,6 +148,15 @@ export class MemoryRepository {
     return this.getById(id);
   }
 
+  findByContent(content: string): Memory | undefined {
+    const row = this.database
+      .prepare(
+        'SELECT id, content, kind, importance, metadata_json AS metadataJson, created_at AS createdAt, updated_at AS updatedAt FROM memories WHERE content = ? ORDER BY updated_at DESC, id DESC LIMIT 1',
+      )
+      .get(content);
+    return row === undefined ? undefined : mapMemory(row);
+  }
+
   getManyByIds(ids: readonly string[]): Memory[] {
     if (ids.length === 0) return [];
     const result: Memory[] = [];

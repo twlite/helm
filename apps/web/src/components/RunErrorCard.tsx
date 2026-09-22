@@ -35,21 +35,21 @@ export function RunErrorCard({
   return (
     <section
       aria-label={title}
-      className="min-w-0 max-w-full overflow-hidden rounded-xl border border-red-400/25 bg-red-400/[0.07] px-4 py-4 text-red-100"
+      className="min-w-0 max-w-[780px] rounded-lg border border-red-400/25 bg-red-950/35 px-4 py-3.5 text-red-100 shadow-sm shadow-black/10"
       role="alert"
     >
-      <div className="flex min-w-0 items-start gap-3">
-        <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-red-400/15 text-red-300">
-          <Icon name="triangle" size={15} />
+      <div className="flex min-w-0 items-start gap-2">
+        <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-red-400/15 text-red-300">
+          <Icon name="triangle" size={13} />
         </span>
         <div className="min-w-0 flex-1">
-          <p className="text-sm font-semibold">{title}</p>
-          <p className="mt-1 whitespace-pre-wrap break-words text-sm leading-6 text-red-100/90">{message}</p>
+          <p className="text-sm font-semibold text-red-100">{title}</p>
+          <p className="mt-1 whitespace-pre-wrap break-words text-xs leading-5 text-red-100/80">{message}</p>
           {code ? <p className="mt-2 font-mono text-[11px] text-red-200/60">{code}</p> : null}
         </div>
       </div>
 
-      <div className="mt-4 flex flex-wrap items-center gap-2 pl-10">
+      <div className="mt-3 flex flex-wrap items-center gap-1 pl-8">
         {onRetry ? (
           <Button disabled={isRetrying} onClick={() => void onRetry()} size="sm" variant="destructive">
             <Icon className={isRetrying ? 'animate-spin' : undefined} name="refresh" size={13} />
@@ -65,7 +65,7 @@ export function RunErrorCard({
       </div>
 
       {serializedDetails ? (
-        <details className="mt-3 pl-10">
+        <details className="mt-3 pl-8">
           <summary className="cursor-pointer text-xs text-red-200/65 hover:text-red-100">Technical details</summary>
           <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md bg-black/20 p-2 font-mono text-[11px] leading-5 text-red-100/70">{serializedDetails}</pre>
         </details>

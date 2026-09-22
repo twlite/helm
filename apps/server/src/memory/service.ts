@@ -76,6 +76,13 @@ export class MemoryService {
     return this.saveInternal(input);
   }
 
+  async saveIfNew(input: CreateMemoryInput): Promise<Memory> {
+    const content = input.content.trim();
+    const existing = this.repository.findByContent(content);
+    if (existing) return existing;
+    return this.saveInternal({ ...input, content });
+  }
+
   async saveInternal(input: CreateMemoryInput): Promise<Memory> {
     const memory = this.repository.save(input);
     await this.indexMemory(memory);

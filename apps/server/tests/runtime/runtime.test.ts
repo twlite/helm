@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { z } from 'zod';
 
 import { AgentRuntime } from '../../src/agent/runtime';
+import { browserResearchTask } from '../../src/agent/browser-research';
 import { LoopDetector } from '../../src/agent/fingerprint';
 import { ScriptedDecisionProvider } from '../../src/agent/planner';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
@@ -14,6 +15,35 @@ import { createScriptedDemo } from '../../src/agent/demo';
 import { ToolRegistry } from '../../src/tools/tool-registry';
 
 describe('AgentRuntime', () => {
+  it('completes a browser research task only after extracting readable page content', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: new ScriptedDecisionProvider([
+        { type: 'action', tool: 'browser.navigate', input: { url: 'https://example.test' } },
+        { type: 'complete' },
+        { type: 'complete' },
+      ]),
+    });
+
+    const result = await runtime.run({
+      userMessage: 'Find the current information from the official site.',
+      task: browserResearchTask({
+        threadId: 'browser-research',
+        userMessage: 'Find the current information from the official site.',
+      }),
+      threadId: 'browser-research',
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(true);
+    expect(result.finalVerification?.complete).toBe(true);
+  });
+
   it('answers conversational plans without executing computer-use tools', async () => {
     const guest = new MockGuestTransport();
     const tools = createGuestToolRegistry(guest);

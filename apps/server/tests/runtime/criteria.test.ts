@@ -1,13 +1,39 @@
 import { describe, expect, it } from 'bun:test';
 
+import { BROWSER_RESEARCH_CRITERION_ID } from '../../src/agent/browser-research';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
 import {
+  DEMO_PAGE_TITLE,
   DEMO_PAGE_TEXT,
   DEMO_PAGE_URL,
   MockGuestTransport,
 } from '../../src/tools/mock-guest-transport';
 
 describe('criterion verification and mock guest state', () => {
+  it('verifies browser research only after readable page text is collected', async () => {
+    const guest = new MockGuestTransport();
+    const verifier = new CriterionVerifierRegistry(guest);
+    const criterion = {
+      type: 'custom' as const,
+      id: BROWSER_RESEARCH_CRITERION_ID,
+      description: 'Read current public web information with the browser before answering.',
+    };
+
+    await guest.request('browser.navigate', { url: DEMO_PAGE_URL });
+    await expect(verifier.verifyTask({
+      criteria: [criterion],
+    }, {
+      lastToolResult: { ok: true, data: { url: DEMO_PAGE_URL, title: DEMO_PAGE_TITLE } },
+    })).resolves.toMatchObject({ complete: false });
+
+    const extracted = await guest.request('browser.extractText', {});
+    await expect(verifier.verifyTask({
+      criteria: [criterion],
+    }, {
+      lastToolResult: { ok: true, data: extracted },
+    })).resolves.toMatchObject({ complete: true });
+  });
+
   it('verifies browser, filesystem, and focused-window criteria mechanically', async () => {
     const guest = new MockGuestTransport();
     await guest.request('browser.navigate', { url: DEMO_PAGE_URL });

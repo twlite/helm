@@ -13,11 +13,13 @@ export type IconName =
   | 'cloud'
   | 'copy'
   | 'database'
+  | 'download'
   | 'file'
   | 'flask'
   | 'folder'
   | 'memory'
   | 'menu'
+  | 'maximize'
   | 'message'
   | 'monitor'
   | 'pause'
@@ -53,11 +55,13 @@ const paths: Record<IconName, string[]> = {
   cloud: ['M7 18h10a4 4 0 0 0 .5-7.97A6 6 0 0 0 6 11a3.5 3.5 0 0 0 1 7Z'],
   copy: ['M8 8h10v12H8z', 'M6 16H4V4h10v2'],
   database: ['M4 5c0 1.1 3.6 2 8 2s8-.9 8-2-3.6-2-8-2-8 .9-8 2Z', 'M4 5v7c0 1.1 3.6 2 8 2s8-.9 8-2V5', 'M4 12v7c0 1.1 3.6 2 8 2s8-.9 8-2v-7'],
+  download: ['M12 3v12', 'm7 10 5 5 5-5', 'M5 21h14'],
   file: ['M6 3h8l4 4v14H6z', 'M14 3v5h5', 'M9 13h6', 'M9 17h6'],
   flask: ['M9 3h6', 'M10 3v6l-5 8a3 3 0 0 0 2.6 4.5h8.8A3 3 0 0 0 19 17l-5-8V3', 'M8 16h8'],
   folder: ['M3 6h6l2 2h10v10H3z'],
   memory: ['M6 6h12v12H6z', 'M9 3v3', 'M15 3v3', 'M9 18v3', 'M15 18v3', 'M3 9h3', 'M3 15h3', 'M18 9h3', 'M18 15h3'],
   menu: ['M4 6h16', 'M4 12h16', 'M4 18h16'],
+  maximize: ['M8 3H3v5', 'm3 3 6 6', 'M16 3h5v5', 'm21 3-6 6', 'M8 21H3v-5', 'm3 21 6-6', 'M16 21h5v-5', 'm21 21-6-6'],
   message: ['M4 5h16v11H8l-4 4z', 'M8 9h8', 'M8 12h5'],
   monitor: ['M4 4h16v12H4z', 'M8 20h8', 'M12 16v4'],
   pause: ['M8 5v14', 'M16 5v14'],

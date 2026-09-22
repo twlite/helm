@@ -65,7 +65,7 @@ export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'off
 
 export type AsyncState = 'idle' | 'loading' | 'saving' | 'error';
 
-export type VmAction = 'start' | 'stop' | 'reset';
+export type VmAction = 'start' | 'stop' | 'reset' | 'reconnect';
 
 export type MemoryKind = Memory['kind'];
 

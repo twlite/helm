@@ -3,23 +3,23 @@ import { cva, type VariantProps } from 'class-variance-authority';
 import { cn } from '../../lib/utils';
 
 const buttonVariants = cva(
-  'inline-flex shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-teal-400/50 disabled:pointer-events-none disabled:opacity-45',
+  'inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-[5px] text-xs font-medium transition-colors duration-100 outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--app-bg)] disabled:pointer-events-none disabled:opacity-40',
   {
     variants: {
       variant: {
-        default: 'bg-teal-500 text-slate-950 hover:bg-teal-400',
-        secondary: 'bg-[#171d24] text-[#e7ebef] hover:bg-[#202832]',
-        ghost: 'text-[#9ba4af] hover:bg-white/[0.06] hover:text-[#f1f3f5]',
-        outline: 'border border-white/[0.1] bg-transparent text-[#d7dde3] hover:bg-white/[0.05]',
-        destructive: 'bg-red-500/15 text-red-300 hover:bg-red-500/25',
-        link: 'text-teal-300 underline-offset-4 hover:underline',
+        default: 'bg-[var(--accent)] text-[#07110f] hover:brightness-110',
+        secondary: 'border border-[var(--border)] bg-[var(--pane-raised)] text-[var(--text)] hover:bg-[var(--hover-bg)] hover:border-[var(--border-strong)]',
+        ghost: 'text-[var(--text-secondary)] hover:bg-[var(--hover-bg)] hover:text-[var(--text)]',
+        outline: 'border border-[var(--border-strong)] bg-transparent text-[var(--text-secondary)] hover:bg-[var(--hover-bg)] hover:text-[var(--text)]',
+        destructive: 'text-[var(--danger)] hover:bg-red-400/[0.08]',
+        link: 'text-[var(--accent)] underline-offset-4 hover:underline',
       },
       size: {
-        default: 'h-9 px-3',
-        sm: 'h-8 rounded-md px-2.5 text-xs',
-        lg: 'h-10 px-4',
-        icon: 'size-9',
-        'icon-sm': 'size-8',
+        default: 'h-8 px-3',
+        sm: 'h-7 px-2 text-[11px]',
+        lg: 'h-9 px-4',
+        icon: 'size-8',
+        'icon-sm': 'size-7',
       },
     },
     defaultVariants: {

@@ -7,6 +7,7 @@ import type {
 } from '@helm/shared';
 import { browserUrlsMatch } from '@helm/shared';
 
+import { BROWSER_RESEARCH_CRITERION_ID } from '../agent/browser-research';
 import type { GuestTransport } from './guest-transport';
 
 export type CriterionType = CompletionCriterion['type'];
@@ -59,6 +60,12 @@ function safeError(error: unknown): CriterionCheck {
     passed: false,
     message: error instanceof Error ? error.message : String(error),
   };
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function matchesWindow(
@@ -215,10 +222,24 @@ export class CriterionVerifierRegistry {
       };
     });
 
-    this.register('custom', async criterion => ({
-      passed: false,
-      message: `No custom verifier registered for ${criterion.id}: ${criterion.description}`,
-    }));
+    this.register('custom', async (criterion, context) => {
+      if (criterion.id === BROWSER_RESEARCH_CRITERION_ID) {
+        const data = recordValue(context.lastToolResult?.data);
+        const text = typeof data?.text === 'string' ? data.text.trim() : '';
+        const passed = context.lastToolResult?.ok === true && text.length > 0;
+        return {
+          passed,
+          message: passed
+            ? 'Readable web page content was collected.'
+            : 'Readable web page content has not been collected yet.',
+          evidence: data ? { url: data.url, title: data.title, textLength: text.length } : undefined,
+        };
+      }
+      return {
+        passed: false,
+        message: `No custom verifier registered for ${criterion.id}: ${criterion.description}`,
+      };
+    });
   }
 
   private requireGuest(): GuestTransport {

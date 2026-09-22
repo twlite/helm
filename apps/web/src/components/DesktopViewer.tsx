@@ -17,7 +17,7 @@ export function DesktopViewer({ open, onOpenChange, screenshot, vm }: DesktopVie
           <DialogTitle>Helm desktop</DialogTitle>
           <DialogDescription>Latest screenshot from the controlled environment.</DialogDescription>
         </DialogHeader>
-        <div className="flex min-h-[240px] items-center justify-center overflow-hidden rounded-lg border border-white/[0.08] bg-black sm:min-h-[420px]">
+        <div className="flex min-h-[240px] items-center justify-center overflow-hidden rounded-[4px] border border-[var(--border)] bg-black sm:min-h-[420px]">
           {screenshot ? (
             <img alt="Latest Linux guest desktop screenshot" className="max-h-[70vh] w-full object-contain" src={screenshot} />
           ) : (

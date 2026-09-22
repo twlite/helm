@@ -16,6 +16,7 @@ import type {
 import { CriterionVerifierRegistry } from '../tools/criterion-verifier';
 import type { GuestTransport } from '../tools/guest-transport';
 import { ToolRegistry } from '../tools/tool-registry';
+import { BROWSER_RESEARCH_CRITERION_ID, isBrowserResearchRequest } from './browser-research';
 import { fingerprintAction, LoopDetector } from './fingerprint';
 import { DEFAULT_RUNTIME_BUDGETS, RunBudget, RunCancellation } from './limits';
 import { GuestObservationProvider } from './observation';
@@ -54,7 +55,11 @@ function criterionKey(criterion: CompletionCriterion): string {
 }
 
 function taskRequiresPageContent(task: TaskDefinition, userMessage = ''): boolean {
+  if (task.criteria.some(criterion => criterion.type === 'custom' && criterion.id === BROWSER_RESEARCH_CRITERION_ID)) {
+    return true;
+  }
   const goal = `${task.goal}\n${userMessage}`.toLowerCase();
+  if (isBrowserResearchRequest(goal)) return true;
   const referencesWebContent = /\b(page|site|website|web|profile|url|browser|github|http)\b/u.test(goal);
   const requestsContent = /\b(read|extract|tell|summari[sz]e|report|content|information|details|what)\b/u.test(goal);
   return referencesWebContent && requestsContent;

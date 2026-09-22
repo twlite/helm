@@ -28,14 +28,14 @@ const DialogContent = React.forwardRef<
     <DialogOverlay />
     <DialogPrimitive.Content
       className={cn(
-        'fixed left-1/2 top-1/2 z-50 grid max-h-[90vh] w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4 overflow-y-auto rounded-xl border border-white/[0.1] bg-[#11151b] p-6 text-[#f1f3f5] shadow-2xl shadow-black/40 outline-none',
+        'fixed left-1/2 top-1/2 z-50 grid max-h-[90vh] w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4 overflow-y-auto rounded-lg border border-[var(--border-strong)] bg-[var(--pane-raised)] p-5 text-[var(--text)] shadow-xl shadow-black/35 outline-none',
         className,
       )}
       ref={ref}
       {...props}
     >
       {children}
-      <DialogPrimitive.Close className="absolute right-4 top-4 rounded-md p-1.5 text-[#79838f] transition-colors hover:bg-white/[0.06] hover:text-[#f1f3f5] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400/50">
+      <DialogPrimitive.Close className="absolute right-3 top-3 rounded-[5px] p-1.5 text-[var(--text-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--text)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent)]">
         <Icon name="x" size={16} />
         <span className="sr-only">Close</span>
       </DialogPrimitive.Close>

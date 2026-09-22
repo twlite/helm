@@ -474,10 +474,10 @@ export const helmApi = {
     return parseSingle(payload, 'thread', parseThread);
   },
 
-  async generateThreadTitle(threadId: string, sourceMessageId: string): Promise<Thread> {
+  async generateThreadTitle(threadId: string, sourceMessageId: string, force = false): Promise<Thread> {
     const payload = await request(
       `/api/threads/${encodeURIComponent(threadId)}/title`,
-      jsonBody({ sourceMessageId }),
+      jsonBody({ sourceMessageId, ...(force ? { force: true } : {}) }),
     );
     return parseSingle(payload, 'thread', parseThread);
   },

@@ -22,6 +22,9 @@ type ActivityRow = {
   title: string;
   toolName?: string;
   step: RunStep;
+  verificationStep?: RunStep;
+  resultStep?: RunStep;
+  duration?: string;
   status: 'active' | 'complete' | 'failed';
 };
 
@@ -127,6 +130,11 @@ function activityRows(run: RunDetails, liveActivity?: LiveActivity): ActivityRow
   return [...groups.entries()].map(([stepIndex, steps]) => {
     const step = stepForGroup(steps);
     const toolName = step.toolName ?? (step.decision?.type === 'action' ? step.decision.tool : undefined);
+    const verificationStep = steps.find((candidate) => candidate.verification);
+    const resultStep = [...steps].reverse().find((candidate) => candidate.observation !== undefined || candidate.toolResult !== undefined);
+    const started = Math.min(...steps.map((candidate) => new Date(candidate.createdAt).getTime()).filter(Number.isFinite));
+    const ended = Math.max(...steps.map((candidate) => candidate.completedAt ? new Date(candidate.completedAt).getTime() : Number.NaN).filter(Number.isFinite));
+    const elapsed = Number.isFinite(started) && Number.isFinite(ended) ? Math.max(0, ended - started) : undefined;
     const failed = step.phase === 'failed' || step.phase === 'blocked' || step.toolResult?.ok === false;
     const active = run.status === 'running'
       && liveActivity?.runId === run.id
@@ -138,6 +146,9 @@ function activityRows(run: RunDetails, liveActivity?: LiveActivity): ActivityRow
       title: toolName ? toolTitle(toolName) : step.decision?.type === 'complete' ? 'Complete task' : humanize(step.phase),
       ...(toolName ? { toolName } : {}),
       step,
+      ...(verificationStep ? { verificationStep } : {}),
+      ...(resultStep ? { resultStep } : {}),
+      ...(elapsed === undefined ? {} : { duration: elapsed < 1000 ? `${elapsed}ms` : `${(elapsed / 1000).toFixed(1)}s` }),
       status: failed ? 'failed' : active ? 'active' : 'complete',
     };
   });
@@ -145,24 +156,24 @@ function activityRows(run: RunDetails, liveActivity?: LiveActivity): ActivityRow
 
 function StepMark({ status }: { status: ActivityRow['status'] }) {
   if (status === 'failed') {
-    return <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-red-400/10 text-red-300"><Icon name="x" size={12} /></span>;
+    return <Icon className="shrink-0 text-[var(--danger)]" name="x" size={13} />;
   }
   if (status === 'active') {
-    return <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-teal-400/10 text-teal-300"><span className="size-1.5 animate-pulse rounded-full bg-teal-300" /></span>;
+    return <span className="size-2 shrink-0 animate-pulse rounded-full bg-[var(--accent)]" />;
   }
-  return <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-emerald-400/10 text-emerald-300"><Icon name="check" size={12} /></span>;
+  return <Icon className="shrink-0 text-[var(--text-muted)]" name="check" size={13} />;
 }
 
 function ActivityRowView({ row }: { row: ActivityRow }) {
   const [expanded, setExpanded] = useState(false);
-  const verification = row.step.verification;
+  const verification = row.verificationStep?.verification ?? row.step.verification;
   const reasoning = row.step.decision?.reasoningSummary;
   return (
-    <Collapsible className="border-b border-white/[0.06] last:border-b-0" onOpenChange={setExpanded} open={expanded}>
-      <CollapsibleTrigger className="flex w-full min-w-0 items-center gap-2.5 py-2.5 text-left outline-none transition-colors hover:text-[#f1f3f5] focus-visible:ring-2 focus-visible:ring-teal-400/50">
+    <Collapsible className="border-b border-[var(--border)] last:border-b-0" onOpenChange={setExpanded} open={expanded}>
+      <CollapsibleTrigger className="flex min-h-8 w-full min-w-0 items-center gap-2 py-1.5 text-left outline-none transition-colors hover:bg-[var(--hover-bg)] focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[var(--accent)]">
         <StepMark status={row.status} />
-        <span className="min-w-0 flex-1 truncate text-xs text-[#d7dde3]">{row.title}</span>
-        <span className="shrink-0 text-[10px] text-[#606975]">{expanded ? 'Hide' : 'Details'}</span>
+        <span className="min-w-0 flex-1 truncate text-xs text-[var(--text-secondary)]">{row.title}</span>
+        {row.duration ? <span className="shrink-0 font-mono text-[9px] text-[var(--text-muted)]">{row.duration}</span> : null}
         <Icon className={`shrink-0 text-[#606975] transition-transform ${expanded ? 'rotate-180' : ''}`} name="chevron-down" size={13} />
       </CollapsibleTrigger>
       <CollapsibleContent className="pb-3 pl-7">
@@ -170,7 +181,8 @@ function ActivityRowView({ row }: { row: ActivityRow }) {
           {reasoning ? <Detail label="What Helm is doing" value={reasoning} /> : null}
           {row.toolName ? <Detail label="Tool" value={row.toolName} /> : null}
           {row.step.toolInput ? <Detail label="Input" value={displayValue(row.step.toolInput)} pre /> : null}
-          {row.step.toolResult ? <Detail label="Result" value={displayValue(row.step.toolResult)} pre /> : null}
+          {row.resultStep?.observation !== undefined ? <Detail label="Observation" value={displayValue(row.resultStep.observation)} pre /> : null}
+          {row.resultStep?.toolResult ? <Detail label="Result" value={displayValue(row.resultStep.toolResult)} pre /> : null}
           {verification ? (
             <Detail label="Verification" value={verification.summary || (verification.complete ? 'Verified.' : 'Still working.')} />
           ) : null}
@@ -243,7 +255,7 @@ export function RunActivityFeed({
       )}
 
       {criteria.length > 0 ? (
-        <section className="space-y-2 border-t border-white/[0.06] pt-3">
+        <section className="space-y-2 border-t border-[var(--border)] pt-3">
           <div className="flex items-center justify-between gap-3">
             <h4 className="text-[11px] font-medium text-[#aeb7c1]">Verification</h4>
             {latestVerification?.complete ? <span className="text-[10px] text-emerald-300">Complete</span> : null}
@@ -260,7 +272,7 @@ export function RunActivityFeed({
       ) : null}
 
       {showError && run.error ? (
-        <div className="flex min-w-0 items-start gap-2 rounded-md bg-red-400/[0.07] px-2.5 py-2 text-xs text-red-200">
+        <div className="flex min-w-0 items-start gap-2 rounded-md border border-red-400/20 bg-red-950/30 px-3 py-2.5 text-xs text-red-100">
           <Icon className="mt-0.5 shrink-0 text-red-300" name="triangle" size={13} />
           <div className="min-w-0 flex-1">
             <p className="break-words leading-5">{run.error.message}</p>

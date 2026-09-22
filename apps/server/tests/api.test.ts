@@ -22,6 +22,7 @@ describe('Helm HTTP API', () => {
       HELM_RUNTIME_DIR: join(dataDir, 'runtime'),
       HELM_VM_HELPER: join(dataDir, 'missing-helper'),
       HELM_PORT: '8787',
+      HELM_LLM_TIMEOUT_MS: '50',
     }));
 
     try {
@@ -47,6 +48,21 @@ describe('Helm HTTP API', () => {
         })),
       );
       expect(createdMessage.message.id).toBeString();
+
+      const correction = await readJson<{ message: { id: string } }>(
+        await application.handle(new Request(`http://helm.test/api/threads/${threadId}/messages`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            content: 'Actually use https://www.nrb.org.np/forex/ for the Nepal Rastra Bank exchange rate; remember this for the future.',
+          }),
+        })),
+      );
+      expect(correction.message.id).toBeString();
+      const automaticMemorySearch = await readJson<{ memories: Array<{ content: string }> }>(
+        await application.handle(new Request('http://helm.test/api/memories/search?q=Nepal%20Rastra%20Bank%20exchange%20rate')),
+      );
+      expect(automaticMemorySearch.memories.some(memory => memory.content.includes('https://www.nrb.org.np/forex/'))).toBe(true);
 
       const createdMemory = await readJson<{ memory: { id: string } }>(
         await application.handle(new Request('http://helm.test/api/memories', {

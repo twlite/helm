@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type {
   JsonValue,
   GuestMethod,
+  Memory,
   Message,
   MessageRole,
   Run,
@@ -19,6 +20,7 @@ import { AgentRuntime, assistantMessageForResult, createScriptedDemoDecisions, c
 import type { RuntimeEvent, RuntimeEventSink, RuntimeRepository } from './agent';
 import { PersistenceDatabase } from './db/database';
 import type { CreateMemoryInput } from './memory/repository';
+import { extractExplicitMemory, shouldAttemptModelMemoryExtraction } from './memory/remember';
 import { MemoryService } from './memory/service';
 import { EventHub, type EventSocket } from './events';
 import { loadConfig, type HelmConfig } from './config';
@@ -54,6 +56,7 @@ const steerRunInputSchema = z.object({
 });
 const threadTitleInputSchema = z.object({
   sourceMessageId: z.string().min(1),
+  force: z.boolean().optional().default(false),
 });
 
 function jsonValue(value: unknown): JsonValue {
@@ -256,6 +259,107 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
     sqliteVec: { dimensions: config.models.embeddingDimensions },
   });
 
+  const isLegacyAutomaticMemory = (candidate: Memory): boolean => (
+    candidate.metadata.source === 'automatic-user-memory'
+    && /^(?:User correction|User instruction) to remember:/u.test(candidate.content)
+  );
+
+  let legacyMemoryUpgradePromise: Promise<void> | undefined;
+  const upgradeLegacyMemories = async (): Promise<void> => {
+    for (const candidate of memory.list(1_000).filter(isLegacyAutomaticMemory)) {
+      const sourceMessageId = candidate.metadata.sourceMessageId;
+      if (typeof sourceMessageId !== 'string') continue;
+      const sourceMessage = database.messages.getById(sourceMessageId);
+      if (!sourceMessage || sourceMessage.role !== 'user') continue;
+      try {
+        const summary = await models.memoryExtractor.extract({
+          userMessage: sourceMessage.content,
+          conversation: database.messages.listByThread(sourceMessage.threadId),
+        });
+        if (!summary) continue;
+        await memory.update(candidate.id, summary);
+        logger.info('Legacy automatic memory summarized', {
+          component: 'memory',
+          memoryId: candidate.id,
+        });
+      } catch (error) {
+        // A legacy row remains usable if the local model is unavailable. It can
+        // be retried after the next server restart without blocking the API.
+        logger.warn('Legacy automatic memory summarization failed', {
+          component: 'memory',
+          memoryId: candidate.id,
+          error,
+        });
+      }
+    }
+  };
+  const ensureLegacyMemoryUpgrade = async (): Promise<void> => {
+    if (!legacyMemoryUpgradePromise) {
+      legacyMemoryUpgradePromise = upgradeLegacyMemories().catch(error => {
+        logger.warn('Legacy memory upgrade failed', { component: 'memory', error });
+      });
+    }
+    await legacyMemoryUpgradePromise;
+  };
+
+  const rememberUserMessage = async (message: Message): Promise<void> => {
+    if (message.role !== 'user') return;
+    const metadata = {
+      source: 'automatic-user-memory',
+      threadId: message.threadId,
+      sourceMessageId: message.id,
+    } satisfies Record<string, JsonValue>;
+    const relatedUserMessages = database.messages
+      .listByThread(message.threadId)
+      .filter(candidate => candidate.role === 'user' && candidate.id !== message.id)
+      .map(candidate => candidate.content);
+    const explicitMemory = extractExplicitMemory(message.content, relatedUserMessages);
+    const shouldExtract = explicitMemory !== undefined || shouldAttemptModelMemoryExtraction(message.content);
+    const modelCandidate = shouldExtract
+      ? await models.memoryExtractor.extract({
+        userMessage: message.content,
+        conversation: database.messages.listByThread(message.threadId),
+      })
+      : undefined;
+    // Explicit memory intent wins even if the local model is temporarily
+    // unavailable. The deterministic candidate is only a conservative
+    // fallback; successful model extraction is what normally gets persisted.
+    const candidate = modelCandidate ?? explicitMemory;
+    if (!candidate) return;
+    const existingAutomaticMemory = memory.list(1_000).find(existing => (
+      existing.metadata.source === metadata.source
+      && existing.metadata.sourceMessageId === message.id
+    ));
+    if (existingAutomaticMemory) {
+      await memory.update(existingAutomaticMemory.id, candidate);
+      return;
+    }
+    await memory.saveIfNew({
+      ...candidate,
+      metadata,
+    });
+  };
+
+  const updateThreadTitleAfterRun = async (threadId: string, sourceMessageId: string): Promise<void> => {
+    try {
+      const thread = database.threads.getById(threadId);
+      const sourceMessage = database.messages.getById(sourceMessageId);
+      const firstUserMessage = database.messages.listByThread(threadId).find(message => message.role === 'user');
+      const titleSource = firstUserMessage ?? sourceMessage;
+      if (!thread || !titleSource || titleSource.role !== 'user') return;
+      const fallbackTitle = fallbackThreadTitle(titleSource.content);
+      if (thread.title !== fallbackTitle) return;
+      const generatedTitle = await models.titleGenerator.generate(titleSource.content);
+      if (!generatedTitle || generatedTitle === fallbackTitle) return;
+      database.threads.updateTitle(threadId, generatedTitle);
+      logger.info('Thread title generated', { component: 'thread', threadId });
+    } catch (error) {
+      // A title is an enhancement. Never turn a completed/failed agent run
+      // into another failure because the local model was busy or unavailable.
+      logger.warn('Thread title generation failed', { component: 'thread', threadId, error });
+    }
+  };
+
   const runScriptedDemo = async (threadId: string, sourceMessageId?: string): Promise<Run> => {
     const guest = new MockGuestTransport();
     const task = createScriptedDemoTask(threadId);
@@ -322,7 +426,10 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       taskPlanner: models.taskPlanner,
       repository: runAdapter,
       events: runtimeEvents,
-      memories: async ({ userMessage }) => memory.recall(userMessage),
+      memories: async ({ userMessage }) => {
+        await ensureLegacyMemoryUpgrade();
+        return memory.recall(userMessage);
+      },
       budgets: {
         maxSteps: config.maxSteps,
         maxRepeatedAction: config.maxRepeatedAction,
@@ -424,8 +531,9 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       // run.completed is emitted by the runtime before this asynchronous
       // response-generation pass. This event lets clients refresh only after
       // the conversational assistant message is durably persisted.
+      await updateThreadTitleAfterRun(threadId, sourceMessageId);
       events.publish('message.created', jsonValue(message), { runId });
-    }).catch(error => {
+    }).catch(async error => {
       const normalized = errorDetails(error);
       const runError = { code: normalized.code, message: normalized.message };
       const cancelled = cancellation.signal.aborted;
@@ -442,6 +550,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
         content: cancelled ? 'Run was cancelled.' : normalized.message,
         metadata: { source: 'ai-run', runId, status: cancelled ? 'cancelled' : 'failed' },
       });
+      await updateThreadTitleAfterRun(threadId, sourceMessageId);
       events.publish('message.created', jsonValue(message), { runId });
       if (canTransition) {
         runtimeEvents.emit({
@@ -566,7 +675,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
           throw new ApiFailure('MESSAGE_NOT_FOUND', 'The source message was not found in this thread.', 404);
         }
         const fallbackTitle = fallbackThreadTitle(sourceMessage.content);
-        if (thread.title !== fallbackTitle) {
+        if (!input.force && thread.title !== fallbackTitle) {
           return jsonResponse({ thread });
         }
         const generatedTitle = await models.titleGenerator.generate(sourceMessage.content);
@@ -579,7 +688,25 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
         if (request.method === 'GET') return jsonResponse({ messages: database.messages.listByThread(threadId) });
         if (request.method === 'POST') {
           const input = messageInputSchema.parse(await parseBody(request));
-          return jsonResponse({ message: database.messages.create({ threadId, role: input.role as MessageRole, content: input.content, metadata: jsonObject(input.metadata) }) }, 201);
+          const message = database.messages.create({
+            threadId,
+            role: input.role as MessageRole,
+            content: input.content,
+            metadata: jsonObject(input.metadata),
+          });
+          if (message.role === 'user') {
+            try {
+              await rememberUserMessage(message);
+            } catch (error) {
+              logger.warn('Automatic memory capture failed', {
+                component: 'memory',
+                threadId,
+                sourceMessageId: message.id,
+                error,
+              });
+            }
+          }
+          return jsonResponse({ message }, 201);
         }
       }
 
@@ -628,8 +755,14 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
         return jsonResponse({ run });
       }
 
-      if (request.method === 'GET' && url.pathname === '/api/memories') return jsonResponse({ memories: memory.list() });
-      if (request.method === 'GET' && url.pathname === '/api/memories/search') return jsonResponse({ memories: await memory.search(url.searchParams.get('q') ?? '') });
+      if (request.method === 'GET' && url.pathname === '/api/memories') {
+        await ensureLegacyMemoryUpgrade();
+        return jsonResponse({ memories: memory.list() });
+      }
+      if (request.method === 'GET' && url.pathname === '/api/memories/search') {
+        await ensureLegacyMemoryUpgrade();
+        return jsonResponse({ memories: await memory.search(url.searchParams.get('q') ?? '') });
+      }
       if (request.method === 'POST' && url.pathname === '/api/memories') {
         const input = memoryInputSchema.parse(await parseBody(request));
         const created = await memory.save(input as CreateMemoryInput);
@@ -648,6 +781,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
         }
         else if (segments[2] === 'stop') await vm.stop();
         else if (segments[2] === 'reset') await vm.reset();
+        else if (segments[2] === 'reconnect') await vm.reconnect();
         else return notFound('Unknown VM action.');
         return jsonResponse(await vm.status());
       }
