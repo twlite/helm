@@ -3,6 +3,7 @@ import type { CompletionCriterion } from '@helm/shared';
 import type { RunDetails, RunStep } from '../types';
 import { humanize } from '../format';
 import { Icon } from './Icon';
+import { RunErrorCard } from './RunErrorCard';
 import { Button } from './ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './ui/collapsible';
 import { ScrollArea } from './ui/scroll-area';
@@ -13,6 +14,8 @@ type ActivityDrawerProps = {
   onOpenChange: (open: boolean) => void;
   run: RunDetails | null;
   onCancelRun: (runId: string) => Promise<void>;
+  onRetryRun: (runId?: string) => Promise<void>;
+  isRetryingRun: boolean;
   onRunDemo: () => Promise<void>;
   isRunStarting: boolean;
 };
@@ -179,7 +182,17 @@ function VerificationList({ run }: { run: RunDetails }) {
   );
 }
 
-function RunProgress({ run, onCancelRun }: { run: RunDetails; onCancelRun: (runId: string) => Promise<void> }) {
+function RunProgress({
+  run,
+  onCancelRun,
+  onRetryRun,
+  isRetryingRun,
+}: {
+  run: RunDetails;
+  onCancelRun: (runId: string) => Promise<void>;
+  onRetryRun: (runId?: string) => Promise<void>;
+  isRetryingRun: boolean;
+}) {
   const steps = [...run.steps].sort((a, b) => a.stepIndex - b.stepIndex);
   const activeStepId = run.status === 'running' || run.status === 'pending' ? steps.at(-1)?.id : undefined;
   const status = statusClasses(run.status);
@@ -214,7 +227,16 @@ function RunProgress({ run, onCancelRun }: { run: RunDetails; onCancelRun: (runI
       </section>
 
       <VerificationList run={run} />
-      {run.error ? <div className="rounded-md border border-red-400/20 bg-red-400/[0.06] px-3 py-2.5 text-sm leading-5 text-red-200">{run.error.message}</div> : null}
+      {run.error ? (
+        <RunErrorCard
+          code={run.error.code}
+          details={run.error.details}
+          isRetrying={isRetryingRun}
+          message={run.error.message}
+          onRetry={() => onRetryRun(run.id)}
+          title={run.status === 'blocked' ? 'Task blocked' : run.status === 'cancelled' ? 'Task stopped' : 'Task failed'}
+        />
+      ) : null}
     </div>
   );
 }
@@ -224,6 +246,8 @@ export function ActivityDrawer({
   onOpenChange,
   run,
   onCancelRun,
+  onRetryRun,
+  isRetryingRun,
   onRunDemo,
   isRunStarting,
 }: ActivityDrawerProps) {
@@ -237,7 +261,7 @@ export function ActivityDrawer({
         <ScrollArea className="min-h-0 flex-1">
           <div className="space-y-8 px-5 pb-8 pt-5">
             {run ? (
-              <RunProgress onCancelRun={onCancelRun} run={run} />
+              <RunProgress isRetryingRun={isRetryingRun} onCancelRun={onCancelRun} onRetryRun={onRetryRun} run={run} />
             ) : (
               <section className="space-y-4">
                 <div>

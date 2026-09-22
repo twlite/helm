@@ -3,6 +3,7 @@ import type { FormEvent, KeyboardEvent } from 'react';
 import type { Message, RunDetails, Thread } from '../types';
 import { formatTime } from '../format';
 import { Icon } from './Icon';
+import { RunErrorCard } from './RunErrorCard';
 import { Alert } from './ui/alert';
 import { Button } from './ui/button';
 import { ScrollArea } from './ui/scroll-area';
@@ -24,6 +25,9 @@ type ConversationProps = {
   onRunDemo: () => Promise<void>;
   isRunStarting: boolean;
   run: RunDetails | null;
+  isRetryingRun: boolean;
+  onRetryRun: (runId?: string) => Promise<void>;
+  onOpenActivity: (runId?: string) => void;
   activityOpen: boolean;
   onToggleActivity: () => void;
   onOpenMobileSidebar: () => void;
@@ -49,6 +53,29 @@ function roleIcon(role: Message['role']) {
     return <span className="text-[11px] font-semibold text-[#aeb7c1]">Y</span>;
   }
   return <Icon name={role === 'assistant' ? 'spark' : role === 'tool' ? 'activity' : 'server'} size={14} />;
+}
+
+function metadataString(message: Message, key: string): string | undefined {
+  const value = message.metadata[key];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function isRunErrorMessage(message: Message): boolean {
+  if (message.role !== 'assistant' || metadataString(message, 'source') !== 'ai-run') {
+    return false;
+  }
+  return ['failed', 'blocked', 'cancelled'].includes(metadataString(message, 'status') ?? '');
+}
+
+function runErrorTitle(status: string | undefined): string {
+  switch (status) {
+    case 'blocked':
+      return 'Task blocked';
+    case 'cancelled':
+      return 'Task stopped';
+    default:
+      return 'Task failed';
+  }
 }
 
 const MessageRow = memo(function MessageRow({ message }: { message: Message }) {
@@ -82,6 +109,13 @@ const MessageRow = memo(function MessageRow({ message }: { message: Message }) {
 });
 
 function RunStatus({ run, open, onToggle }: { run: RunDetails | null; open: boolean; onToggle: () => void }) {
+  const statusDot = run?.status === 'failed' || run?.status === 'blocked'
+    ? 'bg-red-300'
+    : run?.status === 'completed'
+      ? 'bg-emerald-300'
+      : run
+        ? 'bg-amber-300'
+        : undefined;
   return (
     <Button
       aria-label="Open agent activity"
@@ -92,9 +126,7 @@ function RunStatus({ run, open, onToggle }: { run: RunDetails | null; open: bool
     >
       <Icon name="activity" size={15} />
       <span className="hidden sm:inline">Activity</span>
-      {run ? (
-        <span className={`size-1.5 rounded-full ${run.status === 'running' || run.status === 'pending' ? 'bg-teal-300' : run.status === 'completed' ? 'bg-emerald-300' : 'bg-amber-300'}`} />
-      ) : null}
+      {statusDot ? <span className={`size-1.5 rounded-full ${statusDot}`} /> : null}
     </Button>
   );
 }
@@ -110,6 +142,9 @@ export function Conversation({
   onRunDemo,
   isRunStarting,
   run,
+  isRetryingRun,
+  onRetryRun,
+  onOpenActivity,
   activityOpen,
   onToggleActivity,
   onOpenMobileSidebar,
@@ -174,13 +209,43 @@ export function Conversation({
                     Loading messages…
                   </div>
                 ) : messages.length > 0 ? (
-                  messages.map((message) => <MessageRow key={message.id} message={message} />)
+                  messages.map((message) => {
+                    if (!isRunErrorMessage(message)) {
+                      return <MessageRow key={message.id} message={message} />;
+                    }
+                    const runId = metadataString(message, 'runId');
+                    const matchingRun = run?.id === runId ? run : null;
+                    const status = metadataString(message, 'status');
+                    return (
+                      <RunErrorCard
+                        code={matchingRun?.error?.code}
+                        details={matchingRun?.error?.details}
+                        isRetrying={isRetryingRun}
+                        key={message.id}
+                        message={message.content}
+                        onOpenActivity={() => onOpenActivity(runId)}
+                        onRetry={() => onRetryRun(runId)}
+                        title={runErrorTitle(status)}
+                      />
+                    );
+                  })
                 ) : (
                   <div className="py-16 text-center">
                     <p className="text-sm font-medium text-[#aeb7c1]">Start with an instruction</p>
                     <p className="mt-2 text-sm text-[#606975]">Your messages and agent work will appear here.</p>
                   </div>
                 )}
+                {run?.error && !messages.some((message) => isRunErrorMessage(message) && metadataString(message, 'runId') === run.id) ? (
+                  <RunErrorCard
+                    code={run.error.code}
+                    details={run.error.details}
+                    isRetrying={isRetryingRun}
+                    message={run.error.message}
+                    onOpenActivity={() => onOpenActivity(run.id)}
+                    onRetry={() => onRetryRun(run.id)}
+                    title={runErrorTitle(run.status)}
+                  />
+                ) : null}
               </div>
             )}
           </div>

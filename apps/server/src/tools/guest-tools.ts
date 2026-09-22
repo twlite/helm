@@ -41,6 +41,7 @@ function transportFailure(error: unknown): ToolResult {
       error: {
         code: String(typed.code),
         message: String(typed.message),
+        ...(typed.details === undefined ? {} : { details: typed.details }),
       },
     };
   }

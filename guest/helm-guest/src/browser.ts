@@ -126,6 +126,23 @@ function safeUrl(value: string): string {
   return value;
 }
 
+function browserLaunchError(error: unknown): GuestRpcError {
+  const message = error instanceof Error ? error.message.slice(0, 1_000) : "Visible Chromium could not be started.";
+  if (/Executable doesn't exist at|playwright install/iu.test(message)) {
+    return new GuestRpcError(
+      "PLAYWRIGHT_BROWSER_MISSING",
+      "Playwright Chromium is not installed in the guest. As the helm user, run `npx playwright install --with-deps chromium` (or `bunx --bun playwright install --with-deps chromium`), then restart helm-guest.",
+      {
+        details: {
+          installCommand: "npx playwright install --with-deps chromium",
+          originalMessage: message,
+        },
+      },
+    );
+  }
+  return new GuestRpcError("BROWSER_START_FAILED", message);
+}
+
 export class BrowserController {
   private context: PlaywrightContext | undefined;
   private page: PlaywrightPage | undefined;
@@ -446,10 +463,7 @@ export class BrowserController {
     } catch (error) {
       this.context = undefined;
       this.page = undefined;
-      throw new GuestRpcError(
-        "BROWSER_START_FAILED",
-        error instanceof Error ? error.message.slice(0, 500) : "Visible Chromium could not be started.",
-      );
+      throw browserLaunchError(error);
     }
   }
 

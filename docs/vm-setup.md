@@ -156,6 +156,54 @@ The runtime directory is exposed read-only through VirtioFS at
 `/opt/helm-runtime`. Rebuilding the guest bundle therefore does not require
 rebuilding the disk image.
 
+## Install Playwright Chromium in the guest
+
+`guest/helm-guest` keeps the Playwright Node package external to the bundled
+runtime. The package and its browser binary must therefore be installed inside
+Ubuntu. `bun run guest:build` only rebuilds the guest RPC bundle; it does not
+download Chromium.
+
+Open a terminal in the Ubuntu VM and run the browser install as the `helm`
+user. Do not run the browser install as root, because Playwright will then put
+the cache under `/root` instead of the runtime user's
+`/home/helm/.cache/ms-playwright`:
+
+```sh
+sudo -iu helm
+cd /home/helm
+npx playwright install --with-deps chromium
+```
+
+If `npx` is not available, use Bun's runner instead:
+
+```sh
+sudo -iu helm
+cd /home/helm
+bunx --bun playwright install --with-deps chromium
+```
+
+If the guest does not yet have the external package in the directory from
+which `helm-guest` starts, install the package first. Use the version resolved
+by the current Helm lockfile rather than mixing a browser from a different
+Playwright release:
+
+```sh
+sudo -iu helm
+cd /home/helm
+bun add playwright
+bunx --bun playwright install --with-deps chromium
+```
+
+The `--with-deps` option may ask for `sudo` to install Ubuntu's Chromium
+runtime libraries. Verify that the executable is now owned by `helm`:
+
+```sh
+find /home/helm/.cache/ms-playwright -path '*/chrome-linux-arm64/chrome' -type f -perm -111 -print
+```
+
+Restart `helm-guest` after installation. For the requested site, the browser
+navigation target is `https://twlite.dev`.
+
 ## VM devices
 
 Normal runtime configures a generic Linux platform with EFI boot, a writable

@@ -76,6 +76,7 @@ function App() {
   const [draft, setDraft] = useState('');
   const [messageState, setMessageState] = useState<AsyncState>('idle');
   const [isRunStarting, setIsRunStarting] = useState(false);
+  const [isRetryingRun, setIsRetryingRun] = useState(false);
   const [run, setRun] = useState<RunDetails | null>(null);
   const [vm, setVm] = useState<VmStatus | null>(null);
   const [health, setHealth] = useState<HealthStatus | null>(null);
@@ -337,6 +338,47 @@ function App() {
     }
   }, [refreshRun, showError]);
 
+  const handleRetryRun = useCallback(async (runId?: string) => {
+    const threadId = selectedThreadIdRef.current;
+    if (!threadId || isRetryingRun) {
+      return;
+    }
+
+    setIsRetryingRun(true);
+    setNotice(null);
+    try {
+      const currentRun = run;
+      let sourceMessageId = currentRun && currentRun.id === runId ? currentRun.sourceMessageId : undefined;
+      if (!sourceMessageId && runId) {
+        sourceMessageId = (await helmApi.getRun(runId)).sourceMessageId;
+      }
+      sourceMessageId ??= [...messages].reverse().find((message) => message.role === 'user')?.id;
+      if (!sourceMessageId) {
+        throw new Error('Helm could not find the message for this run.');
+      }
+
+      const nextRun = await helmApi.runAgent(threadId, sourceMessageId);
+      setRun(nextRun);
+      setIsActivityOpen(true);
+    } catch (error) {
+      showError(error);
+    } finally {
+      setIsRetryingRun(false);
+    }
+  }, [isRetryingRun, messages, run, showError]);
+
+  const handleOpenActivity = useCallback(async (runId?: string) => {
+    setIsActivityOpen(true);
+    if (!runId || run?.id === runId) {
+      return;
+    }
+    try {
+      setRun(await helmApi.getRun(runId));
+    } catch (error) {
+      showError(error);
+    }
+  }, [run, showError]);
+
   const handleVmAction = useCallback(async (action: VmAction) => {
     setVmAction(action);
     setNotice(null);
@@ -434,12 +476,15 @@ function App() {
           draft={draft}
           isLoading={messageState === 'loading'}
           isRunStarting={isRunStarting}
+          isRetryingRun={isRetryingRun}
           isSending={messageState === 'saving'}
           messages={messages}
           onDraftChange={setDraft}
           onDismissNotice={() => setNotice(null)}
           onOpenMobileSidebar={() => setIsMobileSidebarOpen(true)}
+          onOpenActivity={(runId) => void handleOpenActivity(runId)}
           onRunDemo={handleRunDemo}
+          onRetryRun={handleRetryRun}
           onSend={handleSendMessage}
           onToggleActivity={() => setIsActivityOpen((current) => !current)}
           notice={notice}
@@ -451,6 +496,8 @@ function App() {
       <ActivityDrawer
         isRunStarting={isRunStarting}
         onCancelRun={handleCancelRun}
+        onRetryRun={handleRetryRun}
+        isRetryingRun={isRetryingRun}
         onOpenChange={setIsActivityOpen}
         onRunDemo={handleRunDemo}
         open={isActivityOpen}
