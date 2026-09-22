@@ -102,6 +102,30 @@ export function requirementsForTask(task: TaskDefinition): TaskRequirement[] {
     }));
 }
 
+function pathBasename(value: string): string {
+  return value.split(/[\\/]/u).at(-1)?.split(/[?#]/u)[0]?.toLocaleLowerCase() ?? '';
+}
+
+function navigationBasename(value: string): string {
+  try {
+    const url = new URL(value);
+    return pathBasename(url.pathname === '/' ? url.hostname : url.pathname);
+  } catch {
+    return pathBasename(value);
+  }
+}
+
+/** Output targets are values for filesystem/desktop workers, never browser destinations. */
+export function isTaskOutputPathNavigation(task: TaskDefinition, candidate: string): boolean {
+  const candidatePath = candidate.trim().toLocaleLowerCase();
+  const candidateName = navigationBasename(candidate);
+  return requirementsForTask(task)
+    .filter(requirement => requirement.id === 'outputFile' || requirement.id === 'openFile')
+    .map(requirement => requirement.target?.path)
+    .filter((path): path is string => typeof path === 'string')
+    .some(path => path.toLocaleLowerCase() === candidatePath || pathBasename(path) === candidateName);
+}
+
 function userFacts(task: TaskDefinition, now: () => number): { facts: Fact[]; evidence: Evidence[] } {
   const request = task.originalRequest ?? task.goal;
   const facts: Fact[] = [];

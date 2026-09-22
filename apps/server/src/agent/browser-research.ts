@@ -9,6 +9,8 @@ const WEB_LOOKUP_INTENT_PATTERN = /\b(?:find|look\s*(?:up|for)|lookup|search|che
 const EXPLICIT_WEB_SOURCE_PATTERN = /\b(?:browser|web|website|site|online|internet|duckduckgo|google|bing|search engine)\b/iu;
 const CLEAR_CONVERSATION_PATTERN = /^(?:hi|hello|hey|good morning|good afternoon|good evening|who are you|what can you do|what is helm|tell me about yourself|how are you|thanks|thank you)[?.!, ]*$/iu;
 const DUCKDUCKGO_SEARCH_URL = 'https://duckduckgo.com';
+const SUPPORTED_BROWSER_PROTOCOLS = new Set(['http:', 'https:', 'file:', 'about:']);
+const BARE_FILE_REFERENCE_PATTERN = /\.(?:txt|md|markdown|json|csv|tsv|log|html?|css|js|jsx|mjs|cjs|ts|tsx|xml|ya?ml|toml|ini|conf|env|pdf|docx?|xlsx?|pptx?|zip|tar|gz)(?:[?#].*)?$/iu;
 
 /**
  * Detect requests that require public web research.
@@ -63,7 +65,8 @@ export function browserResearchStartUrl(input: string): string {
   if (explicitUrl) return normalizeUnsupportedSearchEngineUrl(explicitUrl) ?? explicitUrl;
   const explicitNonHttpUrl = normalized.match(/[a-z][a-z0-9+.-]*:(?:\/\/)?[^\s"'<>]+/iu)?.[0];
   if (explicitNonHttpUrl) return explicitNonHttpUrl;
-  if (/^(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?#][^\s]*)?$/iu.test(normalized)) {
+  if (/^(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?#][^\s]*)?$/iu.test(normalized)
+    && !BARE_FILE_REFERENCE_PATTERN.test(normalized)) {
     const explicitHostUrl = `https://${normalized}`;
     return normalizeUnsupportedSearchEngineUrl(explicitHostUrl) ?? explicitHostUrl;
   }
@@ -72,6 +75,19 @@ export function browserResearchStartUrl(input: string): string {
     return `https://github.com/${githubRepository}`;
   }
   return duckDuckGoSearchUrl(input.trim());
+}
+
+/**
+ * Model-proposed browser navigations must already be URLs. Compiled task
+ * sources are normalized separately, so accepting a bare model string here
+ * would turn output names such as `report.html` into browser destinations.
+ */
+export function isAbsoluteBrowserNavigationUrl(input: string): boolean {
+  try {
+    return SUPPORTED_BROWSER_PROTOCOLS.has(new URL(input.trim()).protocol);
+  } catch {
+    return false;
+  }
 }
 
 const SEARCH_ENGINE_HOSTS = new Set([

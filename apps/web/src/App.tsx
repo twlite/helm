@@ -119,6 +119,36 @@ function liveActivityFromEvent(event: HelmEvent, previous: LiveActivity | null):
   }
 }
 
+function liveActivityFromRun(run: RunDetails, previous: LiveActivity | null): LiveActivity {
+  if (run.status === 'completed') return { runId: run.id, phase: 'completed' };
+  if (run.status === 'failed' || run.status === 'blocked') return { runId: run.id, phase: 'failed' };
+  if (run.status === 'cancelled') return { runId: run.id, phase: 'cancelled' };
+  if (run.status === 'pending') {
+    return previous?.runId === run.id ? previous : { runId: run.id, phase: 'starting' };
+  }
+
+  const latestStep = [...run.steps].sort((left, right) => (
+    left.stepIndex - right.stepIndex
+    || new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime()
+  )).at(-1);
+  if (!latestStep) {
+    return previous?.runId === run.id ? previous : { runId: run.id, phase: 'starting' };
+  }
+  const toolName = latestStep.toolName
+    ?? (latestStep.decision?.type === 'action' ? latestStep.decision.tool : undefined)
+    ?? latestStep.workerResult?.actions.at(-1)?.tool;
+  const reasoningSummary = latestStep.decision?.reasoningSummary
+    ?? latestStep.orchestratorDecision?.reasoningSummary
+    ?? latestStep.workerResult?.reasoningSummary;
+  return {
+    runId: run.id,
+    phase: latestStep.phase === 'verify' ? 'verifying' : 'thinking',
+    stepIndex: latestStep.stepIndex,
+    ...(toolName ? { toolName } : {}),
+    ...(reasoningSummary ? { reasoningSummary } : {}),
+  };
+}
+
 function App() {
   const [threads, setThreads] = useState<Thread[]>([]);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
@@ -166,10 +196,11 @@ function App() {
         return;
       }
       const currentThreadId = selectedThreadIdRef.current;
-      if (currentThreadId && nextRun.threadId && currentThreadId !== nextRun.threadId) {
+      if (!currentThreadId || !nextRun.threadId || currentThreadId !== nextRun.threadId) {
         return;
       }
       setRun(nextRun);
+      setLiveActivity((current) => liveActivityFromRun(nextRun, current));
     } catch (error) {
       if (requestId === runRequestRef.current) {
         showError(error);
@@ -283,6 +314,23 @@ function App() {
       cancelled = true;
     };
   }, [socket.connectionVersion]);
+
+  useEffect(() => {
+    const activeRunId = run?.id;
+    const activeRunStatus = run?.status;
+    if (!activeRunId || (activeRunStatus !== 'pending' && activeRunStatus !== 'running')) return;
+
+    let cancelled = false;
+    const poll = () => {
+      if (!cancelled) void refreshRun(activeRunId);
+    };
+    poll();
+    const interval = window.setInterval(poll, 1_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [refreshRun, run?.id, run?.status, socket.connectionVersion]);
 
   useEffect(() => {
     let cancelled = false;

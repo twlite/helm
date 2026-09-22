@@ -22,6 +22,7 @@ import { ToolRegistry } from '../tools/tool-registry';
 import {
   BROWSER_RESEARCH_CRITERION_ID,
   browserResearchStartUrl,
+  isAbsoluteBrowserNavigationUrl,
   isBrowserResearchRequest,
   isSameSearchNavigation,
   isSearchResultsUrl,
@@ -37,6 +38,7 @@ import {
   compactEnvironmentObservation,
   createTaskState,
   evidenceFromObservation,
+  isTaskOutputPathNavigation,
   mergeWorkerResult,
   observedFactsFromToolResult,
   progressFingerprint,
@@ -126,9 +128,36 @@ function normalizeBrowserNavigationInput(
     !enabled
     || tool !== 'browser.navigate'
     || typeof input.url !== 'string'
-    || (/^[a-z][a-z0-9+.-]*:/iu.test(input.url) && !/^https?:\/\//iu.test(input.url))
+    || !isAbsoluteBrowserNavigationUrl(input.url)
   ) return input;
   return { ...input, url: browserResearchStartUrl(input.url) };
+}
+
+function invalidBrowserNavigationResult(
+  tool: string,
+  input: Record<string, unknown>,
+  enabled: boolean,
+  task?: TaskDefinition,
+): ToolResult | undefined {
+  if (!enabled || tool !== 'browser.navigate') return undefined;
+  const url = typeof input.url === 'string' ? input.url : undefined;
+  if (url !== undefined && task && isTaskOutputPathNavigation(task, url)) {
+    return {
+      ok: false,
+      error: {
+        code: 'OUTPUT_PATH_NOT_NAVIGATION',
+        message: 'The requested output path belongs to the filesystem or desktop worker and must not be opened in the browser.',
+      },
+    };
+  }
+  if (url !== undefined && isAbsoluteBrowserNavigationUrl(url)) return undefined;
+  return {
+    ok: false,
+    error: {
+      code: 'INVALID_BROWSER_NAVIGATION',
+      message: 'Browser navigation requires an absolute http(s), file, or about URL. Output filenames must be handled by filesystem or desktop tools.',
+    },
+  };
 }
 
 function normalizeBrowserNavigationDecision(
@@ -594,13 +623,14 @@ export class AgentRuntime {
           action: { tool: decision.tool, input: clone(decision.input) },
           observation,
         };
-        const result = await this.tools.execute(decision.tool, decision.input, {
-          signal: cancellation.signal,
-          runId: run.id,
-          stepIndex,
-          previousResults,
-          timeoutMs: this.budgetOptions?.toolTimeoutMs,
-        });
+        const result = invalidBrowserNavigationResult(decision.tool, decision.input, !conversationalTask, task)
+          ?? await this.tools.execute(decision.tool, decision.input, {
+            signal: cancellation.signal,
+            runId: run.id,
+            stepIndex,
+            previousResults,
+            timeoutMs: this.budgetOptions?.toolTimeoutMs,
+          });
         rejectedCompletionAttempts = 0;
         previousResults.push(clone(result));
         lastToolResult = result;
@@ -1028,7 +1058,12 @@ export class AgentRuntime {
                 return { ok: false, error: { code: 'WORKER_ACTION_BUDGET_EXCEEDED', message: `Worker exceeded its ${maxWorkerActions}-action budget.` } };
               }
               workerExecutionCount += 1;
-              const executableInput = normalizeBrowserNavigationInput(tool, toolInput, objective.kind === 'browser');
+              const invalidNavigation = invalidBrowserNavigationResult(tool, toolInput, true, task);
+              if (invalidNavigation) {
+                lastToolResult = invalidNavigation;
+                return invalidNavigation;
+              }
+              const executableInput = normalizeBrowserNavigationInput(tool, toolInput, true);
               const result = await this.tools.execute(tool, executableInput, {
                 signal: cancellation.signal,
                 runId,

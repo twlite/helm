@@ -32,6 +32,7 @@ import {
 } from '../agent/orchestrator';
 import {
   navigationResolutionFor,
+  isTaskOutputPathNavigation,
   requirementsForTask,
   trustedFacts,
   type BrowserNavigationResolution,
@@ -41,6 +42,7 @@ import {
   browserResearchCriterion,
   browserResearchStartUrl,
   browserResearchTask,
+  isAbsoluteBrowserNavigationUrl,
   isUnsupportedSearchEngineUrl,
   isBrowserResearchRequest,
 } from '../agent/browser-research';
@@ -403,6 +405,8 @@ type DesktopOutputPaths = {
 };
 
 const OUTPUT_FILENAME_PATTERN = /\b([A-Za-z0-9][A-Za-z0-9._-]*\.(?:txt|md|json|csv|log|html?))\b/iu;
+const BARE_FILE_REFERENCE_PATTERN = /\.(?:txt|md|markdown|json|csv|tsv|log|html?|css|js|jsx|mjs|cjs|ts|tsx|xml|ya?ml|toml|ini|conf|env|pdf|docx?|xlsx?|pptx?|zip|tar|gz)(?:[?#].*)?$/iu;
+const FILE_REFERENCE_INTENT_PATTERN = /\b(?:save|write|create|put|copy|store|output|file|filename|document|text\s+viewer|text\s+editor)\b/iu;
 
 function fileNameFromText(input: string): string | undefined {
   return input.match(OUTPUT_FILENAME_PATTERN)?.[1];
@@ -476,9 +480,23 @@ function explicitUrls(request: string): string[] {
           && matchStart < explicitStart + explicit[0].length;
       });
     })
-    .map(match => match[0].replace(/[),.;!?]+$/u, ''));
+    .map(match => match[0].replace(/[),.;!?]+$/u, ''))
+    // A scheme-qualified URL is explicit even when it points at a document
+    // or image. A bare file-like token is retained only when its local
+    // wording explicitly asks for navigation; otherwise it is an
+    // output/reference value, not a browser requirement.
+    .filter(candidate => !BARE_FILE_REFERENCE_PATTERN.test(candidate) || bareCandidateIsExplicitlyNavigated(request, candidate));
   const hosts = hostCandidates.map(value => `https://${value}`);
   return [...new Set([...urls, ...hosts])];
+}
+
+function bareCandidateIsExplicitlyNavigated(request: string, candidate: string): boolean {
+  const context = urlSentenceContext(request, candidate);
+  const contextUrl = candidate.toLocaleLowerCase();
+  const contextUrlIndex = context.toLocaleLowerCase().indexOf(contextUrl);
+  const contextBeforeUrl = contextUrlIndex >= 0 ? context.slice(0, contextUrlIndex) : context;
+  const navigationClause = contextBeforeUrl.split(/\b(?:and|but|then|using|use)\b/iu).at(-1) ?? contextBeforeUrl;
+  return EXPLICIT_NAVIGATION_PATTERN.test(navigationClause) && !FILE_REFERENCE_INTENT_PATTERN.test(context);
 }
 
 type ExplicitUrlRole = 'navigation' | 'asset';
@@ -1019,6 +1037,7 @@ export class AiSdkWorker implements WorkerProvider {
               'Return done only after you have taken the required action or the objective is already satisfied by observed evidence; never return done merely because the objective sounds complete.',
               'Do not redefine requirements and do not declare the entire task complete.',
               'Use semantic browser refs from the current snapshot; never invent selectors, URLs, filenames, or expected outcomes.',
+              'browser.navigate requires an absolute http(s), file, or about URL. Output filenames belong to filesystem or desktop tools; never turn a filename into a URL.',
               'Do not navigate to a user-provided asset/reference URL merely because it contains http. Use that URL directly in the requested output.',
               'After an action, use its actual result and the next observation. A model hypothesis is not an observed fact.',
               'If the objective is browser research or page content, that is the work to perform, not a blocker: navigate to the relevant source and extract readable text.',
@@ -1058,11 +1077,6 @@ export class AiSdkWorker implements WorkerProvider {
         blockers.push({ code: 'WORKER_TOOL_NOT_ALLOWED', message: `${input.objective.kind} worker cannot use ${decision.tool}.`, requirementIds: input.objective.requirementIds });
         break;
       }
-      const actionInput = decision.tool === 'browser.navigate'
-        && input.objective.kind === 'browser'
-        && typeof decision.input.url === 'string'
-        ? { ...decision.input, url: browserResearchStartUrl(decision.input.url) }
-        : decision.input;
       const requestedNavigationUrl = typeof decision.input.url === 'string' ? decision.input.url : undefined;
       const assetUrl = requestedNavigationUrl === undefined
         ? undefined
@@ -1078,6 +1092,33 @@ export class AiSdkWorker implements WorkerProvider {
         });
         break;
       }
+      if (decision.tool === 'browser.navigate'
+        && requestedNavigationUrl !== undefined
+        && isTaskOutputPathNavigation(input.task, requestedNavigationUrl)) {
+        status = 'blocked';
+        handedBack = true;
+        blockers.push({
+          code: 'OUTPUT_PATH_NOT_NAVIGATION',
+          message: 'The requested output path belongs to the filesystem or desktop worker and must not be opened in the browser.',
+          requirementIds: input.objective.requirementIds,
+        });
+        break;
+      }
+      if (decision.tool === 'browser.navigate'
+        && (requestedNavigationUrl === undefined || !isAbsoluteBrowserNavigationUrl(requestedNavigationUrl))) {
+        status = 'blocked';
+        handedBack = true;
+        blockers.push({
+          code: 'INVALID_BROWSER_NAVIGATION',
+          message: 'Browser navigation requires an absolute http(s), file, or about URL. Use filesystem or desktop tools for output filenames.',
+          requirementIds: input.objective.requirementIds,
+        });
+        break;
+      }
+      const actionInput = decision.tool === 'browser.navigate'
+        && typeof decision.input.url === 'string'
+        ? { ...decision.input, url: browserResearchStartUrl(decision.input.url) }
+        : decision.input;
       const result = await input.execute.execute(decision.tool, actionInput);
       const action: WorkerAction = {
         id: `worker-action-${input.objective.id}-${actionIndex}`,

@@ -42,6 +42,15 @@ just because they contain `http`, and a worker-side guard refuses to navigate
 to one unless the user explicitly asks to open it. This lets a portfolio task
 use an image URL directly while still researching the profile page.
 
+Output paths are kept separate from browser sources as well. Bare host-looking
+tokens are not treated as destinations when they are compiled as output file
+names, and the runtime checks the compiled `outputFile`/`openFile` targets
+before executing any model-proposed browser navigation. A model navigation must
+be an absolute supported URL; a filename such as `twlite.txt` or `twlite.html`
+is reported as an invalid browser action and remains work for the filesystem or
+desktop worker. This keeps worker orchestration driven by task requirements,
+not by a URL-shaped substring in the original prompt.
+
 Page-to-file requests are compiled as a dependency chain rather than a single
 optimistic action. For example, `go to https://twlite.dev and save the
 contents in a twlite.txt file` produces a browser destination, a readable
@@ -249,6 +258,17 @@ The activity feed displays objectives, worker names, worker actions, proposed
 facts, progress, requirements, and deterministic verification. It labels a
 completion proposal as a verification proposal rather than showing repeated
 misleading “Complete task” actions.
+
+Agent runs are started asynchronously: `POST /api/runs/agent` returns a
+pending run while the server continues the loop. The websocket is the low-
+latency activity path, but it is not the only source of truth because a socket
+can connect after the first event or reconnect during a run. While the selected
+run is pending or running, the web client polls `GET /api/runs/:id` once per
+second and reconciles the durable run steps and terminal status. Poll results
+also update the activity phase, so a missed `run.started` or `run.step.*`
+event cannot leave the UI permanently showing “Starting Helm…”. Polling stops
+after completion, failure, blocking, or cancellation; websocket events remain
+responsible for immediate updates when available.
 
 ## Benchmark shape
 

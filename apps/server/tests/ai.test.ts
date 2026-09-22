@@ -432,6 +432,8 @@ describe('LM Studio AI adapters', () => {
     expect(browserResearchStartUrl(bingUrl)).toBe(duckDuckGoUrl);
     expect(browserResearchStartUrl('www.google.com/search?q=latest+bun+release')).toBe(duckDuckGoUrl);
     expect(browserResearchStartUrl('https://www.google.com')).toBe('https://duckduckgo.com');
+    expect(browserResearchStartUrl('twlite.txt')).toBe('https://duckduckgo.com/?q=twlite.txt');
+    expect(browserResearchStartUrl('twlite.html')).toBe('https://duckduckgo.com/?q=twlite.html');
     expect(browserResearchStartUrl('file:///home/helm/release.html')).toBe('file:///home/helm/release.html');
     expect(browserResearchStartUrl('about:blank')).toBe('about:blank');
     expect(isSearchEngineUrl(duckDuckGoUrl)).toBe(true);
@@ -594,6 +596,51 @@ describe('LM Studio AI adapters', () => {
     }));
   });
 
+  it('keeps output filenames out of compiled browser destinations', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-output-name-plan',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({ mode: 'task', goal: 'Research the profile and save the result.', criteria: [] }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const planner = new AiSdkTaskPlanner({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 256,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+
+    for (const [index, fileName] of ['twlite.txt', 'twlite.html'].entries()) {
+      const task = await planner.createTask({
+        threadId: `output-name-${index}`,
+        userMessage: `go to github.com/twlite and extract the profile details, then save them in ${fileName} file`,
+      });
+      const destinations = (task.requirements ?? [])
+        .filter(requirement => requirement.type === 'browser')
+        .map(requirement => requirement.target?.url);
+      expect(destinations).toEqual(['https://github.com/twlite']);
+      expect(task.requirements).toContainEqual(expect.objectContaining({
+        id: 'outputFile',
+        target: expect.objectContaining({ path: fileName }),
+      }));
+    }
+  });
+
   it('blocks a worker from navigating to a user-provided asset URL', async () => {
     const provider = createOpenAICompatible({
       name: 'lmstudio',
@@ -679,6 +726,102 @@ describe('LM Studio AI adapters', () => {
     expect(executeCount).toBe(0);
     expect(result.status).toBe('blocked');
     expect(result.blockers[0]?.code).toBe('USER_ASSET_URL_NOT_NAVIGATION');
+  });
+
+  it('blocks a worker from navigating to a compiled output path', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-output-navigation',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({
+              type: 'action',
+              tool: 'browser.navigate',
+              input: { url: 'https://twlite.html' },
+            }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const task: TaskDefinition = {
+      id: 'output-navigation-task',
+      threadId: 'output-navigation-thread',
+      goal: 'Research the profile and write the requested portfolio.',
+      originalRequest: 'Go to github.com/twlite and create twlite.html.',
+      criteria: [],
+      requirements: [
+        {
+          id: 'browserDestination1',
+          description: 'Reach the profile.',
+          type: 'browser',
+          mandatory: true,
+          target: { url: 'https://github.com/twlite' },
+        },
+        {
+          id: 'outputFile',
+          description: 'Create the portfolio file.',
+          type: 'filesystem',
+          mandatory: true,
+          target: { path: 'twlite.html', mode: 'exists' },
+        },
+      ],
+      constraints: [],
+    };
+    const worker = new AiSdkWorker({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      toolDefinitions: [{ name: 'browser.navigate', description: 'Navigate.', inputSchema: z.object({}) }],
+      maxOutputTokens: 256,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    let executeCount = 0;
+    const result = await worker.execute({
+      objective: {
+        id: 'objective-profile-facts-0',
+        kind: 'browser',
+        description: 'Collect profile facts.',
+        requirementIds: ['profileFacts'],
+        rationale: 'test',
+      },
+      task,
+      state: createTaskState(task),
+      observation: {
+        timestamp: 1,
+        browser: { url: 'https://github.com/twlite', loaded: true },
+        task: { completedCriteria: [], remainingCriteria: ['profileFacts'] },
+      },
+      verification: { complete: false, criteria: [], requirements: [], summary: '0/2 requirements passed.' },
+      memories: [],
+      recentActions: [],
+      failedStrategies: [],
+      maxActions: 1,
+      execute: {
+        execute: async () => {
+          executeCount += 1;
+          return { ok: true };
+        },
+        observe: async () => ({
+          timestamp: 1,
+          browser: { url: 'https://github.com/twlite', loaded: true },
+          task: { completedCriteria: [], remainingCriteria: ['profileFacts'] },
+        }),
+      },
+    });
+
+    expect(executeCount).toBe(0);
+    expect(result.status).toBe('blocked');
+    expect(result.blockers[0]?.code).toBe('OUTPUT_PATH_NOT_NAVIGATION');
   });
 
   it('compiles a page-to-file request and a later text-viewer request from the conversation', async () => {
