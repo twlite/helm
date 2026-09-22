@@ -875,11 +875,15 @@ export function startHelmServer(config: HelmConfig = loadConfig()): HelmServer {
       },
     },
   });
+  const eventHeartbeatTimer = setInterval(() => {
+    application.events.heartbeat();
+  }, 15_000);
   logger.info('Helm server listening', { component: 'server', url: `http://${config.host}:${server.port}` });
   return {
     application,
     server,
     close: async () => {
+      clearInterval(eventHeartbeatTimer);
       server.stop(true);
       await application.close();
     },

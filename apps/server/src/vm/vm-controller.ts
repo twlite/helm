@@ -38,7 +38,9 @@ export interface VmControllerDependencies {
   childTerminationTimeoutMs?: number;
 }
 
-const DESKTOP_SCREENSHOT_POLL_INTERVAL_MS = 750;
+const DESKTOP_SCREENSHOT_POLL_INTERVAL_MS = 1_000;
+const GUEST_RECONNECT_INITIAL_DELAY_MS = 1_500;
+const GUEST_RECONNECT_MAX_DELAY_MS = 10_000;
 const VM_RUNNING_DISK_MUTATION_MESSAGE = 'VM is running. Shut it down before modifying disk images.';
 
 function normalizeVmState(value: unknown, fallback: VmStatus['state']): VmStatus['state'] {
@@ -121,6 +123,10 @@ export class VmController {
   private screenshotPollTimer?: ReturnType<typeof setInterval>;
   private screenshotPollInFlight = false;
   private screenshotPollingEnabled = false;
+  private guestReconnectTimer?: ReturnType<typeof setTimeout>;
+  private guestReconnectInFlight = false;
+  private guestReconnectTask?: Promise<void>;
+  private guestReconnectDelayMs = GUEST_RECONNECT_INITIAL_DELAY_MS;
   private helperShowsWindow = false;
   private expectedChildExit = false;
   private closing = false;
@@ -210,6 +216,7 @@ export class VmController {
         logger.warn('Initial VM screenshot unavailable', { component: 'vm', ...loggedVmError(error) });
       }
       this.setStatus({ state: 'running', guestConnected: true, message: undefined });
+      this.resetGuestReconnectBackoff();
       this.events.publish('guest.connected', { connected: true });
       this.startScreenshotPolling();
     } catch (error) {
@@ -229,6 +236,7 @@ export class VmController {
           ...loggedVmError(error),
         });
         this.setStatus({ state: 'running', guestConnected: false, message });
+        this.scheduleGuestReconnect();
         throw new VmControllerError(
           readinessFailure ? 'GUEST_NOT_READY' : 'VM_BOOT_ERROR',
           message,
@@ -241,9 +249,9 @@ export class VmController {
     }
   }
 
-  async reconnect(): Promise<void> {
+  async reconnect(force = false): Promise<void> {
     this.assertAccepting('reconnect to the guest');
-    if (this.currentStatus.guestConnected) return;
+    if (this.currentStatus.guestConnected && !force) return;
     if (!this.currentStatus.helperAvailable) {
       this.setStatus({
         state: 'unavailable',
@@ -297,6 +305,7 @@ export class VmController {
         });
       }
       this.setStatus({ state: 'running', guestConnected: true, message: undefined });
+      this.resetGuestReconnectBackoff();
       this.events.publish('guest.connected', { connected: true });
       this.startScreenshotPolling();
     } catch (error) {
@@ -316,6 +325,7 @@ export class VmController {
           ...loggedVmError(error),
         });
         this.setStatus({ state: 'running', guestConnected: false, message });
+        this.scheduleGuestReconnect();
         throw new VmControllerError(
           readinessFailure ? 'GUEST_NOT_READY' : 'VM_BOOT_ERROR',
           message,
@@ -339,6 +349,8 @@ export class VmController {
   }
 
   private async stopInternal(): Promise<void> {
+    this.cancelGuestReconnect();
+    await this.waitForGuestReconnect();
     this.stopScreenshotPolling();
     if (!this.child && !['stopped', 'unavailable'].includes(this.currentStatus.state)) {
       throw new VmControllerError(
@@ -369,6 +381,8 @@ export class VmController {
   }
 
   private async forceStopInternal(): Promise<void> {
+    this.cancelGuestReconnect();
+    await this.waitForGuestReconnect();
     this.stopScreenshotPolling();
     if (!this.child && !['stopped', 'unavailable'].includes(this.currentStatus.state)) {
       throw new VmControllerError(
@@ -394,6 +408,8 @@ export class VmController {
 
   async reset(): Promise<void> {
     this.assertAccepting('reset the VM');
+    this.cancelGuestReconnect();
+    await this.waitForGuestReconnect();
     this.stopScreenshotPolling();
     if (this.currentStatus.state === 'running'
       || this.currentStatus.state === 'starting'
@@ -458,13 +474,19 @@ export class VmController {
         const response = await abortable(this.sendHostCommand('vm.guestRequest', request), signal);
         const parsed = guestResponseSchema.safeParse(response.result);
         if (!parsed.success) {
-          throw new VmControllerError('INVALID_GUEST_RESPONSE', 'The guest returned an invalid response', parsed.error.issues);
+          throw new VmControllerError(
+            'INVALID_GUEST_RESPONSE',
+            'The guest returned an invalid response',
+            parsed.error.issues,
+            true,
+          );
         }
         if (!parsed.data.ok) {
           throw new VmControllerError(
             parsed.data.error?.code ?? 'GUEST_REQUEST_FAILED',
             parsed.data.error?.message ?? 'The guest rejected the request',
             parsed.data.error?.details,
+            false,
           );
         }
         const result = parsed.data.result as T;
@@ -474,20 +496,24 @@ export class VmController {
         return result;
       } catch (error) {
         if (error instanceof VmControllerError) {
-          if (!behavior.preserveConnectionOnError) {
-            this.setStatus({ guestConnected: false });
+          if (error.connectionLost) {
+            if (behavior.preserveConnectionOnError) this.scheduleGuestReconnect(true);
+            else this.markGuestConnectionLost(error);
           }
           throw error;
         }
         const normalized = asToolError(error);
-        if (!behavior.preserveConnectionOnError) {
-          this.setStatus({ guestConnected: false });
-        }
-        throw new VmControllerError(normalized.code, normalized.message, normalized.details);
+        const connectionError = new VmControllerError(normalized.code, normalized.message, normalized.details, true);
+        if (behavior.preserveConnectionOnError) this.scheduleGuestReconnect(true);
+        else this.markGuestConnectionLost(connectionError);
+        throw connectionError;
       }
     }
     if (!this.guestTransport?.connected) {
-      throw new VmControllerError('GUEST_NOT_CONNECTED', 'The Linux guest is not connected');
+      const connectionError = new VmControllerError('GUEST_NOT_CONNECTED', 'The Linux guest is not connected', undefined, true);
+      if (behavior.preserveConnectionOnError) this.scheduleGuestReconnect(true);
+      else this.markGuestConnectionLost(connectionError);
+      throw connectionError;
     }
     try {
       const result = await this.guestTransport.request<T>(request, signal);
@@ -496,17 +522,29 @@ export class VmController {
       }
       return result;
     } catch (error) {
-      if (!behavior.preserveConnectionOnError) {
-        this.setStatus({ guestConnected: false });
-      }
       const normalized = asToolError(error);
-      throw new VmControllerError(normalized.code, normalized.message, normalized.details);
+      const connectionLost = typeof error === 'object'
+        && error !== null
+        && 'connectionLost' in error
+        && (error as { connectionLost?: unknown }).connectionLost === true;
+      const connectionError = new VmControllerError(
+        normalized.code,
+        normalized.message,
+        normalized.details,
+        connectionLost,
+      );
+      if (connectionLost) {
+        if (behavior.preserveConnectionOnError) this.scheduleGuestReconnect(true);
+        else this.markGuestConnectionLost(connectionError);
+      }
+      throw connectionError;
     }
   }
 
   async close(): Promise<void> {
     if (this.closing) return;
     this.closing = true;
+    this.cancelGuestReconnect();
     this.stopScreenshotPolling();
     this.rejectPendingHostRequests(new Error('VM controller is shutting down'));
     try {
@@ -557,7 +595,6 @@ export class VmController {
       ...(this.currentStatus.uncleanShutdownDetected === undefined
         ? {}
         : { uncleanShutdownDetected: this.currentStatus.uncleanShutdownDetected }),
-      ...(this.currentStatus.screenshot ? { screenshot: this.currentStatus.screenshot } : {}),
       ...(this.currentStatus.message ? { message: this.currentStatus.message } : {}),
     });
   }
@@ -579,7 +616,6 @@ export class VmController {
     this.screenshotPollTimer = setInterval(() => {
       void this.captureDesktopScreenshot();
     }, DESKTOP_SCREENSHOT_POLL_INTERVAL_MS);
-    void this.captureDesktopScreenshot();
   }
 
   private stopScreenshotPolling(): void {
@@ -588,6 +624,68 @@ export class VmController {
       clearInterval(this.screenshotPollTimer);
       this.screenshotPollTimer = undefined;
     }
+  }
+
+  private markGuestConnectionLost(error: VmControllerError): void {
+    const message = `Linux guest connection lost: ${error.message}`;
+    this.setStatus({ guestConnected: false, message });
+    this.events.publish('guest.disconnected', { connected: false });
+    this.scheduleGuestReconnect();
+  }
+
+  private scheduleGuestReconnect(force = false): void {
+    if (this.closing
+      || !this.child
+      || this.currentStatus.state !== 'running'
+      || (this.currentStatus.guestConnected && !force)
+      || this.guestReconnectTimer !== undefined
+      || this.guestReconnectInFlight) {
+      return;
+    }
+    const delay = this.guestReconnectDelayMs;
+    this.guestReconnectTimer = setTimeout(() => {
+      this.guestReconnectTimer = undefined;
+      if (this.closing || !this.child || this.currentStatus.state !== 'running') return;
+      this.guestReconnectInFlight = true;
+      const reconnectTask = this.reconnect(force)
+        .then(() => {
+          this.resetGuestReconnectBackoff();
+        })
+        .catch(error => {
+          logger.warn('Automatic guest reconnect failed; keeping the VM running and retrying', {
+            component: 'vm',
+            ...loggedVmError(error),
+          });
+          this.guestReconnectDelayMs = Math.min(
+            this.guestReconnectDelayMs * 2,
+            GUEST_RECONNECT_MAX_DELAY_MS,
+          );
+          return undefined;
+        });
+      this.guestReconnectTask = reconnectTask;
+      void reconnectTask.finally(() => {
+        this.guestReconnectInFlight = false;
+        if (this.guestReconnectTask === reconnectTask) this.guestReconnectTask = undefined;
+        this.scheduleGuestReconnect();
+      });
+    }, delay);
+  }
+
+  private cancelGuestReconnect(): void {
+    if (this.guestReconnectTimer !== undefined) {
+      clearTimeout(this.guestReconnectTimer);
+      this.guestReconnectTimer = undefined;
+    }
+  }
+
+  private async waitForGuestReconnect(): Promise<void> {
+    const reconnectTask = this.guestReconnectTask;
+    if (reconnectTask) await reconnectTask.catch(() => undefined);
+  }
+
+  private resetGuestReconnectBackoff(): void {
+    this.guestReconnectDelayMs = GUEST_RECONNECT_INITIAL_DELAY_MS;
+    this.cancelGuestReconnect();
   }
 
   private async captureDesktopScreenshot(): Promise<void> {
@@ -767,12 +865,14 @@ export class VmController {
   }
 
   private sendHostCommand(method: string, params: unknown): Promise<HostResponse> {
-    if (!this.child?.stdin.writable) throw new VmControllerError('VM_HELPER_NOT_RUNNING', 'VM helper is not running');
+    if (!this.child?.stdin.writable) {
+      throw new VmControllerError('VM_HELPER_NOT_RUNNING', 'VM helper is not running', undefined, true);
+    }
     const id = `host_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     return new Promise<HostResponse>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new VmControllerError('VM_HELPER_TIMEOUT', `VM helper timed out handling ${method}`));
+        reject(new VmControllerError('VM_HELPER_TIMEOUT', `VM helper timed out handling ${method}`, undefined, true));
       }, this.dependencies.hostCommandTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.child?.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
@@ -783,6 +883,7 @@ export class VmController {
           nativeError?.code ?? 'VM_HELPER_ERROR',
           nativeError?.message ?? 'VM helper rejected the request',
           nativeError?.details,
+          true,
         );
       }
       return response;
@@ -816,6 +917,7 @@ export class VmControllerError extends Error {
     public readonly code: string,
     message: string,
     public readonly details?: unknown,
+    public readonly connectionLost = false,
   ) {
     super(message);
     this.name = 'VmControllerError';

@@ -265,6 +265,26 @@ function App() {
   const socket = useHelmWebSocket(handleEvent);
 
   useEffect(() => {
+    if (socket.connectionVersion === 0) return;
+    let cancelled = false;
+    void Promise.allSettled([helmApi.health(), helmApi.vmStatus()]).then(([healthResult, vmResult]) => {
+      if (cancelled) return;
+      if (healthResult.status === 'fulfilled') {
+        setHealth(healthResult.value);
+        setVm(healthResult.value.vm);
+        if (healthResult.value.vm.screenshot) setScreenshot(healthResult.value.vm.screenshot);
+      }
+      if (vmResult.status === 'fulfilled') {
+        setVm(vmResult.value);
+        if (vmResult.value.screenshot) setScreenshot(vmResult.value.screenshot);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [socket.connectionVersion]);
+
+  useEffect(() => {
     let cancelled = false;
     async function loadInitialData() {
       const [threadResult, healthResult, vmResult, memoryResult] = await Promise.allSettled([

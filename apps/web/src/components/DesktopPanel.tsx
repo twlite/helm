@@ -133,29 +133,6 @@ export function DesktopPanel({
                 Start
               </Button>
               <Button
-                disabled={
-                  vmAction !== null ||
-                  state === 'stopped' ||
-                  state === 'stopping' ||
-                  state === 'unavailable'
-                }
-                onClick={() => void onVmAction('stop')}
-                size="sm"
-                variant="secondary"
-              >
-                <Icon name="square" size={12} />
-                Stop
-              </Button>
-              <Button
-                disabled={vmAction !== null || state !== 'stopped'}
-                onClick={() => void onVmAction('reset')}
-                size="sm"
-                variant="ghost"
-              >
-                <Icon name="refresh" size={13} />
-                Restart
-              </Button>
-              <Button
                 disabled={vmAction !== null || vm?.guestConnected === true}
                 onClick={() => void onVmAction('reconnect')}
                 size="sm"

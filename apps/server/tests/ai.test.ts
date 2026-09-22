@@ -546,6 +546,141 @@ describe('LM Studio AI adapters', () => {
     );
   });
 
+  it('keeps an explicitly supplied profile image URL as an asset instead of a browser destination', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-profile-image-plan',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({
+              mode: 'task',
+              goal: 'Research the GitHub profile and create the portfolio.',
+              criteria: [],
+            }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const planner = new AiSdkTaskPlanner({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 256,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    const task = await planner.createTask({
+      threadId: 'profile-image-plan',
+      userMessage: 'Go to github.com/twlite and find out how many followers he has and his pinned repos with their details. Using that information, create twlite.html with a good looking portfolio website for Twilight. Use this as the profile picture image url: https://github.com/twlite.png',
+    });
+
+    const destinations = (task.requirements ?? [])
+      .filter(requirement => requirement.type === 'browser')
+      .map(requirement => requirement.target?.url);
+    expect(destinations).toContain('https://github.com/twlite');
+    expect(destinations).not.toContain('https://github.com/twlite.png');
+    expect(task.constraints).toContainEqual(expect.objectContaining({
+      description: expect.stringContaining('https://github.com/twlite.png'),
+      source: 'user',
+    }));
+  });
+
+  it('blocks a worker from navigating to a user-provided asset URL', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-asset-navigation',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({
+              type: 'action',
+              tool: 'browser.navigate',
+              input: { url: 'https://github.com/twlite.png' },
+            }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const task: TaskDefinition = {
+      id: 'asset-navigation-task',
+      threadId: 'asset-navigation-thread',
+      goal: 'Research the profile and use the supplied profile image URL.',
+      originalRequest: 'Go to github.com/twlite and use https://github.com/twlite.png as the profile picture image URL.',
+      criteria: [],
+      requirements: [{
+        id: 'browserDestination1',
+        description: 'Reach the profile.',
+        type: 'browser',
+        mandatory: true,
+        target: { url: 'https://github.com/twlite' },
+      }],
+      constraints: [],
+    };
+    const worker = new AiSdkWorker({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      toolDefinitions: [{ name: 'browser.navigate', description: 'Navigate.', inputSchema: z.object({}) }],
+      maxOutputTokens: 256,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    let executeCount = 0;
+    const result = await worker.execute({
+      objective: {
+        id: 'objective-browserDestination1-0',
+        kind: 'browser',
+        description: 'Reach the profile.',
+        requirementIds: ['browserDestination1'],
+        rationale: 'test',
+      },
+      task,
+      state: createTaskState(task),
+      observation: {
+        timestamp: 1,
+        browser: { url: 'https://github.com/twlite', loaded: true },
+        task: { completedCriteria: [], remainingCriteria: ['browserDestination1'] },
+      },
+      verification: { complete: false, criteria: [], requirements: [], summary: '0/1 requirements passed.' },
+      memories: [],
+      recentActions: [],
+      failedStrategies: [],
+      maxActions: 1,
+      execute: {
+        execute: async () => {
+          executeCount += 1;
+          return { ok: true };
+        },
+        observe: async () => ({
+          timestamp: 1,
+          browser: { url: 'https://github.com/twlite', loaded: true },
+          task: { completedCriteria: [], remainingCriteria: ['browserDestination1'] },
+        }),
+      },
+    });
+
+    expect(executeCount).toBe(0);
+    expect(result.status).toBe('blocked');
+    expect(result.blockers[0]?.code).toBe('USER_ASSET_URL_NOT_NAVIGATION');
+  });
+
   it('compiles a page-to-file request and a later text-viewer request from the conversation', async () => {
     const provider = createOpenAICompatible({
       name: 'lmstudio',

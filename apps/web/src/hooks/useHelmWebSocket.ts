@@ -3,6 +3,8 @@ import { getWebSocketUrl } from '../api';
 import type { ConnectionState, HelmEvent } from '../types';
 
 const MAX_RECONNECT_DELAY_MS = 12_000;
+const HEARTBEAT_TIMEOUT_MS = 45_000;
+const HEARTBEAT_CHECK_INTERVAL_MS = 5_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -23,6 +25,7 @@ function parseEvent(value: unknown): HelmEvent | null {
 export function useHelmWebSocket(onEvent: (event: HelmEvent) => void) {
   const [state, setState] = useState<ConnectionState>('connecting');
   const [attempt, setAttempt] = useState(0);
+  const [connectionVersion, setConnectionVersion] = useState(0);
   const eventHandlerRef = useRef(onEvent);
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | undefined>(undefined);
@@ -34,6 +37,7 @@ export function useHelmWebSocket(onEvent: (event: HelmEvent) => void) {
   }, [onEvent]);
 
   const connect = useCallback(() => {
+    if (stoppedRef.current) return;
     stoppedRef.current = false;
     if (reconnectTimerRef.current !== undefined) {
       window.clearTimeout(reconnectTimerRef.current);
@@ -43,16 +47,28 @@ export function useHelmWebSocket(onEvent: (event: HelmEvent) => void) {
 
     const socket = new WebSocket(getWebSocketUrl());
     socketRef.current = socket;
+    let lastHeartbeatAt = Date.now();
+    let heartbeatWatchdog: number | undefined;
 
     socket.addEventListener('open', () => {
       attemptRef.current = 0;
       setAttempt(0);
       setState('connected');
+      lastHeartbeatAt = Date.now();
+      setConnectionVersion((current) => current + 1);
+      heartbeatWatchdog = window.setInterval(() => {
+        if (Date.now() - lastHeartbeatAt > HEARTBEAT_TIMEOUT_MS) {
+          socket.close();
+        }
+      }, HEARTBEAT_CHECK_INTERVAL_MS);
     });
 
     socket.addEventListener('message', (message) => {
+      lastHeartbeatAt = Date.now();
       try {
-        const event = parseEvent(JSON.parse(message.data) as unknown);
+        const parsed = JSON.parse(message.data) as unknown;
+        if (isRecord(parsed) && parsed.type === 'heartbeat') return;
+        const event = parseEvent(parsed);
         if (event) {
           eventHandlerRef.current(event);
         }
@@ -66,6 +82,10 @@ export function useHelmWebSocket(onEvent: (event: HelmEvent) => void) {
     });
 
     socket.addEventListener('close', () => {
+      if (heartbeatWatchdog !== undefined) {
+        window.clearInterval(heartbeatWatchdog);
+        heartbeatWatchdog = undefined;
+      }
       if (stoppedRef.current || socketRef.current !== socket) {
         return;
       }
@@ -94,6 +114,7 @@ export function useHelmWebSocket(onEvent: (event: HelmEvent) => void) {
   return {
     state,
     attempt,
+    connectionVersion,
     reconnect: connect,
   };
 }

@@ -130,8 +130,14 @@ Helm can relaunch it with the viewer enabled.
 VM boot and guest readiness are separate states. A successful native boot with
 an unavailable helm-guest leaves the VM running and reports
 VM is running, but helm-guest is not ready: ... in the API, CLI, and desktop
-panel. Use Reconnect after the guest service becomes ready; do not treat a
-guest handshake failure as a reason to power off the VM.
+panel. The backend keeps retrying guest readiness while the native VM remains
+running; Reconnect is still available after the guest service becomes ready.
+Do not treat a guest handshake or individual guest-RPC failure as a reason to
+power off the VM. The desktop preview uses a best-effort screenshot stream,
+with a heartbeat-backed browser event connection and automatic guest transport
+recovery. Stop and Restart are intentionally not exposed in the desktop panel;
+use `bun run vm:stop`, `bun run vm:reset`, or `bun run vm:start` from a terminal
+for lifecycle and disk operations.
 
 `vm:stop` is the normal shutdown path. It asks the guest to shut down through
 Virtualization.framework, waits until the framework reports stopped, then

@@ -12,6 +12,7 @@ export class GuestTransportError extends Error {
     public readonly code: string,
     message: string,
     public readonly details?: unknown,
+    public readonly connectionLost = true,
   ) {
     super(message);
     this.name = 'GuestTransportError';

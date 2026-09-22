@@ -33,6 +33,15 @@ left for the model to invent.
 Concrete URLs, filenames, and expected text are retained only when they are
 explicit in the user request or are subsequently observed.
 
+Explicit URLs are classified by their role before requirements are compiled.
+URLs used as sources (`go to`, `visit`, `research`, and similar wording) become
+browser objectives. URLs described as an image, profile picture, avatar, logo,
+icon, `src`, `href`, or another asset/reference remain user-provided values and
+are added as constraints for the output. They do not become browser objectives
+just because they contain `http`, and a worker-side guard refuses to navigate
+to one unless the user explicitly asks to open it. This lets a portfolio task
+use an image URL directly while still researching the profile page.
+
 Page-to-file requests are compiled as a dependency chain rather than a single
 optimistic action. For example, `go to https://twlite.dev and save the
 contents in a twlite.txt file` produces a browser destination, a readable
@@ -94,6 +103,14 @@ while the final page remains open. They therefore inspect or continue from the
 redirect target instead of navigating to the original URL again. A redirect
 does not by itself claim that page content is useful: content and other task
 requirements are still verified from the final page.
+
+The browser event channel and desktop preview are also treated as long-lived
+connections. The server sends lightweight heartbeats, the web client closes a
+stale socket and reconnects it, and a reconnect rehydrates authoritative VM
+status and the latest screenshot. Screenshot polling is best effort and is
+not allowed to turn an individual capture or guest command error into a guest
+shutdown or a false connection loss. Actual guest transport loss is retried
+with bounded backoff while the native VM remains running.
 
 Worker permissions are narrow:
 

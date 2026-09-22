@@ -39,6 +39,18 @@ export class EventHub {
     return event;
   }
 
+  /** Keep long-lived browser event connections active while the VM is idle. */
+  heartbeat(): void {
+    const encoded = JSON.stringify({ type: 'heartbeat', timestamp: new Date().toISOString() });
+    for (const socket of this.sockets) {
+      try {
+        socket.send(encoded);
+      } catch {
+        this.sockets.delete(socket);
+      }
+    }
+  }
+
   get size(): number {
     return this.sockets.size;
   }

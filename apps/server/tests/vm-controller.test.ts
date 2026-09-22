@@ -31,7 +31,10 @@ class FakeHostProcess extends EventEmitter {
   signalCode: NodeJS.Signals | null = null;
   private inputBuffer = '';
 
-  constructor(private readonly handshakeReady: boolean) {
+  constructor(
+    private readonly handshakeReady: boolean,
+    private readonly failedGuestMethod?: string,
+  ) {
     super();
     this.stdin.setEncoding('utf8');
     this.stdin.on('data', chunk => {
@@ -96,6 +99,14 @@ class FakeHostProcess extends EventEmitter {
             id: guestId,
             ok: false,
             error: { code: 'guest_unavailable', message: 'helm-guest is not ready' },
+          });
+          return;
+        }
+        if (guestRequest?.method === this.failedGuestMethod) {
+          this.respond(request.id, true, {
+            id: guestId,
+            ok: false,
+            error: { code: 'guest_operation_failed', message: 'The guest operation failed without disconnecting.' },
           });
           return;
         }
@@ -216,6 +227,24 @@ describe('VM lifecycle safety', () => {
       await expect(vm.status()).resolves.toMatchObject({
         state: 'running',
         message: 'VM is running. Shut it down before modifying disk images.',
+      });
+    } finally {
+      await vm.close();
+    }
+  });
+
+  it('does not disconnect the guest when an individual guest operation fails', async () => {
+    const fake = new FakeHostProcess(true, 'browser.click');
+    const vm = makeController(fake);
+
+    try {
+      await vm.start();
+      await expect(vm.guestRequest('browser.click', { x: 10, y: 10 })).rejects.toMatchObject({
+        code: 'guest_operation_failed',
+      });
+      await expect(vm.status()).resolves.toMatchObject({
+        state: 'running',
+        guestConnected: true,
       });
     } finally {
       await vm.close();

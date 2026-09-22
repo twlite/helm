@@ -424,7 +424,7 @@ function inferredReferencedFileName(input: TaskPlannerInput): string | undefined
 }
 
 function savesPageContent(request: string): boolean {
-  const mentionsWebContent = explicitUrls(request).length > 0
+  const mentionsWebContent = browserSourceUrls(request).length > 0
     || /\b(?:page|website|site|browser|web)\b/iu.test(request);
   return mentionsWebContent
     && /\b(?:save|write|create|put|copy|store)\b/iu.test(request)
@@ -464,22 +464,115 @@ function toJsonValue(value: unknown): JsonValue {
 }
 
 function explicitUrls(request: string): string[] {
-  const urls = request.match(/https?:\/\/[^\s"'<>]+/giu)?.map(value => value.replace(/[),.;!?]+$/u, '')) ?? [];
-  const hostCandidates = request.match(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?#][^\s"'<>]*)?/giu)
-    ?.map(value => value.replace(/[),.;!?]+$/u, ''))
-    .filter(value => !urls.some(url => url.includes(value))) ?? [];
-  const hosts = hostCandidates
-    .filter(value => !/\.(?:txt|md|json|csv|log|html?|xml|ya?ml|pdf|png|jpe?g|gif|zip|tar|gz|rs|ts|tsx|js|jsx)$/iu.test(value))
-    .map(value => `https://${value}`) ?? [];
+  const explicitMatches = [...request.matchAll(/https?:\/\/[^\s"'<>]+/giu)];
+  const urls = explicitMatches.map(match => match[0].replace(/[),.;!?]+$/u, ''));
+  const hostCandidates = [...request.matchAll(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?#][^\s"'<>]*)?/giu)]
+    .filter(match => {
+      const matchStart = match.index ?? -1;
+      return !explicitMatches.some(explicit => {
+        const explicitStart = explicit.index ?? -1;
+        return explicitStart >= 0
+          && matchStart >= explicitStart
+          && matchStart < explicitStart + explicit[0].length;
+      });
+    })
+    .map(match => match[0].replace(/[),.;!?]+$/u, ''));
+  const hosts = hostCandidates.map(value => `https://${value}`);
   return [...new Set([...urls, ...hosts])];
 }
 
+type ExplicitUrlRole = 'navigation' | 'asset';
+
+type ExplicitUrlReference = {
+  url: string;
+  role: ExplicitUrlRole;
+};
+
+const STATIC_ASSET_URL_PATTERN = /\.(?:png|jpe?g|gif|webp|svg|ico|avif|bmp|tiff?)(?:[?#].*)?$/iu;
+const ASSET_REFERENCE_PATTERN = /\b(?:image|picture|photo|avatar|profile\s+(?:picture|image|photo)|logo|icon|thumbnail|background|cover|src|href)\b/iu;
+const EXPLICIT_NAVIGATION_PATTERN = /\b(?:go\s+to|navigate(?:\s+to)?|visit|open|browse|read|inspect|research|look\s+(?:it\s+)?up|find(?:\s+out)?|extract|download)\b/iu;
+
+function urlSentenceContext(request: string, url: string): string {
+  const normalizedRequest = request.toLocaleLowerCase();
+  const normalizedUrl = url.toLocaleLowerCase().replace(/^https?:\/\//u, '');
+  const start = normalizedRequest.indexOf(normalizedUrl);
+  if (start < 0) return request;
+  const sentenceStart = Math.max(
+    request.lastIndexOf('.', start),
+    request.lastIndexOf('!', start),
+    request.lastIndexOf('?', start),
+    request.lastIndexOf('\n', start),
+  );
+  const sentenceEndCandidates = [
+    request.indexOf('.', start + normalizedUrl.length),
+    request.indexOf('!', start + normalizedUrl.length),
+    request.indexOf('?', start + normalizedUrl.length),
+    request.indexOf('\n', start + normalizedUrl.length),
+  ].filter(index => index >= 0);
+  const sentenceEnd = sentenceEndCandidates.length > 0
+    ? Math.min(...sentenceEndCandidates)
+    : request.length;
+  return request.slice(sentenceStart + 1, sentenceEnd);
+}
+
+function explicitUrlReferences(request: string): ExplicitUrlReference[] {
+  return explicitUrls(request).map(url => {
+    const context = urlSentenceContext(request, url);
+    const assetLanguage = ASSET_REFERENCE_PATTERN.test(context);
+    const contextUrl = url.toLocaleLowerCase().replace(/^https?:\/\//u, '');
+    const contextUrlIndex = context.toLocaleLowerCase().indexOf(contextUrl);
+    const contextBeforeUrl = contextUrlIndex >= 0 ? context.slice(0, contextUrlIndex) : context;
+    // A sentence can contain both a research source and an asset, for example
+    // "go to profile.example and use https://cdn.example/avatar.png". Scope
+    // navigation wording to the clause immediately owning this URL so the
+    // earlier "go to" does not turn the later image into another destination.
+    const navigationClause = contextBeforeUrl.split(/\b(?:and|but|then|using|use|as)\b/iu).at(-1) ?? contextBeforeUrl;
+    const explicitNavigation = EXPLICIT_NAVIGATION_PATTERN.test(navigationClause);
+    const role: ExplicitUrlRole = assetLanguage && !explicitNavigation
+      ? 'asset'
+      : STATIC_ASSET_URL_PATTERN.test(url) && !explicitNavigation
+        ? 'asset'
+        : 'navigation';
+    return { url, role };
+  });
+}
+
+function browserSourceUrls(request: string): string[] {
+  return explicitUrlReferences(request)
+    .filter(reference => reference.role === 'navigation')
+    .map(reference => reference.url);
+}
+
+function userAssetUrls(request: string): string[] {
+  return explicitUrlReferences(request)
+    .filter(reference => reference.role === 'asset')
+    .map(reference => reference.url);
+}
+
+function userAssetUrlForRequest(request: string, candidate: string): string | undefined {
+  return userAssetUrls(request).find(url => (
+    url === candidate
+    || url.replace(/\/$/u, '') === candidate.replace(/\/$/u, '')
+  ));
+}
+
 function explicitRepository(request: string): string | undefined {
-  return request.match(/(?<![~/])\b([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\b/u)?.[1];
+  const normalizedRequest = request.toLocaleLowerCase();
+  const assetSpans = userAssetUrls(request).flatMap(url => {
+    const normalizedUrl = url.toLocaleLowerCase().replace(/^https?:\/\//u, '');
+    const start = normalizedRequest.indexOf(normalizedUrl);
+    return start < 0 ? [] : [{ start, end: start + normalizedUrl.length }];
+  });
+  for (const match of request.matchAll(/(?<![~/])\b([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\b/gu)) {
+    const start = match.index ?? -1;
+    if (assetSpans.some(span => start >= span.start && start < span.end)) continue;
+    return match[1];
+  }
+  return undefined;
 }
 
 function requestRequiresComputer(request: string): boolean {
-  return explicitUrls(request).length > 0
+  return browserSourceUrls(request).length > 0
     || explicitPaths(request).length > 0
     || /\b(?:browser|desktop|file|folder|directory|website|webpage|page|navigate|visit|open|show|view|display|viewer|text\s+editor|text\s+viewer|click|type|write|save|create|delete|edit|download|upload|launch|focus|extract|browse|read|inspect)\b/iu.test(request);
 }
@@ -489,7 +582,7 @@ function criterionWasExplicit(request: string, criterion: CompletionCriterion): 
   const includesPhrase = (value: string): boolean => normalizedRequest.includes(value.toLocaleLowerCase().replace(/[-_]+/gu, ' '));
   switch (criterion.type) {
     case 'browser.url':
-      return explicitUrls(request).some(url => (
+      return browserSourceUrls(request).some(url => (
         url === criterion.url
         || url.replace(/\/$/u, '') === criterion.url.replace(/\/$/u, '')
         || browserResearchStartUrl(url) === browserResearchStartUrl(criterion.url)
@@ -519,7 +612,7 @@ function compiledRequirements(
   };
   const repository = explicitRepository(request);
   const pageContentSave = savesPageContent(request);
-  for (const [index, url] of explicitUrls(request).entries()) {
+  for (const [index, url] of browserSourceUrls(request).entries()) {
     add({
       id: `browserDestination${index + 1}`,
       description: 'Reach the URL explicitly supplied by the user.',
@@ -622,6 +715,11 @@ function compileTask(
   }));
   const constraints: TaskConstraint[] = [
     ...userConstraints,
+    ...userAssetUrls(originalRequest).map((url, index): TaskConstraint => ({
+      id: `user-asset-url-${index + 1}`,
+      description: `Treat ${url} as a user-provided asset/reference URL and use it directly where requested; do not navigate to it unless the user explicitly asks you to open it.`,
+      source: 'user',
+    })),
     { id: 'unknowns-remain-unknown', description: 'Do not invent URLs, filenames, versions, DOM elements, or outcomes; discover them through tools.', source: 'compiler' },
     { id: 'runtime-verifies', description: 'Only runtime observations and deterministic evidence can satisfy requirements.', source: 'compiler' },
   ];
@@ -671,6 +769,7 @@ export class AiSdkTaskPlanner implements TaskCompiler {
           'Use mode task for browser, desktop, filesystem, or application work.',
           'Questions that require current or publicly available web information are tasks, not conversation. This includes today/latest/live facts, exchange rates, prices, weather, news, schedules, and facts attributed to a named organization.',
           'For web research, create a task that uses browser.navigate and browser.extractText to read source contents. DuckDuckGo is the only supported search engine; never plan Google or Bing search URLs. If search is needed, inspect DuckDuckGo results and open a relevant result site before answering. Do not answer from model memory or recommend a website without first attempting browser research.',
+          'A URL supplied as an image, profile picture, avatar, logo, icon, thumbnail, background, src, href, or other asset/reference value is not a research destination. Preserve it as a user-provided value and embed it directly where requested; do not navigate to it unless the user explicitly asks to open it.',
           'For mode task, convert the request into one concrete goal and the smallest set of explicit, deterministic completion criteria.',
           'Do not choose or return a maxSteps value. The runtime owns the configured safety budget.',
           'Use only criteria that Helm can verify: browser.url, file.exists, file.contains, window.open, or window.focused.',
@@ -920,6 +1019,7 @@ export class AiSdkWorker implements WorkerProvider {
               'Return done only after you have taken the required action or the objective is already satisfied by observed evidence; never return done merely because the objective sounds complete.',
               'Do not redefine requirements and do not declare the entire task complete.',
               'Use semantic browser refs from the current snapshot; never invent selectors, URLs, filenames, or expected outcomes.',
+              'Do not navigate to a user-provided asset/reference URL merely because it contains http. Use that URL directly in the requested output.',
               'After an action, use its actual result and the next observation. A model hypothesis is not an observed fact.',
               'If the objective is browser research or page content, that is the work to perform, not a blocker: navigate to the relevant source and extract readable text.',
               'If you report a discovered fact, set evidenceId to the action receipt id whose actual result contains the value.',
@@ -963,6 +1063,21 @@ export class AiSdkWorker implements WorkerProvider {
         && typeof decision.input.url === 'string'
         ? { ...decision.input, url: browserResearchStartUrl(decision.input.url) }
         : decision.input;
+      const requestedNavigationUrl = typeof decision.input.url === 'string' ? decision.input.url : undefined;
+      const assetUrl = requestedNavigationUrl === undefined
+        ? undefined
+        : userAssetUrlForRequest(input.task.originalRequest ?? '', requestedNavigationUrl);
+      if (decision.tool === 'browser.navigate'
+        && assetUrl !== undefined) {
+        status = 'blocked';
+        handedBack = true;
+        blockers.push({
+          code: 'USER_ASSET_URL_NOT_NAVIGATION',
+          message: 'The requested asset URL is a value to embed, not a browser research destination.',
+          requirementIds: input.objective.requirementIds,
+        });
+        break;
+      }
       const result = await input.execute.execute(decision.tool, actionInput);
       const action: WorkerAction = {
         id: `worker-action-${input.objective.id}-${actionIndex}`,
