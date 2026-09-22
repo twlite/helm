@@ -145,6 +145,59 @@ describe('orchestrated agent loop', () => {
     expect(result.run.state?.blockers.some(item => item.code === 'ORCHESTRATOR_BLOCKED_RECOVERED')).toBe(true);
   });
 
+  it('rewrites unsupported search engines before an orchestrated browser worker executes navigation', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const target = objective('search', 'browser', 'Read the relevant search result page.', 'pageContent');
+    const worker = new FunctionalWorker([async context => {
+      const action = await executeAction(context, 'browser.navigate', {
+        url: 'https://www.bing.com/search?q=helm+agent',
+      }, 'navigate');
+      return {
+        status: 'completed',
+        worker: 'browser',
+        objectiveId: context.objective.id,
+        actions: [action],
+        facts: [],
+        evidence: [],
+        artifacts: [],
+        blockers: [],
+        environmentChanged: true,
+      };
+    }]);
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier: new CriterionVerifierRegistry(guest),
+      decisionProvider: { next: async () => ({ type: 'complete' as const }) },
+      orchestrator: new ScriptedOrchestratorProvider([{ type: 'objective', objective: target }]),
+      worker,
+      budgets: { maxSteps: 1 },
+    });
+
+    await runtime.run({
+      threadId: 'search-policy-thread',
+      userMessage: 'Search for Helm agent information.',
+      task: taskWithRequirements({
+        id: 'search-policy-task',
+        threadId: 'search-policy-thread',
+        goal: 'Read a public search result page.',
+        originalRequest: 'Search for Helm agent information.',
+        requirements: [{
+          id: 'pageContent',
+          description: 'Read the relevant public search result page.',
+          type: 'fact',
+          mandatory: true,
+          target: { factId: 'pageContent' },
+        }],
+      }),
+    });
+
+    expect(tools.invocations.find(invocation => invocation.tool === 'browser.navigate')?.input).toEqual({
+      url: 'https://duckduckgo.com/?q=helm%20agent',
+    });
+  });
+
   it('completes the GitHub release to Desktop folder and file workflow', async () => {
     const releaseUrl = 'https://github.com/oven-sh/bun/releases/tag/bun-v1.2.3';
     const guest = new MockGuestTransport({

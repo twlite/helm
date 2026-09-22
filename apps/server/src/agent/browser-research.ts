@@ -8,6 +8,7 @@ const VOLATILE_WEB_TOPIC_PATTERN = /\b(?:exchange rate|currency rate|price(?:s)?
 const WEB_LOOKUP_INTENT_PATTERN = /\b(?:find|look\s*(?:up|for)|lookup|search|check|verify|research|see\s+what|according to|defined by|reported by|tell me|show me|what(?:'s| is)|how much|from the (?:official )?(?:website|site)|on the (?:official )?(?:website|site))\b/iu;
 const EXPLICIT_WEB_SOURCE_PATTERN = /\b(?:browser|web|website|site|online|internet|duckduckgo|google|bing|search engine)\b/iu;
 const CLEAR_CONVERSATION_PATTERN = /^(?:hi|hello|hey|good morning|good afternoon|good evening|who are you|what can you do|what is helm|tell me about yourself|how are you|thanks|thank you)[?.!, ]*$/iu;
+const DUCKDUCKGO_SEARCH_URL = 'https://duckduckgo.com';
 
 /**
  * Detect requests that require public web research.
@@ -50,7 +51,7 @@ export function browserResearchTask(input: { threadId: string; userMessage: stri
   return {
     id: `ai-browser-research-${input.threadId}`,
     threadId: input.threadId,
-    goal: `Use Helm's browser to search for and read the relevant public web pages for this request, prioritizing any named source. After opening a search-results page, inspect the results and open the most relevant result site before reporting its evidence; do not repeat the same search navigation: ${request}`,
+    goal: `Use Helm's browser to search with DuckDuckGo and read the relevant public web pages for this request, prioritizing any named source. DuckDuckGo is the only supported search engine. After opening a search-results page, inspect the results and open the most relevant result site before reporting its evidence; do not repeat the same search navigation: ${request}`,
     criteria: [browserResearchCriterion()],
   };
 }
@@ -59,20 +60,27 @@ export function browserResearchTask(input: { threadId: string; userMessage: stri
 export function browserResearchStartUrl(input: string): string {
   const normalized = input.trim().replace(/[),.;!?]+$/u, '');
   const explicitUrl = normalized.match(/https?:\/\/[^\s"'<>]+/iu)?.[0];
-  if (explicitUrl) return explicitUrl;
+  if (explicitUrl) return normalizeUnsupportedSearchEngineUrl(explicitUrl) ?? explicitUrl;
+  const explicitNonHttpUrl = normalized.match(/[a-z][a-z0-9+.-]*:(?:\/\/)?[^\s"'<>]+/iu)?.[0];
+  if (explicitNonHttpUrl) return explicitNonHttpUrl;
   if (/^(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?#][^\s]*)?$/iu.test(normalized)) {
-    return `https://${normalized}`;
+    const explicitHostUrl = `https://${normalized}`;
+    return normalizeUnsupportedSearchEngineUrl(explicitHostUrl) ?? explicitHostUrl;
   }
   const githubRepository = normalized.match(/(?<![~/])\b([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\b/u)?.[1];
   if (githubRepository && /\bgithub\b/iu.test(normalized)) {
     return `https://github.com/${githubRepository}`;
   }
-  return `https://www.google.com/search?q=${encodeURIComponent(input.trim())}`;
+  return duckDuckGoSearchUrl(input.trim());
 }
 
 const SEARCH_ENGINE_HOSTS = new Set([
-  'bing.com',
   'duckduckgo.com',
+]);
+
+/** Hosts that Helm recognizes as search engines only for redirecting them to DuckDuckGo. */
+const UNSUPPORTED_SEARCH_ENGINE_HOSTS = new Set([
+  'bing.com',
   'google.com',
 ]);
 
@@ -90,6 +98,41 @@ function searchEngineHost(hostname: string): boolean {
   return [...SEARCH_ENGINE_HOSTS].some(domain => host === domain || host.endsWith(`.${domain}`));
 }
 
+function unsupportedSearchEngineHost(hostname: string): boolean {
+  const host = hostname.toLocaleLowerCase();
+  return [...UNSUPPORTED_SEARCH_ENGINE_HOSTS].some(domain => host === domain || host.endsWith(`.${domain}`));
+}
+
+function searchResultsPath(url: URL): boolean {
+  return url.searchParams.has('q')
+    || url.searchParams.has('query')
+    || /\/(?:search|results)(?:\/|$)/iu.test(url.pathname);
+}
+
+function queryFromSearchUrl(url: URL): string | undefined {
+  const query = url.searchParams.get('q') ?? url.searchParams.get('query');
+  return query?.trim() || undefined;
+}
+
+function duckDuckGoSearchUrl(query: string): string {
+  return `${DUCKDUCKGO_SEARCH_URL}/?q=${encodeURIComponent(query.trim())}`;
+}
+
+function normalizeUnsupportedSearchEngineUrl(value: string): string | undefined {
+  const url = parsedHttpUrl(value);
+  if (url === undefined || !unsupportedSearchEngineHost(url.hostname)) return undefined;
+
+  const query = searchResultsPath(url) ? queryFromSearchUrl(url) : undefined;
+  return query === undefined ? DUCKDUCKGO_SEARCH_URL : duckDuckGoSearchUrl(query);
+}
+
+export function isUnsupportedSearchEngineUrl(value: string | undefined): boolean {
+  const url = value === undefined ? undefined : parsedHttpUrl(value);
+  return url !== undefined
+    && unsupportedSearchEngineHost(url.hostname)
+    && searchResultsPath(url);
+}
+
 export function isSearchEngineUrl(value: string | undefined): boolean {
   const url = value === undefined ? undefined : parsedHttpUrl(value);
   return url !== undefined && searchEngineHost(url.hostname);
@@ -98,14 +141,13 @@ export function isSearchEngineUrl(value: string | undefined): boolean {
 export function isSearchResultsUrl(value: string | undefined): boolean {
   const url = value === undefined ? undefined : parsedHttpUrl(value);
   if (url === undefined || !searchEngineHost(url.hostname)) return false;
-  return url.searchParams.has('q') || /\/search(?:\/|$)/iu.test(url.pathname);
+  return searchResultsPath(url);
 }
 
 function searchQuery(value: string): string | undefined {
   const url = parsedHttpUrl(value);
   if (url === undefined || !searchEngineHost(url.hostname)) return undefined;
-  const query = url.searchParams.get('q') ?? url.searchParams.get('query');
-  return query?.trim().replace(/\s+/gu, ' ').toLocaleLowerCase() || undefined;
+  return queryFromSearchUrl(url)?.replace(/\s+/gu, ' ').toLocaleLowerCase() || undefined;
 }
 
 /** Whether a navigation points back to the same search, or to its home page. */

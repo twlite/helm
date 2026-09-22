@@ -20,6 +20,7 @@ import type { GuestTransport } from '../tools/guest-transport';
 import { ToolRegistry } from '../tools/tool-registry';
 import {
   BROWSER_RESEARCH_CRITERION_ID,
+  browserResearchStartUrl,
   isBrowserResearchRequest,
   isSameSearchNavigation,
   isSearchResultsUrl,
@@ -112,6 +113,32 @@ function toolResultUrl(result: ToolResult | undefined): string | undefined {
   }
   const url = (result.data as Record<string, unknown>).url;
   return typeof url === 'string' ? url : undefined;
+}
+
+/** Enforce the browser research search-engine policy at the execution boundary. */
+function normalizeBrowserNavigationInput(
+  tool: string,
+  input: Record<string, unknown>,
+  enabled: boolean,
+): Record<string, unknown> {
+  if (
+    !enabled
+    || tool !== 'browser.navigate'
+    || typeof input.url !== 'string'
+    || (/^[a-z][a-z0-9+.-]*:/iu.test(input.url) && !/^https?:\/\//iu.test(input.url))
+  ) return input;
+  return { ...input, url: browserResearchStartUrl(input.url) };
+}
+
+function normalizeBrowserNavigationDecision(
+  decision: AgentDecision,
+  enabled: boolean,
+): AgentDecision {
+  if (decision.type !== 'action') return decision;
+  return {
+    ...decision,
+    input: normalizeBrowserNavigationInput(decision.tool, decision.input, enabled),
+  };
 }
 
 /**
@@ -362,6 +389,7 @@ export class AgentRuntime {
         let decision: AgentDecision = conversationalTask
           ? { type: 'complete', reasoningSummary: 'Responding to the conversation.' }
           : await this.decisionProvider.next(context);
+        decision = normalizeBrowserNavigationDecision(decision, !conversationalTask);
 
         // A page-information task must return page contents, even when the
         // model incorrectly asks to complete immediately after navigation.
@@ -975,7 +1003,8 @@ export class AgentRuntime {
                 return { ok: false, error: { code: 'WORKER_ACTION_BUDGET_EXCEEDED', message: `Worker exceeded its ${maxWorkerActions}-action budget.` } };
               }
               workerExecutionCount += 1;
-              const result = await this.tools.execute(tool, toolInput, {
+              const executableInput = normalizeBrowserNavigationInput(tool, toolInput, objective.kind === 'browser');
+              const result = await this.tools.execute(tool, executableInput, {
                 signal: cancellation.signal,
                 runId,
                 stepIndex,

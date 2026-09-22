@@ -24,7 +24,7 @@ describe('AgentRuntime', () => {
       toolRegistry: tools,
       verifier,
       decisionProvider: new ScriptedDecisionProvider([
-        { type: 'action', tool: 'browser.navigate', input: { url: 'https://example.test' } },
+        { type: 'action', tool: 'browser.navigate', input: { url: 'https://www.google.com/search?q=example' } },
         { type: 'complete' },
         { type: 'complete' },
       ]),
@@ -40,6 +40,9 @@ describe('AgentRuntime', () => {
     });
 
     expect(result.status).toBe('completed');
+    expect(tools.invocations.find(invocation => invocation.tool === 'browser.navigate')?.input).toEqual({
+      url: 'https://duckduckgo.com/?q=example',
+    });
     expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(true);
     expect(result.finalVerification?.complete).toBe(true);
   });

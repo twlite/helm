@@ -81,6 +81,14 @@ but it is not the universal observation primitive. Runtime observations request
 both browser state and a semantic snapshot, so repeated calls can be compared
 by meaningful page state.
 
+DuckDuckGo is the only search engine allowed by the agent loop. Search tasks
+start at a DuckDuckGo URL, and a model-proposed Google or Bing search URL is
+normalized to DuckDuckGo before browser execution. Direct non-search URLs are
+preserved for ordinary source sites, so named official sources can still be
+opened directly. A research worker must inspect the results page and then read
+the selected source page; opening a search URL alone does not satisfy the
+research requirement.
+
 ## 4. Action receipts and evidence
 
 The host-side guest tool wrapper records an `ActionReceipt` for every guest

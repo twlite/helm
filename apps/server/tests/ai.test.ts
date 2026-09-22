@@ -5,7 +5,14 @@ import type { AgentTurnContext, EnvironmentObservation, TaskDefinition } from '@
 
 import { createTaskState } from '../src/agent/task-state';
 import type { AgentRuntimeResult } from '../src/agent/types';
-import { BROWSER_RESEARCH_CRITERION_ID, browserResearchStartUrl, isBrowserResearchRequest } from '../src/agent/browser-research';
+import {
+  BROWSER_RESEARCH_CRITERION_ID,
+  browserResearchStartUrl,
+  isBrowserResearchRequest,
+  isSearchEngineUrl,
+  isSearchResultsUrl,
+  isUnsupportedSearchEngineUrl,
+} from '../src/agent/browser-research';
 import {
   AiSdkDecisionProvider,
   AiSdkEmbeddingProvider,
@@ -411,6 +418,26 @@ describe('LM Studio AI adapters', () => {
     });
     expect(JSON.stringify(requestBody)).toContain('current or publicly available web information are tasks, not conversation');
     expect(JSON.stringify(requestBody)).toContain('browser.extractText');
+  });
+
+  it('allows DuckDuckGo as the only search engine and rewrites Google or Bing searches', () => {
+    const duckDuckGoUrl = 'https://duckduckgo.com/?q=latest%20bun%20release';
+    const googleUrl = 'https://www.google.com/search?q=latest+bun+release';
+    const bingUrl = 'https://www.bing.com/search?q=latest+bun+release';
+
+    expect(browserResearchStartUrl('latest bun release')).toBe(duckDuckGoUrl);
+    expect(browserResearchStartUrl(googleUrl)).toBe(duckDuckGoUrl);
+    expect(browserResearchStartUrl(bingUrl)).toBe(duckDuckGoUrl);
+    expect(browserResearchStartUrl('www.google.com/search?q=latest+bun+release')).toBe(duckDuckGoUrl);
+    expect(browserResearchStartUrl('https://www.google.com')).toBe('https://duckduckgo.com');
+    expect(browserResearchStartUrl('file:///home/helm/release.html')).toBe('file:///home/helm/release.html');
+    expect(browserResearchStartUrl('about:blank')).toBe('about:blank');
+    expect(isSearchEngineUrl(duckDuckGoUrl)).toBe(true);
+    expect(isSearchResultsUrl(duckDuckGoUrl)).toBe(true);
+    expect(isSearchEngineUrl(googleUrl)).toBe(false);
+    expect(isSearchResultsUrl(googleUrl)).toBe(false);
+    expect(isUnsupportedSearchEngineUrl(googleUrl)).toBe(true);
+    expect(isUnsupportedSearchEngineUrl(bingUrl)).toBe(true);
   });
 
   it('marks explicit search-engine research as requiring page content', async () => {
