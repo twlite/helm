@@ -33,6 +33,13 @@ export type {
 export interface TaskPlannerInput {
   threadId: string;
   userMessage: string;
+  memories?: Memory[];
+  signal?: AbortSignal;
+}
+
+export interface MemoryRecallInput {
+  threadId: string;
+  userMessage: string;
   signal?: AbortSignal;
 }
 
@@ -120,7 +127,7 @@ export interface AgentRuntimeOptions {
   events?: RuntimeEventSink;
   eventSink?: RuntimeEventSink;
   observe?: ObservationProvider;
-  memories?: Memory[] | (() => Promise<Memory[]>);
+  memories?: Memory[] | ((input: MemoryRecallInput) => Promise<Memory[]>);
   budgets?: Partial<RuntimeBudgets>;
   now?: () => number;
   idFactory?: (prefix: string) => string;

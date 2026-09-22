@@ -23,6 +23,7 @@ import type {
   AgentRuntimeOptions,
   AgentRuntimeResult,
   DecisionProvider,
+  MemoryRecallInput,
   ObservationProvider,
   RunTaskInput,
   RuntimeEvent,
@@ -140,7 +141,12 @@ export class AgentRuntime {
     const input = isTaskDefinition(taskOrInput)
       ? { threadId: taskOrInput.threadId, userMessage: taskOrInput.goal, task: taskOrInput }
       : taskOrInput;
-    const task = input.task ?? await this.createTask(input);
+    const memories = await this.loadMemories({
+      threadId: input.threadId,
+      userMessage: input.userMessage,
+      signal: input.signal,
+    });
+    const task = input.task ?? await this.createTask(input, memories);
     const cancellation = new RunCancellation();
     const removeExternalAbort = this.attachExternalCancellation(cancellation, input.signal);
     this.activeCancellation = cancellation;
@@ -180,7 +186,6 @@ export class AgentRuntime {
       await this.persistRun(run, true);
       await this.emit('run.started', run, run.id);
 
-      const memories = await this.loadMemories();
       while (!this.isTerminal(run.status)) {
         cancellation.throwIfCancelled();
         if (!budget.canStartStep()) {
@@ -386,18 +391,25 @@ export class AgentRuntime {
     return this.run(input);
   }
 
-  private async createTask(input: RunTaskInput): Promise<TaskDefinition> {
+  private async createTask(input: RunTaskInput, memories: Memory[]): Promise<TaskDefinition> {
     if (!this.taskPlanner) throw new Error('A task planner is required when no task is supplied');
     return this.taskPlanner.createTask({
       threadId: input.threadId,
       userMessage: input.userMessage,
+      memories: clone(memories),
       signal: input.signal,
     });
   }
 
-  private async loadMemories(): Promise<Memory[]> {
+  private async loadMemories(input: MemoryRecallInput): Promise<Memory[]> {
     if (!this.memories) return [];
-    return clone(typeof this.memories === 'function' ? await this.memories() : this.memories);
+    try {
+      return clone(typeof this.memories === 'function' ? await this.memories(input) : this.memories);
+    } catch {
+      // Memory is best-effort context. A retrieval failure must not prevent a
+      // valid task from being planned or executed.
+      return [];
+    }
   }
 
   private async verify(

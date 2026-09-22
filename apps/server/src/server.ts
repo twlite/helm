@@ -293,7 +293,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       taskPlanner: models.taskPlanner,
       repository: runAdapter,
       events: runtimeEvents,
-      memories: async () => memory.list(),
+      memories: async ({ userMessage }) => memory.recall(userMessage),
       budgets: {
         maxSteps: config.maxSteps,
         maxRepeatedAction: config.maxRepeatedAction,

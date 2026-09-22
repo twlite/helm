@@ -21,6 +21,35 @@ export interface MemoryServiceOptions {
   sqliteVec?: Omit<SqliteVecMemoryVectorIndexOptions, 'dimensions'> & { dimensions?: number };
 }
 
+export interface MemoryRecallOptions {
+  /** Maximum number of memories to expose to the agent. */
+  limit?: number;
+  /** Number of candidates to inspect before applying relevance filtering. */
+  candidateLimit?: number;
+  /** Maximum vector distance accepted as a semantic match. */
+  maxDistance?: number;
+}
+
+const DEFAULT_MEMORY_RECALL_LIMIT = 6;
+const DEFAULT_MEMORY_RECALL_CANDIDATE_LIMIT = 24;
+const DEFAULT_MEMORY_RECALL_MAX_DISTANCE = 0.95;
+const RECALL_STOP_WORDS = new Set([
+  'a', 'again', 'an', 'and', 'are', 'as', 'at', 'can', 'continue', 'could', 'do', 'does',
+  'for', 'from', 'how', 'i', 'in', 'is', 'it', 'me', 'my', 'no', 'now', 'of', 'ok', 'okay',
+  'on', 'or', 'our', 'please', 'retry', 'same', 'something', 'that', 'the', 'then', 'this',
+  'thing', 'to', 'use', 'what', 'when', 'where', 'which', 'with', 'would', 'yes', 'you', 'your',
+]);
+
+function recallLimit(value: number, name: string): number {
+  if (!Number.isInteger(value) || value < 1) throw new RangeError(`${name} must be a positive integer`);
+  return value;
+}
+
+function recallDistance(value: number): number {
+  if (!Number.isFinite(value) || value < 0) throw new RangeError('maxDistance must be a non-negative number');
+  return value;
+}
+
 /** Global memory API. Thread IDs are intentionally absent from this surface. */
 export class MemoryService {
   readonly repository: MemoryRepository;
@@ -55,13 +84,27 @@ export class MemoryService {
 
   async update(id: string, input: UpdateMemoryInput): Promise<Memory | undefined> {
     const memory = this.repository.update(id, input);
-    if (memory) await this.indexMemory(memory);
+    if (memory) {
+      try {
+        await this.vectorIndex.remove(id);
+      } catch {
+        // A stale vector is less useful than a keyword-only fallback, so do
+        // not let vector cleanup prevent the durable update from succeeding.
+      }
+      await this.indexMemory(memory);
+    }
     return memory;
   }
 
   async delete(id: string): Promise<boolean> {
     const deleted = this.repository.delete(id);
-    if (deleted) await this.vectorIndex.remove(id);
+    if (deleted) {
+      try {
+        await this.vectorIndex.remove(id);
+      } catch {
+        // The primary memory row is already gone; vector cleanup is optional.
+      }
+    }
     return deleted;
   }
 
@@ -91,6 +134,69 @@ export class MemoryService {
     return this.repository.search(query, limit);
   }
 
+  /**
+   * Retrieve a small, relevant memory context for an agent run.
+   *
+   * Keyword matches are retained as an exact-match fallback. Semantic
+   * candidates are only included when their vector distance is within the
+   * recall threshold, so an unrelated memory cannot be injected merely
+   * because it is the nearest item in a small index.
+   */
+  async recall(query: string, options: MemoryRecallOptions = {}): Promise<Memory[]> {
+    const normalizedQuery = query.normalize('NFKC').trim();
+    if (normalizedQuery.length === 0) return [];
+    if (recallTokens(normalizedQuery).length === 0) return [];
+
+    const limit = recallLimit(options.limit ?? DEFAULT_MEMORY_RECALL_LIMIT, 'limit');
+    const candidateLimit = Math.max(
+      limit,
+      recallLimit(
+        options.candidateLimit ?? DEFAULT_MEMORY_RECALL_CANDIDATE_LIMIT,
+        'candidateLimit',
+      ),
+    );
+    const maxDistance = recallDistance(options.maxDistance ?? DEFAULT_MEMORY_RECALL_MAX_DISTANCE);
+    let keywordResults: Memory[] = [];
+    try {
+      keywordResults = this.keywordRecall(normalizedQuery, candidateLimit);
+    } catch {
+      // Semantic retrieval below may still work if the FTS capability is
+      // damaged independently of the primary memory table.
+    }
+    const semanticResults: Memory[] = [];
+
+    if (this.embeddingProvider && this.vectorIndex.available) {
+      try {
+        const embedding = await this.embeddingProvider.embed(normalizedQuery);
+        const matches = await this.vectorIndex.search(embedding, candidateLimit);
+        const byId = new Map(
+          this.repository
+            .getManyByIds(matches.map(match => match.memoryId))
+            .map(memory => [memory.id, memory]),
+        );
+        for (const match of matches) {
+          if (!Number.isFinite(match.distance) || match.distance > maxDistance) continue;
+          const memory = byId.get(match.memoryId);
+          if (memory) semanticResults.push(memory);
+        }
+      } catch {
+        // Recalling memories must never make an otherwise valid agent run fail.
+        // Exact keyword retrieval below remains available when embeddings or
+        // the native vector extension are unavailable.
+      }
+    }
+
+    const recalled: Memory[] = [];
+    const seen = new Set<string>();
+    for (const memory of [...keywordResults, ...semanticResults]) {
+      if (seen.has(memory.id)) continue;
+      seen.add(memory.id);
+      recalled.push(memory);
+      if (recalled.length >= limit) break;
+    }
+    return recalled;
+  }
+
   searchKeyword(query: string, limit = 20): Memory[] {
     return this.repository.search(query, limit);
   }
@@ -118,6 +224,40 @@ export class MemoryService {
       // the primary SQLite and FTS tables even when native vectors fail.
     }
   }
+
+  private keywordRecall(query: string, limit: number): Memory[] {
+    const exactResults = this.repository.search(query, limit);
+    if (exactResults.length > 0) return exactResults;
+
+    const tokens = recallTokens(query);
+    if (tokens.length === 0) return [];
+
+    const candidates = new Map<string, { memory: Memory; matches: number; firstToken: number }>();
+    tokens.forEach((token, tokenIndex) => {
+      for (const memory of this.repository.search(token, limit)) {
+        const candidate = candidates.get(memory.id);
+        if (candidate) {
+          candidate.matches += 1;
+        } else {
+          candidates.set(memory.id, { memory, matches: 1, firstToken: tokenIndex });
+        }
+      }
+    });
+
+    return [...candidates.values()]
+      .sort((left, right) => right.matches - left.matches || left.firstToken - right.firstToken)
+      .slice(0, limit)
+      .map(candidate => candidate.memory);
+  }
+}
+
+function recallTokens(query: string): string[] {
+  return [...new Set(
+    query.match(/[\p{L}\p{N}_]+/gu)
+      ?.map(token => token.toLocaleLowerCase())
+      .filter(token => token.length >= 3 && !RECALL_STOP_WORDS.has(token))
+      .slice(0, 8) ?? [],
+  )];
 }
 
 export const PersistentMemoryService = MemoryService;

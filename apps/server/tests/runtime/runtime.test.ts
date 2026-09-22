@@ -14,6 +14,63 @@ import { createScriptedDemo } from '../../src/agent/demo';
 import { ToolRegistry } from '../../src/tools/tool-registry';
 
 describe('AgentRuntime', () => {
+  it('loads recalled memories for the new thread before asking the decision provider', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    const memory = {
+      id: 'memory-browser-preference',
+      content: 'The user prefers the browser to open in a focused window.',
+      kind: 'preference' as const,
+      importance: 0.9,
+      metadata: {},
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    };
+    let recalledFor: { threadId: string; userMessage: string } | undefined;
+    let plannerMemories: typeof memory[] | undefined;
+    let contextMemories: typeof memory[] | undefined;
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      memories: async input => {
+        recalledFor = { threadId: input.threadId, userMessage: input.userMessage };
+        return [memory];
+      },
+      taskPlanner: {
+        createTask: async input => {
+          plannerMemories = input.memories;
+          return {
+            id: 'memory-task',
+            threadId: input.threadId,
+            goal: input.userMessage,
+            criteria: [{ type: 'browser.url', url: DEMO_PAGE_URL }],
+          };
+        },
+      },
+      decisionProvider: {
+        next: async context => {
+          contextMemories = context.memories;
+          return { type: 'blocked', reason: 'test complete' };
+        },
+      },
+    });
+
+    const result = await runtime.run({
+      threadId: 'new-thread',
+      userMessage: 'Open the browser using my usual preference.',
+    });
+
+    expect(result.status).toBe('blocked');
+    expect(recalledFor).toEqual({
+      threadId: 'new-thread',
+      userMessage: 'Open the browser using my usual preference.',
+    });
+    expect(plannerMemories).toEqual([memory]);
+    expect(contextMemories).toEqual([memory]);
+  });
+
   it('completes the scripted demo only after final verification passes', async () => {
     const demo = createScriptedDemo();
     const result = await demo.runtime.run(demo.task);
