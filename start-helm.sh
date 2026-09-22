@@ -81,11 +81,12 @@ cleanup() {
   for index in "${!pids[@]}"; do
     pid="${pids[$index]}"
     attempts=0
-    while kill -0 "$pid" 2>/dev/null && [ "$attempts" -lt 50 ]; do
+    while kill -0 "$pid" 2>/dev/null && [ "$attempts" -lt 300 ]; do
       sleep 0.1
       attempts=$((attempts + 1))
     done
     if kill -0 "$pid" 2>/dev/null; then
+      printf '[helm] graceful shutdown timed out for child index %s; force terminating process group\n' "$index" >&2
       if [ "${groups[$index]}" = 1 ]; then
         kill -KILL "-${pid}" 2>/dev/null || true
       else
@@ -124,8 +125,8 @@ if [ "$with_vm" = 1 ]; then
     cleanup 1
   fi
   if ! "$BUN_BIN" run vm:start; then
-    printf '%s\n' '[helm] VM startup failed' >&2
-    cleanup 1
+    printf '%s\n' '[helm] VM did not become guest-ready; the server and frontend remain available' >&2
+    printf '%s\n' '[helm] Inspect the VM status in the Helm UI or run bun run vm:status from another terminal' >&2
   fi
 fi
 

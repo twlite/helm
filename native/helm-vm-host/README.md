@@ -51,7 +51,8 @@ The default root is:
 │   ├── provisioning.img  # interactive installer disk
 │   ├── provisioning-efi-vars.bin
 │   ├── provisioning.lock # transient; owned by bun run vm:provision
-│   └── .helm-vm.lock     # native lifecycle lock
+│   ├── .helm-vm.lock     # native lifecycle lock
+│   └── .helm-vm-lifecycle.json # last lifecycle state / clean-stop marker
 └── runtime/              # shared into the guest read-only
 ```
 
@@ -72,12 +73,13 @@ provisioning refuses existing provisioning state unless `--force` is supplied.
 
 If `disk.img` is missing, the normal host copies `base.img` to it. If
 `efi-vars.bin` is missing, the normal host creates it with
-`VZEFIVariableStore(creatingVariableStoreAt:options:)`. `vm.reset` stops the
-VM, replaces the working image from the base image, and preserves the paired
-generic machine identifier and EFI boot state. It never writes to `base.img`.
-The native host takes an exclusive lifecycle lock for the duration of each
-VM owner process, so maintenance, provisioning, sealing, and EFI repair
-cannot concurrently mutate persistent VM state.
+`VZEFIVariableStore(creatingVariableStoreAt:options:)`. `vm.reset` is
+refused while the VM is running. Stop the VM first; after the framework reports
+`stopped`, the host releases its framework object and replaces the working
+image from the base image. The paired generic machine identifier and EFI boot
+state are preserved. It never writes to `base.img`. The native host takes an
+exclusive lifecycle lock for the duration of each VM owner process, so two
+`helm-vm-host` processes cannot open the same working image concurrently.
 
 If the framework reports an invalid boot loader, use the explicit repository
 command `bun run vm:repair-efi`. It preserves the existing EFI file as a
@@ -113,7 +115,8 @@ Commands:
 {"id":"2","method":"vm.start","params":{}}
 {"id":"3","method":"vm.guestRequest","params":{"method":"desktop.screenshot","params":{}}}
 {"id":"4","method":"vm.stop","params":{}}
-{"id":"5","method":"vm.reset","params":{}}
+{"id":"5","method":"vm.force-stop","params":{}}
+{"id":"6","method":"vm.reset","params":{}}
 ```
 
 Successful responses use:
@@ -131,9 +134,11 @@ Failures use a structured code and message:
 Lifecycle events use `type: "event"`, `event: "vm.lifecycle"`, a monotonic
 sequence number, an ISO-8601 timestamp, a state, a reason, and structured
 data. The host emits events for start, validated configuration, running,
-stopping, stopped, reset, and errors. `vm.guestRequest` opens a connection to
-the configured guest AF_VSOCK port, sends one JSON line, reads one JSON line,
-and returns the guest JSON unchanged.
+stopping, force-stopping, stopped, reset, and errors. `vm.stop` requests a
+graceful guest shutdown and waits for the confirmed `stopped` state. It never
+calls the hard-stop API. `vm.force-stop` is the explicit emergency path.
+`vm.guestRequest` opens a connection to the configured guest AF_VSOCK port,
+sends one JSON line, reads one JSON line, and returns the guest JSON unchanged.
 
 ## Limitations
 
@@ -146,8 +151,13 @@ and returns the guest JSON unchanged.
 - It does not contain a runtime screenshot pipeline, guest RPC business logic,
   Bun controller, or automatic display-readiness retry loop; the only native
   viewer is the manual provisioning window.
-- `vm.stop` is the framework's destructive stop operation. The host does not
-  currently request a graceful guest shutdown.
+- `vm.stop` requests a graceful guest shutdown through
+  `VZVirtualMachine.requestStop()`, waits up to the configured stop timeout,
+  and only returns after `VZVirtualMachine.State.stopped` is observed. A host
+  signal or stdin close follows the same graceful path and uses hard stop only
+  as a logged last resort.
+- A lifecycle marker warns on the next startup when the previous host ended
+  while the VM was still in a running, error, or forced state.
 - Real start/stop/guest-RPC integration needs a valid image, the entitlement,
   and a prepared guest with the bridge and runtime listening on the configured
   port. Protocol and path behavior can be checked without those resources.

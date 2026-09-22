@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { loadConfig } from '../apps/server/src/config';
 import { virtualizationHelperAvailable } from '../apps/server/src/vm/helper';
+import { isVmRunning, VM_RUNNING_DISK_MUTATION_MESSAGE } from '../apps/server/src/vm/vm-delete';
 
 function expandPath(value: string): string {
   if (value === '~') return homedir();
@@ -79,6 +80,11 @@ if (process.arch !== 'arm64') {
 
 const config = loadConfig();
 const isoPath = isoInput ? expandPath(isoInput) : undefined;
+
+if (await isVmRunning(config)) {
+  console.error(VM_RUNNING_DISK_MUTATION_MESSAGE);
+  process.exit(1);
+}
 
 if (isoPath) {
   let isoStats;

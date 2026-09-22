@@ -29,7 +29,17 @@ export interface VmStartOptions {
   showWindow?: boolean;
 }
 
+export interface VmControllerDependencies {
+  helperAvailable?: boolean;
+  spawn?: typeof spawn;
+  guestRetryAttempts?: number;
+  guestRetryDelayMs?: number;
+  hostCommandTimeoutMs?: number;
+  childTerminationTimeoutMs?: number;
+}
+
 const DESKTOP_SCREENSHOT_POLL_INTERVAL_MS = 750;
+const VM_RUNNING_DISK_MUTATION_MESSAGE = 'VM is running. Shut it down before modifying disk images.';
 
 function normalizeVmState(value: unknown, fallback: VmStatus['state']): VmStatus['state'] {
   switch (value) {
@@ -112,6 +122,14 @@ export class VmController {
   private screenshotPollInFlight = false;
   private screenshotPollingEnabled = false;
   private helperShowsWindow = false;
+  private expectedChildExit = false;
+  private closing = false;
+  private readonly dependencies: Required<
+    Pick<
+      VmControllerDependencies,
+      'guestRetryAttempts' | 'guestRetryDelayMs' | 'hostCommandTimeoutMs' | 'childTerminationTimeoutMs'
+    >
+  > & Pick<VmControllerDependencies, 'spawn'>;
   private currentStatus: VmStatus = {
     state: 'stopped',
     helperAvailable: false,
@@ -122,11 +140,21 @@ export class VmController {
     private readonly config: HelmConfig,
     private readonly events: EventHub,
     private readonly guestTransport?: GuestTransport,
+    dependencies: VmControllerDependencies = {},
   ) {
-    this.currentStatus.helperAvailable = virtualizationHelperAvailable(config.vmHelperPath);
+    this.currentStatus.helperAvailable = dependencies.helperAvailable
+      ?? virtualizationHelperAvailable(config.vmHelperPath);
+    this.dependencies = {
+      spawn: dependencies.spawn,
+      guestRetryAttempts: dependencies.guestRetryAttempts ?? 20,
+      guestRetryDelayMs: dependencies.guestRetryDelayMs ?? 500,
+      hostCommandTimeoutMs: dependencies.hostCommandTimeoutMs ?? 30_000,
+      childTerminationTimeoutMs: dependencies.childTerminationTimeoutMs ?? 30_000,
+    };
   }
 
   async start(options: VmStartOptions = {}): Promise<void> {
+    this.assertAccepting('start the VM');
     const showWindow = options.showWindow === true;
     if (this.currentStatus.state === 'running' && this.currentStatus.guestConnected) {
       if (!showWindow || this.helperShowsWindow) return;
@@ -142,6 +170,7 @@ export class VmController {
           'The VM helper is already running headlessly. Stop the VM before starting with --gui.',
         );
       }
+      await this.stopInternal();
       await this.terminateChild();
     }
     this.setStatus({ state: 'starting', message: 'Starting the VM helper' });
@@ -153,9 +182,24 @@ export class VmController {
       return;
     }
 
+    let nativeVmBooted = false;
+    let guestReadinessAttempted = false;
     try {
       this.ensureChild(showWindow);
-      await this.sendHostCommand('vm.start', {});
+      const response = await this.sendHostCommand('vm.start', {});
+      const result = recordFrom(response.result);
+      nativeVmBooted = normalizeVmState(result?.state, 'starting') === 'running';
+      if (nativeVmBooted) {
+        this.setStatus({
+          state: 'running',
+          guestConnected: false,
+          ...(typeof result?.uncleanShutdownDetected === 'boolean'
+            ? { uncleanShutdownDetected: result.uncleanShutdownDetected }
+            : {}),
+          message: 'VM is running; waiting for helm-guest readiness',
+        });
+      }
+      guestReadinessAttempted = true;
       await this.connectGuestWithRetry();
       try {
         await this.guestRequest('desktop.screenshot', {});
@@ -165,18 +209,40 @@ export class VmController {
         this.setStatus({ guestConnected: true });
         logger.warn('Initial VM screenshot unavailable', { component: 'vm', ...loggedVmError(error) });
       }
-      this.setStatus({ state: 'running', guestConnected: true });
+      this.setStatus({ state: 'running', guestConnected: true, message: undefined });
       this.events.publish('guest.connected', { connected: true });
       this.startScreenshotPolling();
     } catch (error) {
       const normalized = structuredVmError(error);
+      const mayStillBeRunning = nativeVmBooted
+        || ['running', 'starting', 'stopping'].includes(this.currentStatus.state);
+      const vmStillRunning = mayStillBeRunning && await this.nativeVmIsRunning(mayStillBeRunning);
+      if (vmStillRunning) {
+        const readinessFailure = guestReadinessAttempted || normalized.code === 'GUEST_NOT_READY';
+        const message = readinessFailure
+          ? 'VM is running, but helm-guest is not ready: ' + normalized.message
+          : 'VM is running, but native VM startup reported an error: ' + normalized.message;
+        logger.warn(readinessFailure
+          ? 'VM guest readiness failed; leaving the VM running'
+          : 'VM native startup reported an error after boot; leaving the VM running', {
+          component: 'vm',
+          ...loggedVmError(error),
+        });
+        this.setStatus({ state: 'running', guestConnected: false, message });
+        throw new VmControllerError(
+          readinessFailure ? 'GUEST_NOT_READY' : 'VM_BOOT_ERROR',
+          message,
+          normalized.details,
+        );
+      }
       logger.error('VM start failed', { component: 'vm', ...loggedVmError(error) });
-      this.setStatus({ state: 'error', message: normalized.message });
+      this.setStatus({ state: 'error', guestConnected: false, message: normalized.message });
       throw error;
     }
   }
 
   async reconnect(): Promise<void> {
+    this.assertAccepting('reconnect to the guest');
     if (this.currentStatus.guestConnected) return;
     if (!this.currentStatus.helperAvailable) {
       this.setStatus({
@@ -187,7 +253,9 @@ export class VmController {
     }
 
     this.stopScreenshotPolling();
-    this.setStatus({ state: 'starting', message: 'Reconnecting to the Linux guest' });
+    let nativeVmRunning = this.currentStatus.state === 'running';
+    let guestReadinessAttempted = false;
+    this.setStatus({ state: nativeVmRunning ? 'running' : 'starting', message: 'Reconnecting to the Linux guest' });
     try {
       if (!this.child) {
         await this.start({ showWindow: this.helperShowsWindow });
@@ -199,14 +267,25 @@ export class VmController {
         const response = await this.sendHostCommand('vm.status', {});
         const result = recordFrom(response.result);
         hostState = normalizeVmState(result?.state, hostState);
+        nativeVmRunning = hostState === 'running';
+        if (typeof result?.uncleanShutdownDetected === 'boolean') {
+          this.setStatus({ uncleanShutdownDetected: result.uncleanShutdownDetected });
+        }
       } catch {
         // If status cannot be read, vm.start below gives the helper a chance to
         // restore a stopped VM. A running VM can still be reached directly.
       }
       if (hostState !== 'running') {
-        await this.sendHostCommand('vm.start', {});
+        const response = await this.sendHostCommand('vm.start', {});
+        const result = recordFrom(response.result);
+        hostState = normalizeVmState(result?.state, hostState);
+        nativeVmRunning = hostState === 'running';
+        if (typeof result?.uncleanShutdownDetected === 'boolean') {
+          this.setStatus({ uncleanShutdownDetected: result.uncleanShutdownDetected });
+        }
       }
 
+      guestReadinessAttempted = true;
       await this.connectGuestWithRetry();
       try {
         await this.guestRequest('desktop.screenshot', {});
@@ -222,6 +301,27 @@ export class VmController {
       this.startScreenshotPolling();
     } catch (error) {
       const normalized = structuredVmError(error);
+      const mayStillBeRunning = nativeVmRunning
+        || ['running', 'starting', 'stopping'].includes(this.currentStatus.state);
+      const vmStillRunning = mayStillBeRunning && await this.nativeVmIsRunning(mayStillBeRunning);
+      if (vmStillRunning) {
+        const readinessFailure = guestReadinessAttempted || normalized.code === 'GUEST_NOT_READY';
+        const message = readinessFailure
+          ? 'VM is running, but helm-guest is not ready: ' + normalized.message
+          : 'VM is running, but native VM startup reported an error: ' + normalized.message;
+        logger.warn(readinessFailure
+          ? 'VM guest readiness failed during reconnect; leaving the VM running'
+          : 'VM native startup reported an error after boot during reconnect; leaving the VM running', {
+          component: 'vm',
+          ...loggedVmError(error),
+        });
+        this.setStatus({ state: 'running', guestConnected: false, message });
+        throw new VmControllerError(
+          readinessFailure ? 'GUEST_NOT_READY' : 'VM_BOOT_ERROR',
+          message,
+          normalized.details,
+        );
+      }
       logger.error('VM reconnect failed', { component: 'vm', ...loggedVmError(error) });
       this.setStatus({ state: 'error', guestConnected: false, message: normalized.message });
       throw error;
@@ -229,30 +329,98 @@ export class VmController {
   }
 
   async stop(): Promise<void> {
+    this.assertAccepting('stop the VM');
+    await this.stopInternal();
+  }
+
+  async forceStop(): Promise<void> {
+    this.assertAccepting('force-stop the VM');
+    await this.forceStopInternal();
+  }
+
+  private async stopInternal(): Promise<void> {
     this.stopScreenshotPolling();
+    if (!this.child && !['stopped', 'unavailable'].includes(this.currentStatus.state)) {
+      throw new VmControllerError(
+        'VM_HELPER_NOT_RUNNING',
+        'VM helper is not running; the VM state cannot be confirmed stopped.',
+      );
+    }
     if (this.child) {
       try {
         await this.sendHostCommand('vm.stop', {});
       } catch (error) {
-        logger.warn('VM stop command failed', { component: 'vm', ...loggedVmError(error) });
+        const normalized = structuredVmError(error);
+        logger.error('Graceful VM stop command failed', { component: 'vm', ...loggedVmError(error) });
+        this.setStatus({
+          state: this.currentStatus.state === 'running' ? 'running' : 'error',
+          guestConnected: false,
+          message: normalized.message,
+        });
+        throw error;
       }
     }
     await this.guestTransport?.close();
-    this.setStatus({ state: 'stopped', guestConnected: false, screenshot: undefined });
+    this.setStatus({ state: 'stopped', guestConnected: false, screenshot: undefined, message: undefined });
     this.events.publish('guest.disconnected', { connected: false });
+    // Release the native VM object and its disk attachment. A stopped helper
+    // is still an owner of the VM working image until it exits.
+    await this.terminateChild();
+  }
+
+  private async forceStopInternal(): Promise<void> {
+    this.stopScreenshotPolling();
+    if (!this.child && !['stopped', 'unavailable'].includes(this.currentStatus.state)) {
+      throw new VmControllerError(
+        'VM_HELPER_NOT_RUNNING',
+        'VM helper is not running; emergency VM state cannot be confirmed.',
+      );
+    }
+    if (this.child) {
+      try {
+        await this.sendHostCommand('vm.force-stop', {});
+      } catch (error) {
+        const normalized = structuredVmError(error);
+        logger.error('Emergency VM stop command failed', { component: 'vm', ...loggedVmError(error) });
+        this.setStatus({ state: 'error', guestConnected: false, message: normalized.message });
+        throw error;
+      }
+    }
+    await this.guestTransport?.close();
+    this.setStatus({ state: 'stopped', guestConnected: false, screenshot: undefined, message: undefined });
+    this.events.publish('guest.disconnected', { connected: false });
+    await this.terminateChild();
   }
 
   async reset(): Promise<void> {
+    this.assertAccepting('reset the VM');
     this.stopScreenshotPolling();
+    if (this.currentStatus.state === 'running'
+      || this.currentStatus.state === 'starting'
+      || this.currentStatus.state === 'stopping') {
+      this.setStatus({ guestConnected: false, message: VM_RUNNING_DISK_MUTATION_MESSAGE });
+      throw new VmControllerError('VM_RUNNING', VM_RUNNING_DISK_MUTATION_MESSAGE);
+    }
     if (!this.currentStatus.helperAvailable) {
       this.setStatus({ state: 'unavailable', message: `VM helper not found at ${this.config.vmHelperPath}` });
       return;
     }
-    this.setStatus({ state: 'stopping', message: 'Resetting the working VM disk' });
-    this.ensureChild();
-    await this.sendHostCommand('vm.reset', {});
+    this.setStatus({ state: this.currentStatus.state, message: 'Resetting the working VM disk' });
+    try {
+      this.ensureChild();
+      await this.sendHostCommand('vm.reset', {});
+    } catch (error) {
+      const normalized = structuredVmError(error);
+      const observedState = this.currentStatus.state as VmStatus['state'];
+      this.setStatus({
+        state: observedState === 'running' ? 'running' : 'error',
+        guestConnected: false,
+        message: normalized.message,
+      });
+      throw error;
+    }
     await this.guestTransport?.close();
-    this.setStatus({ state: 'stopped', guestConnected: false, screenshot: undefined });
+    this.setStatus({ state: 'stopped', guestConnected: false, screenshot: undefined, message: undefined });
   }
 
   async status(): Promise<VmStatus> {
@@ -264,7 +432,10 @@ export class VmController {
           this.setStatus({
             state: normalizeVmState(result.state, this.currentStatus.state),
             guestConnected: this.currentStatus.guestConnected,
-            message: result.message,
+            ...(typeof result.message === 'string' ? { message: result.message } : {}),
+            ...(typeof result.uncleanShutdownDetected === 'boolean'
+              ? { uncleanShutdownDetected: result.uncleanShutdownDetected }
+              : {}),
           });
         }
       } catch {
@@ -280,6 +451,7 @@ export class VmController {
     signal?: AbortSignal,
     behavior: GuestRequestBehavior = {},
   ): Promise<T> {
+    this.assertAccepting('use the guest');
     const request: GuestRequest = { id: `guest_${Date.now()}_${Math.random().toString(36).slice(2)}`, method, params };
     if (this.child) {
       try {
@@ -333,14 +505,47 @@ export class VmController {
   }
 
   async close(): Promise<void> {
+    if (this.closing) return;
+    this.closing = true;
     this.stopScreenshotPolling();
-    await this.stop();
+    this.rejectPendingHostRequests(new Error('VM controller is shutting down'));
+    try {
+      await this.stopInternal();
+    } catch (error) {
+      logger.error('Graceful VM shutdown failed; trying emergency VM stop', {
+        component: 'vm',
+        ...loggedVmError(error),
+      });
+      try {
+        await this.forceStopInternal();
+      } catch (forceError) {
+        logger.error('Emergency VM stop failed; helper termination is now the last resort', {
+          component: 'vm',
+          ...loggedVmError(forceError),
+        });
+      }
+    }
+    this.rejectPendingHostRequests(new Error('VM controller closed'));
+    await this.guestTransport?.close();
+    this.setStatus({ guestConnected: false });
+    await this.terminateChild();
+  }
+
+  private rejectPendingHostRequests(error: Error): void {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('VM controller closed'));
+      pending.reject(error);
     }
     this.pending.clear();
-    await this.terminateChild();
+  }
+
+  private assertAccepting(operation: string): void {
+    if (this.closing) {
+      throw new VmControllerError(
+        'VM_CONTROLLER_CLOSING',
+        'The VM controller is shutting down; it cannot ' + operation + '.',
+      );
+    }
   }
 
   private setStatus(update: Partial<VmStatus>): void {
@@ -349,6 +554,9 @@ export class VmController {
       state: this.currentStatus.state,
       helperAvailable: this.currentStatus.helperAvailable,
       guestConnected: this.currentStatus.guestConnected,
+      ...(this.currentStatus.uncleanShutdownDetected === undefined
+        ? {}
+        : { uncleanShutdownDetected: this.currentStatus.uncleanShutdownDetected }),
       ...(this.currentStatus.screenshot ? { screenshot: this.currentStatus.screenshot } : {}),
       ...(this.currentStatus.message ? { message: this.currentStatus.message } : {}),
     });
@@ -405,6 +613,20 @@ export class VmController {
     }
   }
 
+  private async nativeVmIsRunning(fallback = this.currentStatus.state === 'running'): Promise<boolean> {
+    if (!this.child) return false;
+    try {
+      const response = await this.sendHostCommand('vm.status', {});
+      const result = recordFrom(response.result);
+      return normalizeVmState(result?.state, 'error') === 'running';
+    } catch {
+      // Retain the safe assumption that the VM may still be running when the
+      // helper cannot answer a status query. The caller must never power it
+      // off merely because readiness/status I/O failed.
+      return fallback;
+    }
+  }
+
   private ensureChild(showWindow = false): void {
     if (this.child) return;
     if (!this.currentStatus.helperAvailable) {
@@ -423,8 +645,13 @@ export class VmController {
       '--cpus', String(this.config.vmCpus),
       ...(showWindow ? ['--show-window'] : []),
     ];
-    const child = spawn(this.config.vmHelperPath, helperArguments, { stdio: 'pipe' });
+    const child = (this.dependencies.spawn ?? spawn)(
+      this.config.vmHelperPath,
+      helperArguments,
+      { stdio: 'pipe' },
+    );
     this.child = child;
+    this.expectedChildExit = false;
     this.helperShowsWindow = showWindow;
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
@@ -438,7 +665,19 @@ export class VmController {
       this.child = undefined;
       this.helperShowsWindow = false;
       this.stopScreenshotPolling();
-      this.setStatus({ state: 'stopped', guestConnected: false });
+      const expected = this.expectedChildExit;
+      this.expectedChildExit = false;
+      const stateWasKnownStopped = this.currentStatus.state === 'stopped'
+        || this.currentStatus.state === 'unavailable';
+      if (expected || stateWasKnownStopped) {
+        this.setStatus({ state: 'stopped', guestConnected: false });
+      } else {
+        this.setStatus({
+          state: 'error',
+          guestConnected: false,
+          message: 'helm-vm-host exited unexpectedly; VM state is unknown.',
+        });
+      }
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timer);
         pending.reject(new Error('VM helper exited'));
@@ -450,17 +689,37 @@ export class VmController {
   private async terminateChild(): Promise<void> {
     const child = this.child;
     if (!child) return;
-    this.child = undefined;
+    this.expectedChildExit = true;
     this.helperShowsWindow = false;
-    if (child.exitCode !== null || child.signalCode !== null) return;
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      const exited = await this.waitForChildExit(child, this.dependencies.childTerminationTimeoutMs);
+      if (!exited) {
+        logger.error('Forced VM host termination required after graceful shutdown attempts were exhausted', {
+          component: 'vm-host',
+        });
+        child.kill('SIGKILL');
+        await this.waitForChildExit(child, 2_000);
+      }
+    }
+    if (this.child === child && (child.exitCode !== null || child.signalCode !== null)) {
+      this.child = undefined;
+    }
+  }
 
-    await new Promise<void>(resolve => {
-      const timeout = setTimeout(resolve, 1_000);
+  private waitForChildExit(
+    child: ChildProcessWithoutNullStreams,
+    timeoutMilliseconds: number,
+  ): Promise<boolean> {
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+    return new Promise(resolve => {
+      const timeout = setTimeout(() => {
+        resolve(false);
+      }, timeoutMilliseconds);
       child.once('exit', () => {
         clearTimeout(timeout);
-        resolve();
+        resolve(true);
       });
-      child.kill();
     });
   }
 
@@ -514,7 +773,7 @@ export class VmController {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new VmControllerError('VM_HELPER_TIMEOUT', `VM helper timed out handling ${method}`));
-      }, 30_000);
+      }, this.dependencies.hostCommandTimeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.child?.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
     }).then(response => {
@@ -532,7 +791,7 @@ export class VmController {
 
   private async connectGuestWithRetry(): Promise<void> {
     let lastError: unknown;
-    for (let attempt = 0; attempt < 20; attempt += 1) {
+    for (let attempt = 0; attempt < this.dependencies.guestRetryAttempts; attempt += 1) {
       try {
         if (this.child) {
           await this.guestRequest('guest.handshake', {});
@@ -545,7 +804,7 @@ export class VmController {
         return;
       } catch (error) {
         lastError = error;
-        await new Promise(resolve => setTimeout(resolve, 500));
+        await new Promise(resolve => setTimeout(resolve, this.dependencies.guestRetryDelayMs));
       }
     }
     throw lastError instanceof Error ? lastError : new Error('Guest did not become ready');

@@ -12,6 +12,8 @@ export const VM_STATE_FILE_NAMES = [
   'provisioning-efi-vars.bin',
 ] as const;
 
+export const VM_RUNNING_DISK_MUTATION_MESSAGE = 'VM is running. Shut it down before modifying disk images.';
+
 const ACTIVE_VM_STATES = new Set(['running', 'starting', 'stopping']);
 
 export class VmDeleteError extends Error {
@@ -319,7 +321,7 @@ export async function ensureVmStopped(
   check: () => Promise<boolean> = () => isVmRunning(config),
 ): Promise<void> {
   if (await check()) {
-    throw new VmDeleteError('VM is running. Stop it before deleting VM state.');
+    throw new VmDeleteError(VM_RUNNING_DISK_MUTATION_MESSAGE);
   }
 }
 

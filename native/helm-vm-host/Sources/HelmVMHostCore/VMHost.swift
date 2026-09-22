@@ -10,6 +10,8 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
     private let vmQueue = DispatchQueue(label: "com.helm.vm-host.virtual-machine")
     private let eventLock = NSLock()
     private let errorLock = NSLock()
+    private let operationLock = NSLock()
+    private let shutdownStateLock = NSLock()
 
     private var virtualMachine: VZVirtualMachine?
     private var lifecycleLock: HelmVMLifecycleLock?
@@ -18,6 +20,11 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
     private var lastError: HostFailure?
     private var viewerWindow: HelmVMViewerWindow?
     private var inputReader: VMHostInputReader?
+    private var signalSources: [(number: Int32, source: DispatchSourceSignal)] = []
+    private var headlessCompletion: DispatchSemaphore?
+    private var acceptingOperations = true
+    private var terminationRequested = false
+    private var uncleanShutdownDetected = false
 
     public init(options: HostOptions) {
         self.options = options
@@ -33,23 +40,43 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
         super.init()
     }
 
+    static func requireStoppedForDiskMutation(state: VZVirtualMachine.State) throws {
+        guard state == .stopped else {
+            throw HostFailure(
+                code: "vm_running",
+                message: "VM is running. Shut it down before modifying disk images."
+            )
+        }
+    }
+
     public func run() {
+        installSignalHandlers()
+        defer { removeSignalHandlers() }
+
         if options.showWindow {
             runWithViewer()
-            return
+        } else {
+            runHeadless()
         }
-
-        runHeadless()
     }
 
     private func runHeadless() {
-        while let line = readLine() {
-            handle(line: line)
-        }
-
-        if virtualMachine != nil {
-            _ = try? stopVM(emitEvents: false)
-        }
+        let completion = DispatchSemaphore(value: 0)
+        headlessCompletion = completion
+        let reader = VMHostInputReader(
+            onLine: { [weak self] line in
+                self?.handle(line: line)
+            },
+            onEnd: { [weak self] in
+                self?.handleInputEnd()
+            }
+        )
+        inputReader = reader
+        reader.start()
+        completion.wait()
+        reader.stop()
+        inputReader = nil
+        headlessCompletion = nil
     }
 
     private func runWithViewer() {
@@ -61,9 +88,7 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
                 self?.handle(line: line)
             },
             onEnd: { [weak self] in
-                DispatchQueue.main.async {
-                    self?.stopViewerRunLoop()
-                }
+                self?.handleInputEnd()
             }
         )
         inputReader = reader
@@ -73,8 +98,76 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
 
         reader.stop()
         inputReader = nil
-        if virtualMachine != nil {
-            _ = try? stopVM(emitEvents: false)
+    }
+
+    private func installSignalHandlers() {
+        for signalNumber in [SIGINT, SIGTERM] {
+            _ = Darwin.signal(signalNumber, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(
+                signal: signalNumber,
+                queue: DispatchQueue.global(qos: .userInitiated)
+            )
+            source.setEventHandler { [weak self] in
+                self?.handleTerminationSignal(signalNumber)
+            }
+            source.resume()
+            signalSources.append((number: signalNumber, source: source))
+        }
+    }
+
+    private func removeSignalHandlers() {
+        for entry in signalSources {
+            entry.source.cancel()
+            _ = Darwin.signal(entry.number, SIG_DFL)
+        }
+        signalSources.removeAll()
+    }
+
+    private func handleTerminationSignal(_ signalNumber: Int32) {
+        beginTermination(reason: "signal \(signalNumber)")
+    }
+
+    private func handleInputEnd() {
+        beginTermination(reason: "stdin closed")
+    }
+
+    private func beginTermination(reason: String) {
+        shutdownStateLock.lock()
+        if terminationRequested {
+            shutdownStateLock.unlock()
+            return
+        }
+        terminationRequested = true
+        acceptingOperations = false
+        shutdownStateLock.unlock()
+
+        operationLock.lock()
+        var shutdownConfirmed = virtualMachine == nil
+        defer {
+            operationLock.unlock()
+            if shutdownConfirmed {
+                headlessCompletion?.signal()
+                if options.showWindow {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.stopViewerRunLoop()
+                    }
+                }
+            }
+        }
+
+        do {
+            _ = try stopVM(emitEvents: true, reason: reason)
+            shutdownConfirmed = true
+        } catch {
+            let failure = hostFailure(from: error)
+            logDiagnostic("Graceful VM shutdown failed (\(reason)): \(failure.message)")
+            do {
+                _ = try forceStopVM(reason: reason)
+                shutdownConfirmed = true
+            } catch {
+                let forceFailure = hostFailure(from: error)
+                logDiagnostic("Emergency VM stop failed; the VM host could not confirm shutdown: \(forceFailure.message)")
+            }
         }
     }
 
@@ -108,23 +201,32 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
         }
 
         do {
-            let result: JSONValue
-            switch command.method {
-            case "vm.start":
-                result = try startVM()
-            case "vm.stop":
-                result = try stopVM(emitEvents: true)
-            case "vm.status":
-                result = statusJSON()
-            case "vm.reset":
-                result = try resetVM()
-            case "vm.guestRequest":
-                result = try guestRequest(params: command.params)
-            default:
-                throw HostFailure(
-                    code: "unknown_method",
-                    message: "Unknown host method: \(command.method)"
-                )
+            let result: JSONValue = try withOperationLock {
+                if !acceptsOperations && command.method != "vm.status" {
+                    throw HostFailure(
+                        code: "host_shutting_down",
+                        message: "The VM host is shutting down and no new VM operations are accepted."
+                    )
+                }
+                switch command.method {
+                case "vm.start":
+                    return try startVM()
+                case "vm.stop":
+                    return try stopVM(emitEvents: true, reason: "vm.stop")
+                case "vm.force-stop":
+                    return try forceStopVM(reason: "vm.force-stop")
+                case "vm.status":
+                    return statusJSON()
+                case "vm.reset":
+                    return try resetVM()
+                case "vm.guestRequest":
+                    return try guestRequest(params: command.params)
+                default:
+                    throw HostFailure(
+                        code: "unknown_method",
+                        message: "Unknown host method: \(command.method)"
+                    )
+                }
             }
             writer.response(id: command.id, result: result)
         } catch {
@@ -141,7 +243,9 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             case .running:
                 return statusJSON()
             case .stopped:
-                break
+                // Drop the stopped framework object before reopening the
+                // working image. This makes the ownership boundary explicit.
+                virtualMachine = nil
             case .error:
                 // A VM in the error state cannot be reused safely. The
                 // framework requires the failed object to be discarded.
@@ -156,9 +260,18 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
 
         if lifecycleLock == nil {
             lifecycleLock = try HelmVMLifecycleLock(url: paths.stateLockURL)
+            if let previousState = paths.previousLifecycleState(),
+               ["running", "starting", "stopping", "force-stopping", "forced-stop", "error"].contains(previousState) {
+                uncleanShutdownDetected = true
+                logDiagnostic(
+                    "Warning: previous VM shutdown was unclean (last lifecycle state: \(previousState)). "
+                        + "The guest filesystem may need recovery."
+                )
+            }
         }
 
         configurationValidated = false
+        try? paths.writeLifecycleMarker(state: "starting", clean: false, reason: "vm.start")
         emitLifecycle(state: "starting", reason: "vm.start")
 
         do {
@@ -173,12 +286,22 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             showViewer(for: newVM)
             try start(newVM)
             setLastError(nil)
+            try paths.writeLifecycleMarker(state: "running", clean: false, reason: "vm.start")
             emitLifecycle(state: "running", reason: "vm.start")
             return statusJSON()
         } catch {
             let failure = hostFailure(from: error)
             setLastError(failure)
-            virtualMachine = nil
+            let currentState = virtualMachine.map { vm in
+                vmQueue.sync { vm.state }
+            }
+            if virtualMachine != nil {
+                try? paths.writeLifecycleMarker(state: "error", clean: false, reason: "vm.start")
+            }
+            if currentState == nil || currentState == .stopped || currentState == .error {
+                virtualMachine = nil
+                try? paths.writeLifecycleMarker(state: "stopped", clean: true, reason: "vm.start.failed")
+            }
             emitLifecycle(
                 state: "error",
                 reason: "vm.start",
@@ -188,38 +311,66 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
         }
     }
 
-    private func stopVM(emitEvents: Bool) throws -> JSONValue {
+    private func stopVM(
+        emitEvents: Bool,
+        reason: String
+    ) throws -> JSONValue {
         guard let existingVM = virtualMachine else {
             return statusJSON()
         }
 
         let snapshot = vmQueue.sync {
-            (state: existingVM.state, canStop: existingVM.canStop)
+            (
+                state: existingVM.state,
+                canRequestStop: existingVM.canRequestStop
+            )
         }
 
         switch snapshot.state {
         case .stopped:
+            markCleanStop(reason: reason)
             return statusJSON()
         case .error:
-            virtualMachine = nil
+            throw HostFailure(
+                code: "vm_not_stoppable",
+                message: "The VM is in an error state and cannot be confirmed stopped safely."
+            )
+        case .stopping:
+            guard waitUntilStopped(existingVM) else {
+                throw HostFailure(
+                    code: "vm_graceful_stop_timeout",
+                    message: "The VM did not reach the stopped state within \(options.stopTimeoutMilliseconds) ms."
+                )
+            }
+            markCleanStop(reason: reason)
+            if emitEvents {
+                emitLifecycle(state: "stopped", reason: reason)
+            }
             return statusJSON()
         default:
-            guard snapshot.canStop else {
+            guard snapshot.canRequestStop else {
                 throw HostFailure(
-                    code: "vm_not_stoppable",
-                    message: "The VM cannot be stopped from the \(stateName(snapshot.state)) state."
+                    code: "vm_graceful_stop_unavailable",
+                    message: "The VM cannot request a graceful guest shutdown from the \(stateName(snapshot.state)) state."
                 )
             }
         }
 
         if emitEvents {
-            emitLifecycle(state: "stopping", reason: "vm.stop")
+            emitLifecycle(state: "stopping", reason: reason)
         }
 
         do {
-            try stop(existingVM)
+            try requestStop(existingVM)
+            guard waitUntilStopped(existingVM) else {
+                throw HostFailure(
+                    code: "vm_graceful_stop_timeout",
+                    message: "The VM did not reach the stopped state within \(options.stopTimeoutMilliseconds) ms."
+                )
+            }
+            try paths.writeLifecycleMarker(state: "stopped", clean: true, reason: reason)
             if emitEvents {
-                emitLifecycle(state: "stopped", reason: "vm.stop")
+                emitLifecycle(state: "stopped", reason: reason)
             }
             return statusJSON()
         } catch {
@@ -227,27 +378,76 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             setLastError(failure)
             emitLifecycle(
                 state: "error",
-                reason: "vm.stop",
+                reason: reason,
                 data: failure.jsonValue
             )
             throw failure
         }
     }
 
-    private func resetVM() throws -> JSONValue {
-        emitLifecycle(state: "resetting", reason: "vm.reset")
+    private func forceStopVM(reason: String) throws -> JSONValue {
+        guard let existingVM = virtualMachine else {
+            return statusJSON()
+        }
 
+        let snapshot = vmQueue.sync {
+            (state: existingVM.state, canStop: existingVM.canStop)
+        }
+        if snapshot.state == .stopped {
+            markCleanStop(reason: reason)
+            return statusJSON()
+        }
+        guard snapshot.canStop else {
+            throw HostFailure(
+                code: "vm_force_stop_unavailable",
+                message: "The VM cannot be force-stopped from the \(stateName(snapshot.state)) state."
+            )
+        }
+
+        logDiagnostic("Forcing VM termination after graceful shutdown was not confirmed.")
+        emitLifecycle(state: "force-stopping", reason: reason)
+        do {
+            try forceStop(existingVM)
+            guard waitUntilStopped(existingVM) else {
+                throw HostFailure(
+                    code: "vm_force_stop_timeout",
+                    message: "The VM did not reach the stopped state after emergency termination."
+                )
+            }
+            try paths.writeLifecycleMarker(state: "forced-stop", clean: false, reason: reason)
+            uncleanShutdownDetected = true
+            emitLifecycle(
+                state: "stopped",
+                reason: reason,
+                data: .object(["forced": .boolean(true)])
+            )
+            return statusJSON()
+        } catch {
+            let failure = hostFailure(from: error)
+            setLastError(failure)
+            emitLifecycle(state: "error", reason: reason, data: failure.jsonValue)
+            throw failure
+        }
+    }
+
+    private func resetVM() throws -> JSONValue {
         do {
             if lifecycleLock == nil {
                 lifecycleLock = try HelmVMLifecycleLock(url: paths.stateLockURL)
             }
-            if virtualMachine != nil {
-                _ = try stopVM(emitEvents: true)
+            if let existingVM = virtualMachine {
+                let state = vmQueue.sync { existingVM.state }
+                try Self.requireStoppedForDiskMutation(state: state)
+                // Release the stopped framework object before replacing the
+                // working image so no native helper retains the attachment.
+                virtualMachine = nil
             }
+            emitLifecycle(state: "resetting", reason: "vm.reset")
             virtualMachine = nil
             configurationValidated = false
             try paths.prepareHostDirectories()
             try paths.resetWorkingState()
+            try paths.writeLifecycleMarker(state: "stopped", clean: true, reason: "vm.reset")
             setLastError(nil)
             emitLifecycle(state: "stopped", reason: "vm.reset")
             return statusJSON()
@@ -312,7 +512,7 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
                 height: self.options.displayHeight,
                 virtualMachine: virtualMachine,
                 onClose: { [weak self] in
-                    self?.stopViewerRunLoop()
+                    self?.handleInputEnd()
                 }
             )
             viewerWindow = newViewerWindow
@@ -344,7 +544,28 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
         try startResult.get()
     }
 
-    private func stop(_ virtualMachine: VZVirtualMachine) throws {
+    private func requestStop(_ virtualMachine: VZVirtualMachine) throws {
+        let semaphore = DispatchSemaphore(value: 0)
+        let result = BlockingResult<Void>()
+
+        vmQueue.async {
+            do {
+                try virtualMachine.requestStop()
+                result.resolve(.success(()))
+            } catch {
+                result.resolve(.failure(error))
+            }
+            semaphore.signal()
+        }
+
+        semaphore.wait()
+        guard let stopResult = result.result() else {
+            throw HostFailure(code: "vm_graceful_stop_failed", message: "Graceful VM stop completed without a result.")
+        }
+        try stopResult.get()
+    }
+
+    private func forceStop(_ virtualMachine: VZVirtualMachine) throws {
         let semaphore = DispatchSemaphore(value: 0)
         let result = BlockingResult<Void>()
 
@@ -361,9 +582,20 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
 
         semaphore.wait()
         guard let stopResult = result.result() else {
-            throw HostFailure(code: "vm_stop_failed", message: "VM stop completed without a result.")
+            throw HostFailure(code: "vm_force_stop_failed", message: "Emergency VM stop completed without a result.")
         }
         try stopResult.get()
+    }
+
+    private func waitUntilStopped(_ virtualMachine: VZVirtualMachine) -> Bool {
+        let deadline = Date().addingTimeInterval(TimeInterval(options.stopTimeoutMilliseconds) / 1000)
+        while Date() < deadline {
+            if vmQueue.sync(execute: { virtualMachine.state == .stopped }) {
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return vmQueue.sync { virtualMachine.state == .stopped }
     }
 
     private func statusJSON() -> JSONValue {
@@ -404,9 +636,34 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             "runtimeTag": .string(options.runtimeTag),
             "guestTransport": .string("virtio-socket"),
             "guestPort": .number(Double(options.guestPort)),
+            "uncleanShutdownDetected": .boolean(uncleanShutdownDetected),
             "lastError": lastErrorJSON()
         ]
         return .object(status)
+    }
+
+    private var acceptsOperations: Bool {
+        shutdownStateLock.lock()
+        defer { shutdownStateLock.unlock() }
+        return acceptingOperations
+    }
+
+    private func markCleanStop(reason: String) {
+        // Preserve an explicit forced-stop marker until the next startup can
+        // report it. A later SIGTERM used only to close an already-stopped
+        // helper must not hide that recovery signal.
+        guard paths.previousLifecycleState() != "forced-stop" else { return }
+        try? paths.writeLifecycleMarker(state: "stopped", clean: true, reason: reason)
+    }
+
+    private func withOperationLock<T>(_ body: () throws -> T) rethrows -> T {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        return try body()
+    }
+
+    private func logDiagnostic(_ message: String) {
+        FileHandle.standardError.write(Data("helm-vm-host: \(message)\n".utf8))
     }
 
     private func lastErrorJSON() -> JSONValue {
@@ -474,12 +731,14 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
     // MARK: VZVirtualMachineDelegate
 
     public func guestDidStop(_ virtualMachine: VZVirtualMachine) {
+        markCleanStop(reason: "guestDidStop")
         emitLifecycle(state: "stopped", reason: "guestDidStop")
     }
 
     public func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         let failure = hostFailure(from: error)
         setLastError(failure)
+        try? paths.writeLifecycleMarker(state: "error", clean: false, reason: "virtualMachineDidStopWithError")
         emitLifecycle(
             state: "error",
             reason: "virtualMachineDidStopWithError",

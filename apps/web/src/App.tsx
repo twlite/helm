@@ -50,6 +50,9 @@ function mergeVmStatus(payload: unknown, previous: VmStatus | null): VmStatus | 
     state,
     helperAvailable: typeof source.helperAvailable === 'boolean' ? source.helperAvailable : previous?.helperAvailable ?? false,
     guestConnected: typeof source.guestConnected === 'boolean' ? source.guestConnected : previous?.guestConnected ?? false,
+    uncleanShutdownDetected: typeof source.uncleanShutdownDetected === 'boolean'
+      ? source.uncleanShutdownDetected
+      : previous?.uncleanShutdownDetected,
     message: asString(source.message) ?? previous?.message,
     screenshot: asString(source.screenshot) ?? previous?.screenshot,
   };
@@ -542,6 +545,18 @@ function App() {
       }
     } catch (error) {
       showError(error);
+      // A guest-readiness failure is returned as an API error even though the
+      // native VM remains running. Refresh the authoritative VM status so the
+      // desktop panel still exposes that state when websocket events are not
+      // available.
+      const currentVm = await helmApi.vmStatus().catch(() => undefined);
+      if (currentVm) {
+        setVm(currentVm);
+        setHealth((current) => current ? { ...current, vm: currentVm } : current);
+        if (currentVm.screenshot) {
+          setScreenshot(currentVm.screenshot);
+        }
+      }
     } finally {
       setVmAction(null);
     }

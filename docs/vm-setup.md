@@ -118,6 +118,7 @@ bun run vm:doctor
 bun run vm:start
 bun run vm:start --gui
 bun run vm:stop
+bun run vm:status
 ```
 
 Use `vm:start --gui` when debugging the agent loop. It launches the normal
@@ -125,6 +126,24 @@ working VM with the native `VZVirtualMachineView` window attached while the
 server and JSONL guest path continue to operate normally. Plain `vm:start`
 remains headless. If a helper is already running headlessly, stop it first so
 Helm can relaunch it with the viewer enabled.
+
+VM boot and guest readiness are separate states. A successful native boot with
+an unavailable helm-guest leaves the VM running and reports
+VM is running, but helm-guest is not ready: ... in the API, CLI, and desktop
+panel. Use Reconnect after the guest service becomes ready; do not treat a
+guest handshake failure as a reason to power off the VM.
+
+`vm:stop` is the normal shutdown path. It asks the guest to shut down through
+Virtualization.framework, waits until the framework reports stopped, then
+closes the native host so its disk attachment is released. It never calls the
+hard-stop API. If an emergency power-off is explicitly required, use:
+
+~~~sh
+bun run vm:force-stop
+~~~
+
+The emergency command is intentionally separate and logs that a forced
+termination was used.
 
 For maintenance work that only needs the native desktop viewer, start the
 helper directly. This boots the working image and does not wait for
@@ -135,9 +154,9 @@ bun run vm:maintenance
 ```
 
 The helper still accepts JSONL commands on stdin, so `vm.status`, `vm.stop`,
-`vm.reset`, and other host commands remain available in the terminal. Closing
-the viewer stops the maintenance host cleanly; it does not replace or rewrite
-the VM disk.
+`vm.force-stop`, `vm.reset`, and other host commands remain available in the
+terminal. Closing the viewer stops the maintenance host cleanly; it does not
+replace or rewrite the VM disk.
 
 Normal initialization requires `base.img`. If `disk.img` is absent, the native
 helper creates it by copying `base.img`. If `efi-vars.bin` is absent, the helper
@@ -151,11 +170,13 @@ To discard the mutable guest state and return to the sealed base image:
 bun run vm:reset
 ```
 
-Reset stops the VM, recreates `disk.img` from `base.img`, and preserves the
-paired machine identifier and EFI variable store. Keeping those two pieces
-of VM identity together prevents the generic machine identity from diverging
-from the NVRAM boot state. If the EFI store is absent, the next start creates
-it automatically. Reset never modifies `base.img`.
+Reset is a disk mutation and refuses while the VM is running or while a native
+VM host still owns the working image. Run `bun run vm:stop` first and wait for
+the host to exit. Once the VM is fully stopped, reset recreates `disk.img` from
+`base.img` and preserves the paired machine identifier and EFI variable store.
+Keeping those two pieces of VM identity together prevents the generic machine
+identity from diverging from the NVRAM boot state. If the EFI store is absent,
+the next start creates it automatically. Reset never modifies `base.img`.
 
 If Virtualization.framework reports that the existing boot loader is invalid,
 do not delete the guest disk. Stop every VM host and use the explicit
@@ -197,7 +218,8 @@ By default Helm keeps VM state under:
 │   ├── provisioning.img               # interactive installer disk
 │   ├── provisioning-efi-vars.bin      # provisioning-only EFI state
 │   ├── provisioning.lock              # transient while installer is open
-│   └── .helm-vm.lock                  # native lifecycle lock
+│   ├── .helm-vm.lock                  # native lifecycle lock
+│   └── .helm-vm-lifecycle.json        # last lifecycle state / clean-stop marker
 ├── runtime/guest/helm-guest.js
 └── helm.sqlite
 ```
@@ -205,6 +227,24 @@ By default Helm keeps VM state under:
 The provisioning EFI store is separate from normal runtime state. The
 provisioning disk is not attached by normal Helm VM startup and can be retained
 until the base image has been verified.
+
+The native host holds `.helm-vm.lock` for its entire lifetime. A second native
+host fails before opening the working image with `vm_in_use`. The lifecycle
+marker records running, stopped, and forced/error states. On the next start,
+an interrupted running, error, or forced state is reported as an unclean
+previous shutdown so filesystem recovery can be investigated before
+continuing.
+
+All disk-mutating commands (`vm:seal`, `vm:reset`, `vm:delete`,
+`vm:provision` destructive runs, and EFI repair) use the same safety rule:
+
+~~~text
+VM is running. Shut it down before modifying disk images.
+~~~
+
+They also refuse while a native helper still owns the image. This prevents a
+copy, replacement, or deletion from racing a live Virtualization.framework
+attachment.
 
 ## Prepared guest expectations
 

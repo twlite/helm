@@ -7,6 +7,7 @@ import { describe, expect, it } from 'bun:test';
 
 import { loadConfig } from '../src/config';
 import {
+  ensureVmStopped,
   executeVmDeletion,
   resolveSafeVmDirectory,
 } from '../src/vm/vm-delete';
@@ -159,8 +160,19 @@ describe('safe VM deletion', () => {
       await expect(executeVmDeletion(config, {
         yes: true,
         isVmRunning: async () => true,
-      })).rejects.toThrow('VM is running. Stop it before deleting VM state.');
+      })).rejects.toThrow('VM is running. Shut it down before modifying disk images.');
       expect(await exists(config.baseImagePath)).toBe(true);
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses the vm:seal disk mutation guard while the VM is running', async () => {
+    const { config, dataDir } = await fixture();
+    try {
+      await expect(ensureVmStopped(config, async () => true)).rejects.toThrow(
+        'VM is running. Shut it down before modifying disk images.',
+      );
     } finally {
       await rm(dataDir, { recursive: true, force: true });
     }

@@ -12,7 +12,10 @@ export * from './vm/vm-controller';
 
 if (import.meta.main) {
   const server = startHelmServer();
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     await server.close();
     process.exit(0);
   };

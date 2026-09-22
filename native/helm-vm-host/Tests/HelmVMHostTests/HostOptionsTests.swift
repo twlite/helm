@@ -9,4 +9,11 @@ final class HostOptionsTests: XCTestCase {
         let withViewer = try XCTUnwrap(HostOptions.parse(arguments: ["--show-window"]))
         XCTAssertTrue(withViewer.showWindow)
     }
+
+    func testGracefulStopTimeoutCanBeConfigured() throws {
+        let options = try XCTUnwrap(
+            HostOptions.parse(arguments: ["--stop-timeout-ms", "1234"])
+        )
+        XCTAssertEqual(options.stopTimeoutMilliseconds, 1234)
+    }
 }

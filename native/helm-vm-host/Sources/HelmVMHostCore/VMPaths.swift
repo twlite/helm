@@ -15,6 +15,12 @@ struct VMPaths {
             .appendingPathComponent(".helm-vm.lock", isDirectory: false)
     }
 
+    var lifecycleMarkerURL: URL {
+        rootURL
+            .appendingPathComponent("vm", isDirectory: true)
+            .appendingPathComponent(".helm-vm-lifecycle.json", isDirectory: false)
+    }
+
     func prepareHostDirectories() throws {
         let fileManager = FileManager.default
         try createDirectory(rootURL, fileManager: fileManager)
@@ -53,6 +59,33 @@ struct VMPaths {
         }
 
         try copyFileAtomically(from: baseImageURL, to: workingImageURL)
+    }
+
+    func previousLifecycleState() -> String? {
+        guard let data = try? Data(contentsOf: lifecycleMarkerURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let state = object["state"] as? String else {
+            return nil
+        }
+        return state
+    }
+
+    func writeLifecycleMarker(state: String, clean: Bool, reason: String) throws {
+        let object: [String: Any] = [
+            "state": state,
+            "clean": clean,
+            "reason": reason,
+            "updatedAt": ISO8601DateFormatter().string(from: Date()),
+        ]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: object, options: [])
+            try data.write(to: lifecycleMarkerURL, options: .atomic)
+        } catch {
+            throw HostFailure(
+                code: "storage_error",
+                message: "Unable to write the VM lifecycle marker at \(lifecycleMarkerURL.path): \(error.localizedDescription)"
+            )
+        }
     }
 
     func fileInfo(for url: URL) -> [String: JSONValue] {

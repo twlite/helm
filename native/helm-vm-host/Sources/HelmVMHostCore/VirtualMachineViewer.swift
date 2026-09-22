@@ -15,9 +15,10 @@ func makeHelmVirtualMachineView(for virtualMachine: VZVirtualMachine) -> VZVirtu
 
 /// Small native viewer used by the JSONL maintenance host.
 ///
-/// Closing the window only exits the viewer's AppKit loop through `onClose`.
-/// The VM owner decides how and when the VM is stopped, which keeps window
-/// lifetime separate from disk and guest-RPC lifecycle.
+/// Closing the window asks the VM owner to perform its lifecycle shutdown path
+/// before the AppKit loop exits. The VM owner decides how and when the VM is
+/// stopped, which keeps window lifetime separate from disk and guest-RPC
+/// lifecycle.
 final class HelmVMViewerWindow: NSObject, NSWindowDelegate {
     let window: NSWindow
     let virtualMachineView: VZVirtualMachineView

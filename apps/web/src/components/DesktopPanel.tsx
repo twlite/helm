@@ -116,7 +116,7 @@ export function DesktopPanel({
               ) : null}
             </div>
 
-            {vm?.message ? <p className="mt-1 truncate text-[10px] text-[var(--text-muted)]">{vm.message}</p> : null}
+            {vm?.message ? <p className="mt-1 break-words text-[10px] text-[var(--text-muted)]">{vm.message}</p> : null}
 
             <div className="mt-2 flex flex-wrap gap-1">
               <Button
@@ -147,7 +147,7 @@ export function DesktopPanel({
                 Stop
               </Button>
               <Button
-                disabled={vmAction !== null}
+                disabled={vmAction !== null || state !== 'stopped'}
                 onClick={() => void onVmAction('reset')}
                 size="sm"
                 variant="ghost"

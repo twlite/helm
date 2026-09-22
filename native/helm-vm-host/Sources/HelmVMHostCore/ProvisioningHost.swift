@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import Virtualization
 
@@ -18,6 +19,7 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
     private var window: NSWindow?
     private var virtualMachineView: VZVirtualMachineView?
     private var statusField: NSTextField?
+    private var signalSources: [(number: Int32, source: DispatchSourceSignal)] = []
     private var isTerminating = false
     private var terminationReplyPending = false
     private(set) var exitCode = 0
@@ -52,6 +54,8 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
         host.writeDiagnostic("directorySharingDevices=\(configuration.directorySharingDevices.count)")
         application.setActivationPolicy(.regular)
         application.delegate = host
+        host.installSignalHandlers()
+        defer { host.removeSignalHandlers() }
         application.run()
         application.delegate = nil
         activeHost = nil
@@ -240,7 +244,7 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
                 statusField?.stringValue = "Asking Ubuntu to shut down. The provisioning disk will be retained."
                 return false
             } catch {
-                writeDiagnostic("Graceful guest shutdown was unavailable; stopping the VM directly: \(diagnosticText(for: error))")
+                writeDiagnostic("Graceful guest shutdown was unavailable; using emergency power-off: \(diagnosticText(for: error))")
             }
         }
 
@@ -257,11 +261,37 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
                 if let error {
                     self.exitCode = 1
                     self.writeDiagnostic("Unable to stop the provisioning VM: \(self.diagnosticText(for: error))")
+                } else {
+                    self.writeDiagnostic("Emergency VM power-off was required after graceful shutdown was unavailable.")
                 }
                 self.completeTermination()
             }
         }
         return false
+    }
+
+    private func installSignalHandlers() {
+        for signalNumber in [SIGINT, SIGTERM] {
+            _ = Darwin.signal(signalNumber, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(
+                signal: signalNumber,
+                queue: DispatchQueue.global(qos: .userInitiated)
+            )
+            source.setEventHandler { [weak self] in
+                guard self != nil else { return }
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+            }
+            source.resume()
+            signalSources.append((number: signalNumber, source: source))
+        }
+    }
+
+    private func removeSignalHandlers() {
+        for entry in signalSources {
+            entry.source.cancel()
+            _ = Darwin.signal(entry.number, SIG_DFL)
+        }
+        signalSources.removeAll()
     }
 
     private func completeTermination() {

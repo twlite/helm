@@ -409,6 +409,9 @@ function parseVmStatus(value: unknown): VmStatus {
     state,
     helperAvailable: asBoolean(input.helperAvailable ?? input.helper_available),
     guestConnected: asBoolean(input.guestConnected ?? input.guest_connected),
+    uncleanShutdownDetected: typeof input.uncleanShutdownDetected === 'boolean'
+      ? input.uncleanShutdownDetected
+      : undefined,
     message: asOptionalString(input.message),
     screenshot: asOptionalString(input.screenshot),
   };

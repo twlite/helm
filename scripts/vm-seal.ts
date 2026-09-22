@@ -2,7 +2,10 @@ import { copyFile, link, mkdir, readFile, rename, stat, unlink } from 'node:fs/p
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { loadConfig } from '../apps/server/src/config';
-import { isVmRunning } from '../apps/server/src/vm/vm-delete';
+import {
+  ensureVmStopped,
+  VM_RUNNING_DISK_MUTATION_MESSAGE,
+} from '../apps/server/src/vm/vm-delete';
 
 type FileState = 'missing' | 'invalid' | 'valid';
 
@@ -91,12 +94,6 @@ async function removeFileIfPresent(path: string): Promise<void> {
 }
 
 
-async function ensureVmStopped(config: ReturnType<typeof loadConfig>): Promise<void> {
-  if (await isVmRunning(config)) {
-    throw new Error('A Helm VM host is active. Stop it before sealing VM state.');
-  }
-}
-
 const argumentsList = Bun.argv.slice(2);
 let force = false;
 for (const argument of argumentsList) {
@@ -128,8 +125,8 @@ if (
 }
 
 try {
-  await ensureProvisioningFinished(resolve(config.provisioningLockPath));
   await ensureVmStopped(config);
+  await ensureProvisioningFinished(resolve(config.provisioningLockPath));
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
@@ -193,21 +190,30 @@ if (normalEfiPath === basePath || provisioningEfiPath === basePath) {
 }
 
 try {
+  await ensureVmStopped(config);
   await atomicCopy(sourcePath, basePath, baseState === 'valid');
+  await ensureVmStopped(config);
   await atomicCopy(provisioningEfiPath, normalEfiPath, normalEfiState === 'valid');
 } catch (error) {
-  console.error(`Unable to seal the installed disk: ${error instanceof Error ? error.message : String(error)}`);
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(message === VM_RUNNING_DISK_MUTATION_MESSAGE
+    ? message
+    : `Unable to seal the installed disk: ${message}`);
   process.exit(1);
 }
 
 if (force) {
   try {
+    await ensureVmStopped(config);
     for (const artifact of normalArtifacts) {
       if (artifact.path === normalEfiPath || artifact.path === resolve(config.machineIdentifierPath)) continue;
       await removeFileIfPresent(artifact.path);
     }
   } catch (error) {
-    console.error(`Base image sealed, but existing working state could not be cleared: ${error instanceof Error ? error.message : String(error)}`);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(message === VM_RUNNING_DISK_MUTATION_MESSAGE
+      ? message
+      : `Base image sealed, but existing working state could not be cleared: ${message}`);
     process.exit(1);
   }
 }

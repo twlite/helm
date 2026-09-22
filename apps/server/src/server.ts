@@ -797,6 +797,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
           await vm.start({ showWindow });
         }
         else if (segments[2] === 'stop') await vm.stop();
+        else if (segments[2] === 'force-stop') await vm.forceStop();
         else if (segments[2] === 'reset') await vm.reset();
         else if (segments[2] === 'reconnect') await vm.reconnect();
         else return notFound('Unknown VM action.');

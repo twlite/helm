@@ -1,4 +1,5 @@
 import Foundation
+import Virtualization
 import XCTest
 @testable import HelmVMHostCore
 
@@ -20,5 +21,17 @@ final class VMLifecycleTests: XCTestCase {
 
         let second = try HelmVMLifecycleLock(url: lockURL)
         withExtendedLifetime(second) {}
+    }
+
+    func testResetRefusesDiskMutationWhileVMIsRunning() {
+        XCTAssertThrowsError(
+            try VMHost.requireStoppedForDiskMutation(state: .running)
+        ) { error in
+            XCTAssertEqual((error as? HostFailure)?.code, "vm_running")
+            XCTAssertEqual(
+                (error as? HostFailure)?.message,
+                "VM is running. Shut it down before modifying disk images."
+            )
+        }
     }
 }

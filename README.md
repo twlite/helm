@@ -71,6 +71,8 @@ bun run vm:seal
 bun run vm:start
 bun run vm:start --gui
 bun run vm:stop
+bun run vm:force-stop
+bun run vm:status
 bun run vm:reset
 ```
 
@@ -84,8 +86,11 @@ does not modify the disk. `vm:doctor` reports lazy first-run artifacts as `WAIT`
 
 `vm:start --gui` starts the normal VM through the server with a resizable
 Virtualization.framework viewer window attached. Plain `vm:start` remains
-headless. If the helper is already running headlessly, stop it before retrying
-with `--gui`.
+headless. Boot success and `helm-guest` readiness are reported separately: a
+guest handshake failure leaves the VM running and visible as unavailable in
+the UI. `vm:stop` requests a graceful guest shutdown and waits for confirmed
+stopped state; use `vm:force-stop` only for emergency power-off. If the helper
+is already running headlessly, stop it before retrying with `--gui`.
 
 ## Documentation
 

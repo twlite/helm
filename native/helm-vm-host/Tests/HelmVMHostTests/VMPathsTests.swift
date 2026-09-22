@@ -34,4 +34,27 @@ final class VMPathsTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: workingURL), Data("sealed base".utf8))
         XCTAssertEqual(try Data(contentsOf: machineIDURL), Data("persistent identity".utf8))
     }
+
+    func testLifecycleMarkerRoundTripsLastState() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let vmDirectory = directory.appendingPathComponent("vm", isDirectory: true)
+        let runtimeDirectory = directory.appendingPathComponent("runtime", isDirectory: true)
+        try FileManager.default.createDirectory(at: vmDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: runtimeDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let paths = VMPaths(
+            rootURL: directory,
+            baseImageURL: vmDirectory.appendingPathComponent("base.img"),
+            workingImageURL: vmDirectory.appendingPathComponent("disk.img"),
+            efiVariablesURL: vmDirectory.appendingPathComponent("efi-vars.bin"),
+            machineIdentifierURL: vmDirectory.appendingPathComponent("machine-id.bin"),
+            runtimeShareURL: runtimeDirectory
+        )
+
+        XCTAssertNil(paths.previousLifecycleState())
+        try paths.writeLifecycleMarker(state: "running", clean: false, reason: "test")
+        XCTAssertEqual(paths.previousLifecycleState(), "running")
+    }
 }

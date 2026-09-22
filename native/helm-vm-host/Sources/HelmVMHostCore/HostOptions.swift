@@ -10,6 +10,7 @@ public struct HostOptions {
     let runtimeTag: String
     let guestPort: UInt32
     let guestRequestTimeoutMilliseconds: Int32
+    let stopTimeoutMilliseconds: Int32
     let cpuCount: Int
     let memorySize: UInt64
     let displayWidth: Int
@@ -31,6 +32,10 @@ public struct HostOptions {
         var timeoutMilliseconds = try parseInt32(
             environmentValue("HELM_VM_GUEST_TIMEOUT_MS") ?? "10000",
             option: "HELM_VM_GUEST_TIMEOUT_MS"
+        )
+        var stopTimeoutMilliseconds = try parseInt32(
+            environmentValue("HELM_VM_STOP_TIMEOUT_MS") ?? "20000",
+            option: "HELM_VM_STOP_TIMEOUT_MS"
         )
         var cpuCount = try parseInt(
             environmentValue("HELM_VM_CPUS") ?? "4",
@@ -75,6 +80,11 @@ public struct HostOptions {
                     nextArgument(arguments, index: &index, option: argument),
                     option: argument
                 )
+            case "--stop-timeout-ms":
+                stopTimeoutMilliseconds = try parseInt32(
+                    nextArgument(arguments, index: &index, option: argument),
+                    option: argument
+                )
             case "--cpus":
                 cpuCount = try parseInt(
                     nextArgument(arguments, index: &index, option: argument),
@@ -97,6 +107,9 @@ public struct HostOptions {
         }
         guard timeoutMilliseconds > 0 else {
             throw HostFailure(code: "invalid_argument", message: "Guest request timeout must be positive.")
+        }
+        guard stopTimeoutMilliseconds > 0 else {
+            throw HostFailure(code: "invalid_argument", message: "VM stop timeout must be positive.")
         }
         guard cpuCount > 0 else {
             throw HostFailure(code: "invalid_argument", message: "CPU count must be positive.")
@@ -148,6 +161,7 @@ public struct HostOptions {
             runtimeTag: runtimeTag,
             guestPort: guestPort,
             guestRequestTimeoutMilliseconds: timeoutMilliseconds,
+            stopTimeoutMilliseconds: stopTimeoutMilliseconds,
             cpuCount: cpuCount,
             memorySize: memoryMiB * 1024 * 1024,
             displayWidth: 1280,
@@ -215,6 +229,7 @@ public struct HostOptions {
           --runtime-tag TAG       VirtioFS tag (default: helm-runtime)
           --guest-port PORT       Guest AF_VSOCK port (default: 4242)
           --guest-timeout-ms N    Guest RPC read timeout (default: 10000)
+          --stop-timeout-ms N     Graceful guest shutdown timeout (default: 20000)
           --cpus N                Guest CPU count (default: 4)
           --memory-mib N          Guest memory (default: 4096)
           --show-window           Attach a resizable native VM viewer window

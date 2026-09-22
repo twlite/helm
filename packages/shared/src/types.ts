@@ -420,6 +420,7 @@ export interface VmStatus {
   state: 'stopped' | 'starting' | 'running' | 'stopping' | 'error' | 'unavailable';
   helperAvailable: boolean;
   guestConnected: boolean;
+  uncleanShutdownDetected?: boolean;
   message?: string;
   screenshot?: string;
 }

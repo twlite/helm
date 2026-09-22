@@ -58,7 +58,7 @@ try {
 
 try {
   if (await isVmRunning(config)) {
-    throw new VmDeleteError('VM is running. Stop it before repairing EFI state.');
+    throw new VmDeleteError('VM is running. Shut it down before modifying disk images.');
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));

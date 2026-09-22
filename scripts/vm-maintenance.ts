@@ -43,8 +43,8 @@ const helper = Bun.spawn([
 });
 
 // The helper remains a JSONL host. Start it once, then forward any subsequent
-// stdin commands so maintenance work can still use vm.status, vm.stop, reset,
-// and guestRequest without starting the guest runtime.
+// stdin commands so maintenance work can still use vm.status, vm.stop,
+// vm.force-stop, reset, and guestRequest without starting a second helper.
 helper.stdin.write(`${JSON.stringify({ id: 'maintenance-start', method: 'vm.start', params: {} })}\n`);
 
 const inputController = new AbortController();
