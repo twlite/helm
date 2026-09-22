@@ -80,8 +80,9 @@ bun run vm:seal --force
 ```
 
 Use `--force` only when intentionally replacing the current base image. When
-forced, Helm clears the existing normal working disk and machine identifier;
-the promoted EFI state is retained for boot.
+forced, Helm replaces the existing normal working disk and EFI store but
+preserves the paired machine identifier; the promoted EFI state is retained
+for boot.
 
 ### Resume an interrupted installation
 
@@ -150,11 +151,25 @@ To discard the mutable guest state and return to the sealed base image:
 bun run vm:reset
 ```
 
-Reset stops the VM, recreates `disk.img` from `base.img`, and removes the
-working machine identifier. It preserves the EFI variable store so the boot
-entry captured during provisioning remains available; if the EFI store is
-absent, the next start creates it automatically. Reset never modifies
-`base.img`.
+Reset stops the VM, recreates `disk.img` from `base.img`, and preserves the
+paired machine identifier and EFI variable store. Keeping those two pieces
+of VM identity together prevents the generic machine identity from diverging
+from the NVRAM boot state. If the EFI store is absent, the next start creates
+it automatically. Reset never modifies `base.img`.
+
+If Virtualization.framework reports that the existing boot loader is invalid,
+do not delete the guest disk. Stop every VM host and use the explicit
+EFI-only recovery command:
+
+```sh
+bun run vm:repair-efi
+```
+
+The command requires typing `repair-efi`, moves the old `efi-vars.bin` to a
+timestamped `.bak` file, and installs a fresh EFI store. It never opens or
+modifies `disk.img` or `base.img`. The old EFI state remains available for
+manual investigation. A missing EFI store is not an error during normal
+startup; it is created lazily and atomically.
 
 To remove the active, sealed, and provisioning VM state so Helm can be
 provisioned from a fresh Ubuntu ISO, use the guarded deletion command:
@@ -181,7 +196,8 @@ By default Helm keeps VM state under:
 │   ├── machine-id.bin                 # persistent provisioning/normal VM identity
 │   ├── provisioning.img               # interactive installer disk
 │   ├── provisioning-efi-vars.bin      # provisioning-only EFI state
-│   └── provisioning.lock              # transient while installer is open
+│   ├── provisioning.lock              # transient while installer is open
+│   └── .helm-vm.lock                  # native lifecycle lock
 ├── runtime/guest/helm-guest.js
 └── helm.sqlite
 ```

@@ -12,9 +12,10 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
     private let errorLock = NSLock()
 
     private var virtualMachine: VZVirtualMachine?
+    private var lifecycleLock: HelmVMLifecycleLock?
     private var eventSequence: UInt64 = 0
     private var configurationValidated = false
-    private var lastError: String?
+    private var lastError: HostFailure?
     private var viewerWindow: HelmVMViewerWindow?
     private var inputReader: VMHostInputReader?
 
@@ -102,7 +103,7 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
         } catch {
             let failure = error as? HostFailure
                 ?? HostFailure(code: "invalid_json", message: error.localizedDescription)
-            writer.error(id: .null, code: failure.code, message: failure.message)
+            writer.error(id: .null, failure: failure)
             return
         }
 
@@ -128,8 +129,8 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             writer.response(id: command.id, result: result)
         } catch {
             let failure = hostFailure(from: error)
-            setLastError(failure.message)
-            writer.error(id: command.id, code: failure.code, message: failure.message)
+            setLastError(failure)
+            writer.error(id: command.id, failure: failure)
         }
     }
 
@@ -153,6 +154,10 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             }
         }
 
+        if lifecycleLock == nil {
+            lifecycleLock = try HelmVMLifecycleLock(url: paths.stateLockURL)
+        }
+
         configurationValidated = false
         emitLifecycle(state: "starting", reason: "vm.start")
 
@@ -172,15 +177,12 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             return statusJSON()
         } catch {
             let failure = hostFailure(from: error)
-            setLastError(failure.message)
+            setLastError(failure)
             virtualMachine = nil
             emitLifecycle(
                 state: "error",
                 reason: "vm.start",
-                data: .object([
-                    "code": .string(failure.code),
-                    "message": .string(failure.message)
-                ])
+                data: failure.jsonValue
             )
             throw failure
         }
@@ -222,14 +224,11 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             return statusJSON()
         } catch {
             let failure = hostFailure(from: error)
-            setLastError(failure.message)
+            setLastError(failure)
             emitLifecycle(
                 state: "error",
                 reason: "vm.stop",
-                data: .object([
-                    "code": .string(failure.code),
-                    "message": .string(failure.message)
-                ])
+                data: failure.jsonValue
             )
             throw failure
         }
@@ -239,6 +238,9 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
         emitLifecycle(state: "resetting", reason: "vm.reset")
 
         do {
+            if lifecycleLock == nil {
+                lifecycleLock = try HelmVMLifecycleLock(url: paths.stateLockURL)
+            }
             if virtualMachine != nil {
                 _ = try stopVM(emitEvents: true)
             }
@@ -251,14 +253,11 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             return statusJSON()
         } catch {
             let failure = hostFailure(from: error)
-            setLastError(failure.message)
+            setLastError(failure)
             emitLifecycle(
                 state: "error",
                 reason: "vm.reset",
-                data: .object([
-                    "code": .string(failure.code),
-                    "message": .string(failure.message)
-                ])
+                data: failure.jsonValue
             )
             throw failure
         }
@@ -416,10 +415,10 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
         guard let lastError else {
             return .null
         }
-        return .string(lastError)
+        return lastError.jsonValue
     }
 
-    private func setLastError(_ value: String?) {
+    private func setLastError(_ value: HostFailure?) {
         errorLock.lock()
         lastError = value
         errorLock.unlock()
@@ -479,11 +478,12 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
     }
 
     public func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
-        setLastError(error.localizedDescription)
+        let failure = hostFailure(from: error)
+        setLastError(failure)
         emitLifecycle(
             state: "error",
             reason: "virtualMachineDidStopWithError",
-            data: .object(["message": .string(error.localizedDescription)])
+            data: failure.jsonValue
         )
     }
 }

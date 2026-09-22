@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 struct VMPaths {
     let rootURL: URL
@@ -7,6 +8,12 @@ struct VMPaths {
     let efiVariablesURL: URL
     let machineIdentifierURL: URL
     let runtimeShareURL: URL
+
+    var stateLockURL: URL {
+        rootURL
+            .appendingPathComponent("vm", isDirectory: true)
+            .appendingPathComponent(".helm-vm.lock", isDirectory: false)
+    }
 
     func prepareHostDirectories() throws {
         let fileManager = FileManager.default
@@ -46,7 +53,6 @@ struct VMPaths {
         }
 
         try copyFileAtomically(from: baseImageURL, to: workingImageURL)
-        try removeIfPresent(machineIdentifierURL)
     }
 
     func fileInfo(for url: URL) -> [String: JSONValue] {
@@ -124,13 +130,29 @@ struct VMPaths {
 
         do {
             try fileManager.copyItem(at: source, to: temporaryURL)
-            if fileManager.fileExists(atPath: destination.path) {
-                try fileManager.removeItem(at: destination)
+            let renameResult = temporaryURL.path.withCString { sourcePath in
+                destination.path.withCString { destinationPath in
+                    Darwin.rename(sourcePath, destinationPath)
+                }
             }
-            try fileManager.moveItem(at: temporaryURL, to: destination)
+            guard renameResult == 0 else {
+                let failureNumber = errno
+                throw HostFailure(
+                    code: "storage_error",
+                    message: "Unable to atomically install \(destination.path) (errno \(failureNumber)).",
+                    details: .object([
+                        "source": .string(source.path),
+                        "destination": .string(destination.path),
+                        "errno": .number(Double(failureNumber)),
+                    ])
+                )
+            }
         } catch {
             if fileManager.fileExists(atPath: temporaryURL.path) {
                 try? fileManager.removeItem(at: temporaryURL)
+            }
+            if let failure = error as? HostFailure {
+                throw failure
             }
             throw HostFailure(
                 code: "storage_error",
@@ -139,9 +161,4 @@ struct VMPaths {
         }
     }
 
-    private func removeIfPresent(_ url: URL) throws {
-        if FileManager.default.fileExists(atPath: url.path) {
-            try FileManager.default.removeItem(at: url)
-        }
-    }
 }

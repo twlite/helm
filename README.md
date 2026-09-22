@@ -65,7 +65,8 @@ Build the native helper and inspect the environment with:
 ```sh
 bun run vm:build
 bun run vm:doctor
-bun run vm:provision /path/to/ubuntu-24.04-arm64.iso
+bun run vm:provision --iso /path/to/ubuntu-24.04-arm64.iso
+bun run vm:provision --resume
 bun run vm:seal
 bun run vm:start
 bun run vm:start --gui
@@ -76,7 +77,9 @@ bun run vm:reset
 The first-run provisioning command opens a native Virtualization.framework
 window for an official Ubuntu 24.04 LTS ARM64 installer. After the guest is
 installed and shut down, `vm:seal` promotes the retained installation disk to
-`base.img`. `vm:doctor` reports lazy first-run artifacts as `WAIT`; see
+`base.img`. If a boot-loader error points at EFI state, use the explicit
+`bun run vm:repair-efi` recovery command, which preserves the old EFI file and
+does not modify the disk. `vm:doctor` reports lazy first-run artifacts as `WAIT`; see
 [docs/vm-setup.md](docs/vm-setup.md).
 
 `vm:start --gui` starts the normal VM through the server with a resizable

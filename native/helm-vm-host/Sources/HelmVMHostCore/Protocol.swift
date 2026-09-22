@@ -28,6 +28,7 @@ struct GuestRequestEnvelope: Encodable {
 struct HostErrorPayload: Encodable {
     let code: String
     let message: String
+    let details: JSONValue?
 }
 
 struct HostResponse: Encodable {
@@ -77,13 +78,17 @@ final class JSONLWriter {
         write(HostResponse(id: id, ok: true, result: result, error: nil))
     }
 
-    func error(id: JSONValue, code: String, message: String) {
+    func error(id: JSONValue, failure: HostFailure) {
         write(
             HostResponse(
                 id: id,
                 ok: false,
                 result: nil,
-                error: HostErrorPayload(code: code, message: message)
+                error: HostErrorPayload(
+                    code: failure.code,
+                    message: failure.message,
+                    details: failure.details
+                )
             )
         )
     }

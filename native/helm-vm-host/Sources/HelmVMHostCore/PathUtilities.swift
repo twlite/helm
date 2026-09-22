@@ -1,6 +1,6 @@
 import Foundation
 
-func resolveHelmPath(_ value: String) -> URL {
+public func resolveHelmPath(_ value: String) -> URL {
     let expanded: String
     if value == "~" {
         expanded = FileManager.default.homeDirectoryForCurrentUser.path

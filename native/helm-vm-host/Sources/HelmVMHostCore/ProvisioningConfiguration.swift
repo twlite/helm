@@ -56,13 +56,15 @@ struct ProvisioningConfigurationBuilder {
         // A fresh EFI store is created specifically for this installer run.
         let bootLoader = VZEFIBootLoader()
         if options.resume {
-            bootLoader.variableStore = VZEFIVariableStore(url: options.efiVariablesURL)
+            bootLoader.variableStore = try HelmEFIVariableStore.loadExisting(
+                at: options.efiVariablesURL,
+                label: "existing provisioning EFI variable store"
+            )
         } else {
             // A fresh EFI store is created specifically for this installer run.
             // It is intentionally separate from Helm's normal runtime EFI state.
-            bootLoader.variableStore = try VZEFIVariableStore(
-                creatingVariableStoreAt: options.efiVariablesURL,
-                options: []
+            bootLoader.variableStore = try HelmEFIVariableStore.createAtomically(
+                at: options.efiVariablesURL
             )
         }
         configuration.bootLoader = bootLoader

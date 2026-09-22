@@ -15,6 +15,7 @@ public struct ProvisioningOptions {
     let installationImageURL: URL
     let efiVariablesURL: URL
     let machineIdentifierURL: URL
+    let stateLockURL: URL
     let runtimeShareURL: URL
     let runtimeTag: String
     let cpuCount: Int
@@ -159,6 +160,7 @@ public struct ProvisioningOptions {
             installationImageURL: resolvedInstallationImageURL,
             efiVariablesURL: resolvedEFIURL,
             machineIdentifierURL: resolvedMachineIdentifierURL,
+            stateLockURL: vmDirectoryURL.appendingPathComponent(".helm-vm.lock", isDirectory: false),
             runtimeShareURL: resolvedRuntimeURL,
             runtimeTag: runtimeTag,
             cpuCount: cpuCount,

@@ -411,11 +411,14 @@ export class VmController {
       throw new VmControllerError('VM_HELPER_MISSING', `VM helper not found at ${this.config.vmHelperPath}`);
     }
     const helperArguments = [
+      '--root', this.config.dataDir,
       '--base-image', this.config.baseImagePath,
       '--working-image', this.config.workingImagePath,
       '--efi-vars', this.config.efiVariablesPath,
+      '--machine-id', this.config.machineIdentifierPath,
       '--runtime-share', this.config.runtimeDir,
       '--runtime-tag', this.config.runtimeTag,
+      '--guest-port', String(this.config.guestPort),
       '--memory-mib', String(this.config.vmMemoryMb),
       '--cpus', String(this.config.vmCpus),
       ...(showWindow ? ['--show-window'] : []),

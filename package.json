@@ -28,6 +28,7 @@
     "vm:start": "bun scripts/vm-command.ts start",
     "vm:stop": "bun scripts/vm-command.ts stop",
     "vm:reset": "bun scripts/vm-command.ts reset",
+    "vm:repair-efi": "bun scripts/vm-repair-efi.ts",
     "vm:delete": "bun scripts/vm-delete.ts",
     "vm:maintenance": "bun scripts/vm-maintenance.ts",
     "demo": "bun scripts/demo.ts"

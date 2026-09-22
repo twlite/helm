@@ -120,11 +120,11 @@ struct VMConfigurationBuilder {
     private func loadOrCreateEFIVariableStore() throws -> VZEFIVariableStore {
         let fileManager = FileManager.default
         if fileManager.fileExists(atPath: options.efiVariablesURL.path) {
-            return VZEFIVariableStore(url: options.efiVariablesURL)
+            return try HelmEFIVariableStore.loadExisting(
+                at: options.efiVariablesURL,
+                label: "normal EFI variable store"
+            )
         }
-        return try VZEFIVariableStore(
-            creatingVariableStoreAt: options.efiVariablesURL,
-            options: []
-        )
+        return try HelmEFIVariableStore.createAtomically(at: options.efiVariablesURL)
     }
 }

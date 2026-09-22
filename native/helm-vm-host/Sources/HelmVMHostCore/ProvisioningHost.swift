@@ -13,6 +13,7 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
 
     private let options: ProvisioningOptions
     private let configuration: VZVirtualMachineConfiguration
+    private let lifecycleLock: HelmVMLifecycleLock
     private var virtualMachine: VZVirtualMachine?
     private var window: NSWindow?
     private var virtualMachineView: VZVirtualMachineView?
@@ -21,9 +22,14 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
     private var terminationReplyPending = false
     private(set) var exitCode = 0
 
-    private init(options: ProvisioningOptions, configuration: VZVirtualMachineConfiguration) {
+    private init(
+        options: ProvisioningOptions,
+        configuration: VZVirtualMachineConfiguration,
+        lifecycleLock: HelmVMLifecycleLock
+    ) {
         self.options = options
         self.configuration = configuration
+        self.lifecycleLock = lifecycleLock
         super.init()
     }
 
@@ -31,9 +37,14 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
         // Validate and prepare all host-side resources before entering the
         // AppKit event loop. CLI failures must return normally even when no
         // window can be created.
+        let lifecycleLock = try HelmVMLifecycleLock(url: options.stateLockURL)
         let configuration = try ProvisioningConfigurationBuilder(options: options).makeConfiguration()
         let application = NSApplication.shared
-        let host = ProvisioningHost(options: options, configuration: configuration)
+        let host = ProvisioningHost(
+            options: options,
+            configuration: configuration,
+            lifecycleLock: lifecycleLock
+        )
         activeHost = host
         host.writeDiagnostic("resolved runtime directory: \(options.runtimeShareURL.path)")
         host.writeDiagnostic("VirtioFS tag: \(options.runtimeTag)")
@@ -63,9 +74,7 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
             DispatchQueue.main.async {
                 guard let self else { return }
                 if case .failure(let error) = result {
-                    self.finishWithError(
-                        HostFailure(code: "vm_start_failed", message: error.localizedDescription)
-                    )
+                    self.finishWithError(hostFailure(from: error))
                     return
                 }
                 self.statusField?.stringValue = self.options.resume
@@ -140,7 +149,7 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
     public func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         exitCode = 1
         statusField?.stringValue = "VM stopped with an error. The installation disk was retained."
-        writeDiagnostic("The provisioning VM stopped with an error: \(error.localizedDescription)")
+        writeDiagnostic("The provisioning VM stopped with an error: \(diagnosticText(for: error))")
         if isTerminating {
             completeTermination()
         }
@@ -231,7 +240,7 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
                 statusField?.stringValue = "Asking Ubuntu to shut down. The provisioning disk will be retained."
                 return false
             } catch {
-                writeDiagnostic("Graceful guest shutdown was unavailable; stopping the VM directly: \(error.localizedDescription)")
+                writeDiagnostic("Graceful guest shutdown was unavailable; stopping the VM directly: \(diagnosticText(for: error))")
             }
         }
 
@@ -247,7 +256,7 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
                 guard let self else { return }
                 if let error {
                     self.exitCode = 1
-                    self.writeDiagnostic("Unable to stop the provisioning VM: \(error.localizedDescription)")
+                    self.writeDiagnostic("Unable to stop the provisioning VM: \(self.diagnosticText(for: error))")
                 }
                 self.completeTermination()
             }
@@ -267,5 +276,13 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
     private func writeDiagnostic(_ message: String) {
         let output = "helm-vm-host provisioning: \(message)\n"
         FileHandle.standardError.write(Data(output.utf8))
+    }
+
+    private func diagnosticText(for error: Error) -> String {
+        let failure = hostFailure(from: error)
+        let encodedDetails = (try? JSONEncoder().encode(failure.jsonValue))
+            .flatMap { String(data: $0, encoding: .utf8) }
+            ?? failure.message
+        return encodedDetails
     }
 }

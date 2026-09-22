@@ -2,6 +2,7 @@ import { copyFile, link, mkdir, readFile, rename, stat, unlink } from 'node:fs/p
 import { dirname, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { loadConfig } from '../apps/server/src/config';
+import { isVmRunning } from '../apps/server/src/vm/vm-delete';
 
 type FileState = 'missing' | 'invalid' | 'valid';
 
@@ -89,16 +90,10 @@ async function removeFileIfPresent(path: string): Promise<void> {
   }
 }
 
-async function ensureNormalVmStopped(config: ReturnType<typeof loadConfig>): Promise<void> {
-  const serverUrl = process.env.HELM_SERVER_URL ?? `http://${config.host}:${config.port}`;
-  const response = await fetch(`${serverUrl}/api/vm/status`, {
-    signal: AbortSignal.timeout(750),
-  }).catch(() => undefined);
-  if (!response?.ok) return;
 
-  const body = await response.json().catch(() => undefined) as { state?: unknown } | undefined;
-  if (body?.state === 'running' || body?.state === 'starting' || body?.state === 'stopping') {
-    throw new Error(`The normal VM is ${String(body.state)}. Run bun run vm:stop before sealing with --force.`);
+async function ensureVmStopped(config: ReturnType<typeof loadConfig>): Promise<void> {
+  if (await isVmRunning(config)) {
+    throw new Error('A Helm VM host is active. Stop it before sealing VM state.');
   }
 }
 
@@ -134,6 +129,7 @@ if (
 
 try {
   await ensureProvisioningFinished(resolve(config.provisioningLockPath));
+  await ensureVmStopped(config);
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
@@ -190,15 +186,6 @@ if (normalStateOtherThanMachineIdentifier.length > 0 && !force) {
   console.error('Stop the normal VM, then rerun `bun run vm:seal --force` to replace the base and clear stale working state.');
   process.exit(1);
 }
-if (force && existingNormalArtifacts.length > 0) {
-  try {
-    await ensureNormalVmStopped(config);
-  } catch (error) {
-    console.error(error instanceof Error ? error.message : String(error));
-    process.exit(1);
-  }
-}
-
 await mkdir(dirname(basePath), { recursive: true });
 if (normalEfiPath === basePath || provisioningEfiPath === basePath) {
   console.error('The EFI store and base image must be stored at different paths.');
@@ -216,7 +203,7 @@ try {
 if (force) {
   try {
     for (const artifact of normalArtifacts) {
-      if (artifact.path === normalEfiPath) continue;
+      if (artifact.path === normalEfiPath || artifact.path === resolve(config.machineIdentifierPath)) continue;
       await removeFileIfPresent(artifact.path);
     }
   } catch (error) {
@@ -229,5 +216,5 @@ console.log(`${baseState === 'valid' ? 'Replaced' : 'Created'} Helm base image: 
 console.log(`Copied provisioning EFI state to: ${normalEfiPath}`);
 console.log(`Source provisioning disk retained: ${sourcePath}`);
 if (force && existingNormalArtifacts.length > 0) {
-  console.log('Cleared existing normal working state; the next VM start will use the sealed base image.');
+  console.log('Cleared existing normal working disk; the next VM start will use the sealed base image and preserved VM identity.');
 }

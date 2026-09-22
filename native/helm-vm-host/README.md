@@ -50,7 +50,8 @@ The default root is:
 │   ├── machine-id.bin    # persistent provisioning/normal VM identifier
 │   ├── provisioning.img  # interactive installer disk
 │   ├── provisioning-efi-vars.bin
-│   └── provisioning.lock # transient; owned by bun run vm:provision
+│   ├── provisioning.lock # transient; owned by bun run vm:provision
+│   └── .helm-vm.lock     # native lifecycle lock
 └── runtime/              # shared into the guest read-only
 ```
 
@@ -72,9 +73,17 @@ provisioning refuses existing provisioning state unless `--force` is supplied.
 If `disk.img` is missing, the normal host copies `base.img` to it. If
 `efi-vars.bin` is missing, the normal host creates it with
 `VZEFIVariableStore(creatingVariableStoreAt:options:)`. `vm.reset` stops the
-VM, replaces the working image from the base image, preserves the EFI boot
-state, and clears the generic machine identifier. It never writes to
-`base.img`.
+VM, replaces the working image from the base image, and preserves the paired
+generic machine identifier and EFI boot state. It never writes to `base.img`.
+The native host takes an exclusive lifecycle lock for the duration of each
+VM owner process, so maintenance, provisioning, sealing, and EFI repair
+cannot concurrently mutate persistent VM state.
+
+If the framework reports an invalid boot loader, use the explicit repository
+command `bun run vm:repair-efi`. It preserves the existing EFI file as a
+`.bak` backup and replaces only the EFI variable store; it never modifies a
+guest disk. Normal startup creates a missing EFI store lazily, but it never
+recreates an existing store.
 
 Override paths with the command-line options shown by `--help`, or with the
 corresponding `HELM_VM_*` environment variables. The runtime VirtioFS tag is
