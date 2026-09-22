@@ -9,7 +9,7 @@ import type {
 } from '@helm/shared';
 
 import { AgentRuntime } from '../../src/agent/runtime';
-import { objectiveForRequirement, ScriptedOrchestratorProvider } from '../../src/agent/orchestrator';
+import { deterministicObjectiveAction, objectiveForRequirement, ScriptedOrchestratorProvider } from '../../src/agent/orchestrator';
 import { createTaskState, progressFingerprint } from '../../src/agent/task-state';
 import type { WorkerContext, WorkerProvider } from '../../src/agent/types';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
@@ -105,6 +105,181 @@ function runtimeFor(
 }
 
 describe('orchestrated agent loop', () => {
+  it('gives browserResearch a deterministic navigate-then-extract action', () => {
+    const task = taskWithRequirements({
+      id: 'deterministic-browser-research',
+      requirements: [
+        { id: 'browserDestination', description: 'Reach the requested page.', type: 'browser', mandatory: true, target: { url: 'https://twlite.dev' } },
+        { id: 'browserResearch', description: 'Collect readable page content.', type: 'fact', mandatory: true, target: { factId: 'pageContent' } },
+      ],
+    });
+    const state = createTaskState(task);
+    const research = objectiveForRequirement(state, { timestamp: 1, task: { completedCriteria: [], remainingCriteria: ['browserResearch'] } }, 'browserResearch');
+    if (!research) throw new Error('Expected a browser research objective.');
+
+    expect(deterministicObjectiveAction(state, {
+      timestamp: 1,
+      browser: { url: 'https://twlite.dev', loaded: true },
+      task: { completedCriteria: [], remainingCriteria: ['browserResearch'] },
+    }, research)).toMatchObject({ tool: 'browser.extractText', input: {} });
+    expect(deterministicObjectiveAction(state, {
+      timestamp: 1,
+      browser: { url: 'about:blank', loaded: true },
+      task: { completedCriteria: [], remainingCriteria: ['browserDestination', 'browserResearch'] },
+    }, research)).toMatchObject({ tool: 'browser.navigate', input: { url: 'https://twlite.dev' } });
+  });
+
+  it('treats a successful redirect as the requested browser destination', async () => {
+    const sourceUrl = 'https://github.com/twlite.png';
+    const finalUrl = 'https://avatars.githubusercontent.com/u/123456?v=4';
+    const guest = new MockGuestTransport({
+      redirects: { [sourceUrl]: finalUrl },
+      pages: { [finalUrl]: '<html><body><p>profile image</p></body></html>' },
+    });
+    const destination = objective('redirect-destination', 'browser', 'Reach the requested image URL.', 'browserDestination');
+    const worker = new FunctionalWorker([async context => {
+      const action = await executeAction(context, 'browser.navigate', { url: sourceUrl }, 'navigate');
+      return {
+        status: 'completed',
+        worker: 'browser',
+        objectiveId: context.objective.id,
+        actions: [action],
+        facts: [],
+        evidence: [],
+        artifacts: [],
+        blockers: [],
+        environmentChanged: true,
+      };
+    }]);
+    const result = await runtimeFor(guest, [{ type: 'objective', objective: destination }], worker, { maxSteps: 1 }).run({
+      threadId: 'redirect-destination-thread',
+      userMessage: `Open ${sourceUrl}.`,
+      task: taskWithRequirements({
+        id: 'redirect-destination-task',
+        threadId: 'redirect-destination-thread',
+        goal: 'Reach the requested image URL.',
+        originalRequest: `Open ${sourceUrl}.`,
+        requirements: [{
+          id: 'browserDestination',
+          description: 'Reach the URL explicitly supplied by the user.',
+          type: 'browser',
+          mandatory: true,
+          target: { url: sourceUrl },
+        }],
+      }),
+    });
+
+    expect(result.status).toBe('completed');
+    expect(guest.browserState.url).toBe(finalUrl);
+    expect(result.run.state?.completedRequirementIds).toContain('browserDestination');
+    const workerActions = result.steps
+      .filter(step => step.phase === 'act')
+      .flatMap(step => step.workerResult?.actions ?? []);
+    expect(workerActions).toHaveLength(1);
+    expect(workerActions[0]?.result).toMatchObject({
+      data: { url: finalUrl },
+      evidence: { receipt: { effect: { requestedUrl: sourceUrl, urlAfter: finalUrl, redirected: true } } },
+    });
+  });
+
+  it('gives page-to-file objectives deterministic write and viewer actions', () => {
+    const task = taskWithRequirements({
+      id: 'page-file-task',
+      threadId: 'page-file-thread',
+      requirements: [
+        {
+          id: 'browserDestination',
+          description: 'Reach the requested page.',
+          type: 'browser',
+          mandatory: true,
+          target: { url: 'https://twlite.dev' },
+        },
+        {
+          id: 'outputDirectory',
+          description: 'Create the requested output directory.',
+          type: 'filesystem',
+          mandatory: true,
+          target: { path: '~/Desktop', mode: 'exists' },
+        },
+        {
+          id: 'outputFile',
+          description: 'Write the observed page content.',
+          type: 'filesystem',
+          mandatory: true,
+          target: { path: '~/Desktop/twlite.md', mode: 'contains-facts', factIds: ['pageContent'] },
+        },
+        {
+          id: 'openFile',
+          description: 'Open the requested file in the text viewer.',
+          type: 'desktop',
+          mandatory: true,
+          target: { path: '~/Desktop/twlite.md', content: 'twlite.md' },
+        },
+      ],
+    });
+    const state = createTaskState(task);
+    state.facts.push(fact('pageContent', 'The observed twlite page.', 'receipt-extract'));
+    const outputObjective = objectiveForRequirement(
+      state,
+      { timestamp: 1, task: { completedCriteria: [], remainingCriteria: ['outputFile'] } },
+      'outputFile',
+    );
+    const destinationObjective = objectiveForRequirement(
+      state,
+      { timestamp: 1, task: { completedCriteria: [], remainingCriteria: ['browserDestination'] } },
+      'browserDestination',
+    );
+    const directoryObjective = objectiveForRequirement(
+      state,
+      { timestamp: 1, task: { completedCriteria: [], remainingCriteria: ['outputDirectory'] } },
+      'outputDirectory',
+    );
+    const openObjective = objectiveForRequirement(
+      state,
+      { timestamp: 1, task: { completedCriteria: [], remainingCriteria: ['openFile'] } },
+      'openFile',
+    );
+    if (!outputObjective || !openObjective || !destinationObjective || !directoryObjective) throw new Error('Expected page-to-file objectives.');
+
+    expect(deterministicObjectiveAction(state, {
+      timestamp: 1,
+      browser: { url: 'about:blank', loaded: true },
+      task: { completedCriteria: [], remainingCriteria: ['browserDestination'] },
+    }, destinationObjective)).toMatchObject({
+      tool: 'browser.navigate',
+      input: { url: 'https://twlite.dev' },
+    });
+    expect(deterministicObjectiveAction(state, {
+      timestamp: 1,
+      task: { completedCriteria: [], remainingCriteria: ['outputDirectory'] },
+    }, directoryObjective)).toMatchObject({
+      tool: 'fs.mkdir',
+      input: { path: '~/Desktop' },
+    });
+
+    expect(deterministicObjectiveAction(state, {
+      timestamp: 1,
+      desktop: { windows: [] },
+      task: { completedCriteria: [], remainingCriteria: ['outputFile'] },
+    }, outputObjective)).toMatchObject({
+      tool: 'fs.write',
+      input: { path: '~/Desktop/twlite.md', content: 'The observed twlite page.' },
+    });
+    expect(deterministicObjectiveAction(state, {
+      timestamp: 1,
+      desktop: { windows: [] },
+      task: { completedCriteria: [], remainingCriteria: ['openFile'] },
+    }, openObjective)).toMatchObject({
+      tool: 'app.openFile',
+      input: { path: '~/Desktop/twlite.md' },
+    });
+    expect(deterministicObjectiveAction(state, {
+      timestamp: 1,
+      desktop: { windows: [{ id: 'text-editor', title: 'twlite.md - Text Editor', focused: true }] },
+      task: { completedCriteria: [], remainingCriteria: ['openFile'] },
+    }, openObjective)).toBeUndefined();
+  });
+
   it('recovers when the orchestrator mistakes an unmet browser requirement for a blocker', async () => {
     const guest = new MockGuestTransport();
     const worker = new FunctionalWorker([async context => {

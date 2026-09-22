@@ -68,6 +68,33 @@ artifacts, blockers, and a suggested next information field. `done` means only
 that the worker is handing its objective back to the orchestrator; there is no
 worker action for completing the entire task.
 
+Mechanical objective actions are enforced at the worker boundary when the
+compiled requirement makes them unambiguous. For a page-to-file request, the
+browser worker is forced through this dependency chain:
+
+```text
+source not open -> browser.navigate(source)
+source open     -> browser.extractText()
+pageContent fact observed -> fs.write(requested path, pageContent)
+file written    -> app.openFile(requested path) when the viewer is required
+```
+
+The model may still provide the short operational reasoning and handle
+ambiguous flows, but `done`, `blocked`, or a repeated `browser.snapshot` cannot
+substitute for the required extraction. A successful required action is
+accepted only from its actual tool result. A single-page-content output is
+written from the trusted observed fact, which keeps this common workflow from
+depending on the model to retype or invent the page contents.
+
+Navigation is redirect-aware. The guest returns the final browser URL after
+Playwright follows HTTP redirects, and the host receipt records both
+`requestedUrl` and `urlAfter` plus a `redirected` flag. The worker and verifier
+use that successful navigation evidence as an alias for the requested URL
+while the final page remains open. They therefore inspect or continue from the
+redirect target instead of navigating to the original URL again. A redirect
+does not by itself claim that page content is useful: content and other task
+requirements are still verified from the final page.
+
 Worker permissions are narrow:
 
 - browser workers can use `browser.*`;
@@ -98,12 +125,22 @@ opened directly. A research worker must inspect the results page and then read
 the selected source page; opening a search URL alone does not satisfy the
 research requirement.
 
+All browser operations use the existing typed guest RPC surface. There is no
+second Playwright MCP transport to coordinate. The guest applies a watchdog to
+`browser.getState`, `browser.snapshot`, and `browser.extractText`; a timeout
+resets the Playwright context and returns a typed error so the worker can
+recover. The host tool boundary does not add redundant browser state reads
+around those observation methods. This prevents a stuck page evaluation from
+holding the guest JSONL request queue indefinitely and turning a recoverable
+browser error into an apparently frozen VM.
+
 ## 4. Action receipts and evidence
 
 The host-side guest tool wrapper records an `ActionReceipt` for every guest
 call. Receipts include success/failure, timestamps, and effects such as:
 
-- URL before/after, navigation, new-tab, and DOM-fingerprint changes;
+- requested URL, final URL after redirects, redirect status, navigation,
+  new-tab, and DOM-fingerprint changes;
 - filesystem path, existence before/after, bytes, and SHA-256 for writes;
 - download started, source URL, final URL, suggested filename, saved path,
   size, and browser context.
@@ -152,6 +189,13 @@ requirement is complete” is treated as procedural guidance when it references
 an unmet actionable requirement. Helm records that response for diagnostics and
 continues with the deterministic fallback objective. Missing user input,
 permission, safety, and policy blockers remain terminal.
+
+The same recovery rule applies when a worker model returns a premature `done`
+or `blocked` response for a deterministic page-content objective. The worker
+replaces that response with the required navigate/extract action, records the
+real receipt, and stops with a concrete blocker only if that action fails or
+returns an empty page. Repeated failures remain bounded by the worker and
+runtime recovery budgets.
 
 Final replies are evidence-grounded. Successful `fs.read`, `fs.write`, and
 `app.openFile` actions are rendered directly from their receipts, so a missing

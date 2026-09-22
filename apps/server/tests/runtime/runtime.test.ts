@@ -90,6 +90,45 @@ describe('AgentRuntime', () => {
     expect(tools.invocations.filter(invocation => invocation.tool === 'browser.snapshot')).toHaveLength(1);
   });
 
+  it('continues from a redirected page instead of repeating the source URL', async () => {
+    const sourceUrl = 'https://github.com/twlite.png';
+    const finalUrl = 'https://avatars.githubusercontent.com/u/123456?v=4';
+    const guest = new MockGuestTransport({
+      redirects: { [sourceUrl]: finalUrl },
+      pages: { [finalUrl]: '<html><body><p>profile image page</p></body></html>' },
+    });
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: new ScriptedDecisionProvider([
+        { type: 'action', tool: 'browser.navigate', input: { url: sourceUrl } },
+        // This repeated source navigation is rewritten to extractText because
+        // the first navigation already reached its redirect target.
+        { type: 'action', tool: 'browser.navigate', input: { url: sourceUrl } },
+        { type: 'complete' },
+      ]),
+    });
+
+    const result = await runtime.run({
+      threadId: 'redirect-research-thread',
+      userMessage: `Open ${sourceUrl} and read the page.`,
+      task: browserResearchTask({
+        threadId: 'redirect-research-thread',
+        userMessage: `Open ${sourceUrl} and read the page.`,
+      }),
+    });
+
+    expect(result.status).toBe('completed');
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.navigate').map(invocation => invocation.input)).toEqual([
+      { url: sourceUrl },
+    ]);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.extractText')).toHaveLength(1);
+    expect(result.steps.some(step => step.toolName === 'browser.extractText')).toBe(true);
+  });
+
   it('answers conversational plans without executing computer-use tools', async () => {
     const guest = new MockGuestTransport();
     const tools = createGuestToolRegistry(guest);

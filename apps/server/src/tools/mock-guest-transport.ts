@@ -35,6 +35,8 @@ const EMPTY_PNG_DATA_URL =
 export interface MockGuestOptions {
   initialFiles?: Record<string, string>;
   pages?: Record<string, string>;
+  /** Deterministic HTTP redirect map used by browser navigation tests. */
+  redirects?: Record<string, string>;
   delayMs?: number;
   downloads?: Record<string, { finalUrl?: string; filename: string; content?: string; context?: string }>;
 }
@@ -153,6 +155,7 @@ export class MockGuestTransport implements GuestTransport {
   private readonly files = new Map<string, string>();
   private readonly directories = new Set<string>([MOCK_GUEST_ROOT]);
   private readonly pages: Record<string, string>;
+  private readonly redirects: Record<string, string>;
   private readonly delayMs: number;
   private readonly downloads: Record<string, { finalUrl?: string; filename: string; content?: string; context?: string }>;
   private readonly windows = new Map<string, WindowInfo>();
@@ -168,6 +171,7 @@ export class MockGuestTransport implements GuestTransport {
   constructor(options: MockGuestOptions = {}) {
     this.delayMs = Math.max(0, options.delayMs ?? 0);
     this.pages = { ...(options.pages ?? {}) };
+    this.redirects = { ...(options.redirects ?? {}) };
     this.downloads = options.downloads ?? {};
     this.files.set(DEMO_PAGE_PATH, DEMO_PAGE_HTML);
     this.addDirectoryParents(DEMO_PAGE_PATH);
@@ -334,9 +338,15 @@ export class MockGuestTransport implements GuestTransport {
         } as GuestMethodResult[M];
       }
       case 'browser.navigate': {
-        const url = (params as GuestMethodParams['browser.navigate']).url;
+        const requestedUrl = (params as GuestMethodParams['browser.navigate']).url;
+        let url = requestedUrl;
+        const visited = new Set<string>();
+        while (this.redirects[url] && !visited.has(url)) {
+          visited.add(url);
+          url = this.redirects[url] as string;
+        }
         const path = pathFromFileUrl(url);
-        const html = path ? this.files.get(path) : this.pages[url];
+        const html = path ? this.files.get(path) : this.pages[url] ?? this.pages[requestedUrl];
         if (path && html === undefined) {
           throw new GuestTransportError('PAGE_NOT_FOUND', `Page does not exist: ${path}`);
         }

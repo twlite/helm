@@ -159,14 +159,29 @@ export class CriterionVerifierRegistry {
   }
 
   private registerDefaultVerifiers(): void {
-    this.register('browser.url', async criterion => {
+    this.register('browser.url', async (criterion, context) => {
       const guest = this.requireGuest();
       const state = await guest.request('browser.getState', {});
-      const passed = browserUrlsMatch(state.url, criterion.url);
+      const resultData = recordValue(context.lastToolResult?.data);
+      const resultEvidence = recordValue(context.lastToolResult?.evidence);
+      const receipt = recordValue(resultEvidence?.receipt);
+      const effect = recordValue(receipt?.effect);
+      const requestedUrl = effect?.requestedUrl;
+      const finalUrl = resultData?.url;
+      const followedRedirect = context.lastToolResult?.ok === true
+        && typeof requestedUrl === 'string'
+        && typeof finalUrl === 'string'
+        && browserUrlsMatch(requestedUrl, criterion.url)
+        && browserUrlsMatch(state.url, finalUrl);
+      const passed = browserUrlsMatch(state.url, criterion.url) || followedRedirect;
       return {
         passed,
-        message: passed ? `Browser URL is ${criterion.url}.` : `Browser URL is not ${criterion.url}.`,
-        evidence: state,
+        message: passed
+          ? followedRedirect
+            ? `Browser followed the redirect from ${criterion.url} to ${state.url}.`
+            : `Browser URL is ${criterion.url}.`
+          : `Browser URL is not ${criterion.url}.`,
+        evidence: followedRedirect ? { state, requestedUrl, finalUrl } : state,
       };
     });
 

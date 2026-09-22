@@ -10,7 +10,12 @@ import type {
 } from '@helm/shared';
 
 import type { OrchestratorContext, OrchestratorProvider, WorkerContext, WorkerProvider } from './types';
-import { requirementsForTask } from './task-state';
+import {
+  browserDestinationReached,
+  requirementsForTask,
+  trustedFact,
+  type BrowserNavigationResolution,
+} from './task-state';
 
 function workerKind(requirement: TaskRequirement): WorkerKind {
   if (requirement.type === 'browser' || requirement.type === 'artifact') return 'browser';
@@ -52,6 +57,184 @@ export function objectiveForRequirement(
 export function fallbackObjective(state: TaskState, observation: EnvironmentObservation): WorkerObjective | undefined {
   const pending = requirementsForTask(state.task).find(requirement => !state.completedRequirementIds.includes(requirement.id));
   return pending ? objectiveForRequirement(state, observation, pending.id) : undefined;
+}
+
+export interface DeterministicObjectiveAction {
+  tool: 'browser.navigate' | 'browser.extractText' | 'fs.mkdir' | 'fs.write' | 'app.openFile';
+  input: Record<string, unknown>;
+  reasoningSummary: string;
+}
+
+function readableBrowserUrl(value: string | undefined): boolean {
+  return value !== undefined && /^(?:https?|file):\/\//iu.test(value);
+}
+
+function fileNameFromPath(value: string): string {
+  return value.split(/[\\/]/u).at(-1) ?? value;
+}
+
+function factValueText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === null || typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function factLabel(id: string): string {
+  const labels: Record<string, string> = {
+    repositoryName: 'Repository',
+    latestReleaseVersion: 'Latest release version',
+    releaseDate: 'Release date',
+    releaseUrl: 'Release URL',
+    currentDate: 'Current date',
+  };
+  return labels[id] ?? id.replace(/([a-z])([A-Z])/gu, '$1 $2').replace(/^./u, value => value.toLocaleUpperCase());
+}
+
+/**
+ * Some objectives have a mechanical first action that must not be delegated
+ * to a model guess. Page-content research is one of those objectives: a
+ * snapshot is useful perception, but it is not the page-content evidence that
+ * can satisfy the requirement.
+ */
+export function deterministicObjectiveAction(
+  state: TaskState,
+  observation: EnvironmentObservation,
+  objective: WorkerObjective,
+  navigationResolutions: readonly BrowserNavigationResolution[] = [],
+): DeterministicObjectiveAction | undefined {
+  const requirements = requirementsForTask(state.task);
+  const browserDestinationRequirement = requirements.find(requirement => (
+    objective.requirementIds.includes(requirement.id)
+    && requirement.type === 'browser'
+    && typeof requirement.target?.url === 'string'
+  ));
+  if (browserDestinationRequirement) {
+    const destinationUrl = browserDestinationRequirement.target?.url as string;
+    if (!browserDestinationReached(
+      observation.browser?.url,
+      destinationUrl,
+      state.recentActions,
+      navigationResolutions,
+    )) {
+      return {
+        tool: 'browser.navigate',
+        input: { url: destinationUrl },
+        reasoningSummary: 'Opening the URL explicitly requested by the user.',
+      };
+    }
+  }
+
+  const pageContentRequirement = requirements.find(requirement => (
+    objective.requirementIds.includes(requirement.id)
+    && requirement.target?.factId === 'pageContent'
+  ));
+  if (pageContentRequirement) {
+    const destination = requirements.find(requirement => (
+      requirement.type === 'browser'
+      && typeof requirement.target?.url === 'string'
+    ));
+    const destinationUrl = typeof destination?.target?.url === 'string' ? destination.target.url : undefined;
+    const currentUrl = observation.browser?.url;
+    const pageIsOpen = readableBrowserUrl(currentUrl);
+    const pageIsDestination = destinationUrl === undefined
+      ? pageIsOpen
+      : browserDestinationReached(
+        currentUrl,
+        destinationUrl,
+        state.recentActions,
+        navigationResolutions,
+      );
+
+    if (destinationUrl !== undefined && (!pageIsOpen || !pageIsDestination)) {
+      return {
+        tool: 'browser.navigate',
+        input: { url: destinationUrl },
+        reasoningSummary: 'Opening the compiled research source before extracting its contents.',
+      };
+    }
+
+    if (pageIsOpen && pageIsDestination) {
+      return {
+        tool: 'browser.extractText',
+        input: {},
+        reasoningSummary: 'Extracting readable page content for the browserResearch requirement.',
+      };
+    }
+  }
+
+  const outputDirectoryRequirement = requirements.find(requirement => (
+    objective.requirementIds.includes(requirement.id)
+    && requirement.id === 'outputDirectory'
+    && requirement.type === 'filesystem'
+    && requirement.target?.mode === 'exists'
+    && typeof requirement.target.path === 'string'
+  ));
+  if (outputDirectoryRequirement) {
+    return {
+      tool: 'fs.mkdir',
+      input: { path: outputDirectoryRequirement.target?.path },
+      reasoningSummary: 'Creating the requested output directory.',
+    };
+  }
+
+  const outputFileRequirement = requirements.find(requirement => (
+    objective.requirementIds.includes(requirement.id)
+    && requirement.type === 'filesystem'
+    && requirement.target?.mode === 'contains-facts'
+    && typeof requirement.target.path === 'string'
+  ));
+  if (outputFileRequirement) {
+    const factIds = outputFileRequirement.target?.factIds ?? [];
+    const facts = factIds.map(id => trustedFact(state.facts, id));
+    if (factIds.length === 1 && factIds[0] === 'pageContent' && typeof facts[0]?.value === 'string') {
+      return {
+        tool: 'fs.write',
+        input: {
+          path: outputFileRequirement.target?.path,
+          content: facts[0].value,
+        },
+        reasoningSummary: 'Writing the observed page content to the requested output file.',
+      };
+    }
+    if (factIds.length > 0 && facts.every(fact => fact !== undefined)) {
+      return {
+        tool: 'fs.write',
+        input: {
+          path: outputFileRequirement.target?.path,
+          content: facts.map((fact, index) => `${factLabel(factIds[index])}: ${factValueText(fact?.value)}`).join('\n'),
+        },
+        reasoningSummary: 'Writing the trusted observed facts to the requested output file.',
+      };
+    }
+  }
+
+  const openFileRequirement = requirements.find(requirement => (
+    objective.requirementIds.includes(requirement.id)
+    && requirement.id === 'openFile'
+    && requirement.type === 'desktop'
+    && typeof requirement.target?.path === 'string'
+  ));
+  if (openFileRequirement) {
+    const path = openFileRequirement.target?.path as string;
+    const fileName = fileNameFromPath(path).toLocaleLowerCase();
+    const alreadyOpen = observation.desktop?.windows?.some(window => (
+      typeof window.title === 'string'
+      && window.title.toLocaleLowerCase().includes(fileName)
+    )) ?? false;
+    if (!alreadyOpen) {
+      return {
+        tool: 'app.openFile',
+        input: { path },
+        reasoningSummary: 'Opening the requested file in the text viewer.',
+      };
+    }
+  }
+
+  return undefined;
 }
 
 function normalizedWords(value: string): string[] {
@@ -98,10 +281,12 @@ export function recoverOrchestratorBlocker(
   }
 
   const referencesRequirement = pending.some(requirement => hasRequirementReference(reason, requirement));
-  const describesPendingWork = /\b(?:cannot|can't|unable|need|needs|must|required|before|first|complete|perform|do|read|extract|research|collect|observe|inspect|open|navigate|use)\b/iu.test(reason);
-  if (!referencesRequirement || !describesPendingWork) return undefined;
-
   const objective = fallbackObjective(state, observation);
+  const describesPendingWork = /\b(?:cannot|can't|unable|need|needs|must|required|before|first|complete|perform|do|read|extract|research|collect|observe|inspect|open|navigate|use|blocked|stuck|unavailable|failed|error|retry)\b/iu.test(reason);
+  const hasDeterministicRecovery = objective !== undefined
+    && deterministicObjectiveAction(state, observation, objective) !== undefined;
+  if ((!referencesRequirement || !describesPendingWork) && !hasDeterministicRecovery) return undefined;
+
   return objective
     ? {
       type: 'objective',

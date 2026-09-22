@@ -1,4 +1,4 @@
-import { guestMethodSchemas } from '@helm/shared';
+import { browserUrlsMatch, guestMethodSchemas } from '@helm/shared';
 import type { ActionReceipt, GuestMethod, ToolError, ToolResult } from '@helm/shared';
 import { z } from 'zod';
 
@@ -69,7 +69,7 @@ async function boundarySnapshot(
   signal: AbortSignal,
 ): Promise<BoundarySnapshot> {
   const snapshot: BoundarySnapshot = {};
-  if (method.startsWith('browser.')) {
+  if (method.startsWith('browser.') && !['browser.extractText', 'browser.snapshot', 'browser.getState'].includes(method)) {
     try {
       const state = await guest.request('browser.getState', {}, { signal });
       snapshot.browser = { url: state.url, title: state.title, pageCount: state.pageCount, domFingerprint: state.domFingerprint };
@@ -122,10 +122,16 @@ function receiptEffect(
     : undefined;
   const effect: ActionReceipt['effect'] = {};
   if (before.browser || after.browser) {
+    if (method === 'browser.navigate' && typeof input.url === 'string') {
+      effect.requestedUrl = input.url;
+    }
     const urlBefore = before.browser?.url;
     const urlAfter = after.browser?.url ?? (typeof dataRecord?.url === 'string' ? dataRecord.url : undefined);
     effect.urlBefore = urlBefore;
     effect.urlAfter = urlAfter;
+    if (method === 'browser.navigate' && typeof input.url === 'string' && urlAfter !== undefined) {
+      effect.redirected = !browserUrlsMatch(urlAfter, input.url);
+    }
     effect.navigationOccurred = Boolean(urlBefore && urlAfter && urlBefore !== urlAfter);
     effect.newTabOpened = (after.browser?.pageCount ?? 1) > (before.browser?.pageCount ?? 1);
     effect.domChanged = Boolean(

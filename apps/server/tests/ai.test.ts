@@ -1,6 +1,7 @@
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { asSchema, embed, type EmbeddingModel } from 'ai';
 import { describe, expect, it } from 'bun:test';
+import { z } from 'zod';
 import type { AgentTurnContext, EnvironmentObservation, TaskDefinition } from '@helm/shared';
 
 import { createTaskState } from '../src/agent/task-state';
@@ -21,6 +22,7 @@ import {
   AiSdkResponseGenerator,
   AiSdkTaskPlanner,
   AiSdkThreadTitleGenerator,
+  AiSdkWorker,
   aiTaskPlanSchema,
   aiDecisionSchema,
 } from '../src/ai/adapter';
@@ -586,6 +588,21 @@ describe('LM Studio AI adapters', () => {
       }),
     ]));
 
+    const combinedTask = await planner.createTask({
+      threadId: 'combined-page-to-file-thread',
+      userMessage: 'go to https://twlite.dev and save the content in a twlite.md file and open it via text viewer app',
+    });
+    expect(combinedTask.requirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'outputFile',
+        target: { path: 'twlite.md', mode: 'contains-facts', factIds: ['pageContent'] },
+      }),
+      expect.objectContaining({
+        id: 'openFile',
+        target: { path: 'twlite.md', content: 'twlite.md' },
+      }),
+    ]));
+
     const followUp = await planner.createTask({
       threadId: 'page-to-file-thread',
       userMessage: 'show me that text file using text viewer',
@@ -615,6 +632,293 @@ describe('LM Studio AI adapters', () => {
         target: { path: 'twlite.txt', content: 'twlite.txt' },
       }),
     ]));
+  });
+
+  it('forces a browserResearch worker to extract content instead of accepting done', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-browser-worker-done',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({ type: 'done', reasoningSummary: 'The page is open.' }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const task: TaskDefinition = {
+      id: 'browser-worker-task',
+      threadId: 'browser-worker-thread',
+      goal: 'Read the page.',
+      originalRequest: 'Go to https://twlite.dev and read the page.',
+      criteria: [],
+      requirements: [
+        { id: 'browserDestination', description: 'Reach the page.', type: 'browser', mandatory: true, target: { url: 'https://twlite.dev' } },
+        { id: 'browserResearch', description: 'Collect readable page content.', type: 'fact', mandatory: true, target: { factId: 'pageContent' } },
+      ],
+      constraints: [],
+    };
+    const state = createTaskState(task);
+    const observation: EnvironmentObservation = {
+      timestamp: 1,
+      browser: { url: 'https://twlite.dev', loaded: true },
+      task: { completedCriteria: ['browserDestination'], remainingCriteria: ['browserResearch'] },
+    };
+    const executed: string[] = [];
+    const worker = new AiSdkWorker({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      toolDefinitions: [{
+        name: 'browser.extractText',
+        description: 'Extract page text.',
+        inputSchema: z.object({}),
+        execute: async () => ({ ok: true }),
+      }],
+      maxOutputTokens: 256,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+
+    const result = await worker.execute({
+      objective: {
+        id: 'objective-browserResearch-0',
+        kind: 'browser',
+        description: 'Collect readable page content.',
+        requirementIds: ['browserResearch'],
+        rationale: 'test',
+      },
+      task,
+      state,
+      observation,
+      verification: { complete: false, criteria: [], requirements: [], summary: '0/2 requirements passed.' },
+      memories: [],
+      recentActions: [],
+      failedStrategies: [],
+      maxActions: 2,
+      execute: {
+        execute: async tool => {
+          executed.push(tool);
+          return {
+            ok: true,
+            data: { url: 'https://twlite.dev', title: 'Twilight', text: 'Helm makes local computer use useful.' },
+            evidence: { receipt: { id: 'receipt-browser-extract' } },
+          };
+        },
+        observe: async () => observation,
+      },
+    });
+
+    expect(executed).toEqual(['browser.extractText']);
+    expect(result.actions[0]?.tool).toBe('browser.extractText');
+    expect(result.status).toBe('completed');
+  });
+
+  it('continues from a redirect target instead of navigating the source URL again', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-redirect-worker-done',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({ type: 'done', reasoningSummary: 'The page is open.' }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 1 },
+      }),
+    });
+    const sourceUrl = 'https://github.com/twlite.png';
+    const finalUrl = 'https://avatars.githubusercontent.com/u/123456?v=4';
+    const task: TaskDefinition = {
+      id: 'redirect-worker-task',
+      threadId: 'redirect-worker-thread',
+      goal: 'Read the redirected page.',
+      originalRequest: `Go to ${sourceUrl} and read the page.`,
+      criteria: [],
+      requirements: [
+        { id: 'browserDestination', description: 'Reach the requested page.', type: 'browser', mandatory: true, target: { url: sourceUrl } },
+        { id: 'browserResearch', description: 'Collect readable page content.', type: 'fact', mandatory: true, target: { factId: 'pageContent' } },
+      ],
+      constraints: [],
+    };
+    const worker = new AiSdkWorker({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      toolDefinitions: [
+        { name: 'browser.navigate', description: 'Navigate the browser.', inputSchema: z.object({}) },
+        { name: 'browser.extractText', description: 'Extract page text.', inputSchema: z.object({}) },
+      ],
+      maxOutputTokens: 256,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    let currentUrl = 'about:blank';
+    const executed: string[] = [];
+    const result = await worker.execute({
+      objective: {
+        id: 'objective-redirect-browserResearch-0',
+        kind: 'browser',
+        description: 'Collect readable page content.',
+        requirementIds: ['browserResearch'],
+        rationale: 'test',
+      },
+      task,
+      state: createTaskState(task),
+      observation: {
+        timestamp: 1,
+        browser: { url: currentUrl, loaded: true },
+        task: { completedCriteria: [], remainingCriteria: ['browserDestination', 'browserResearch'] },
+      },
+      verification: { complete: false, criteria: [], requirements: [], summary: '0/2 requirements passed.' },
+      memories: [],
+      recentActions: [],
+      failedStrategies: [],
+      maxActions: 3,
+      execute: {
+        execute: async tool => {
+          executed.push(tool);
+          if (tool === 'browser.navigate') currentUrl = finalUrl;
+          return {
+            ok: true,
+            data: tool === 'browser.extractText'
+              ? { url: finalUrl, title: 'Profile', text: 'Redirected profile page content.' }
+              : { url: finalUrl, title: 'Profile', loaded: true },
+            evidence: { receipt: { id: `receipt-${executed.length}` } },
+          };
+        },
+        observe: async () => ({
+          timestamp: Date.now(),
+          browser: { url: currentUrl, loaded: true },
+          task: { completedCriteria: [], remainingCriteria: ['browserDestination', 'browserResearch'] },
+        }),
+      },
+    });
+
+    expect(executed).toEqual(['browser.navigate', 'browser.extractText']);
+    expect(result.actions.map(action => action.tool)).toEqual(executed);
+    expect(result.status).toBe('completed');
+  });
+
+  it('forces page-to-file workers to write the observed fact and open the viewer', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-page-file-worker-done',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({ type: 'done', reasoningSummary: 'The requested operation is complete.' }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const task: TaskDefinition = {
+      id: 'page-file-worker-task',
+      threadId: 'page-file-worker-thread',
+      goal: 'Save the observed page and open it.',
+      originalRequest: 'Go to https://twlite.dev, save the content in twlite.md, and open it in the text viewer.',
+      criteria: [],
+      requirements: [
+        { id: 'outputFile', description: 'Write the observed page content.', type: 'filesystem', mandatory: true, target: { path: 'twlite.md', mode: 'contains-facts', factIds: ['pageContent'] } },
+        { id: 'openFile', description: 'Open the file in the text viewer.', type: 'desktop', mandatory: true, target: { path: 'twlite.md', content: 'twlite.md' } },
+      ],
+      constraints: [],
+    };
+    const state = createTaskState(task);
+    state.facts.push({
+      id: 'pageContent',
+      value: 'Observed page content.',
+      origin: 'observed',
+      confidence: 'observed',
+      evidenceIds: ['receipt-browser-extract'],
+      observedAt: new Date().toISOString(),
+    });
+    const baseObservation: EnvironmentObservation = {
+      timestamp: 1,
+      desktop: { windows: [] },
+      task: { completedCriteria: [], remainingCriteria: ['outputFile', 'openFile'] },
+    };
+    const worker = new AiSdkWorker({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      toolDefinitions: [
+        { name: 'fs.write', description: 'Write a file.', inputSchema: z.object({}), execute: async () => ({}) },
+        { name: 'app.openFile', description: 'Open a file.', inputSchema: z.object({}), execute: async () => ({}) },
+      ],
+      maxOutputTokens: 256,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    const writeTools: string[] = [];
+    const writeResult = await worker.execute({
+      objective: { id: 'objective-outputFile-0', kind: 'filesystem', description: 'Write the observed page content.', requirementIds: ['outputFile'], rationale: 'test' },
+      task,
+      state,
+      observation: baseObservation,
+      verification: { complete: false, criteria: [], requirements: [], summary: '0/2 requirements passed.' },
+      memories: [],
+      recentActions: [],
+      failedStrategies: [],
+      maxActions: 2,
+      execute: {
+        execute: async tool => {
+          writeTools.push(tool);
+          return { ok: true, data: { path: 'twlite.md', size: 23 }, evidence: { receipt: { id: 'receipt-write' } } };
+        },
+        observe: async () => baseObservation,
+      },
+    });
+    expect(writeTools).toEqual(['fs.write']);
+    expect(writeResult.status).toBe('completed');
+
+    const openTools: string[] = [];
+    const openResult = await worker.execute({
+      objective: { id: 'objective-openFile-0', kind: 'desktop', description: 'Open the file in the text viewer.', requirementIds: ['openFile'], rationale: 'test' },
+      task,
+      state,
+      observation: baseObservation,
+      verification: { complete: false, criteria: [], requirements: [], summary: '0/2 requirements passed.' },
+      memories: [],
+      recentActions: [],
+      failedStrategies: [],
+      maxActions: 2,
+      execute: {
+        execute: async tool => {
+          openTools.push(tool);
+          return { ok: true, data: { path: 'twlite.md', application: 'text-editor', title: 'twlite.md - Text Editor' }, evidence: { receipt: { id: 'receipt-open' } } };
+        },
+        observe: async () => ({
+          ...baseObservation,
+          desktop: { windows: [{ id: 'text-editor', title: 'twlite.md - Text Editor', focused: true }] },
+        }),
+      },
+    });
+    expect(openTools).toEqual(['app.openFile']);
+    expect(openResult.status).toBe('completed');
   });
 
   it('turns a procedural browserResearch blocker into the next orchestrator objective', async () => {

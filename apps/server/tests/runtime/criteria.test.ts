@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 
 import { BROWSER_RESEARCH_CRITERION_ID } from '../../src/agent/browser-research';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
+import { createGuestToolRegistry } from '../../src/tools/guest-tools';
 import {
   DEMO_PAGE_TITLE,
   DEMO_PAGE_TEXT,
@@ -80,6 +81,24 @@ describe('criterion verification and mock guest state', () => {
 
     expect(result.complete).toBe(true);
     expect(result.criteria[0]?.passed).toBe(true);
+  });
+
+  it('accepts a browser URL criterion when navigation followed a redirect', async () => {
+    const sourceUrl = 'https://github.com/twlite.png';
+    const finalUrl = 'https://avatars.githubusercontent.com/u/123456?v=4';
+    const guest = new MockGuestTransport({
+      redirects: { [sourceUrl]: finalUrl },
+      pages: { [finalUrl]: '<html><body><p>profile image</p></body></html>' },
+    });
+    const tools = createGuestToolRegistry(guest);
+    const navigation = await tools.execute('browser.navigate', { url: sourceUrl });
+    const verifier = new CriterionVerifierRegistry(guest);
+    const result = await verifier.verifyTask({
+      criteria: [{ type: 'browser.url', url: sourceUrl }],
+    }, { lastToolResult: navigation });
+
+    expect(result.complete).toBe(true);
+    expect(result.criteria[0]?.message).toContain(finalUrl);
   });
 
   it('reports missing criteria instead of treating them as complete', async () => {

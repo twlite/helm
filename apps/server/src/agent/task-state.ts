@@ -172,6 +172,71 @@ export function trustedFacts(facts: readonly Fact[]): Fact[] {
   return facts.filter(fact => fact.origin !== 'hypothesis');
 }
 
+/**
+ * The browser owns redirect resolution. Keep the requested URL and the final
+ * URL together so a redirect is treated as successful navigation rather than
+ * as an instruction to submit the same URL again.
+ */
+export interface BrowserNavigationResolution {
+  requestedUrl: string;
+  finalUrl: string;
+  redirected: boolean;
+}
+
+function toolResultRecord(action: WorkerAction): Record<string, unknown> | undefined {
+  return action.result.data !== null
+    && typeof action.result.data === 'object'
+    && !Array.isArray(action.result.data)
+    ? action.result.data as Record<string, unknown>
+    : undefined;
+}
+
+function navigationFinalUrl(action: WorkerAction): string | undefined {
+  const dataUrl = toolResultRecord(action)?.url;
+  if (typeof dataUrl === 'string' && dataUrl.length > 0) return dataUrl;
+  const receiptUrl = action.receipt?.effect?.urlAfter;
+  return typeof receiptUrl === 'string' && receiptUrl.length > 0 ? receiptUrl : undefined;
+}
+
+/**
+ * Find the most recent successful navigation from an explicit source URL.
+ * `additional` is used while a bounded worker is still executing and its
+ * actions have not yet been merged into TaskState.
+ */
+export function navigationResolutionFor(
+  actions: readonly WorkerAction[],
+  expectedUrl: string,
+  additional: readonly BrowserNavigationResolution[] = [],
+): BrowserNavigationResolution | undefined {
+  for (const resolution of [...additional].reverse()) {
+    if (browserUrlsMatch(resolution.requestedUrl, expectedUrl)) return resolution;
+  }
+  for (const action of [...actions].reverse()) {
+    if (action.tool !== 'browser.navigate' || !action.result.ok) continue;
+    const requestedUrl = typeof action.input.url === 'string' ? action.input.url : undefined;
+    const finalUrl = navigationFinalUrl(action);
+    if (!requestedUrl || !finalUrl || !browserUrlsMatch(requestedUrl, expectedUrl)) continue;
+    return {
+      requestedUrl,
+      finalUrl,
+      redirected: !browserUrlsMatch(requestedUrl, finalUrl),
+    };
+  }
+  return undefined;
+}
+
+/** Return true when the current page is either the requested URL or its known redirect target. */
+export function browserDestinationReached(
+  currentUrl: string | undefined,
+  expectedUrl: string,
+  actions: readonly WorkerAction[] = [],
+  additional: readonly BrowserNavigationResolution[] = [],
+): boolean {
+  if (browserUrlsMatch(currentUrl, expectedUrl)) return true;
+  const resolution = navigationResolutionFor(actions, expectedUrl, additional);
+  return resolution !== undefined && browserUrlsMatch(currentUrl, resolution.finalUrl);
+}
+
 function factRank(fact: Fact): number {
   if (fact.source?.type === 'user' || fact.origin === 'user') return 5;
   // Runtime-owned system facts, such as the current date, must not be
@@ -403,6 +468,23 @@ async function requirementCheck(
         evidence: supportedFact(state, 'pageContent'),
       };
     }
+    if (
+      requirement.criterion.type === 'browser.url'
+      && browserDestinationReached(
+        observation.browser?.url,
+        requirement.criterion.url,
+        state.recentActions,
+      )
+    ) {
+      const resolution = navigationResolutionFor(state.recentActions, requirement.criterion.url);
+      return {
+        passed: true,
+        message: resolution?.redirected
+          ? `Browser followed the redirect from ${requirement.criterion.url} to ${resolution.finalUrl}.`
+          : `Browser reached ${requirement.criterion.url}.`,
+        evidence: { browser: observation.browser, navigation: resolution },
+      };
+    }
     if (verifier) {
       const verified = await verifier.verifyTask(
         { criteria: [requirement.criterion] },
@@ -468,8 +550,23 @@ async function requirementCheck(
   }
   if (requirement.type === 'browser') {
     const expected = target.url ?? (target.factId ? supportedFact(state, target.factId)?.value : undefined);
-    const passed = typeof expected === 'string' && browserUrlsMatch(observation.browser?.url, expected);
-    return { passed, message: passed ? `Browser reached ${expected}.` : `Browser has not reached the required page.`, evidence: observation.browser };
+    const resolution = typeof expected === 'string'
+      ? navigationResolutionFor(state.recentActions, expected)
+      : undefined;
+    const passed = typeof expected === 'string' && browserDestinationReached(
+      observation.browser?.url,
+      expected,
+      state.recentActions,
+    );
+    return {
+      passed,
+      message: passed
+        ? resolution?.redirected
+          ? `Browser followed the redirect from ${expected} to ${resolution.finalUrl}.`
+          : `Browser reached ${expected}.`
+        : 'Browser has not reached the required page.',
+      evidence: { browser: observation.browser, navigation: resolution },
+    };
   }
   if (requirement.type === 'desktop') {
     const expected = target.content;
@@ -500,6 +597,21 @@ export async function verifyTaskState(
         passed: true,
         message: 'Readable web page content is present in observed evidence.',
         evidence: supportedFact(state, 'pageContent'),
+      };
+    }
+    if (
+      !check.passed
+      && check.criterion.type === 'browser.url'
+      && browserDestinationReached(observation.browser?.url, check.criterion.url, state.recentActions)
+    ) {
+      const resolution = navigationResolutionFor(state.recentActions, check.criterion.url);
+      return {
+        ...check,
+        passed: true,
+        message: resolution?.redirected
+          ? `Browser followed the redirect from ${check.criterion.url} to ${resolution.finalUrl}.`
+          : `Browser reached ${check.criterion.url}.`,
+        evidence: { browser: observation.browser, navigation: resolution },
       };
     }
     return check;

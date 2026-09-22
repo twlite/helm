@@ -175,8 +175,19 @@ function shouldInspectRepeatedBrowserNavigation(
     && lastToolResult?.ok === true
     && browserUrlsMatch(currentUrl, targetUrl)
   );
+  const redirectedCurrentPage = (() => {
+    if (
+      lastStep?.action?.tool !== 'browser.navigate'
+      || lastToolResult?.ok !== true
+      || typeof lastStep.action.input.url !== 'string'
+    ) return false;
+    const finalUrl = toolResultUrl(lastToolResult);
+    return finalUrl !== undefined
+      && browserUrlsMatch(lastStep.action.input.url, targetUrl)
+      && browserUrlsMatch(currentUrl, finalUrl);
+  })();
   const returningToSearchPage = isSearchResultsUrl(currentUrl) && isSameSearchNavigation(currentUrl, targetUrl);
-  if (!repeatedCurrentPage && !returningToSearchPage) return undefined;
+  if (!repeatedCurrentPage && !redirectedCurrentPage && !returningToSearchPage) return undefined;
 
   const inspected = [...inspectedBrowserUrls].some(url => browserUrlsMatch(url, currentUrl));
   return inspected ? 'browser.snapshot' : 'browser.extractText';

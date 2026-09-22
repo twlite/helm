@@ -102,6 +102,15 @@ export interface BrowserSnapshot {
 
 const INTERACTIVE_SELECTOR =
   "button, input, textarea, select, a[href], summary, [role], [contenteditable='true']";
+const BROWSER_OPERATION_TIMEOUT_MS = 10_000;
+const BROWSER_CONTEXT_RESET_TIMEOUT_MS = 1_000;
+
+class BrowserOperationTimeout extends Error {
+  constructor(public readonly operation: string) {
+    super(`${operation} timed out.`);
+    this.name = "BrowserOperationTimeout";
+  }
+}
 
 let playwrightModule: Promise<PlaywrightModule> | undefined;
 
@@ -230,6 +239,10 @@ export class BrowserController {
   }
 
   async getState(): Promise<BrowserState> {
+    return this.withWatchdog(() => this.getStateInternal(), "browser.getState");
+  }
+
+  private async getStateInternal(): Promise<BrowserState> {
     const page = await this.ensurePage();
     let domFingerprint: string | undefined;
     try {
@@ -274,6 +287,10 @@ export class BrowserController {
   }
 
   async snapshot(): Promise<BrowserSnapshot> {
+    return this.withWatchdog(() => this.snapshotInternal(), "browser.snapshot");
+  }
+
+  private async snapshotInternal(): Promise<BrowserSnapshot> {
     const page = await this.ensurePage();
     const url = page.url();
     const title = await this.readTitle(page);
@@ -487,6 +504,15 @@ export class BrowserController {
     url: string;
     title: string;
   }> {
+    return this.withWatchdog(() => this.extractTextInternal(maxChars), "browser.extractText");
+  }
+
+  private async extractTextInternal(maxChars: number): Promise<{
+    text: string;
+    truncated: boolean;
+    url: string;
+    title: string;
+  }> {
     const page = await this.ensurePage();
     const body = page.locator("body");
     let text: string;
@@ -667,7 +693,35 @@ export class BrowserController {
     this.context = undefined;
     this.page = undefined;
     this.invalidateReferences();
-    await context?.close().catch(() => undefined);
+    if (!context) return;
+    const close = context.close().catch(() => undefined);
+    await Promise.race([
+      close,
+      new Promise<void>(resolve => setTimeout(resolve, BROWSER_CONTEXT_RESET_TIMEOUT_MS)),
+    ]);
+  }
+
+  private async withWatchdog<T>(operation: () => Promise<T>, name: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation(),
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => reject(new BrowserOperationTimeout(name)), BROWSER_OPERATION_TIMEOUT_MS);
+        }),
+      ]);
+    } catch (error) {
+      if (error instanceof BrowserOperationTimeout) {
+        await this.resetContext();
+        throw new GuestRpcError(
+          "BROWSER_OPERATION_TIMEOUT",
+          `${name} exceeded ${BROWSER_OPERATION_TIMEOUT_MS} ms; the browser context was reset.`,
+        );
+      }
+      throw error;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   private async readTitle(page: PlaywrightPage): Promise<string> {

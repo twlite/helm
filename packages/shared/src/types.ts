@@ -110,8 +110,12 @@ export interface Artifact {
 }
 
 export interface ActionEffect {
+  /** URL supplied to browser.navigate before the browser followed redirects. */
+  requestedUrl?: string;
   urlBefore?: string;
   urlAfter?: string;
+  /** True when browser.navigate finished at a URL different from requestedUrl. */
+  redirected?: boolean;
   navigationOccurred?: boolean;
   newTabOpened?: boolean;
   domChanged?: boolean;
