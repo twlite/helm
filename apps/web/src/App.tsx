@@ -75,7 +75,6 @@ function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState('');
   const [messageState, setMessageState] = useState<AsyncState>('idle');
-  const [isCreatingThread, setIsCreatingThread] = useState(false);
   const [isRunStarting, setIsRunStarting] = useState(false);
   const [run, setRun] = useState<RunDetails | null>(null);
   const [vm, setVm] = useState<VmStatus | null>(null);
@@ -239,23 +238,16 @@ function App() {
     setNotice(null);
   }, []);
 
-  const handleCreateThread = useCallback(async (title: string): Promise<boolean> => {
-    setIsCreatingThread(true);
+  const handleCreateThread = useCallback(() => {
+    selectedThreadIdRef.current = null;
+    setSelectedThreadId(null);
+    setMessages([]);
+    setDraft('');
+    setRun(null);
+    setIsActivityOpen(false);
     setNotice(null);
-    try {
-      const thread = await helmApi.createThread(title);
-      setThreads((current) => [thread, ...current.filter((item) => item.id !== thread.id)]);
-      setSelectedThreadId(thread.id);
-      setMessages([]);
-      setIsActivityOpen(false);
-      return true;
-    } catch (error) {
-      showError(error);
-      return false;
-    } finally {
-      setIsCreatingThread(false);
-    }
-  }, [showError]);
+    setMessageState('idle');
+  }, []);
 
   const handleDeleteThread = useCallback(async (threadId: string) => {
     const thread = threads.find((item) => item.id === threadId);
@@ -419,7 +411,6 @@ function App() {
     <div className="flex h-dvh min-h-0 w-full overflow-hidden bg-[#0b0d10] font-sans text-[#f1f3f5]">
       <ThreadSidebar
         connectionState={connectionState}
-        isCreating={isCreatingThread}
         onCreateThread={handleCreateThread}
         onDeleteThread={handleDeleteThread}
         onMobileOpenChange={setIsMobileSidebarOpen}

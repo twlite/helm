@@ -1,5 +1,4 @@
-import { useState } from 'react';
-import type { FormEvent, KeyboardEvent, MouseEvent } from 'react';
+import type { KeyboardEvent, MouseEvent } from 'react';
 import type { Thread } from '../types';
 import { formatDate, formatTime } from '../format';
 import { Icon } from './Icon';
@@ -11,9 +10,8 @@ type ThreadSidebarProps = {
   threads: Thread[];
   selectedThreadId: string | null;
   onSelectThread: (threadId: string) => void;
-  onCreateThread: (title: string) => Promise<boolean>;
+  onCreateThread: () => void;
   onDeleteThread: (threadId: string) => Promise<void>;
-  isCreating: boolean;
   connectionState: 'connecting' | 'connected' | 'reconnecting' | 'offline';
   reconnectAttempt: number;
   mobileOpen: boolean;
@@ -139,37 +137,15 @@ function SidebarContent({
   onSelectThread,
   onCreateThread,
   onDeleteThread,
-  isCreating,
   connectionState,
   reconnectAttempt,
   onCloseMobile,
   onOpenMemory,
   onOpenSettings,
 }: SidebarContentProps) {
-  const [isComposerOpen, setIsComposerOpen] = useState(false);
-  const [title, setTitle] = useState('');
   const todayThreads = threads.filter((thread) => isToday(thread.updatedAt));
   const previousThreads = threads.filter((thread) => !isToday(thread.updatedAt));
   const connection = connectionCopy(connectionState, reconnectAttempt);
-
-  async function handleCreate(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const nextTitle = title.trim();
-    if (!nextTitle || isCreating) {
-      return;
-    }
-    const created = await onCreateThread(nextTitle);
-    if (created) {
-      setTitle('');
-      setIsComposerOpen(false);
-      onCloseMobile();
-    }
-  }
-
-  function closeComposer() {
-    setTitle('');
-    setIsComposerOpen(false);
-  }
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[#0d1015]">
@@ -182,30 +158,18 @@ function SidebarContent({
       </div>
 
       <div className="px-3">
-        {isComposerOpen ? (
-          <form className="space-y-2 rounded-lg bg-white/[0.035] p-2" onSubmit={(event) => void handleCreate(event)}>
-            <label className="sr-only" htmlFor="new-thread-title">Thread title</label>
-            <input
-              autoFocus
-              className="h-8 w-full rounded-md border border-white/[0.1] bg-[#11151b] px-2.5 text-xs text-[#f1f3f5] outline-none placeholder:text-[#606975] focus:border-teal-400/60 focus:ring-2 focus:ring-teal-400/15"
-              id="new-thread-title"
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder="Name this thread"
-              value={title}
-            />
-            <div className="flex gap-1.5">
-              <Button className="flex-1" disabled={!title.trim() || isCreating} size="sm" type="submit">
-                {isCreating ? 'Creating…' : 'Create'}
-              </Button>
-              <Button className="flex-1" onClick={closeComposer} size="sm" variant="ghost" type="button">Cancel</Button>
-            </div>
-          </form>
-        ) : (
-          <Button className="w-full justify-start" onClick={() => setIsComposerOpen(true)} size="sm" variant="secondary">
-            <Icon name="plus" size={15} />
-            New thread
-          </Button>
-        )}
+        <Button
+          className="w-full justify-start"
+          onClick={() => {
+            onCreateThread();
+            onCloseMobile();
+          }}
+          size="sm"
+          variant="secondary"
+        >
+          <Icon name="plus" size={15} />
+          New thread
+        </Button>
       </div>
 
       <ScrollArea className="mt-6 min-h-0 flex-1 px-3">
