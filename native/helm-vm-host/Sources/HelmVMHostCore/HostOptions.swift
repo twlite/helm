@@ -14,6 +14,7 @@ public struct HostOptions {
     let memorySize: UInt64
     let displayWidth: Int
     let displayHeight: Int
+    let showWindow: Bool
 
     public static func parse(arguments: [String]) throws -> HostOptions? {
         var rootPath: String?
@@ -39,6 +40,7 @@ public struct HostOptions {
             environmentValue("HELM_VM_MEMORY_MIB") ?? "4096",
             option: "HELM_VM_MEMORY_MIB"
         )
+        var showWindow = false
         var index = 0
 
         while index < arguments.count {
@@ -83,6 +85,8 @@ public struct HostOptions {
                     nextArgument(arguments, index: &index, option: argument),
                     option: argument
                 )
+            case "--show-window":
+                showWindow = true
             default:
                 throw HostFailure(code: "invalid_argument", message: "Unknown argument: \(argument)")
             }
@@ -147,7 +151,8 @@ public struct HostOptions {
             cpuCount: cpuCount,
             memorySize: memoryMiB * 1024 * 1024,
             displayWidth: 1280,
-            displayHeight: 800
+            displayHeight: 800,
+            showWindow: showWindow
         )
     }
 
@@ -235,6 +240,7 @@ public struct HostOptions {
           --guest-timeout-ms N    Guest RPC read timeout (default: 10000)
           --cpus N                Guest CPU count (default: 4)
           --memory-mib N          Guest memory (default: 4096)
+          --show-window           Attach a resizable native VM viewer window
 
         Commands are JSON objects on stdin. Responses and lifecycle events are JSON objects on stdout.
         """

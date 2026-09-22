@@ -87,6 +87,19 @@ bun run vm:start
 bun run vm:stop
 ```
 
+For maintenance work that only needs the native desktop viewer, start the
+helper directly. This boots the working image and does not wait for
+`helm-guest` or a guest RPC handshake:
+
+```sh
+bun run vm:maintenance
+```
+
+The helper still accepts JSONL commands on stdin, so `vm.status`, `vm.stop`,
+`vm.reset`, and other host commands remain available in the terminal. Closing
+the viewer stops the maintenance host cleanly; it does not replace or rewrite
+the VM disk.
+
 Normal initialization requires `base.img`. If `disk.img` is absent, the native
 helper creates it by copying `base.img`. If `efi-vars.bin` is absent, the helper
 creates a fresh EFI variable store automatically. A machine identifier is also

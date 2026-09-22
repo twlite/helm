@@ -156,11 +156,8 @@ public final class ProvisioningHost: NSObject, NSApplicationDelegate, NSWindowDe
         status.textColor = .secondaryLabelColor
         statusField = status
 
-        let view = VZVirtualMachineView(frame: .zero)
+        let view = makeHelmVirtualMachineView(for: virtualMachine)
         view.translatesAutoresizingMaskIntoConstraints = false
-        view.automaticallyReconfiguresDisplay = true
-        view.capturesSystemKeys = true
-        view.virtualMachine = virtualMachine
         virtualMachineView = view
 
         let stack = NSStackView(views: [title, subtitle, instructions, view, status])

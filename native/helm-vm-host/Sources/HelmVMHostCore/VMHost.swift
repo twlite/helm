@@ -1,5 +1,7 @@
+import AppKit
 import Foundation
 import Virtualization
+import Darwin
 
 public final class VMHost: NSObject, VZVirtualMachineDelegate {
     private let options: HostOptions
@@ -13,6 +15,8 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
     private var eventSequence: UInt64 = 0
     private var configurationValidated = false
     private var lastError: String?
+    private var viewerWindow: HelmVMViewerWindow?
+    private var inputReader: VMHostInputReader?
 
     public init(options: HostOptions) {
         self.options = options
@@ -29,6 +33,15 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
     }
 
     public func run() {
+        if options.showWindow {
+            runWithViewer()
+            return
+        }
+
+        runHeadless()
+    }
+
+    private func runHeadless() {
         while let line = readLine() {
             handle(line: line)
         }
@@ -36,6 +49,42 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
         if virtualMachine != nil {
             _ = try? stopVM(emitEvents: false)
         }
+    }
+
+    private func runWithViewer() {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.regular)
+
+        let reader = VMHostInputReader(
+            onLine: { [weak self] line in
+                self?.handle(line: line)
+            },
+            onEnd: { [weak self] in
+                DispatchQueue.main.async {
+                    self?.stopViewerRunLoop()
+                }
+            }
+        )
+        inputReader = reader
+        reader.start()
+
+        application.run()
+
+        reader.stop()
+        inputReader = nil
+        if virtualMachine != nil {
+            _ = try? stopVM(emitEvents: false)
+        }
+    }
+
+    private func stopViewerRunLoop() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.stopViewerRunLoop()
+            }
+            return
+        }
+        NSApp.stop(nil)
     }
 
     private func handle(line: String) {
@@ -116,6 +165,7 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             let newVM = VZVirtualMachine(configuration: configuration, queue: vmQueue)
             newVM.delegate = self
             virtualMachine = newVM
+            showViewer(for: newVM)
             try start(newVM)
             setLastError(nil)
             emitLifecycle(state: "running", reason: "vm.start")
@@ -244,6 +294,37 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             guestPort: options.guestPort,
             timeoutMilliseconds: options.guestRequestTimeoutMilliseconds
         ).request(id: requestID, method: method, params: requestParams)
+    }
+
+    private func showViewer(for virtualMachine: VZVirtualMachine) {
+        guard options.showWindow else { return }
+
+        let attach = { [weak self] in
+            guard let self else { return }
+            if let viewerWindow {
+                viewerWindow.attach(to: virtualMachine)
+                viewerWindow.show()
+                return
+            }
+
+            let newViewerWindow = HelmVMViewerWindow(
+                title: "Helm VM Maintenance",
+                width: self.options.displayWidth,
+                height: self.options.displayHeight,
+                virtualMachine: virtualMachine,
+                onClose: { [weak self] in
+                    self?.stopViewerRunLoop()
+                }
+            )
+            viewerWindow = newViewerWindow
+            newViewerWindow.show()
+        }
+
+        if Thread.isMainThread {
+            attach()
+        } else {
+            DispatchQueue.main.sync(execute: attach)
+        }
     }
 
     private func start(_ virtualMachine: VZVirtualMachine) throws {
@@ -404,5 +485,77 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
             reason: "virtualMachineDidStopWithError",
             data: .object(["message": .string(error.localizedDescription)])
         )
+    }
+}
+
+private final class VMHostInputReader {
+    private let fileDescriptor: Int32
+    private let queue = DispatchQueue(label: "com.helm.vm-host.stdin")
+    private let onLine: (String) -> Void
+    private let onEnd: () -> Void
+    private var source: DispatchSourceRead?
+    private var buffer = Data()
+    private var finished = false
+
+    init(onLine: @escaping (String) -> Void, onEnd: @escaping () -> Void) {
+        self.fileDescriptor = FileHandle.standardInput.fileDescriptor
+        self.onLine = onLine
+        self.onEnd = onEnd
+    }
+
+    func start() {
+        let newSource = DispatchSource.makeReadSource(
+            fileDescriptor: fileDescriptor,
+            queue: queue
+        )
+        source = newSource
+        newSource.setEventHandler { [weak self] in
+            self?.readAvailableData()
+        }
+        newSource.setCancelHandler {}
+        newSource.resume()
+    }
+
+    func stop() {
+        source?.cancel()
+        source = nil
+        queue.sync {}
+    }
+
+    private func readAvailableData() {
+        var bytes = [UInt8](repeating: 0, count: 64 * 1024)
+        let count = bytes.withUnsafeMutableBytes { buffer in
+            Darwin.read(fileDescriptor, buffer.baseAddress, buffer.count)
+        }
+
+        if count > 0 {
+            buffer.append(contentsOf: bytes[0..<count])
+            drainLines()
+            return
+        }
+        if count == 0 || errno != EINTR {
+            finish()
+        }
+    }
+
+    private func drainLines() {
+        while let newlineIndex = buffer.firstIndex(of: 0x0A) {
+            let endIndex = buffer.index(after: newlineIndex)
+            let lineData = buffer[..<newlineIndex]
+            buffer.removeSubrange(..<endIndex)
+            onLine(String(decoding: lineData, as: UTF8.self))
+        }
+    }
+
+    private func finish() {
+        guard !finished else { return }
+        finished = true
+        drainLines()
+        if !buffer.isEmpty {
+            onLine(String(decoding: buffer, as: UTF8.self))
+            buffer.removeAll(keepingCapacity: false)
+        }
+        onEnd()
+        source?.cancel()
     }
 }

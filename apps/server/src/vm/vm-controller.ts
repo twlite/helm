@@ -53,6 +53,26 @@ function screenshotImage(value: unknown): string | undefined {
   return candidate.startsWith('data:') ? candidate : `data:image/png;base64,${candidate}`;
 }
 
+function structuredVmError(error: unknown): ToolError {
+  if (error instanceof VmControllerError) {
+    return {
+      code: error.code,
+      message: error.message,
+      ...(error.details === undefined ? {} : { details: error.details }),
+    };
+  }
+  return asToolError(error);
+}
+
+function loggedVmError(error: unknown): { error: unknown; code: string; details?: unknown } {
+  const normalized = structuredVmError(error);
+  return {
+    error,
+    code: normalized.code,
+    ...(normalized.details === undefined ? {} : { details: normalized.details }),
+  };
+}
+
 function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
   if (signal.aborted) return Promise.reject(new VmControllerError('CANCELLED', 'The guest request was cancelled'));
@@ -75,6 +95,7 @@ function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 export class VmController {
   private child?: ChildProcessWithoutNullStreams;
   private stdoutBuffer = '';
+  private stderrBuffer = '';
   private readonly pending = new Map<string, PendingHostRequest>();
   private currentStatus: VmStatus = {
     state: 'stopped',
@@ -111,13 +132,14 @@ export class VmController {
         // A missing screenshot utility should not make an otherwise connected
         // guest look disconnected. The next explicit screenshot can retry it.
         this.setStatus({ guestConnected: true });
-        logger.warn('Initial VM screenshot unavailable', { component: 'vm', error });
+        logger.warn('Initial VM screenshot unavailable', { component: 'vm', ...loggedVmError(error) });
       }
       this.setStatus({ state: 'running', guestConnected: true });
       this.events.publish('guest.connected', { connected: true });
     } catch (error) {
-      logger.error('VM start failed', { component: 'vm', error });
-      this.setStatus({ state: 'error', message: error instanceof Error ? error.message : String(error) });
+      const normalized = structuredVmError(error);
+      logger.error('VM start failed', { component: 'vm', ...loggedVmError(error) });
+      this.setStatus({ state: 'error', message: normalized.message });
       throw error;
     }
   }
@@ -127,7 +149,7 @@ export class VmController {
       try {
         await this.sendHostCommand('vm.stop', {});
       } catch (error) {
-        logger.warn('VM stop command failed', { component: 'vm', error });
+        logger.warn('VM stop command failed', { component: 'vm', ...loggedVmError(error) });
       }
     }
     await this.guestTransport?.close();
@@ -256,10 +278,13 @@ export class VmController {
       '--cpus', String(this.config.vmCpus),
     ], { stdio: 'pipe' });
     this.child.stdout.setEncoding('utf8');
+    this.child.stderr.setEncoding('utf8');
+    this.stderrBuffer = '';
     this.child.stdout.on('data', (chunk: string) => this.consumeHostOutput(chunk));
-    this.child.stderr.on('data', (chunk: string) => logger.info(String(chunk).trim(), { component: 'vm-helper' }));
+    this.child.stderr.on('data', (chunk: string) => this.consumeHostStderr(chunk));
+    this.child.stderr.on('end', () => this.flushHostStderr());
     this.child.on('exit', (code, signal) => {
-      logger.info('VM helper exited', { component: 'vm-helper', code, signal });
+      logger.info('VM helper exited', { component: 'vm-host', code, signal });
       this.child = undefined;
       this.setStatus({ state: 'stopped', guestConnected: false });
       for (const pending of this.pending.values()) {
@@ -280,7 +305,7 @@ export class VmController {
       try {
         response = JSON.parse(line) as HostResponse;
       } catch {
-        logger.warn('Ignoring malformed VM helper output', { component: 'vm-helper' });
+        logger.warn('Ignoring malformed VM helper output', { component: 'vm-host' });
         continue;
       }
       const pending = this.pending.get(response.id);
@@ -289,6 +314,28 @@ export class VmController {
       clearTimeout(pending.timer);
       pending.resolve(response);
     }
+  }
+
+  private consumeHostStderr(chunk: string): void {
+    this.stderrBuffer += chunk;
+    const lines = this.stderrBuffer.split(/\r\n|\n|\r/u);
+    this.stderrBuffer = lines.pop() ?? '';
+    for (const line of lines) {
+      this.logHostStderrLine(line);
+    }
+  }
+
+  private flushHostStderr(): void {
+    if (this.stderrBuffer.length > 0) {
+      this.logHostStderrLine(this.stderrBuffer);
+    }
+    this.stderrBuffer = '';
+  }
+
+  private logHostStderrLine(line: string): void {
+    const message = line.trim();
+    if (!message) return;
+    logger.info(message, { component: 'vm-host' });
   }
 
   private sendHostCommand(method: string, params: unknown): Promise<HostResponse> {
@@ -303,7 +350,12 @@ export class VmController {
       this.child?.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
     }).then(response => {
       if (!response.ok) {
-        throw new VmControllerError(response.error?.code ?? 'VM_HELPER_ERROR', response.error?.message ?? 'VM helper rejected the request', response.error?.details);
+        const nativeError = response.error;
+        throw new VmControllerError(
+          nativeError?.code ?? 'VM_HELPER_ERROR',
+          nativeError?.message ?? 'VM helper rejected the request',
+          nativeError?.details,
+        );
       }
       return response;
     });
