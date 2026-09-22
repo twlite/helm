@@ -1,124 +1,152 @@
-import { asGuestRpcError, errorPayload, GuestRpcError } from "./errors";
-import { failureResponse, type GuestResponse } from "./protocol";
+import {
+  createJsonlConnection,
+  type JsonlConnection,
+} from "./jsonl";
 import { GuestRuntime } from "./runtime";
 
-const MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024;
+export const GUEST_TCP_HOST = "127.0.0.1";
+export const GUEST_TCP_PORT = 4242;
 
-export interface GuestHttpHandlerOptions {
+export interface GuestTcpServerOptions {
   runtime: GuestRuntime;
+  /** Test-only override; production uses 127.0.0.1:4242. */
+  port?: number;
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
+interface GuestSocketState {
+  connection?: JsonlConnection;
+  writer?: GuestSocketWriter;
+}
+
+type GuestSocket = Bun.Socket<GuestSocketState>;
+
+interface PendingWrite {
+  bytes: Uint8Array;
+  offset: number;
+  resolve: () => void;
+  reject: (error: Error) => void;
+}
+
+/** Serializes socket writes and waits for Bun's drain callback on backpressure. */
+class GuestSocketWriter {
+  private readonly encoder = new TextEncoder();
+  private readonly queue: PendingWrite[] = [];
+  private current: PendingWrite | undefined = undefined;
+  private waitingForDrain = false;
+  private closed = false;
+
+  constructor(private readonly socket: GuestSocket) {}
+
+  write(line: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (this.closed) {
+        reject(new Error("Guest socket is closed."));
+        return;
+      }
+      this.queue.push({
+        bytes: this.encoder.encode(line),
+        offset: 0,
+        resolve,
+        reject,
+      });
+      this.pump();
+    });
+  }
+
+  drain(): void {
+    this.waitingForDrain = false;
+    this.pump();
+  }
+
+  close(error = new Error("Guest socket closed.")): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.current?.reject(error);
+    this.current = undefined;
+    for (const pending of this.queue.splice(0)) pending.reject(error);
+  }
+
+  private pump(): void {
+    if (this.closed || this.waitingForDrain) return;
+    if (!this.current) this.current = this.queue.shift();
+
+    while (this.current) {
+      const pending = this.current;
+      let written: number;
+      try {
+        written = this.socket.write(
+          pending.bytes,
+          pending.offset,
+          pending.bytes.byteLength - pending.offset,
+        );
+      } catch (error) {
+        this.close(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+
+      if (written < 0) {
+        this.close(new Error("Unable to write to the guest socket."));
+        return;
+      }
+      if (written === 0) {
+        this.waitingForDrain = true;
+        return;
+      }
+
+      pending.offset += written;
+      if (pending.offset < pending.bytes.byteLength) continue;
+
+      pending.resolve();
+      this.current = this.queue.shift();
+    }
+  }
+}
+
+export function createGuestTcpServer(options: GuestTcpServerOptions): Bun.TCPSocketListener<GuestSocketState> {
+  const states = new WeakMap<GuestSocket, GuestSocketState>();
+  const listener = Bun.listen<GuestSocketState>({
+    hostname: GUEST_TCP_HOST,
+    port: options.port ?? GUEST_TCP_PORT,
+    allowHalfOpen: true,
+    socket: {
+      open(socket) {
+        ensureSocketState(socket, options.runtime);
+      },
+      data(socket, data) {
+        const state = ensureSocketState(socket, options.runtime);
+        void state.connection?.push(data).catch(() => socket.terminate());
+      },
+      drain(socket) {
+        states.get(socket)?.writer?.drain();
+      },
+      end(socket) {
+        const connection = states.get(socket)?.connection;
+        if (!connection) {
+          socket.end();
+          return;
+        }
+        void connection.end().catch(() => undefined).finally(() => socket.end());
+      },
+      error(socket, error) {
+        states.get(socket)?.writer?.close(error);
+      },
+      close(socket) {
+        states.get(socket)?.writer?.close();
+        states.delete(socket);
+      },
     },
   });
-}
 
-async function readLimitedBody(request: Request): Promise<string> {
-  const reader = request.body?.getReader();
-  if (reader === undefined) return "";
+  return listener;
 
-  const chunks: Uint8Array[] = [];
-  let bytes = 0;
-  try {
-    while (true) {
-      const next = await reader.read();
-      if (next.done) break;
-      bytes += next.value.byteLength;
-      if (bytes > MAX_HTTP_BODY_BYTES) {
-        throw new GuestRpcError("REQUEST_TOO_LARGE", "The request body is too large.", {
-          httpStatus: 413,
-        });
-      }
-      chunks.push(next.value);
-    }
-  } finally {
-    reader.releaseLock();
+  function ensureSocketState(socket: GuestSocket, runtime: GuestRuntime): GuestSocketState {
+    const existing = states.get(socket);
+    if (existing) return existing;
+
+    const writer = new GuestSocketWriter(socket);
+    const connection = createJsonlConnection(runtime, line => writer.write(line));
+    const state = { writer, connection };
+    states.set(socket, state);
+    return state;
   }
-
-  const body = new Uint8Array(bytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(body);
-}
-
-export function createGuestHttpHandler(
-  options: GuestHttpHandlerOptions,
-): (request: Request) => Promise<Response> {
-  return async (request: Request): Promise<Response> => {
-    const url = new URL(request.url);
-
-    if (request.method === "GET" && url.pathname === "/health") {
-      try {
-        return jsonResponse({ ok: true, health: await options.runtime.health() });
-      } catch (error) {
-        const normalized = asGuestRpcError(error);
-        return jsonResponse(
-          { ok: false, error: errorPayload(normalized) },
-          normalized.httpStatus,
-        );
-      }
-    }
-
-    if (url.pathname !== "/rpc" && url.pathname !== "/") {
-      return jsonResponse(
-        failureResponse(null, {
-          code: "NOT_FOUND",
-          message: "The guest endpoint was not found.",
-        }),
-        404,
-      );
-    }
-
-    if (request.method !== "POST") {
-      return jsonResponse(
-        failureResponse(null, {
-          code: "METHOD_NOT_ALLOWED",
-          message: "Guest RPC requests must use POST.",
-        }),
-        405,
-      );
-    }
-
-    try {
-      const rawBody = await readLimitedBody(request);
-      let value: unknown;
-      try {
-        value = JSON.parse(rawBody);
-      } catch {
-        return jsonResponse(
-          failureResponse(null, {
-            code: "INVALID_JSON",
-            message: "The request body is not valid JSON.",
-          }),
-          400,
-        );
-      }
-
-      const response = await options.runtime.dispatch(value);
-      return jsonResponse(response, responseStatus(response));
-    } catch (error) {
-      const normalized = asGuestRpcError(error);
-      return jsonResponse(
-        failureResponse(null, errorPayload(normalized)),
-        normalized.httpStatus,
-      );
-    }
-  };
-}
-
-function responseStatus(response: GuestResponse): number {
-  if (response.ok) return 200;
-  if (response.error.code === "INVALID_REQUEST" || response.error.code === "INVALID_PARAMS") {
-    return 400;
-  }
-  if (response.error.code === "METHOD_NOT_FOUND") return 404;
-  return 200;
 }

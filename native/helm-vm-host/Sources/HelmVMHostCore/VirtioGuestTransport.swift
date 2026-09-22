@@ -30,11 +30,13 @@ struct VirtioGuestTransport {
         defer { connection.close() }
 
         let request = GuestRequestEnvelope(id: id, method: method, params: params)
+        // The guest bridge is a transparent byte proxy. Keep the wire format
+        // explicitly JSONL: one UTF-8 JSON object followed by one newline.
         var requestData = try JSONEncoder().encode(request)
         requestData.append(0x0A)
         try writeAll(requestData, to: connection.fileDescriptor)
 
-        let responseData = try readLine(from: connection.fileDescriptor)
+        let responseData = try readJSONLFrame(from: connection.fileDescriptor)
         do {
             return try JSONDecoder().decode(JSONValue.self, from: responseData)
         } catch {
@@ -115,11 +117,12 @@ struct VirtioGuestTransport {
         }
     }
 
-    private func readLine(from fileDescriptor: Int32) throws -> Data {
-        let maximumResponseBytes = 16 * 1024 * 1024
+    private func readJSONLFrame(from fileDescriptor: Int32) throws -> Data {
+        let maximumFrameBytes = 64 * 1024 * 1024
         var response = Data()
+        var terminated = false
 
-        while response.count < maximumResponseBytes {
+        while response.count <= maximumFrameBytes {
             var descriptor = pollfd(
                 fd: fileDescriptor,
                 events: Int16(POLLIN),
@@ -157,6 +160,7 @@ struct VirtioGuestTransport {
                 break
             }
             if byte == 0x0A {
+                terminated = true
                 break
             }
             response.append(byte)
@@ -168,10 +172,16 @@ struct VirtioGuestTransport {
                 message: "The guest closed the Virtio socket without returning a response."
             )
         }
-        guard response.count < maximumResponseBytes else {
+        guard terminated else {
+            throw HostFailure(
+                code: "invalid_guest_response",
+                message: "The guest closed the JSONL stream before terminating its response frame."
+            )
+        }
+        guard response.count <= maximumFrameBytes else {
             throw HostFailure(
                 code: "guest_response_too_large",
-                message: "The guest response exceeded the 16 MiB limit."
+                message: "The guest response exceeded the 64 MiB JSONL frame limit."
             )
         }
         return response

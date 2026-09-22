@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { StructuredOutputCompatibility } from './ai/structured-output';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
@@ -51,6 +52,7 @@ export interface HelmModelsConfig {
   temperature: number;
   requestTimeoutMs: number;
   supportsStructuredOutputs: boolean;
+  structuredOutputCompatibility: StructuredOutputCompatibility;
 }
 
 interface ModelConfigFile {
@@ -64,6 +66,7 @@ interface ModelConfigFile {
   temperature?: unknown;
   requestTimeoutMs?: unknown;
   supportsStructuredOutputs?: unknown;
+  structuredOutputCompatibility?: unknown;
 }
 
 const defaultModelsConfigPath = join(repositoryRoot, 'config', 'models.json');
@@ -98,6 +101,14 @@ function loadModelsConfig(env: NodeJS.ProcessEnv): HelmModelsConfig {
   if (typeof supportsStructuredOutputs !== 'boolean') {
     throw new Error('Model configuration field "supportsStructuredOutputs" must be a boolean');
   }
+  const structuredOutputCompatibility = env.HELM_LLM_STRUCTURED_OUTPUT_COMPATIBILITY
+    ?? file.structuredOutputCompatibility
+    ?? 'native';
+  if (structuredOutputCompatibility !== 'native' && structuredOutputCompatibility !== 'lmstudio-mlx') {
+    throw new Error(
+      'Model configuration field "structuredOutputCompatibility" must be "native" or "lmstudio-mlx"',
+    );
+  }
 
   return {
     providerName: requiredString(env.HELM_LLM_PROVIDER ?? file.providerName, 'providerName'),
@@ -122,6 +133,7 @@ function loadModelsConfig(env: NodeJS.ProcessEnv): HelmModelsConfig {
       'requestTimeoutMs',
     ),
     supportsStructuredOutputs,
+    structuredOutputCompatibility,
   };
 }
 

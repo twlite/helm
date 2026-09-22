@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { helmApi, parseError } from './api';
 import { ActivityDrawer } from './components/ActivityDrawer';
 import { Conversation, type ConversationNotice } from './components/Conversation';
+import { DesktopPanel } from './components/DesktopPanel';
 import { MemoryDialog } from './components/MemoryDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { ThreadSidebar } from './components/ThreadSidebar';
@@ -436,34 +437,33 @@ function App() {
         threads={threads}
         mobileOpen={isMobileSidebarOpen}
       />
-      <Conversation
-        activityOpen={isActivityOpen}
-        draft={draft}
-        isLoading={messageState === 'loading'}
-        isRunStarting={isRunStarting}
-        isSending={messageState === 'saving'}
-        messages={messages}
-        onDraftChange={setDraft}
-        onDismissNotice={() => setNotice(null)}
-        onOpenMobileSidebar={() => setIsMobileSidebarOpen(true)}
-        onRunDemo={handleRunDemo}
-        onSend={handleSendMessage}
-        onToggleActivity={() => setIsActivityOpen((current) => !current)}
-        notice={notice}
-        run={run}
-        thread={selectedThread}
-      />
+      <section className="flex min-w-0 flex-1">
+        <Conversation
+          activityOpen={isActivityOpen}
+          draft={draft}
+          isLoading={messageState === 'loading'}
+          isRunStarting={isRunStarting}
+          isSending={messageState === 'saving'}
+          messages={messages}
+          onDraftChange={setDraft}
+          onDismissNotice={() => setNotice(null)}
+          onOpenMobileSidebar={() => setIsMobileSidebarOpen(true)}
+          onRunDemo={handleRunDemo}
+          onSend={handleSendMessage}
+          onToggleActivity={() => setIsActivityOpen((current) => !current)}
+          notice={notice}
+          run={run}
+          thread={selectedThread}
+        />
+        <DesktopPanel onVmAction={handleVmAction} screenshot={screenshot} vm={vm} vmAction={vmAction} />
+      </section>
       <ActivityDrawer
         isRunStarting={isRunStarting}
         onCancelRun={handleCancelRun}
         onOpenChange={setIsActivityOpen}
         onRunDemo={handleRunDemo}
-        onVmAction={handleVmAction}
         open={isActivityOpen}
         run={run}
-        screenshot={screenshot}
-        vm={vm}
-        vmAction={vmAction}
       />
       <MemoryDialog
         memoryActionId={memoryActionId}

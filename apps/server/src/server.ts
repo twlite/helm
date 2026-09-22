@@ -22,7 +22,6 @@ import { MemoryService } from './memory/service';
 import { EventHub, type EventSocket } from './events';
 import { loadConfig, type HelmConfig } from './config';
 import { logger } from './logger';
-import { HttpGuestTransport } from './vm/transport';
 import { VmController } from './vm/vm-controller';
 import type {
   GuestMethodParams,
@@ -218,11 +217,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
   mkdirSync(config.runtimeDir, { recursive: true });
   const database = new PersistenceDatabase(config.databasePath);
   const events = new EventHub();
-  const envelopeGuest = new HttpGuestTransport({
-    baseUrl: `http://${config.guestHost}:${config.guestPort}`,
-    timeoutMs: config.toolTimeoutMs,
-  });
-  const vm = new VmController(config, events, envelopeGuest);
+  const vm = new VmController(config, events);
   const activeRuns = new Map<string, { runtime: AgentRuntime; cancellation: AbortController }>();
   const runAdapter = new RuntimeDatabaseAdapter(database);
   const runtimeEvents = new RuntimeEvents(events);
@@ -232,8 +227,9 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       method: M,
       params: GuestMethodParams[M],
       options?: GuestRequestOptions,
-    ): Promise<GuestMethodResult[M]> => envelopeGuest.request<GuestMethodResult[M]>(
-      { id: `guest_${Date.now()}_${Math.random().toString(36).slice(2)}`, method, params },
+    ): Promise<GuestMethodResult[M]> => vm.guestRequest<GuestMethodResult[M]>(
+      method,
+      params,
       options?.signal,
     ),
   };

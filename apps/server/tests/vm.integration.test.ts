@@ -2,7 +2,6 @@ import { describe, expect, it } from 'bun:test';
 
 import { EventHub } from '../src/events';
 import { loadConfig } from '../src/config';
-import { HttpGuestTransport } from '../src/vm/transport';
 import { VmController } from '../src/vm/vm-controller';
 
 const enabled = process.env.HELM_VM_INTEGRATION === '1';
@@ -18,10 +17,6 @@ describe('Apple VM integration', () => {
     const vm = new VmController(
       config,
       new EventHub(),
-      new HttpGuestTransport({
-        baseUrl: `http://${config.guestHost}:${config.guestPort}`,
-        timeoutMs: config.toolTimeoutMs,
-      }),
     );
 
     try {

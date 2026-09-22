@@ -1,9 +1,8 @@
 import { memo, useState } from 'react';
 import type { CompletionCriterion } from '@helm/shared';
-import type { RunDetails, RunStep, VmAction, VmStatus } from '../types';
+import type { RunDetails, RunStep } from '../types';
 import { humanize } from '../format';
 import { Icon } from './Icon';
-import { DesktopViewer } from './DesktopViewer';
 import { Button } from './ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './ui/collapsible';
 import { ScrollArea } from './ui/scroll-area';
@@ -13,10 +12,6 @@ type ActivityDrawerProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   run: RunDetails | null;
-  vm: VmStatus | null;
-  screenshot: string | null;
-  vmAction: VmAction | null;
-  onVmAction: (action: VmAction) => Promise<void>;
   onCancelRun: (runId: string) => Promise<void>;
   onRunDemo: () => Promise<void>;
   isRunStarting: boolean;
@@ -224,107 +219,40 @@ function RunProgress({ run, onCancelRun }: { run: RunDetails; onCancelRun: (runI
   );
 }
 
-function DesktopSection({
-  screenshot,
-  vm,
-  onOpen,
-}: {
-  screenshot: string | null;
-  vm: VmStatus | null;
-  onOpen: () => void;
-}) {
-  return (
-    <section className="space-y-3">
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-medium text-[#d7dde3]">Desktop</h3>
-        {screenshot ? <Button onClick={onOpen} size="sm" variant="ghost">Open desktop</Button> : null}
-      </div>
-      <button
-        aria-label={screenshot ? 'Open desktop screenshot' : 'Desktop screenshot unavailable'}
-        className="block w-full overflow-hidden rounded-lg border border-white/[0.08] bg-black text-left outline-none transition hover:border-white/[0.16] focus-visible:ring-2 focus-visible:ring-teal-400/50"
-        disabled={!screenshot}
-        onClick={onOpen}
-        type="button"
-      >
-        {screenshot ? (
-          <img alt="Latest Linux guest desktop screenshot" className="aspect-video w-full object-cover" src={screenshot} />
-        ) : (
-          <div className="flex aspect-video flex-col items-center justify-center gap-2 text-xs text-[#606975]"><Icon name="monitor" size={21} /><span>{vm?.state === 'unavailable' ? 'VM helper unavailable' : 'No desktop screenshot yet'}</span></div>
-        )}
-      </button>
-      <div className="flex items-center gap-2 text-xs text-[#79838f]">
-        <span className={`size-1.5 rounded-full ${vm?.guestConnected ? 'bg-emerald-400' : 'bg-[#606975]'}`} />
-        <span>{vm?.guestConnected ? 'Connected' : 'Not connected'}</span>
-      </div>
-    </section>
-  );
-}
-
-function EnvironmentSection({ vm, vmAction, onVmAction }: Pick<ActivityDrawerProps, 'vm' | 'vmAction' | 'onVmAction'>) {
-  const state = vm?.state ?? 'unavailable';
-  const status = statusClasses(state);
-  return (
-    <section className="space-y-3">
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-medium text-[#d7dde3]">Environment</h3>
-        <span className={`flex items-center gap-1.5 text-xs ${status.text}`}><span className={`size-1.5 rounded-full ${status.dot}`} />{humanize(state)}</span>
-      </div>
-      {vm?.message ? <p className="text-xs leading-5 text-[#79838f]">{vm.message}</p> : null}
-      <div className="flex flex-wrap gap-2">
-        <Button disabled={vmAction !== null || state === 'running' || state === 'starting'} onClick={() => void onVmAction('start')} size="sm" variant="secondary"><Icon name="play" size={13} />Start</Button>
-        <Button disabled={vmAction !== null || state === 'stopped' || state === 'stopping' || state === 'unavailable'} onClick={() => void onVmAction('stop')} size="sm" variant="secondary"><Icon name="square" size={12} />Stop</Button>
-        <Button disabled={vmAction !== null} onClick={() => void onVmAction('reset')} size="sm" variant="ghost"><Icon name="refresh" size={13} />Restart</Button>
-      </div>
-    </section>
-  );
-}
-
 export function ActivityDrawer({
   open,
   onOpenChange,
   run,
-  vm,
-  screenshot,
-  vmAction,
-  onVmAction,
   onCancelRun,
   onRunDemo,
   isRunStarting,
 }: ActivityDrawerProps) {
-  const [desktopOpen, setDesktopOpen] = useState(false);
   return (
-    <>
-      <Sheet onOpenChange={onOpenChange} open={open}>
-        <SheetContent className="w-[min(100vw,400px)] p-0 sm:max-w-[400px]" side="right">
-          <SheetHeader className="border-b border-white/[0.06] pr-14">
-            <SheetTitle>Activity</SheetTitle>
-            <SheetDescription>Agent actions, verification, and the controlled desktop.</SheetDescription>
-          </SheetHeader>
-          <ScrollArea className="min-h-0 flex-1">
-            <div className="space-y-8 px-5 pb-8 pt-5">
-              {run ? (
-                <>
-                  <RunProgress onCancelRun={onCancelRun} run={run} />
-                  <DesktopSection onOpen={() => setDesktopOpen(true)} screenshot={screenshot} vm={vm} />
-                  <EnvironmentSection onVmAction={onVmAction} vm={vm} vmAction={vmAction} />
-                </>
-              ) : (
-                <section className="space-y-4">
-                  <div>
-                    <h3 className="text-sm font-medium text-[#d7dde3]">No active run</h3>
-                    <p className="mt-2 text-sm leading-6 text-[#79838f]">Start a task to see actions, observations, and verification.</p>
-                  </div>
-                  <Button disabled={isRunStarting} onClick={() => void onRunDemo()} size="sm" variant="secondary">
-                    <Icon name="play" size={14} />
-                    {isRunStarting ? 'Starting…' : 'Run scripted demo'}
-                  </Button>
-                </section>
-              )}
-            </div>
-          </ScrollArea>
-        </SheetContent>
-      </Sheet>
-      <DesktopViewer onOpenChange={setDesktopOpen} open={desktopOpen} screenshot={screenshot} vm={vm} />
-    </>
+    <Sheet onOpenChange={onOpenChange} open={open}>
+      <SheetContent className="w-[min(100vw,400px)] p-0 sm:max-w-[400px]" side="right">
+        <SheetHeader className="border-b border-white/[0.06] pr-14">
+          <SheetTitle>Activity</SheetTitle>
+          <SheetDescription>Agent actions and verification.</SheetDescription>
+        </SheetHeader>
+        <ScrollArea className="min-h-0 flex-1">
+          <div className="space-y-8 px-5 pb-8 pt-5">
+            {run ? (
+              <RunProgress onCancelRun={onCancelRun} run={run} />
+            ) : (
+              <section className="space-y-4">
+                <div>
+                  <h3 className="text-sm font-medium text-[#d7dde3]">No active run</h3>
+                  <p className="mt-2 text-sm leading-6 text-[#79838f]">Start a task to see actions, observations, and verification.</p>
+                </div>
+                <Button disabled={isRunStarting} onClick={() => void onRunDemo()} size="sm" variant="secondary">
+                  <Icon name="play" size={14} />
+                  {isRunStarting ? 'Starting…' : 'Run scripted demo'}
+                </Button>
+              </section>
+            )}
+          </div>
+        </ScrollArea>
+      </SheetContent>
+    </Sheet>
   );
 }

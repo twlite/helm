@@ -147,8 +147,9 @@ login, Chromium, a lightweight text editor, a lightweight file manager,
 Playwright dependencies, and the desktop utilities needed by semantic RPC
 methods. Build and install the small Linux-only bridge in
 [guest/helm-guest/bridge](../guest/helm-guest/bridge/README.md); it forwards
-AF_VSOCK port `4242` to the guest runtime's loopback HTTP port `4242`. Start the
-bridge and then `helm-guest` after the graphical session, retrying until
+AF_VSOCK port `4242` to the guest runtime's loopback JSONL TCP port `4242`.
+Each request and response is one UTF-8 JSON object terminated by `\n`. Start
+the bridge and then `helm-guest` after the graphical session, retrying until
 `DISPLAY` and `XAUTHORITY` are usable.
 
 The runtime directory is exposed read-only through VirtioFS at

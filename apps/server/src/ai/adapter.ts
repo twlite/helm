@@ -10,6 +10,10 @@ import type {
 import type { TaskPlanner, TaskPlannerInput } from '../agent/types';
 import type { EmbeddingProvider } from '../memory/vector';
 import type { ToolDefinition } from '../tools/registry';
+import {
+  structuredOutputSchema,
+  type StructuredOutputCompatibility,
+} from './structured-output';
 
 /** The model boundary never owns tool execution, verification, or run state. */
 export interface DecisionProviderBoundary {
@@ -45,6 +49,7 @@ export interface AiSdkDecisionProviderOptions {
   maxOutputTokens: number;
   temperature: number;
   requestTimeoutMs: number;
+  structuredOutputCompatibility?: StructuredOutputCompatibility;
 }
 
 export class AiSdkDecisionProvider implements DecisionProviderBoundary {
@@ -56,6 +61,7 @@ export class AiSdkDecisionProvider implements DecisionProviderBoundary {
       maxOutputTokens: this.options.maxOutputTokens,
       temperature: this.options.temperature,
       requestTimeoutMs: this.options.requestTimeoutMs,
+      structuredOutputCompatibility: this.options.structuredOutputCompatibility,
       abortSignal: context.signal,
       schema: aiDecisionSchema,
       system: [
@@ -87,6 +93,7 @@ export interface AiSdkTaskPlannerOptions {
   maxOutputTokens: number;
   temperature: number;
   requestTimeoutMs: number;
+  structuredOutputCompatibility?: StructuredOutputCompatibility;
 }
 
 export interface AiSdkThreadTitleGeneratorOptions {
@@ -94,6 +101,7 @@ export interface AiSdkThreadTitleGeneratorOptions {
   maxOutputTokens: number;
   temperature: number;
   requestTimeoutMs: number;
+  structuredOutputCompatibility?: StructuredOutputCompatibility;
 }
 
 const criterionSchema = z.discriminatedUnion('type', [
@@ -201,12 +209,15 @@ async function generateStructured<T extends z.ZodType>(options: {
   temperature: number;
   requestTimeoutMs: number;
   abortSignal?: AbortSignal;
+  structuredOutputCompatibility?: StructuredOutputCompatibility;
 }): Promise<z.infer<T>> {
   const response = await generateText({
     model: options.model,
     system: options.system,
     prompt: options.prompt,
-    output: Output.object({ schema: options.schema }),
+    output: Output.object({
+      schema: structuredOutputSchema(options.schema, options.structuredOutputCompatibility),
+    }),
     maxOutputTokens: options.maxOutputTokens,
     temperature: options.temperature,
     timeout: options.requestTimeoutMs,
@@ -225,6 +236,7 @@ export class AiSdkTaskPlanner implements TaskPlanner {
       maxOutputTokens: this.options.maxOutputTokens,
       temperature: this.options.temperature,
       requestTimeoutMs: this.options.requestTimeoutMs,
+      structuredOutputCompatibility: this.options.structuredOutputCompatibility,
       abortSignal: input.signal,
       schema: aiTaskPlanSchema,
       system: [
@@ -270,6 +282,7 @@ export class AiSdkThreadTitleGenerator {
         maxOutputTokens: this.options.maxOutputTokens,
         temperature: this.options.temperature,
         requestTimeoutMs: this.options.requestTimeoutMs,
+        structuredOutputCompatibility: this.options.structuredOutputCompatibility,
         schema: aiThreadTitleSchema,
         system: [
           'You generate concise conversation titles for Helm.',

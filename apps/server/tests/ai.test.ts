@@ -1,8 +1,15 @@
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
-import { embed, type EmbeddingModel } from 'ai';
+import { asSchema, embed, type EmbeddingModel } from 'ai';
 import { describe, expect, it } from 'bun:test';
+import type { AgentTurnContext } from '@helm/shared';
 
-import { AiSdkEmbeddingProvider, AiSdkThreadTitleGenerator } from '../src/ai/adapter';
+import {
+  AiSdkDecisionProvider,
+  AiSdkEmbeddingProvider,
+  AiSdkThreadTitleGenerator,
+  aiDecisionSchema,
+} from '../src/ai/adapter';
+import { adaptStructuredOutputJsonSchema } from '../src/ai/structured-output';
 
 function fakeEmbeddingModel(values: number[]): EmbeddingModel {
   return {
@@ -19,6 +26,107 @@ function fakeEmbeddingModel(values: number[]): EmbeddingModel {
 }
 
 describe('LM Studio AI adapters', () => {
+  it('keeps arbitrary action input keys while adapting the MLX schema', async () => {
+    const nativeSchema = await asSchema(aiDecisionSchema).jsonSchema;
+    const compatibleSchema = adaptStructuredOutputJsonSchema(nativeSchema, 'lmstudio-mlx');
+    const actionBranch = (compatibleSchema.oneOf as Array<Record<string, unknown>>).find(branch => (
+      ((branch.properties as Record<string, unknown>).type as Record<string, unknown>).const === 'action'
+    ));
+    const actionInput = (actionBranch?.properties as Record<string, unknown>).input;
+
+    expect(actionInput).toEqual({ type: 'object', additionalProperties: {} });
+    expect(compatibleSchema.oneOf).toHaveLength(3);
+    expect(actionBranch).toMatchObject({ additionalProperties: false });
+    expect(JSON.stringify(compatibleSchema)).not.toContain('propertyNames');
+
+    const parsed = aiDecisionSchema.safeParse({
+      type: 'action',
+      tool: 'some_tool',
+      input: { foo: 'bar', nested: { anything: true } },
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('preserves the native schema object for providers without compatibility requirements', async () => {
+    const nativeSchema = await asSchema(aiDecisionSchema).jsonSchema;
+
+    expect(adaptStructuredOutputJsonSchema(nativeSchema, 'native')).toBe(nativeSchema);
+    expect(JSON.stringify(nativeSchema)).toContain('propertyNames');
+  });
+
+  it('keeps all decision variants valid and rejects invalid top-level shapes', () => {
+    expect(aiDecisionSchema.safeParse({ type: 'complete' }).success).toBe(true);
+    expect(aiDecisionSchema.safeParse({ type: 'blocked', reason: 'Needs attention' }).success).toBe(true);
+    expect(aiDecisionSchema.safeParse({ type: 'unexpected' }).success).toBe(false);
+    expect(aiDecisionSchema.safeParse({ type: 'action', tool: 'some_tool' }).success).toBe(false);
+  });
+
+  it('sends the MLX-compatible schema to the model without weakening native validation', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requestBody = JSON.parse(await request.text()) as Record<string, unknown>;
+        return Response.json({
+          id: 'chatcmpl-decision',
+          object: 'chat.completion',
+          created: 1,
+          model: 'google/gemma-4-e2b',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: JSON.stringify({
+                type: 'action',
+                tool: 'some_tool',
+                input: { foo: 'bar', nested: { anything: true } },
+              }),
+            },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      },
+    });
+    const decisionProvider = new AiSdkDecisionProvider({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      toolDefinitions: [],
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    const context: AgentTurnContext = {
+      task: {
+        id: 'task-1',
+        threadId: 'thread-1',
+        goal: 'Do a thing',
+        criteria: [{ type: 'file.exists', path: 'note.txt' }],
+      },
+      observation: {
+        timestamp: 1,
+        task: { completedCriteria: [], remainingCriteria: ['File exists: note.txt'] },
+      },
+      history: [],
+      memories: [],
+      stepIndex: 0,
+      previousResults: [],
+    };
+
+    await expect(decisionProvider.next(context)).resolves.toMatchObject({
+      type: 'action',
+      tool: 'some_tool',
+    });
+
+    const responseFormat = requestBody?.response_format as Record<string, unknown>;
+    const modelSchema = ((responseFormat?.json_schema as Record<string, unknown>)?.schema) as Record<string, unknown>;
+    expect(JSON.stringify(modelSchema)).not.toContain('propertyNames');
+    expect(modelSchema.oneOf).toHaveLength(3);
+  });
+
   it('converts AI SDK embeddings to the runtime Float32Array boundary', async () => {
     const provider = new AiSdkEmbeddingProvider({
       model: fakeEmbeddingModel([0.25, -0.5, 0.75]),

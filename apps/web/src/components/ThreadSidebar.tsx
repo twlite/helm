@@ -250,7 +250,7 @@ export function ThreadSidebar(props: ThreadSidebarProps) {
 
   return (
     <>
-      <aside aria-label="Threads" className="hidden h-full w-[248px] shrink-0 border-r border-white/[0.07] md:flex">
+      <aside aria-label="Threads" className="hidden h-full w-[248px] shrink-0 border-r border-white/[0.07] lg:flex">
         <SidebarContent {...contentProps} onCloseMobile={() => undefined} />
       </aside>
       <Sheet onOpenChange={onMobileOpenChange} open={mobileOpen}>

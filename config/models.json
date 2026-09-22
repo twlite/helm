@@ -7,5 +7,6 @@
   "maxOutputTokens": 2048,
   "temperature": 0,
   "requestTimeoutMs": 120000,
-  "supportsStructuredOutputs": true
+  "supportsStructuredOutputs": true,
+  "structuredOutputCompatibility": "lmstudio-mlx"
 }

@@ -36,6 +36,7 @@ export function createLmStudioModels(config: HelmConfig, toolDefinitions: readon
     maxOutputTokens: config.models.maxOutputTokens,
     temperature: config.models.temperature,
     requestTimeoutMs: config.models.requestTimeoutMs,
+    structuredOutputCompatibility: config.models.structuredOutputCompatibility,
   } as const;
 
   return {

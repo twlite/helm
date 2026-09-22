@@ -12,6 +12,7 @@ describe('Helm model configuration', () => {
       languageModel: 'google/gemma-4-e2b',
       embeddingModel: 'text-embedding-nomic-embed-text-v1.5',
       embeddingDimensions: 768,
+      structuredOutputCompatibility: 'lmstudio-mlx',
     });
   });
 

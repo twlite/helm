@@ -10,5 +10,10 @@ const response = await fetch(`${baseUrl}/api/vm/${command}`, { method: 'POST' })
   process.exit(1);
 });
 const body = await response.json().catch(() => ({ error: 'Invalid server response' }));
-console.log(JSON.stringify(body, null, 2));
+if (body && typeof body === 'object' && !Array.isArray(body) && 'screenshot' in body) {
+  const { screenshot: _screenshot, ...compactBody } = body as Record<string, unknown>;
+  console.log(JSON.stringify(compactBody, null, 2));
+} else {
+  console.log(JSON.stringify(body, null, 2));
+}
 if (!response.ok) process.exit(1);

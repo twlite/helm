@@ -3,7 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { createGuestHttpHandler } from '../src/server';
+import { createGuestTcpServer } from '../src/server';
 import { GuestRuntime } from '../src/runtime';
 import { GuestSandbox } from '../src/sandbox';
 
@@ -23,18 +23,91 @@ describe('helm-guest RPC', () => {
     }
   });
 
-  it('serves the same protocol over the HTTP handler', async () => {
+  it('serves fragmented and multiple JSONL frames over one TCP connection', async () => {
     const runtime = new GuestRuntime();
+    const server = createGuestTcpServer({ runtime, port: 0 });
+
     try {
-      const handler = createGuestHttpHandler({ runtime });
-      const response = await handler(new Request('http://guest.test/rpc', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ id: 'http-1', method: 'guest.handshake', params: {} }),
-      }));
-      expect(response.status).toBe(200);
-      expect(await response.json()).toMatchObject({ id: 'http-1', ok: true });
+      const responses = await new Promise<Record<string, unknown>[]>((resolve, reject) => {
+        const expected = 4;
+        const received: Record<string, unknown>[] = [];
+        let input = '';
+        let settled = false;
+        const decoder = new TextDecoder();
+
+        const settle = (callback: () => void) => {
+          if (settled) return;
+          settled = true;
+          callback();
+        };
+
+        void Bun.connect({
+          hostname: '127.0.0.1',
+          port: server.port,
+          socket: {
+            open(socket) {
+              const handshake = `${JSON.stringify({
+                id: 'tcp-1',
+                method: 'guest.handshake',
+                params: {},
+              })}\n`;
+              socket.write(handshake.slice(0, 7));
+              socket.write(handshake.slice(7));
+
+              socket.write([
+                JSON.stringify({ id: 'tcp-2', method: 'not-a-method', params: {} }),
+                '{"id":"invalid-json"',
+                JSON.stringify({ id: 'tcp-3', method: 'guest.handshake', params: {} }),
+              ].join('\n') + '\n');
+            },
+            data(socket, data) {
+              input += decoder.decode(data, { stream: true });
+              let newlineIndex = input.indexOf('\n');
+              while (newlineIndex >= 0) {
+                const line = input.slice(0, newlineIndex);
+                input = input.slice(newlineIndex + 1);
+                try {
+                  received.push(JSON.parse(line) as Record<string, unknown>);
+                } catch (error) {
+                  settle(() => reject(error));
+                  socket.end();
+                  return;
+                }
+                if (received.length === expected) {
+                  settle(() => resolve(received));
+                  socket.end();
+                  return;
+                }
+                newlineIndex = input.indexOf('\n');
+              }
+            },
+            error(socket, error) {
+              settle(() => reject(error));
+              socket.end();
+            },
+            close() {
+              if (received.length !== expected) {
+                settle(() => reject(new Error(`Expected ${expected} responses, got ${received.length}.`)));
+              }
+            },
+          },
+        }).catch(error => settle(() => reject(error)));
+      });
+
+      expect(responses[0]).toMatchObject({ id: 'tcp-1', ok: true });
+      expect(responses[1]).toMatchObject({
+        id: 'tcp-2',
+        ok: false,
+        error: { code: 'METHOD_NOT_FOUND' },
+      });
+      expect(responses[2]).toMatchObject({
+        id: null,
+        ok: false,
+        error: { code: 'INVALID_JSON' },
+      });
+      expect(responses[3]).toMatchObject({ id: 'tcp-3', ok: true });
     } finally {
+      server.stop(true);
       await runtime.close();
     }
   });

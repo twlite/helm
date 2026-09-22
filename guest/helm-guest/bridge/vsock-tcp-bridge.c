@@ -2,8 +2,8 @@
 //
 // Tiny Linux guest-side bridge for Helm's Virtio socket transport.
 // It accepts one AF_VSOCK stream at a time and forwards it to the local
-// helm-guest HTTP server. It intentionally exposes no command execution or
-// host filesystem access.
+// helm-guest JSONL TCP listener. It intentionally exposes no command
+// execution or host filesystem access.
 
 #define _GNU_SOURCE
 

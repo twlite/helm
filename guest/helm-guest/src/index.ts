@@ -1,4 +1,4 @@
-import { createGuestHttpHandler } from "./server";
+import { createGuestTcpServer, GUEST_TCP_HOST, GUEST_TCP_PORT } from "./server";
 import { readableStreamChunks, serveJsonLines } from "./jsonl";
 import { GuestRuntime } from "./runtime";
 
@@ -15,20 +15,12 @@ export * from "./server";
 
 interface GuestCliOptions {
   jsonl: boolean;
-  host: string;
-  port: number;
 }
 
 function cliOptions(): GuestCliOptions {
   const jsonl =
     process.argv.includes("--jsonl") || process.env.HELM_GUEST_TRANSPORT === "jsonl";
-  const host = process.env.HELM_GUEST_HOST ?? "127.0.0.1";
-  const portValue = process.env.HELM_GUEST_PORT ?? process.env.PORT ?? "4242";
-  const port = Number(portValue);
-  if (!Number.isInteger(port) || port < 0 || port > 65_535) {
-    throw new Error("HELM_GUEST_PORT must be an integer between 0 and 65535.");
-  }
-  return { jsonl, host, port };
+  return { jsonl };
 }
 
 async function run(): Promise<void> {
@@ -47,18 +39,14 @@ async function run(): Promise<void> {
     return;
   }
 
-  const server = Bun.serve({
-    hostname: options.host,
-    port: options.port,
-    fetch: createGuestHttpHandler({ runtime }),
-  });
-  process.stderr.write(`helm-guest listening on http://${options.host}:${server.port}/rpc\n`);
+  const server = createGuestTcpServer({ runtime });
+  process.stderr.write(`helm-guest listening on tcp://${GUEST_TCP_HOST}:${GUEST_TCP_PORT} (JSONL)\n`);
 
   let stopping = false;
   const stop = async (): Promise<void> => {
     if (stopping) return;
     stopping = true;
-    server.stop();
+    server.stop(true);
     await runtime.close();
   };
   process.once("SIGINT", () => void stop());
