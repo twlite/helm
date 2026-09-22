@@ -1,4 +1,4 @@
-import type { Database } from 'bun:sqlite';
+import type { Database } from './types';
 
 export interface DatabaseDiagnostics {
   sqlite: boolean;

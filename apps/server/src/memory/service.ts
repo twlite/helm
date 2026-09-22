@@ -1,4 +1,3 @@
-import type { Database } from 'bun:sqlite';
 import type { JsonObject, Memory } from '@helm/shared';
 
 import {
@@ -14,6 +13,7 @@ import {
   type MemoryVectorIndex,
   type SqliteVecMemoryVectorIndexOptions,
 } from './vector';
+import type { Database } from '../db/types';
 
 export interface MemoryServiceOptions {
   embeddingProvider?: EmbeddingProvider;

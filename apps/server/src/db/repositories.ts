@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
 
-import type { Database } from 'bun:sqlite';
 import type {
   AgentDecision,
   CompletionCriterion,
@@ -19,6 +18,7 @@ import type {
 } from '@helm/shared';
 
 import { jsonObject, parseJson, stableStringify } from './json';
+import type { Database } from './types';
 
 const MESSAGE_ROLES = new Set<MessageRole>(['user', 'assistant', 'system', 'tool']);
 const RUN_STATUSES = new Set<RunStatus>([
@@ -218,7 +218,7 @@ export class ThreadRepository {
         'SELECT id, title, created_at AS createdAt, updated_at AS updatedAt FROM threads WHERE id = ?',
       )
       .get(id);
-    return row === null ? undefined : mapThread(row);
+    return row === undefined ? undefined : mapThread(row);
   }
 
   get(id: string): Thread | undefined {
@@ -310,7 +310,7 @@ export class MessageRepository {
         'SELECT id, thread_id AS threadId, role, content, metadata_json AS metadataJson, created_at AS createdAt FROM messages WHERE id = ?',
       )
       .get(id);
-    return row === null ? undefined : mapMessage(row);
+    return row === undefined ? undefined : mapMessage(row);
   }
 
   get(id: string): Message | undefined {
@@ -423,7 +423,7 @@ export class RunRepository {
         'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs WHERE id = ?',
       )
       .get(id);
-    return row === null ? undefined : mapRun(row);
+    return row === undefined ? undefined : mapRun(row);
   }
 
   get(id: string): Run | undefined {
@@ -603,7 +603,7 @@ export class RunStepRepository {
         'SELECT id, run_id AS runId, step_index AS stepIndex, phase, decision_json AS decisionJson, tool_name AS toolName, tool_input_json AS toolInputJson, tool_result_json AS toolResultJson, observation_json AS observationJson, verification_json AS verificationJson, created_at AS createdAt, completed_at AS completedAt FROM run_steps WHERE id = ?',
       )
       .get(id);
-    return row === null ? undefined : mapRunStep(row);
+    return row === undefined ? undefined : mapRunStep(row);
   }
 
   get(id: string): RunStep | undefined {

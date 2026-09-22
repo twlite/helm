@@ -1,6 +1,5 @@
-import type { Database } from 'bun:sqlite';
-
 import { stableStringify } from './json';
+import type { Database } from './types';
 
 export interface DatabaseMigration {
   version: number;
@@ -119,7 +118,7 @@ function ensureMigrationTable(database: Database): void {
 function currentVersion(database: Database): number {
   const row = database
     .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
-    .get() as { version: number } | null;
+    .get() as { version: number } | undefined;
   return row?.version ?? 0;
 }
 
@@ -143,7 +142,7 @@ export function runMigrations(
   for (const migration of ordered) {
     const existing = database
       .prepare('SELECT version, name FROM schema_migrations WHERE version = ?')
-      .get(migration.version) as { version: number; name: string } | null;
+      .get(migration.version) as { version: number; name: string } | undefined;
     if (existing) {
       if (existing.name !== migration.name) {
         throw new Error(

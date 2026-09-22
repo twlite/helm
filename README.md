@@ -6,7 +6,7 @@ Helm is a small, explainable computer-use agent harness for a final-year univers
 
 - Vite, React, and TypeScript for the UI
 - Bun and TypeScript for the backend and guest runtime
-- `bun:sqlite`, SQLite FTS5, and an optional `sqlite-vec` adapter
+- `better-sqlite3`, SQLite FTS5, and an optional `sqlite-vec` adapter
 - Zod-validated host/guest protocol
 - Playwright with visible Chromium in an XFCE/X11 Linux guest
 - Swift and Apple Virtualization.framework on Apple Silicon macOS

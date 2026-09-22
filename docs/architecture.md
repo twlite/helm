@@ -7,7 +7,7 @@ browser UI
    │ REST + WebSocket
    ▼
 Bun server
-   ├── repositories ── bun:sqlite
+   ├── repositories ── better-sqlite3
    ├── memory service ── FTS5 / optional sqlite-vec
    ├── AgentRuntime ── LM Studio model ── verifier ── ToolRegistry
    ├── VmController ── guest transport

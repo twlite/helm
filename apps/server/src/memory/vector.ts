@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 
-import type { Database } from 'bun:sqlite';
+import type { Database } from '../db/types';
 
 export interface MemoryVectorMatch {
   memoryId: string;
@@ -242,7 +242,7 @@ export class SqliteVecMemoryVectorIndex implements MemoryVectorIndex {
       this.database.prepare(`INSERT OR IGNORE INTO ${keys} (memory_id) VALUES (?)`).run(memoryId);
       const row = this.database
         .prepare(`SELECT vector_rowid AS vectorRowid FROM ${keys} WHERE memory_id = ?`)
-        .get(memoryId) as { vectorRowid: number | bigint } | null;
+        .get(memoryId) as { vectorRowid: number | bigint } | undefined;
       if (!row) throw new Error(`Unable to allocate vector row for memory ${memoryId}`);
       const vectorRowid = typeof row.vectorRowid === 'bigint' ? row.vectorRowid : BigInt(row.vectorRowid);
       this.database.prepare(`DELETE FROM ${table} WHERE rowid = ?`).run(vectorRowid);
@@ -262,11 +262,11 @@ export class SqliteVecMemoryVectorIndex implements MemoryVectorIndex {
     const rows = this.database
       .prepare(
         `SELECT keys.memory_id AS memoryId, vectors.distance AS distance
-           FROM ${table} AS vectors
+          FROM ${table} AS vectors
            JOIN ${keys} AS keys ON keys.vector_rowid = vectors.rowid
           WHERE vectors.embedding MATCH ?
-          ORDER BY vectors.distance ASC
-          LIMIT ?`,
+            AND vectors.k = ?
+          ORDER BY vectors.distance ASC`,
       )
       .all(embedding, limit) as Array<{ memoryId: string; distance: number }>;
     return rows.map(row => ({ memoryId: row.memoryId, distance: row.distance }));
@@ -279,7 +279,7 @@ export class SqliteVecMemoryVectorIndex implements MemoryVectorIndex {
     const remove = this.database.transaction(() => {
       const row = this.database
         .prepare(`SELECT vector_rowid AS vectorRowid FROM ${keys} WHERE memory_id = ?`)
-        .get(memoryId) as { vectorRowid: number | bigint } | null;
+        .get(memoryId) as { vectorRowid: number | bigint } | undefined;
       if (!row) return;
       const vectorRowid = typeof row.vectorRowid === 'bigint' ? row.vectorRowid : BigInt(row.vectorRowid);
       this.database.prepare(`DELETE FROM ${table} WHERE rowid = ?`).run(vectorRowid);

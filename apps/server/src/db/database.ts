@@ -1,8 +1,9 @@
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-import { Database } from 'bun:sqlite';
+import BetterSqlite3 from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
+import type { Database } from './types';
 import {
   getDatabaseDiagnostics,
   type DatabaseDiagnostics,
@@ -36,11 +37,10 @@ export class PersistenceDatabase {
       mkdirSync(dirname(filename), { recursive: true });
     }
 
-    this.sqlite = new Database(filename, {
+    this.sqlite = new BetterSqlite3(filename, {
       readonly: options.readonly ?? false,
-      readwrite: !(options.readonly ?? false),
-      create: !(options.readonly ?? false),
-      strict: true,
+      fileMustExist: options.readonly ?? false,
+      timeout: 5000,
     });
     try {
       sqliteVec.load(this.sqlite);
@@ -70,7 +70,7 @@ export class PersistenceDatabase {
   }
 
   close(): void {
-    this.sqlite.close(true);
+    this.sqlite.close();
   }
 }
 
@@ -86,7 +86,7 @@ export function createDatabase(
 
 export const createPersistenceDatabase = createDatabase;
 
-/** Open a migrated raw Bun database for callers that own their repositories. */
+/** Open a migrated raw better-sqlite3 database for callers that own their repositories. */
 export function openDatabase(
   filename = ':memory:',
   options: DatabaseOpenOptions = {},

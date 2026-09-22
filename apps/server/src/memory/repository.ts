@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 
-import type { Database } from 'bun:sqlite';
 import type { JsonObject, Memory } from '@helm/shared';
 
 import { jsonObject, parseJson, stableStringify } from '../db/json';
+import type { Database } from '../db/types';
 
 export type MemoryKind = Memory['kind'];
 
@@ -137,7 +137,7 @@ export class MemoryRepository {
         'SELECT id, content, kind, importance, metadata_json AS metadataJson, created_at AS createdAt, updated_at AS updatedAt FROM memories WHERE id = ?',
       )
       .get(id);
-    return row === null ? undefined : mapMemory(row);
+    return row === undefined ? undefined : mapMemory(row);
   }
 
   get(id: string): Memory | undefined {
@@ -256,7 +256,7 @@ export class MemoryRepository {
       this.database.prepare('DELETE FROM memory_fts WHERE memory_id = ?').run(id);
       const row = this.database
         .prepare('SELECT id, content, kind FROM memories WHERE id = ?')
-        .get(id) as { id: string; content: string; kind: string } | null;
+        .get(id) as { id: string; content: string; kind: string } | undefined;
       if (row) {
         this.database
           .prepare('INSERT INTO memory_fts (memory_id, content, kind) VALUES (?, ?, ?)')
