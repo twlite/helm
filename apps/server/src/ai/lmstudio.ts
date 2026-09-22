@@ -7,9 +7,11 @@ import {
   AiSdkDecisionProvider,
   AiSdkEmbeddingProvider,
   AiSdkMemoryExtractor,
+  AiSdkOrchestrator,
   AiSdkResponseGenerator,
   AiSdkTaskPlanner,
   AiSdkThreadTitleGenerator,
+  AiSdkWorker,
 } from './adapter';
 
 export interface HelmAiModels {
@@ -18,6 +20,8 @@ export interface HelmAiModels {
   embeddingModel: EmbeddingModel;
   decisionProvider: AiSdkDecisionProvider;
   taskPlanner: AiSdkTaskPlanner;
+  orchestrator: AiSdkOrchestrator;
+  worker: AiSdkWorker;
   responseGenerator: AiSdkResponseGenerator;
   titleGenerator: AiSdkThreadTitleGenerator;
   memoryExtractor: AiSdkMemoryExtractor;
@@ -52,6 +56,11 @@ export function createLmStudioModels(config: HelmConfig, toolDefinitions: readon
       toolDefinitions,
     }),
     taskPlanner: new AiSdkTaskPlanner(sharedGenerationOptions),
+    orchestrator: new AiSdkOrchestrator(sharedGenerationOptions),
+    worker: new AiSdkWorker({
+      ...sharedGenerationOptions,
+      toolDefinitions,
+    }),
     responseGenerator: new AiSdkResponseGenerator({
       model: languageModel,
       maxOutputTokens: config.models.maxOutputTokens,

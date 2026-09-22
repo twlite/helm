@@ -7,6 +7,9 @@ export const DEFAULT_RUNTIME_BUDGETS: RuntimeBudgets = {
   maxRepeatedAction: 3,
   maxConsecutiveFailures: 3,
   toolTimeoutMs: 30_000,
+  maxWorkerActions: 8,
+  noProgressThreshold: 2,
+  maxRecoveryAttempts: 2,
 };
 
 export interface BudgetSnapshot {
@@ -90,4 +93,3 @@ export class RunCancellation {
 }
 
 export const CancellationToken = RunCancellation;
-

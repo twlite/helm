@@ -303,6 +303,57 @@ describe('LM Studio AI adapters', () => {
     expect(JSON.stringify(requestBody)).toContain('Who are you?');
   });
 
+  it('keeps model guesses out of compiled acceptance criteria', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-plan-guard',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({
+              mode: 'conversation',
+              goal: 'Open a page and write a result file.',
+              criteria: [
+                { type: 'browser.url', url: 'https://invented.example/releases' },
+                { type: 'file.contains', path: '~/Desktop/result.txt', expected: 'invented content' },
+              ],
+            }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const planner = new AiSdkTaskPlanner({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+
+    const task = await planner.createTask({
+      threadId: 'thread-plan-guard',
+      userMessage: 'Open example.com and write ~/Desktop/result.txt.',
+    });
+
+    expect(task.isConversation).toBe(false);
+    expect(task.criteria).toEqual([]);
+    expect(task.requirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'browser', target: { url: 'https://example.com' } }),
+      expect.objectContaining({ type: 'filesystem', target: expect.objectContaining({ path: '~/Desktop/result.txt' }) }),
+    ]));
+    expect(JSON.stringify(task)).not.toContain('invented.example');
+    expect(JSON.stringify(task)).not.toContain('invented content');
+  });
+
   it('routes current public web questions to browser research instead of accepting a conversational refusal', async () => {
     let requestBody: Record<string, unknown> | undefined;
     const provider = createOpenAICompatible({

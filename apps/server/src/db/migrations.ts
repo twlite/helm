@@ -101,6 +101,29 @@ export const migrations: readonly DatabaseMigration[] = [
       database.exec(INDEX_AND_FTS_SQL);
     },
   },
+  {
+    version: 3,
+    name: 'run-task-state-snapshots',
+    up(database) {
+      database.exec(`
+        ALTER TABLE runs ADD COLUMN task_json TEXT;
+        ALTER TABLE runs ADD COLUMN state_json TEXT;
+      `);
+    },
+  },
+  {
+    version: 4,
+    name: 'orchestrator-step-observability',
+    up(database) {
+      database.exec(`
+        ALTER TABLE run_steps ADD COLUMN orchestrator_decision_json TEXT;
+        ALTER TABLE run_steps ADD COLUMN objective_json TEXT;
+        ALTER TABLE run_steps ADD COLUMN worker TEXT;
+        ALTER TABLE run_steps ADD COLUMN worker_result_json TEXT;
+        ALTER TABLE run_steps ADD COLUMN progress_json TEXT;
+      `);
+    },
+  },
 ];
 
 export const MIGRATIONS = migrations;

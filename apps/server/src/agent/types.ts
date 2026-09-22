@@ -2,15 +2,25 @@ import type {
   AgentDecision,
   AgentStep,
   AgentTurnContext,
+  Blocker,
   CompletionCriterion,
   EnvironmentObservation,
+  Evidence,
+  Fact,
   Memory,
   Message,
+  OrchestratorDecision,
+  ProgressState,
   Run,
   RunStep,
+  TaskState,
   TaskDefinition,
   ToolResult,
   VerificationResult,
+  WorkerAction,
+  WorkerKind,
+  WorkerObjective,
+  WorkerResult,
 } from '@helm/shared';
 
 import type { GuestTransport } from '../tools/guest-transport';
@@ -21,14 +31,24 @@ export type {
   AgentDecision,
   AgentStep,
   AgentTurnContext,
+  Blocker,
   CompletionCriterion,
   EnvironmentObservation,
+  Evidence,
+  Fact,
   Memory,
   Run,
   RunStep,
+  TaskState,
   TaskDefinition,
   ToolResult,
   VerificationResult,
+  OrchestratorDecision,
+  ProgressState,
+  WorkerAction,
+  WorkerKind,
+  WorkerObjective,
+  WorkerResult,
 };
 
 export interface TaskPlannerInput {
@@ -47,6 +67,49 @@ export interface MemoryRecallInput {
 
 export interface TaskPlanner {
   createTask(input: TaskPlannerInput): Promise<TaskDefinition>;
+}
+
+/** Compiler boundary: it describes requirements, not a guessed action plan. */
+export interface TaskCompiler extends TaskPlanner {}
+
+export interface OrchestratorContext {
+  task: TaskDefinition;
+  state: TaskState;
+  observation: EnvironmentObservation;
+  verification: VerificationResult;
+  memories: Memory[];
+  conversation?: readonly Message[];
+  stepIndex: number;
+  signal?: AbortSignal;
+}
+
+export interface OrchestratorProvider {
+  next(input: OrchestratorContext): Promise<OrchestratorDecision>;
+}
+
+export interface WorkerExecutionContext {
+  execute(tool: string, input: Record<string, unknown>): Promise<ToolResult>;
+  observe(): Promise<EnvironmentObservation>;
+  signal?: AbortSignal;
+}
+
+export interface WorkerContext {
+  objective: WorkerObjective;
+  task: TaskDefinition;
+  state: TaskState;
+  observation: EnvironmentObservation;
+  verification: VerificationResult;
+  memories: Memory[];
+  conversation?: readonly Message[];
+  recentActions: WorkerAction[];
+  failedStrategies: TaskState['failedStrategies'];
+  execute: WorkerExecutionContext;
+  maxActions: number;
+  signal?: AbortSignal;
+}
+
+export interface WorkerProvider {
+  execute(input: WorkerContext): Promise<WorkerResult>;
 }
 
 export interface DecisionProvider {
@@ -116,6 +179,9 @@ export interface RuntimeBudgets {
   maxRepeatedAction: number;
   maxConsecutiveFailures: number;
   toolTimeoutMs: number;
+  maxWorkerActions: number;
+  noProgressThreshold: number;
+  maxRecoveryAttempts: number;
 }
 
 export interface AgentRuntimeOptions {
@@ -124,6 +190,9 @@ export interface AgentRuntimeOptions {
   verifier: CriterionVerifierRegistry | VerificationProvider;
   decisionProvider: DecisionProvider;
   taskPlanner?: TaskPlanner;
+  taskCompiler?: TaskCompiler;
+  orchestrator?: OrchestratorProvider;
+  worker?: WorkerProvider;
   repository?: RuntimeRepository;
   persistence?: RuntimePersistence;
   events?: RuntimeEventSink;

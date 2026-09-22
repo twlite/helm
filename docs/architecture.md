@@ -1,45 +1,72 @@
 # Helm architecture
 
-Helm is intentionally a single backend process with a small number of explicit boundaries.
+Helm is a single backend process with explicit boundaries. The model proposes
+objectives and bounded actions; the runtime owns execution, state, evidence,
+verification, and completion.
 
 ```text
-browser UI
-   │ REST + WebSocket
-   ▼
-Bun server
-   ├── repositories ── better-sqlite3
-   ├── memory service ── FTS5 / optional sqlite-vec
-   ├── AgentRuntime ── LM Studio model ── verifier ── ToolRegistry
-   ├── VmController ── guest transport
-   └── event hub
-          │ JSON Lines
-          ▼
-Swift VM host ── Virtualization.framework ── ARM64 Linux
-                                             └── helm-guest
+browser UI -- REST + WebSocket --> Bun server
+                                   |- task compiler -> requirements
+                                   |- orchestrator -> one objective
+                                   |- bounded worker -> ToolRegistry
+                                   |- evidence/fact store -> verifier
+                                   |- repositories -> better-sqlite3
+                                   `- VmController -> typed guest transport
+                                                        | JSON Lines
+                                                        v
+                                             Swift VM host -> helm-guest
+                                                              |- Playwright
+                                                              `- desktop/filesystem
 ```
 
-The UI never talks directly to the VM. The server translates UI requests into typed tool calls and emits validated activity events. The guest exposes semantic filesystem, browser, application, and desktop operations rather than a shell.
+## Responsibilities
 
-## Boundaries
+- `packages/shared` owns domain types and Zod guest protocol schemas.
+- `apps/server/src/agent` owns task state, orchestration, worker boundaries,
+  runtime budgets, progress fingerprints, recovery, and completion.
+- `apps/server/src/ai` owns LM Studio adapters. The compiler, orchestrator, and
+  workers can use the same model, but each has a separate schema, prompt, and
+  responsibility.
+- `apps/server/src/tools` owns typed tool validation, guest calls, and action
+  receipts.
+- `apps/server/src/db` persists task/state snapshots and structured run-step
+  observability.
+- `guest/helm-guest` performs sandboxed filesystem, visible-browser, and desktop
+  operations.
+- `apps/web` renders persisted and live objectives, actions, facts, progress,
+  and verification; it does not infer completion from UI state.
 
-- `packages/shared` owns Zod protocol schemas and shared domain types.
-- `apps/server/src/db` owns migrations and SQLite repositories.
-- `apps/server/src/memory` owns global memory persistence, FTS search, semantic recall, and vector capability reporting. AI runs receive only a small relevant recall set for their source message rather than the entire memory table.
-- `apps/server/src/agent` owns the run loop, budgets, loop detection, and provider boundary.
-- `apps/server/src/ai` owns the LM Studio OpenAI-compatible model and embedding adapters. It proposes tasks and actions; it never executes tools or decides verification.
-- `apps/server/src/tools` owns tool schemas and execution.
-- `apps/server/src/vm` hides the helper process and guest transport from the rest of the server.
-- `guest/helm-guest` owns operations that must execute inside the isolated Linux desktop.
-- `native/helm-vm-host` owns only Virtualization.framework configuration and lifecycle.
+## Model boundaries
 
-The model boundary is intentionally subordinate to Helm's runtime. The AI SDK adapter proposes a validated task plan or one next action from the current observation. Actual execution remains routed through Helm's registry and completion remains owned by Helm's verifier.
+The task compiler answers “what requirements did the user request?” without
+choosing a rigid action sequence. The orchestrator answers “which one unmet
+objective should be attempted next?” A worker answers “which bounded tool
+actions can achieve that objective?” Runtime receipts answer “what happened?”
+The verifier answers “does that evidence satisfy the exact requirement?”
 
-## Memory recall
+No model response can promote its own guess into authoritative environment
+state, redefine requirements, or finish the entire run.
 
-Memories are global, explicitly persisted notes. At the start of an AI run, Helm
-uses the source user message to retrieve a small context set through semantic
-vector search when available, with FTS keyword fallback. Empty or generic
-follow-ups do not trigger semantic recall, and distant vector candidates are
-discarded. The same snapshot is supplied to task planning and subsequent
-decision turns; the model is instructed to treat it as untrusted reference
-material rather than current state or an instruction override.
+## Redesign mapping
+
+The former path coupled one model decision, one tool call, a text-oriented
+observation, and free-form completion criteria. It also treated repeated calls
+as loops before checking whether the environment changed. The new boundaries
+map those failures directly:
+
+- guessed URLs, filenames, and expected content are filtered at compilation;
+- observations and action receipts are produced by the guest/runtime;
+- browser snapshots use semantic Playwright state instead of body text alone;
+- facts carry origin and evidence links, so hypotheses cannot satisfy checks;
+- deterministic verification evaluates exact requirements rather than model
+  supplied acceptance criteria;
+- progress compares meaningful state, and recovery records failed strategies;
+- structured state is persisted and bounded before it is sent back to a model.
+
+## Persistence
+
+Migrations 3 and 4 add task/state snapshots to `runs` and orchestration fields
+to `run_steps`. The compact state is durable and inspectable, while recent
+actions and receipts provide an audit trail. The API continues to expose the
+shared `Run` and `RunStep` shapes, so older runs without snapshots remain
+readable.

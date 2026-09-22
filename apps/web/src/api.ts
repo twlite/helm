@@ -236,6 +236,8 @@ function parseRun(value: unknown): RunDetails | null {
     goal: asString(value.goal),
     status: parseRunStatus(value.status),
     criteria,
+    ...(isRecord(value.task) ? { task: value.task as unknown as RunDetails['task'] } : {}),
+    ...(isRecord(value.state) ? { state: value.state as unknown as RunDetails['state'] } : {}),
     error: parseToolError(value.error),
     createdAt: asString(value.createdAt ?? value.created_at),
     startedAt: asOptionalString(value.startedAt ?? value.started_at),
@@ -270,6 +272,19 @@ function parseRunStep(value: unknown): RunDetails['steps'][number] | null {
     stepIndex: asNumber(value.stepIndex ?? value.step_index, 0),
     phase,
     decision,
+    orchestratorDecision: isRecord(value.orchestratorDecision)
+      ? value.orchestratorDecision as RunDetails['steps'][number]['orchestratorDecision']
+      : undefined,
+    objective: isRecord(value.objective)
+      ? value.objective as unknown as RunDetails['steps'][number]['objective']
+      : undefined,
+    worker: asOptionalString(value.worker) as RunDetails['steps'][number]['worker'],
+    workerResult: isRecord(value.workerResult)
+      ? value.workerResult as unknown as RunDetails['steps'][number]['workerResult']
+      : undefined,
+    progress: isRecord(value.progress)
+      ? value.progress as unknown as RunDetails['steps'][number]['progress']
+      : undefined,
     toolName: asOptionalString(value.toolName ?? value.tool_name),
     toolInput: isRecord(value.toolInput ?? value.tool_input)
       ? (value.toolInput ?? value.tool_input) as Record<string, unknown>
@@ -357,9 +372,21 @@ function parseVerification(value: unknown): import('@helm/shared').VerificationR
         ];
       })
     : [];
+  const requirements = Array.isArray(value.requirements)
+    ? value.requirements.flatMap((check) => {
+        if (!isRecord(check) || !isRecord(check.requirement)) return [];
+        return [{
+          requirement: check.requirement as unknown as import('@helm/shared').TaskRequirement,
+          passed: asBoolean(check.passed),
+          message: asString(check.message),
+          evidence: check.evidence,
+        }];
+      })
+    : undefined;
   return {
     complete: value.complete,
     criteria,
+    ...(requirements === undefined ? {} : { requirements }),
     summary: asString(value.summary),
   };
 }

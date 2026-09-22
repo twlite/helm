@@ -14,6 +14,7 @@ export type GuestMethodParams = {
   'browser.getState': Record<string, never>;
   'browser.snapshot': Record<string, never>;
   'browser.extractText': Record<string, never>;
+  'browser.download': { ref?: string; url?: string };
   'browser.click': { ref?: string; x?: number; y?: number };
   'browser.type': { ref: string; text: string };
   'app.launch': { application: 'browser' | 'text-editor' | 'file-manager' };
@@ -36,7 +37,7 @@ export type GuestMethodResult = {
     capabilities: GuestMethod[];
   };
   'fs.read': { path: string; content: string; size: number };
-  'fs.write': { path: string; size: number };
+  'fs.write': { path: string; size: number; sha256?: string; existedBefore?: boolean };
   'fs.exists': { path: string; exists: boolean };
   'fs.list': { path: string; entries: string[] };
   'fs.stat': {
@@ -50,18 +51,36 @@ export type GuestMethodResult = {
     url?: string;
     title?: string;
     loaded?: boolean;
+    pageCount?: number;
+    domFingerprint?: string;
   };
   'browser.snapshot': {
     url?: string;
     title?: string;
+    pageCount?: number;
+    main?: { heading?: string; text?: string };
     elements: Array<{
       ref: string;
       role: string;
       name?: string;
       value?: string;
+      text?: string;
+      enabled?: boolean;
+      href?: string;
+      checked?: boolean;
+      selected?: boolean;
     }>;
   };
   'browser.extractText': { url: string; title: string; text: string };
+  'browser.download': {
+    sourceUrl: string;
+    finalUrl?: string;
+    suggestedFilename?: string;
+    savedPath?: string;
+    size?: number;
+    context?: string;
+    startedAt: string;
+  };
   'browser.click': { ref?: string; x?: number; y?: number; clicked: boolean };
   'browser.type': { ref: string; text: string; typed: boolean };
   'app.launch': { application: 'browser' | 'text-editor' | 'file-manager'; title: string };

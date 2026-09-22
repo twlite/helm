@@ -7,8 +7,8 @@ describe('persistence migrations', () => {
   it('creates all persistence tables and is idempotent', () => {
     const persistence = testDatabase();
     try {
-      expect(persistence.migrations.currentVersion).toBe(2);
-      expect(persistence.migrations.applied.map(migration => migration.version)).toEqual([1, 2]);
+      expect(persistence.migrations.currentVersion).toBe(4);
+      expect(persistence.migrations.applied.map(migration => migration.version)).toEqual([1, 2, 3, 4]);
 
       const tables = persistence.sqlite
         .prepare(
@@ -27,9 +27,9 @@ describe('persistence migrations', () => {
         'threads',
       ]);
 
-      expect(runMigrations(persistence.sqlite)).toEqual({ applied: [], currentVersion: 2 });
-      expect(getAppliedMigrations(persistence.sqlite)).toHaveLength(2);
-      expect(persistence.sqlite.prepare('PRAGMA user_version').get()).toEqual({ user_version: 2 });
+      expect(runMigrations(persistence.sqlite)).toEqual({ applied: [], currentVersion: 4 });
+      expect(getAppliedMigrations(persistence.sqlite)).toHaveLength(4);
+      expect(persistence.sqlite.prepare('PRAGMA user_version').get()).toEqual({ user_version: 4 });
     } finally {
       persistence.close();
     }

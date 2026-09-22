@@ -44,6 +44,13 @@ export const guestMethodSchemas = {
   'browser.getState': z.object({}),
   'browser.snapshot': z.object({}),
   'browser.extractText': z.object({}),
+  'browser.download': z.object({
+    ref: z.string().min(1).optional(),
+    url: z.string().min(1).optional(),
+  }).refine(
+    value => Boolean(value.ref) !== Boolean(value.url),
+    'Provide either ref or url',
+  ),
   'browser.click': z.object({
     ref: z.string().min(1).optional(),
     x: z.number().finite().optional(),

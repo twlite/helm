@@ -58,6 +58,9 @@ export const GuestMethodContracts: Readonly<
   "browser.extractText": {
     description: "Extract readable text from the current page.",
   },
+  "browser.download": {
+    description: "Start and record a browser download.",
+  },
   "browser.click": { description: "Click a semantic browser ref." },
   "browser.type": { description: "Type into a semantic browser ref." },
   "app.launch": { description: "Launch an allowlisted guest application." },

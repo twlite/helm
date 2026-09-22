@@ -9,7 +9,8 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { createHash } from "node:crypto";
 import { GuestRpcError } from "./errors";
 
 export interface SandboxOptions {
@@ -28,6 +29,8 @@ export interface FileReadResult {
 export interface FileWriteResult {
   path: string;
   size: number;
+  sha256: string;
+  existedBefore: boolean;
 }
 
 export interface FileEntry {
@@ -131,9 +134,21 @@ export class GuestSandbox {
     }
 
     const target = await this.writablePath(inputPath);
+    let existedBefore = false;
+    try {
+      await lstat(target);
+      existedBefore = true;
+    } catch (error) {
+      if (!this.isMissing(error)) throw error;
+    }
     try {
       await writeFile(target, content, { encoding: "utf8", flag: "w" });
-      return { path: target, size: bytes };
+      return {
+        path: target,
+        size: bytes,
+        sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+        existedBefore,
+      };
     } catch (error) {
       throw this.fileError(error, "FILE_WRITE_FAILED", `Could not write ${target}.`);
     }
@@ -205,6 +220,12 @@ export class GuestSandbox {
     return target;
   }
 
+  /** Allocate a safe path for a browser download without allowing filename traversal. */
+  async downloadPath(inputFilename: string): Promise<string> {
+    const safeName = basename(inputFilename).replace(/[\u0000\\/]/gu, "_").trim() || "download";
+    return this.writablePath(join(this.rootPath, "Downloads", safeName));
+  }
+
   async diagnostics(): Promise<{ root: string; workspace: string; writable: boolean }> {
     let writable = false;
     try {
@@ -230,9 +251,14 @@ export class GuestSandbox {
       });
     }
 
-    return isAbsolute(inputPath)
-      ? resolve(inputPath)
-      : resolve(this.workspacePath, inputPath);
+    const expanded = inputPath === "~"
+      ? this.rootPath
+      : inputPath.startsWith("~/")
+        ? join(this.rootPath, inputPath.slice(2))
+        : inputPath;
+    return isAbsolute(expanded)
+      ? resolve(expanded)
+      : resolve(this.workspacePath, expanded);
   }
 
   private async existingPath(inputPath: string): Promise<string> {

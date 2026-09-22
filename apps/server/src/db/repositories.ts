@@ -10,11 +10,17 @@ import type {
   RunStatus,
   RunStep,
   RunStepPhase,
+  OrchestratorDecision,
+  ProgressState,
   TaskDefinition,
+  TaskState,
   ToolError,
   ToolResult,
   Thread,
   VerificationResult,
+  WorkerKind,
+  WorkerObjective,
+  WorkerResult,
 } from '@helm/shared';
 
 import { jsonObject, parseJson, stableStringify } from './json';
@@ -116,6 +122,8 @@ function mapRun(row: unknown): Run {
     status: string;
     criteriaJson: string;
     errorJson: string | null;
+    taskJson: string | null;
+    stateJson: string | null;
     createdAt: string;
     startedAt: string | null;
     completedAt: string | null;
@@ -130,6 +138,8 @@ function mapRun(row: unknown): Run {
     goal: requiredString(value.goal, 'run.goal'),
     status: value.status as RunStatus,
     criteria: parseJson<CompletionCriterion[]>(value.criteriaJson, 'run.criteria_json'),
+    ...(value.taskJson === null ? {} : { task: parseJson<TaskDefinition>(value.taskJson, 'run.task_json') }),
+    ...(value.stateJson === null ? {} : { state: parseJson<TaskState>(value.stateJson, 'run.state_json') }),
     ...(value.errorJson === null ? {} : { error: parseJson<ToolError>(value.errorJson, 'run.error') }),
     createdAt: requiredString(value.createdAt, 'run.createdAt'),
     ...(value.startedAt === null ? {} : { startedAt: value.startedAt }),
@@ -149,6 +159,11 @@ function mapRunStep(row: unknown): RunStep {
     toolResultJson: string | null;
     observationJson: string | null;
     verificationJson: string | null;
+    orchestratorDecisionJson: string | null;
+    objectiveJson: string | null;
+    worker: string | null;
+    workerResultJson: string | null;
+    progressJson: string | null;
     createdAt: string;
     completedAt: string | null;
   };
@@ -176,6 +191,11 @@ function mapRunStep(row: unknown): RunStep {
     ...(value.verificationJson === null
       ? {}
       : { verification: parseJson<VerificationResult>(value.verificationJson, 'run_step.verification_json') }),
+    ...(value.orchestratorDecisionJson === null ? {} : { orchestratorDecision: parseJson<OrchestratorDecision>(value.orchestratorDecisionJson, 'run_step.orchestrator_decision_json') }),
+    ...(value.objectiveJson === null ? {} : { objective: parseJson<WorkerObjective>(value.objectiveJson, 'run_step.objective_json') }),
+    ...(value.worker === null ? {} : { worker: value.worker as WorkerKind }),
+    ...(value.workerResultJson === null ? {} : { workerResult: parseJson<WorkerResult>(value.workerResultJson, 'run_step.worker_result_json') }),
+    ...(value.progressJson === null ? {} : { progress: parseJson<ProgressState>(value.progressJson, 'run_step.progress_json') }),
     createdAt: requiredString(value.createdAt, 'runStep.createdAt'),
     ...(value.completedAt === null ? {} : { completedAt: value.completedAt }),
   };
@@ -357,6 +377,8 @@ export interface CreateRunInput {
   createdAt?: string;
   startedAt?: string;
   completedAt?: string;
+  task?: TaskDefinition;
+  state?: TaskState;
 }
 
 export interface UpdateRunInput {
@@ -366,6 +388,8 @@ export interface UpdateRunInput {
   error?: ToolError | null;
   startedAt?: string | null;
   completedAt?: string | null;
+  task?: TaskDefinition | null;
+  state?: TaskState | null;
 }
 
 const TRANSITIONS: Record<RunStatus, readonly RunStatus[]> = {
@@ -400,7 +424,7 @@ export class RunRepository {
     const createdAt = input.createdAt ?? now();
     this.database
       .prepare(
-        'INSERT INTO runs (id, thread_id, source_message_id, goal, status, criteria_json, error, created_at, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO runs (id, thread_id, source_message_id, goal, status, criteria_json, task_json, state_json, error, created_at, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         id,
@@ -409,6 +433,8 @@ export class RunRepository {
         input.goal,
         status,
         stableStringify(input.criteria),
+        input.task === undefined ? null : stableStringify(input.task),
+        input.state === undefined ? null : stableStringify(input.state),
         input.error === undefined ? null : stableStringify(input.error),
         createdAt,
         input.startedAt ?? null,
@@ -420,7 +446,7 @@ export class RunRepository {
   getById(id: string): Run | undefined {
     const row = this.database
       .prepare(
-        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs WHERE id = ?',
+        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, task_json AS taskJson, state_json AS stateJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs WHERE id = ?',
       )
       .get(id);
     return row === undefined ? undefined : mapRun(row);
@@ -437,7 +463,7 @@ export class RunRepository {
   listByThread(threadId: string, limit?: number): Run[] {
     const rows = this.database
       .prepare(
-        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT ?',
+        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, task_json AS taskJson, state_json AS stateJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT ?',
       )
       .all(threadId, normalizeLimit(limit));
     return rows.map(mapRun);
@@ -447,7 +473,7 @@ export class RunRepository {
     if (threadId !== undefined) return this.listByThread(threadId, limit);
     const rows = this.database
       .prepare(
-        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs ORDER BY created_at DESC, id DESC LIMIT ?',
+        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, task_json AS taskJson, state_json AS stateJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs ORDER BY created_at DESC, id DESC LIMIT ?',
       )
       .all(normalizeLimit(limit));
     return rows.map(mapRun);
@@ -463,12 +489,14 @@ export class RunRepository {
     const error = input.error === undefined ? current.error : input.error;
     this.database
       .prepare(
-        'UPDATE runs SET source_message_id = ?, goal = ?, criteria_json = ?, error = ?, started_at = ?, completed_at = ? WHERE id = ?',
+        'UPDATE runs SET source_message_id = ?, goal = ?, criteria_json = ?, task_json = ?, state_json = ?, error = ?, started_at = ?, completed_at = ? WHERE id = ?',
       )
       .run(
         input.sourceMessageId === undefined ? current.sourceMessageId ?? null : input.sourceMessageId,
         goal,
         stableStringify(criteria),
+        input.task === undefined ? current.task === undefined ? null : stableStringify(current.task) : input.task === null ? null : stableStringify(input.task),
+        input.state === undefined ? current.state === undefined ? null : stableStringify(current.state) : input.state === null ? null : stableStringify(input.state),
         error === undefined || error === null ? null : stableStringify(error),
         input.startedAt === undefined ? current.startedAt ?? null : input.startedAt,
         input.completedAt === undefined ? current.completedAt ?? null : input.completedAt,
@@ -535,6 +563,11 @@ export interface CreateRunStepInput {
   toolResult?: ToolResult;
   observation?: unknown;
   verification?: VerificationResult;
+  orchestratorDecision?: OrchestratorDecision;
+  objective?: WorkerObjective;
+  worker?: WorkerKind;
+  workerResult?: WorkerResult;
+  progress?: ProgressState;
   id?: string;
   createdAt?: string;
   completedAt?: string;
@@ -548,6 +581,11 @@ export interface UpdateRunStepInput {
   toolResult?: ToolResult | null;
   observation?: unknown;
   verification?: VerificationResult | null;
+  orchestratorDecision?: OrchestratorDecision | null;
+  objective?: WorkerObjective | null;
+  worker?: WorkerKind | null;
+  workerResult?: WorkerResult | null;
+  progress?: ProgressState | null;
   completedAt?: string | null;
 }
 
@@ -574,7 +612,7 @@ export class RunStepRepository {
     const stepIndex = input.stepIndex ?? this.nextStepIndex(input.runId);
     this.database
       .prepare(
-        'INSERT INTO run_steps (id, run_id, step_index, phase, decision_json, tool_name, tool_input_json, tool_result_json, observation_json, verification_json, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO run_steps (id, run_id, step_index, phase, decision_json, orchestrator_decision_json, objective_json, worker, worker_result_json, progress_json, tool_name, tool_input_json, tool_result_json, observation_json, verification_json, created_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         id,
@@ -582,6 +620,11 @@ export class RunStepRepository {
         stepIndex,
         input.phase,
         input.decision === undefined ? null : stableStringify(input.decision),
+        input.orchestratorDecision === undefined ? null : stableStringify(input.orchestratorDecision),
+        input.objective === undefined ? null : stableStringify(input.objective),
+        input.worker ?? null,
+        input.workerResult === undefined ? null : stableStringify(input.workerResult),
+        input.progress === undefined ? null : stableStringify(input.progress),
         input.toolName ?? null,
         input.toolInput === undefined ? null : stableStringify(input.toolInput),
         input.toolResult === undefined ? null : stableStringify(input.toolResult),
@@ -600,7 +643,7 @@ export class RunStepRepository {
   getById(id: string): RunStep | undefined {
     const row = this.database
       .prepare(
-        'SELECT id, run_id AS runId, step_index AS stepIndex, phase, decision_json AS decisionJson, tool_name AS toolName, tool_input_json AS toolInputJson, tool_result_json AS toolResultJson, observation_json AS observationJson, verification_json AS verificationJson, created_at AS createdAt, completed_at AS completedAt FROM run_steps WHERE id = ?',
+        'SELECT id, run_id AS runId, step_index AS stepIndex, phase, decision_json AS decisionJson, orchestrator_decision_json AS orchestratorDecisionJson, objective_json AS objectiveJson, worker, worker_result_json AS workerResultJson, progress_json AS progressJson, tool_name AS toolName, tool_input_json AS toolInputJson, tool_result_json AS toolResultJson, observation_json AS observationJson, verification_json AS verificationJson, created_at AS createdAt, completed_at AS completedAt FROM run_steps WHERE id = ?',
       )
       .get(id);
     return row === undefined ? undefined : mapRunStep(row);
@@ -613,7 +656,7 @@ export class RunStepRepository {
   listByRun(runId: string, limit?: number): RunStep[] {
     const rows = this.database
       .prepare(
-        'SELECT id, run_id AS runId, step_index AS stepIndex, phase, decision_json AS decisionJson, tool_name AS toolName, tool_input_json AS toolInputJson, tool_result_json AS toolResultJson, observation_json AS observationJson, verification_json AS verificationJson, created_at AS createdAt, completed_at AS completedAt FROM run_steps WHERE run_id = ? ORDER BY step_index ASC, created_at ASC, id ASC LIMIT ?',
+        'SELECT id, run_id AS runId, step_index AS stepIndex, phase, decision_json AS decisionJson, orchestrator_decision_json AS orchestratorDecisionJson, objective_json AS objectiveJson, worker, worker_result_json AS workerResultJson, progress_json AS progressJson, tool_name AS toolName, tool_input_json AS toolInputJson, tool_result_json AS toolResultJson, observation_json AS observationJson, verification_json AS verificationJson, created_at AS createdAt, completed_at AS completedAt FROM run_steps WHERE run_id = ? ORDER BY step_index ASC, created_at ASC, id ASC LIMIT ?',
       )
       .all(runId, normalizeLimit(limit));
     return rows.map(mapRunStep);
@@ -630,13 +673,26 @@ export class RunStepRepository {
     if (!RUN_STEP_PHASES.has(phase)) throw new Error(`Invalid run step phase: ${phase}`);
     this.database
       .prepare(
-        'UPDATE run_steps SET phase = ?, decision_json = ?, tool_name = ?, tool_input_json = ?, tool_result_json = ?, observation_json = ?, verification_json = ?, completed_at = ? WHERE id = ?',
+        'UPDATE run_steps SET phase = ?, decision_json = ?, orchestrator_decision_json = ?, objective_json = ?, worker = ?, worker_result_json = ?, progress_json = ?, tool_name = ?, tool_input_json = ?, tool_result_json = ?, observation_json = ?, verification_json = ?, completed_at = ? WHERE id = ?',
       )
       .run(
         phase,
         input.decision === undefined
           ? current.decision === undefined ? null : stableStringify(current.decision)
           : input.decision === null ? null : stableStringify(input.decision),
+        input.orchestratorDecision === undefined
+          ? current.orchestratorDecision === undefined ? null : stableStringify(current.orchestratorDecision)
+          : input.orchestratorDecision === null ? null : stableStringify(input.orchestratorDecision),
+        input.objective === undefined
+          ? current.objective === undefined ? null : stableStringify(current.objective)
+          : input.objective === null ? null : stableStringify(input.objective),
+        input.worker === undefined ? current.worker ?? null : input.worker,
+        input.workerResult === undefined
+          ? current.workerResult === undefined ? null : stableStringify(current.workerResult)
+          : input.workerResult === null ? null : stableStringify(input.workerResult),
+        input.progress === undefined
+          ? current.progress === undefined ? null : stableStringify(current.progress)
+          : input.progress === null ? null : stableStringify(input.progress),
         input.toolName === undefined ? current.toolName ?? null : input.toolName,
         input.toolInput === undefined
           ? current.toolInput === undefined ? null : stableStringify(current.toolInput)

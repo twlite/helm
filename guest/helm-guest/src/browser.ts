@@ -10,6 +10,13 @@ interface PlaywrightLocator {
   pressSequentially(value: string, options?: { timeout?: number }): Promise<void>;
   nth(index: number): PlaywrightLocator;
   evaluateAll<T>(pageFunction: (elements: readonly unknown[]) => T): Promise<T>;
+  getAttribute(name: string): Promise<string | null>;
+}
+
+interface PlaywrightDownload {
+  url(): string;
+  suggestedFilename(): string;
+  saveAs(path: string): Promise<void>;
 }
 
 interface PlaywrightPage {
@@ -21,6 +28,7 @@ interface PlaywrightPage {
   url(): string;
   locator(selector: string): PlaywrightLocator;
   mouse: { click(x: number, y: number): Promise<void> };
+  waitForEvent(event: "download", options?: { timeout?: number }): Promise<PlaywrightDownload>;
   on(event: string, listener: (...args: unknown[]) => void): void;
   waitForLoadState(state?: WaitUntil, options?: { timeout?: number }): Promise<void>;
   close(): Promise<void>;
@@ -56,6 +64,9 @@ interface SemanticElement {
   value?: string;
   text?: string;
   enabled: boolean;
+  href?: string;
+  checked?: boolean;
+  selected?: boolean;
 }
 
 export interface BrowserState {
@@ -64,11 +75,18 @@ export interface BrowserState {
   url: string;
   title: string;
   loading: boolean;
+  pageCount: number;
+  domFingerprint?: string;
 }
 
 export interface BrowserSnapshot {
   url: string;
   title: string;
+  pageCount: number;
+  main: {
+    heading?: string;
+    text?: string;
+  };
   elements: Array<{
     ref: string;
     role: string;
@@ -76,6 +94,9 @@ export interface BrowserSnapshot {
     value?: string;
     text?: string;
     enabled: boolean;
+    href?: string;
+    checked?: boolean;
+    selected?: boolean;
   }>;
 }
 
@@ -210,12 +231,45 @@ export class BrowserController {
 
   async getState(): Promise<BrowserState> {
     const page = await this.ensurePage();
+    let domFingerprint: string | undefined;
+    try {
+      const text = await page.locator("body").evaluateAll((nodes) => {
+        const body = nodes[0];
+        if (!(body instanceof HTMLElement)) return "";
+        const elements = Array.from(body.querySelectorAll("button, input, textarea, select, a[href], summary, [role], [contenteditable='true']"))
+          .slice(0, 200)
+          .map(node => ({
+            tag: node.tagName.toLowerCase(),
+            text: node.textContent?.replace(/\s+/g, " ").trim().slice(0, 160),
+            value: node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement || node instanceof HTMLSelectElement
+              ? node.value.slice(0, 240)
+              : undefined,
+            checked: node instanceof HTMLInputElement && (node.type === "checkbox" || node.type === "radio")
+              ? node.checked
+              : undefined,
+            selected: node instanceof HTMLOptionElement ? node.selected : undefined,
+            disabled: node instanceof HTMLButtonElement || node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement || node instanceof HTMLSelectElement
+              ? node.disabled
+              : node.getAttribute("aria-disabled") === "true",
+            href: node instanceof HTMLAnchorElement ? node.href : undefined,
+          }));
+        return JSON.stringify({
+          text: body.innerText.replace(/\s+/g, " ").trim().slice(0, 4_000),
+          elements,
+        }).slice(0, 8_000);
+      });
+      domFingerprint = text.length > 0 ? text : undefined;
+    } catch {
+      domFingerprint = undefined;
+    }
     return {
       ready: true,
       visible: true,
       url: page.url(),
       title: await this.readTitle(page),
       loading: this.loading,
+      pageCount: this.context?.pages().length ?? 1,
+      ...(domFingerprint === undefined ? {} : { domFingerprint }),
     };
   }
 
@@ -224,6 +278,15 @@ export class BrowserController {
     const url = page.url();
     const title = await this.readTitle(page);
     const candidates = page.locator(INTERACTIVE_SELECTOR);
+    const main = await page.locator("main, body").evaluateAll((nodes) => {
+      const node = nodes[0];
+      if (!(node instanceof HTMLElement)) return {};
+      const heading = node.querySelector("h1, h2, [role='heading']")?.textContent;
+      return {
+        ...(heading ? { heading: cleanTextForSnapshot(heading, 200) } : {}),
+        text: cleanTextForSnapshot(node.innerText, 2_000),
+      };
+    });
     let elements: SemanticElement[];
     try {
       elements = await candidates.evaluateAll((nodes) =>
@@ -297,6 +360,12 @@ export class BrowserController {
               node instanceof HTMLTextAreaElement ||
               node instanceof HTMLSelectElement) &&
             node.disabled;
+          const href = node instanceof HTMLAnchorElement ? node.href : node.getAttribute("href") ?? undefined;
+          const checked =
+            node instanceof HTMLInputElement && (node.type === "checkbox" || node.type === "radio")
+              ? node.checked
+              : undefined;
+          const selected = node instanceof HTMLOptionElement ? node.selected : undefined;
 
           return [
             {
@@ -306,6 +375,9 @@ export class BrowserController {
               ...(value === undefined || value.length === 0 ? {} : { value: value.slice(0, 240) }),
               ...(text === undefined ? {} : { text }),
               enabled: !disabled && node.getAttribute("aria-disabled") !== "true",
+              ...(href === undefined ? {} : { href }),
+              ...(checked === undefined ? {} : { checked }),
+              ...(selected === undefined ? {} : { selected }),
             },
           ];
         }),
@@ -334,10 +406,79 @@ export class BrowserController {
         ...(element.value === undefined ? {} : { value: element.value }),
         ...(element.text === undefined ? {} : { text: element.text }),
         enabled: element.enabled,
+        ...(element.href === undefined ? {} : { href: element.href }),
+        ...(element.checked === undefined ? {} : { checked: element.checked }),
+        ...(element.selected === undefined ? {} : { selected: element.selected }),
       });
     }
 
-    return { url, title, elements: output };
+    return {
+      url,
+      title,
+      pageCount: this.context?.pages().length ?? 1,
+      main,
+      elements: output,
+    };
+  }
+
+  async download(input: { ref?: string; url?: string }): Promise<{
+    sourceUrl: string;
+    finalUrl?: string;
+    suggestedFilename?: string;
+    savedPath?: string;
+    size?: number;
+    context?: string;
+    startedAt: string;
+  }> {
+    const page = await this.ensurePage();
+    const startedAt = new Date().toISOString();
+    const rawSourceUrl = input.url
+      ?? (input.ref === undefined ? page.url() : await this.resolveReference(input.ref).getAttribute("href"))
+      ?? page.url();
+    let sourceUrl = rawSourceUrl;
+    try {
+      sourceUrl = new URL(rawSourceUrl, page.url()).toString();
+    } catch {
+      // The download event remains authoritative even when a page exposes an
+      // unusual non-URL href. Preserve the raw source for diagnostics.
+    }
+    const downloadPromise = page.waitForEvent("download", { timeout: 30_000 });
+    try {
+      if (input.ref !== undefined) {
+        await this.resolveReference(input.ref).click({ timeout: 15_000 });
+      } else if (input.url !== undefined) {
+        try {
+          await page.goto(safeUrl(input.url), { waitUntil: "commit", timeout: 30_000 });
+        } catch (error) {
+          // Chromium reports downloads as a navigation error in some versions;
+          // the download event below remains the authoritative result.
+          if (!/download|interrupted|navigation/iu.test(error instanceof Error ? error.message : String(error))) {
+            throw error;
+          }
+        }
+      }
+      const download = await downloadPromise;
+      const suggestedFilename = download.suggestedFilename();
+      const savedPath = await this.sandbox.downloadPath(suggestedFilename);
+      await download.saveAs(savedPath);
+      const state = await this.sandbox.stat(savedPath);
+      this.invalidateReferences();
+      return {
+        sourceUrl,
+        finalUrl: download.url(),
+        suggestedFilename,
+        savedPath,
+        size: state.size,
+        ...(this.context === undefined ? {} : { context: "persistent-chromium" }),
+        startedAt,
+      };
+    } catch (error) {
+      this.invalidateReferences();
+      throw new GuestRpcError(
+        "BROWSER_DOWNLOAD_FAILED",
+        error instanceof Error ? error.message.slice(0, 500) : "The browser download could not be completed.",
+      );
+    }
   }
 
   async extractText(maxChars = 100_000): Promise<{
@@ -551,6 +692,7 @@ export class BrowserController {
       url,
       title: await this.readTitle(page),
       loading: this.loading,
+      pageCount: this.context?.pages().length ?? 1,
     };
   }
 }

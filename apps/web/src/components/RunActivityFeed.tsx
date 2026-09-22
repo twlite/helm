@@ -20,6 +20,7 @@ type ActivityRow = {
   id: string;
   stepIndex: number;
   title: string;
+  worker?: string;
   toolName?: string;
   step: RunStep;
   verificationStep?: RunStep;
@@ -44,6 +45,7 @@ function toolTitle(toolName: string): string {
     'browser.navigate': 'Opened webpage',
     'browser.extractText': 'Read page contents',
     'browser.snapshot': 'Inspected webpage',
+    'browser.download': 'Recorded browser download',
     'browser.click': 'Clicked webpage element',
     'browser.type': 'Entered text in browser',
     'fs.read': 'Read file',
@@ -140,10 +142,13 @@ function activityRows(run: RunDetails, liveActivity?: LiveActivity): ActivityRow
       && liveActivity?.runId === run.id
       && liveActivity.stepIndex === stepIndex
       && liveActivity.phase !== 'recorded';
+    const objective = step.objective ?? steps.find((candidate) => candidate.objective)?.objective;
+    const worker = step.worker ?? steps.find((candidate) => candidate.worker)?.worker;
     return {
       id: step.id,
       stepIndex,
-      title: toolName ? toolTitle(toolName) : step.decision?.type === 'complete' ? 'Complete task' : humanize(step.phase),
+      title: objective?.description ?? (toolName ? toolTitle(toolName) : step.orchestratorDecision?.type === 'complete' ? 'Verified completion proposal' : humanize(step.phase)),
+      ...(worker ? { worker } : {}),
       ...(toolName ? { toolName } : {}),
       step,
       ...(verificationStep ? { verificationStep } : {}),
@@ -168,6 +173,8 @@ function ActivityRowView({ row }: { row: ActivityRow }) {
   const [expanded, setExpanded] = useState(false);
   const verification = row.verificationStep?.verification ?? row.step.verification;
   const reasoning = row.step.decision?.reasoningSummary;
+  const objective = row.step.objective;
+  const workerResult = row.step.workerResult;
   return (
     <Collapsible className="border-b border-[var(--border)] last:border-b-0" onOpenChange={setExpanded} open={expanded}>
       <CollapsibleTrigger className="flex min-h-8 w-full min-w-0 items-center gap-2 py-1.5 text-left outline-none transition-colors hover:bg-[var(--hover-bg)] focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[var(--accent)]">
@@ -179,10 +186,15 @@ function ActivityRowView({ row }: { row: ActivityRow }) {
       <CollapsibleContent className="pb-3 pl-7">
         <div className="space-y-2.5 text-[11px] leading-5 text-[#aeb7c1]">
           {reasoning ? <Detail label="What Helm is doing" value={reasoning} /> : null}
+          {row.worker ? <Detail label="Worker" value={row.worker} /> : null}
+          {objective?.rationale ? <Detail label="Why this objective" value={objective.rationale} /> : null}
           {row.toolName ? <Detail label="Tool" value={row.toolName} /> : null}
           {row.step.toolInput ? <Detail label="Input" value={displayValue(row.step.toolInput)} pre /> : null}
           {row.resultStep?.observation !== undefined ? <Detail label="Observation" value={displayValue(row.resultStep.observation)} pre /> : null}
           {row.resultStep?.toolResult ? <Detail label="Result" value={displayValue(row.resultStep.toolResult)} pre /> : null}
+          {workerResult?.actions.length ? <Detail label="Worker actions" value={displayValue(workerResult.actions.map((action) => ({ tool: action.tool, input: action.input, ok: action.result.ok })))} pre /> : null}
+          {workerResult?.facts.length ? <Detail label="Facts proposed from receipts" value={displayValue(workerResult.facts.map((fact) => ({ id: fact.id, value: fact.value, origin: fact.origin })))} pre /> : null}
+          {row.step.progress ? <Detail label="Progress" value={row.step.progress.changed ? 'Meaningful state changed.' : `No meaningful state change (${row.step.progress.noProgressStreak} iteration${row.step.progress.noProgressStreak === 1 ? '' : 's'}).`} /> : null}
           {verification ? (
             <Detail label="Verification" value={verification.summary || (verification.complete ? 'Verified.' : 'Still working.')} />
           ) : null}
@@ -222,6 +234,11 @@ export function RunActivityFeed({
     .find((step) => step.verification)?.verification;
   const criteria = latestVerification?.criteria
     ?? run.criteria.map((criterion) => ({ criterion, passed: false, message: 'Waiting for verification.' }));
+  const requirements = latestVerification?.requirements ?? run.state?.task.requirements?.map((requirement) => ({
+    requirement,
+    passed: run.state?.completedRequirementIds.includes(requirement.id) ?? false,
+    message: run.state?.completedRequirementIds.includes(requirement.id) ? 'Requirement satisfied.' : 'Waiting for verification.',
+  })) ?? [];
 
   return (
     <div className={compact ? 'space-y-3' : 'space-y-4'}>
@@ -265,6 +282,23 @@ export function RunActivityFeed({
               <div className="flex min-w-0 items-start gap-2 text-[11px]" key={`${criterionLabel(criterion.criterion)}-${index}`}>
                 <Icon className={`mt-0.5 shrink-0 ${criterion.passed ? 'text-emerald-300' : 'text-[#606975]'}`} name={criterion.passed ? 'check' : 'circle'} size={12} />
                 <span className={`min-w-0 break-words ${criterion.passed ? 'text-[#c9d1d9]' : 'text-[#79838f]'}`}>{criterion.message || criterionLabel(criterion.criterion)}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {requirements.length > 0 ? (
+        <section className="space-y-2 border-t border-[var(--border)] pt-3">
+          <div className="flex items-center justify-between gap-3">
+            <h4 className="text-[11px] font-medium text-[#aeb7c1]">Requirements</h4>
+            {latestVerification?.complete ? <span className="text-[10px] text-emerald-300">All mandatory requirements satisfied</span> : null}
+          </div>
+          <div className="space-y-1.5">
+            {requirements.map((check) => (
+              <div className="flex min-w-0 items-start gap-2 text-[11px]" key={check.requirement.id}>
+                <Icon className={`mt-0.5 shrink-0 ${check.passed ? 'text-emerald-300' : 'text-[#606975]'}`} name={check.passed ? 'check' : 'circle'} size={12} />
+                <span className={`min-w-0 break-words ${check.passed ? 'text-[#c9d1d9]' : 'text-[#79838f]'}`}>{check.message || check.requirement.description}</span>
               </div>
             ))}
           </div>

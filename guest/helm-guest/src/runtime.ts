@@ -141,6 +141,15 @@ export class GuestRuntime {
         return this.browser.extractText(
           optionalInteger(params, "maxChars", { min: 1, max: 1_000_000 }) ?? 100_000,
         );
+      case "browser.download":
+        return this.browser.download((() => {
+          const ref = optionalString(params, "ref", { maxLength: 64 });
+          const url = optionalString(params, "url", { maxLength: 8_192 });
+          return {
+            ...(ref === undefined ? {} : { ref }),
+            ...(url === undefined ? {} : { url }),
+          };
+        })());
       case "browser.click":
         return this.browserClick(params);
       case "browser.type":

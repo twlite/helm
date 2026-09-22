@@ -6,6 +6,7 @@ import type {
   CompletionCriterion,
   EnvironmentObservation,
   Memory,
+  Message,
   Run,
   RunStep,
   TaskDefinition,
@@ -26,6 +27,21 @@ import {
 import { fingerprintAction, LoopDetector } from './fingerprint';
 import { DEFAULT_RUNTIME_BUDGETS, RunBudget, RunCancellation } from './limits';
 import { GuestObservationProvider } from './observation';
+import { allowedWorkerTool, FallbackOrchestrator, objectiveForRequirement } from './orchestrator';
+import {
+  addFailedStrategy,
+  artifactsFromResult,
+  blocker,
+  compactEnvironmentObservation,
+  createTaskState,
+  evidenceFromObservation,
+  mergeWorkerResult,
+  observedFactsFromToolResult,
+  progressFingerprint,
+  updateCompletedRequirements,
+  updateProgress,
+  verifyTaskState,
+} from './task-state';
 import type {
   AgentRuntimeOptions,
   AgentRuntimeResult,
@@ -36,8 +52,12 @@ import type {
   RuntimeEvent,
   RuntimeEventSink,
   RuntimeRepository,
+  OrchestratorProvider,
   TaskPlanner,
+  TaskCompiler,
   VerificationProvider,
+  WorkerProvider,
+  WorkerResult,
 } from './types';
 
 function defaultIdFactory(prefix: string): string {
@@ -171,6 +191,9 @@ export class AgentRuntime {
   private readonly verifier: CriterionVerifierRegistry | VerificationProvider;
   private readonly decisionProvider: DecisionProvider;
   private readonly taskPlanner?: TaskPlanner;
+  private readonly taskCompiler?: TaskCompiler;
+  private readonly orchestrator?: OrchestratorProvider;
+  private readonly worker?: WorkerProvider;
   private readonly repository?: RuntimeRepository;
   private readonly eventSink?: RuntimeEventSink;
   private readonly observationProvider: ObservationProvider;
@@ -187,6 +210,9 @@ export class AgentRuntime {
     this.verifier = options.verifier;
     this.decisionProvider = options.decisionProvider;
     this.taskPlanner = options.taskPlanner;
+    this.taskCompiler = options.taskCompiler;
+    this.orchestrator = options.orchestrator;
+    this.worker = options.worker;
     this.repository = options.repository ?? options.persistence;
     this.eventSink = options.events ?? options.eventSink;
     this.observationProvider = options.observe ?? new GuestObservationProvider({ guest: this.guest });
@@ -232,6 +258,9 @@ export class AgentRuntime {
     // thread or starting a second runtime against the same desktop.
     const conversation = [...(input.conversation ?? [])];
     const task = input.task ?? await this.createTask(input, memories);
+    if (this.orchestrator && this.worker) {
+      return this.runOrchestrated(input, task, memories, conversation);
+    }
     const cancellation = new RunCancellation();
     const removeExternalAbort = this.attachExternalCancellation(cancellation, input.signal);
     this.activeCancellation = cancellation;
@@ -713,9 +742,365 @@ export class AgentRuntime {
     return this.run(input);
   }
 
+  /**
+   * Execute the requirements-first loop. This path deliberately does not
+   * share the legacy one-action decision loop: its model boundaries are
+   * orchestrator -> bounded worker -> runtime observation -> verifier.
+   */
+  private async runOrchestrated(
+    input: RunTaskInput,
+    task: TaskDefinition,
+    memories: Memory[],
+    conversation: Message[],
+  ): Promise<AgentRuntimeResult> {
+    const cancellation = new RunCancellation();
+    const removeExternalAbort = this.attachExternalCancellation(cancellation, input.signal);
+    this.activeCancellation = cancellation;
+    const runId = input.runId ?? this.idFactory('run');
+    this.activeRunId = runId;
+    const startedAt = this.isoNow();
+    const state = createTaskState(task, this.now);
+    const conversationalTask = task.isConversation === true
+      && task.criteria.length === 0
+      && (task.requirements?.length ?? 0) === 0;
+    const run: Run = {
+      id: runId,
+      threadId: task.threadId,
+      ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}),
+      goal: task.goal,
+      status: 'pending',
+      criteria: clone(task.criteria),
+      task: clone(task),
+      state: clone(state),
+      createdAt: startedAt,
+    };
+    const history: AgentStep[] = [];
+    const steps: RunStep[] = [];
+    const observations: EnvironmentObservation[] = [];
+    let finalVerification: VerificationResult | undefined;
+    let lastToolResult: ToolResult | undefined;
+    let completionRejected = 0;
+    const budget = new RunBudget({
+      ...DEFAULT_RUNTIME_BUDGETS,
+      ...this.budgetOptions,
+      ...(task.maxSteps === undefined ? {} : { maxSteps: Math.min(this.budgetOptions?.maxSteps ?? DEFAULT_RUNTIME_BUDGETS.maxSteps, task.maxSteps) }),
+    });
+    const maxRecoveryAttempts = this.budgetOptions?.maxRecoveryAttempts ?? DEFAULT_RUNTIME_BUDGETS.maxRecoveryAttempts;
+    const noProgressThreshold = this.budgetOptions?.noProgressThreshold ?? DEFAULT_RUNTIME_BUDGETS.noProgressThreshold;
+
+    const observe = async (currentState: typeof state, result?: ToolResult): Promise<EnvironmentObservation> => {
+      if (conversationalTask) {
+        return {
+          timestamp: this.now(),
+          ...(result ? { lastToolResult: result } : {}),
+          task: {
+            completedCriteria: [...currentState.completedRequirementIds],
+            remainingCriteria: [],
+          },
+        };
+      }
+      const observation = await this.observationProvider.observe({
+        task,
+        completedCriteria: currentState.completedRequirementIds,
+        remainingCriteria: (currentState.task.requirements ?? []).filter(requirement => !currentState.completedRequirementIds.includes(requirement.id)).map(requirement => requirement.id),
+        lastToolResult: result,
+        signal: cancellation.signal,
+      });
+      observations.push(clone(observation));
+      currentState.evidence = [...currentState.evidence, evidenceFromObservation(observation, observations.length, this.now)].slice(-80);
+      currentState.currentEnvironment = compactEnvironmentObservation(observation);
+      return observation;
+    };
+
+    const persistState = async (): Promise<void> => {
+      run.task = clone(state.task);
+      run.state = clone(state);
+      await this.persistRun(run);
+    };
+
+    try {
+      run.status = 'running';
+      run.startedAt = startedAt;
+      await this.persistRun(run, true);
+      await this.emit('run.started', run, run.id);
+
+      let observation = await observe(state);
+      state.currentEnvironment = compactEnvironmentObservation(observation);
+      state.progress = updateProgress(state, observation, undefined, undefined, true);
+      let verification = await verifyTaskState(task, state, this.guest, observation, this.verifier, lastToolResult);
+      let currentState = updateCompletedRequirements(state, verification);
+      Object.assign(state, currentState);
+      finalVerification = verification;
+      await persistState();
+
+      if (verification.complete) {
+        await this.persistStep(steps, { runId, stepIndex: 0, phase: 'complete', observation, verification });
+        await this.emit('run.verification', verification, run.id);
+        await this.complete(run, verification);
+        return { run: clone(run), task: clone(task), history: [], steps: clone(steps), observations: clone(observations), finalVerification: clone(verification), status: run.status };
+      }
+
+      while (!this.isTerminal(run.status)) {
+        cancellation.throwIfCancelled();
+        const steering = input.drainSteering?.() ?? [];
+        if (steering.length > 0) conversation.push(...steering.map(message => clone(message)));
+        if (!budget.canStartStep()) {
+          await this.fail(run, error('STEP_BUDGET_EXCEEDED', `Run exceeded its ${budget.maxSteps}-step budget.`));
+          break;
+        }
+        const stepIndex = budget.startStep();
+        await this.emit('run.step.started', { stepIndex, observation, verification }, run.id);
+
+        let decision;
+        try {
+          decision = await this.orchestrator!.next({
+            task: clone(task),
+            state: clone(state),
+            observation: clone(observation),
+            verification: clone(verification),
+            memories: clone(memories),
+            conversation: clone(conversation),
+            stepIndex,
+            signal: cancellation.signal,
+          });
+        } catch (caught) {
+          decision = await new FallbackOrchestrator().next({
+            task: clone(task),
+            state: clone(state),
+            observation: clone(observation),
+            verification: clone(verification),
+            memories: clone(memories),
+            conversation: clone(conversation),
+            stepIndex,
+            signal: cancellation.signal,
+          });
+          state.blockers = [...state.blockers, blocker('ORCHESTRATOR_ERROR', errorMessage(caught))].slice(-12);
+        }
+
+        if (decision.type === 'objective') {
+          const safeObjective = decision.objective.requirementIds.length === 1
+            ? objectiveForRequirement(state, observation, decision.objective.requirementIds[0])
+            : undefined;
+          if (safeObjective) {
+            // The runtime reconstructs the objective from compiled state so a
+            // provider cannot widen the requirement or worker permission.
+            decision = { ...decision, objective: { ...safeObjective, id: decision.objective.id } };
+          } else {
+            state.blockers = [...state.blockers, blocker('INVALID_OBJECTIVE', 'The orchestrator selected a requirement that is not currently unmet.')].slice(-12);
+            decision = await new FallbackOrchestrator().next({
+              task: clone(task),
+              state: clone(state),
+              observation: clone(observation),
+              verification: clone(verification),
+              memories: clone(memories),
+              conversation: clone(conversation),
+              stepIndex,
+              signal: cancellation.signal,
+            });
+          }
+        }
+
+        if (decision.type === 'complete') {
+          verification = await verifyTaskState(task, state, this.guest, observation, this.verifier, lastToolResult);
+          finalVerification = verification;
+          await this.persistStep(steps, { runId, stepIndex, phase: 'verify', orchestratorDecision: decision, observation, verification, progress: state.progress });
+          await this.emit('run.verification', verification, run.id);
+          if (verification.complete) {
+            await persistState();
+            await this.complete(run, verification);
+            await this.emit('run.step.completed', { stepIndex, decision, verification }, run.id);
+            break;
+          }
+          completionRejected += 1;
+          state.blockers = [...state.blockers, blocker('COMPLETION_REJECTED', `The orchestrator proposed completion while requirements remained unmet.`, verification.requirements?.filter(check => !check.passed).map(check => check.requirement.id))].slice(-12);
+          state.progress = {
+            ...state.progress,
+            recoveryActive: true,
+            recoveryAttempts: state.progress.recoveryAttempts + 1,
+            reason: 'Completion was rejected by deterministic verification.',
+          };
+          await persistState();
+          if (completionRejected > maxRecoveryAttempts) {
+            await this.fail(run, error('COMPLETION_REJECTED', `Completion was proposed ${completionRejected} times before all mandatory requirements were satisfied.`));
+            await this.emit('run.step.completed', { stepIndex, decision, verification }, run.id);
+            break;
+          }
+          await this.emit('run.step.completed', { stepIndex, decision, verification }, run.id);
+          continue;
+        }
+
+        if (decision.type === 'blocked') {
+          state.blockers = [...state.blockers, decision.blocker].slice(-12);
+          await persistState();
+          await this.persistStep(steps, { runId, stepIndex, phase: 'blocked', orchestratorDecision: decision, observation, verification, progress: state.progress });
+          await this.block(run, error(decision.blocker.code, decision.blocker.message));
+          await this.emit('run.step.completed', { stepIndex, decision }, run.id);
+          break;
+        }
+
+        const objective = decision.objective;
+        state.currentObjective = objective;
+        const beforeFingerprint = progressFingerprint(state, observation, objective);
+        let workerExecutionCount = 0;
+        const maxWorkerActions = this.budgetOptions?.maxWorkerActions ?? DEFAULT_RUNTIME_BUDGETS.maxWorkerActions;
+        const workerContext = {
+          objective: clone(objective),
+          task: clone(task),
+          state: clone(state),
+          observation: clone(observation),
+          verification: clone(verification),
+          memories: clone(memories),
+          conversation: clone(conversation),
+          recentActions: clone(state.recentActions),
+          failedStrategies: clone(state.failedStrategies),
+          maxActions: maxWorkerActions,
+          signal: cancellation.signal,
+          execute: {
+            execute: async (tool: string, toolInput: Record<string, unknown>): Promise<ToolResult> => {
+              if (!allowedWorkerTool(objective.kind, tool)) {
+                return { ok: false, error: { code: 'WORKER_TOOL_NOT_ALLOWED', message: `${objective.kind} worker cannot use ${tool}.` } };
+              }
+              if (workerExecutionCount >= maxWorkerActions) {
+                return { ok: false, error: { code: 'WORKER_ACTION_BUDGET_EXCEEDED', message: `Worker exceeded its ${maxWorkerActions}-action budget.` } };
+              }
+              workerExecutionCount += 1;
+              const result = await this.tools.execute(tool, toolInput, {
+                signal: cancellation.signal,
+                runId,
+                stepIndex,
+                timeoutMs: this.budgetOptions?.toolTimeoutMs,
+              });
+              lastToolResult = result;
+              return result;
+            },
+            observe: async (): Promise<EnvironmentObservation> => observe(state, lastToolResult),
+            signal: cancellation.signal,
+          },
+        } as Parameters<WorkerProvider['execute']>[0];
+
+        let workerResult: WorkerResult;
+        try {
+          workerResult = await this.worker!.execute(workerContext);
+        } catch (caught) {
+          workerResult = {
+            status: 'failed',
+            worker: objective.kind,
+            objectiveId: objective.id,
+            actions: [],
+            facts: [],
+            evidence: [],
+            artifacts: [],
+            blockers: [blocker('WORKER_ERROR', errorMessage(caught), objective.requirementIds)],
+            environmentChanged: false,
+          };
+        }
+        const actionLimit = maxWorkerActions;
+        const cappedActions = workerResult.actions.slice(0, actionLimit);
+        const actualReceiptIds = new Set(cappedActions.flatMap(action => {
+          const value = typeof action.result.evidence === 'object' && action.result.evidence !== null
+            ? action.result.evidence as Record<string, unknown>
+            : undefined;
+          const receipt = value?.receipt;
+          const embeddedId = typeof receipt === 'object' && receipt !== null && typeof (receipt as { id?: unknown }).id === 'string'
+            ? (receipt as { id: string }).id
+            : undefined;
+          return [action.receipt?.id ?? embeddedId].filter((id): id is string => id !== undefined);
+        }));
+        const safeEvidence = workerResult.evidence.filter(evidence => actualReceiptIds.has(evidence.id));
+        const automaticFacts = cappedActions.flatMap(action => observedFactsFromToolResult(action.result, this.now));
+        const safeFacts = [...workerResult.facts, ...automaticFacts].map(fact => (
+          fact.origin === 'user' || fact.evidenceIds.some(id => actualReceiptIds.has(id))
+            ? fact
+            : { ...fact, origin: 'hypothesis' as const, confidence: 'hypothesis' as const }
+        ));
+        const actualArtifacts = cappedActions.flatMap(action => artifactsFromResult(action.result, this.now));
+        const normalizedWorkerResult: WorkerResult = {
+          ...workerResult,
+          worker: objective.kind,
+          objectiveId: objective.id,
+          actions: cappedActions,
+          facts: safeFacts,
+          evidence: safeEvidence,
+          artifacts: actualArtifacts,
+          ...(workerResult.actions.length > actionLimit
+            ? { blockers: [...workerResult.blockers, blocker('WORKER_ACTION_BUDGET_EXCEEDED', `Worker returned more than ${actionLimit} actions.`, objective.requirementIds)] }
+            : {}),
+        };
+        const postObservation = await observe(state, lastToolResult);
+        const merged = mergeWorkerResult(state, normalizedWorkerResult, postObservation, this.now);
+        Object.assign(state, merged);
+        const priorNoProgress = state.progress.noProgressStreak;
+        verification = await verifyTaskState(task, state, this.guest, postObservation, this.verifier, lastToolResult);
+        Object.assign(state, updateCompletedRequirements(state, verification));
+        finalVerification = verification;
+        const progress = updateProgress(state, postObservation, objective, beforeFingerprint);
+        state.progress = progress;
+        if (!progress.changed && progress.noProgressStreak >= noProgressThreshold) {
+          const failed = addFailedStrategy(state, objective, normalizedWorkerResult, 'No meaningful environment or requirement state changed.', this.now);
+          state.failedStrategies = [...state.failedStrategies.filter(item => item.signature !== failed.signature), failed].slice(-20);
+          state.progress = {
+            ...progress,
+            recoveryActive: true,
+            recoveryAttempts: progress.recoveryAttempts + 1,
+            reason: 'Recovery required after repeated no-progress worker iterations.',
+          };
+          if (state.progress.recoveryAttempts > maxRecoveryAttempts) {
+            state.blockers = [...state.blockers, blocker('RECOVERY_BUDGET_EXHAUSTED', `No-progress recovery was exhausted for objective ${objective.id}.`, objective.requirementIds, { previousAttempts: priorNoProgress })].slice(-12);
+            await persistState();
+            await this.persistStep(steps, { runId, stepIndex, phase: 'failed', orchestratorDecision: decision, objective, worker: objective.kind, workerResult: normalizedWorkerResult, observation: postObservation, verification, progress: state.progress });
+            await this.fail(run, error('RECOVERY_BUDGET_EXHAUSTED', `No-progress recovery was exhausted for objective ${objective.id}.`));
+            await this.emit('run.step.completed', { stepIndex, objective, workerResult: normalizedWorkerResult, verification, progress: state.progress }, run.id);
+            break;
+          }
+        } else if (progress.changed) {
+          state.progress = { ...progress, recoveryActive: false };
+        }
+        await persistState();
+        for (const action of normalizedWorkerResult.actions) {
+          history.push({
+            reasoningSummary: normalizedWorkerResult.reasoningSummary,
+            action: { tool: action.tool, input: clone(action.input) },
+            observation: postObservation,
+            verification,
+          });
+        }
+        await this.persistStep(steps, { runId, stepIndex, phase: 'act', orchestratorDecision: decision, objective, worker: objective.kind, workerResult: normalizedWorkerResult, observation: postObservation, verification, progress: state.progress });
+        await this.persistStep(steps, { runId, stepIndex, phase: 'verify', orchestratorDecision: decision, objective, worker: objective.kind, workerResult: normalizedWorkerResult, observation: postObservation, verification, progress: state.progress });
+        await this.emit('run.verification', verification, run.id);
+        await this.emit('run.step.completed', { stepIndex, objective, workerResult: normalizedWorkerResult, verification, progress: state.progress }, run.id);
+        observation = postObservation;
+        if (verification.complete) {
+          await this.complete(run, verification);
+          break;
+        }
+      }
+    } catch (caught) {
+      if (cancellation.cancelled || input.signal?.aborted) {
+        await this.cancelled(run, error('RUN_CANCELLED', 'Run was cancelled.'));
+      } else if (!this.isTerminal(run.status)) {
+        await this.fail(run, error('RUNTIME_ERROR', errorMessage(caught)));
+      }
+    } finally {
+      removeExternalAbort();
+      this.activeCancellation = undefined;
+      this.activeRunId = undefined;
+    }
+
+    return {
+      run: clone(run),
+      task: clone(task),
+      history: clone(history),
+      steps: clone(steps),
+      observations: clone(observations),
+      finalVerification: finalVerification ? clone(finalVerification) : undefined,
+      status: run.status,
+    };
+  }
+
   private async createTask(input: RunTaskInput, memories: Memory[]): Promise<TaskDefinition> {
-    if (!this.taskPlanner) throw new Error('A task planner is required when no task is supplied');
-    return this.taskPlanner.createTask({
+    const planner = this.taskCompiler ?? this.taskPlanner;
+    if (!planner) throw new Error('A task planner is required when no task is supplied');
+    return planner.createTask({
       threadId: input.threadId,
       userMessage: input.userMessage,
       conversation: clone(input.conversation ?? []),

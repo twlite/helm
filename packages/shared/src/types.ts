@@ -21,6 +21,205 @@ export type RunStepPhase =
   | 'blocked'
   | 'failed';
 
+export type RequirementType =
+  | 'fact'
+  | 'artifact'
+  | 'filesystem'
+  | 'browser'
+  | 'desktop'
+  | 'semantic';
+
+export type RequirementStatus = 'pending' | 'satisfied' | 'blocked';
+
+export type FactOrigin = 'user' | 'observed' | 'derived' | 'hypothesis';
+
+export type FactConfidence = 'user-provided' | 'observed' | 'derived' | 'hypothesis';
+
+export interface TaskConstraint {
+  id: string;
+  description: string;
+  source: 'user' | 'compiler';
+}
+
+export interface RequirementTarget {
+  path?: string;
+  url?: string;
+  factIds?: string[];
+  content?: string;
+  mode?: 'exists' | 'contains-facts' | 'contains-text' | 'downloaded' | 'matches-fact';
+  factId?: string;
+}
+
+export interface TaskRequirement {
+  id: string;
+  description: string;
+  type: RequirementType;
+  mandatory: boolean;
+  status?: RequirementStatus;
+  /** Targets are compiler-owned and are only populated from user text or observed state. */
+  target?: RequirementTarget;
+  /** A legacy criterion may be retained as a deterministic compatibility check. */
+  criterion?: CompletionCriterion;
+}
+
+export interface EvidenceSource {
+  type: 'user' | 'browser' | 'filesystem' | 'desktop' | 'action' | 'system' | 'verification';
+  url?: string;
+  observationId?: string;
+  actionId?: string;
+}
+
+export interface Evidence {
+  id: string;
+  type: EvidenceSource['type'];
+  summary: string;
+  data: JsonValue;
+  source?: EvidenceSource;
+  observedAt: string;
+}
+
+export interface Fact {
+  id: string;
+  value: JsonValue;
+  origin: FactOrigin;
+  confidence: FactConfidence;
+  evidenceIds: string[];
+  source?: EvidenceSource;
+  observedAt: string;
+}
+
+export interface DownloadRecord {
+  sourceUrl: string;
+  finalUrl?: string;
+  suggestedFilename?: string;
+  savedPath?: string;
+  size?: number;
+  context?: string;
+  startedAt: string;
+}
+
+export interface Artifact {
+  id: string;
+  type: 'file' | 'directory' | 'download';
+  path: string;
+  size?: number;
+  sha256?: string;
+  sourceUrl?: string;
+  download?: DownloadRecord;
+  observedAt: string;
+}
+
+export interface ActionEffect {
+  urlBefore?: string;
+  urlAfter?: string;
+  navigationOccurred?: boolean;
+  newTabOpened?: boolean;
+  domChanged?: boolean;
+  path?: string;
+  existsBefore?: boolean;
+  existsAfter?: boolean;
+  bytesWritten?: number;
+  sha256?: string;
+  downloadStarted?: boolean;
+  download?: DownloadRecord;
+  changed?: boolean;
+}
+
+export interface ActionReceipt {
+  id: string;
+  tool: string;
+  ok: boolean;
+  effect?: ActionEffect;
+  startedAt: string;
+  completedAt: string;
+  error?: ToolError;
+}
+
+export interface WorkerAction {
+  id: string;
+  tool: string;
+  input: Record<string, unknown>;
+  result: ToolResult;
+  receipt?: ActionReceipt;
+}
+
+export type WorkerKind = 'browser' | 'filesystem' | 'desktop' | 'system';
+
+export interface WorkerObjective {
+  id: string;
+  kind: WorkerKind;
+  description: string;
+  requirementIds: string[];
+  rationale: string;
+  recovery?: boolean;
+}
+
+export interface Blocker {
+  code: string;
+  message: string;
+  requirementIds?: string[];
+  strategy?: string;
+  details?: JsonValue;
+}
+
+export interface FailedStrategy {
+  signature: string;
+  objectiveId: string;
+  description: string;
+  reason: string;
+  attempts: number;
+  recordedAt: string;
+}
+
+export interface ProgressState {
+  fingerprint: string;
+  changed: boolean;
+  noProgressStreak: number;
+  recoveryAttempts: number;
+  recoveryActive: boolean;
+  reason?: string;
+}
+
+export interface TaskState {
+  task: TaskDefinition;
+  facts: Fact[];
+  evidence: Evidence[];
+  artifacts: Artifact[];
+  completedRequirementIds: string[];
+  currentObjective?: WorkerObjective;
+  currentEnvironment?: EnvironmentObservation;
+  recentActions: WorkerAction[];
+  failedStrategies: FailedStrategy[];
+  blockers: Blocker[];
+  progress: ProgressState;
+  workerResults: WorkerResult[];
+}
+
+export type OrchestratorDecision =
+  | {
+      type: 'objective';
+      objective: WorkerObjective;
+      reasoningSummary?: string;
+    }
+  | { type: 'complete'; reasoningSummary?: string }
+  | { type: 'blocked'; blocker: Blocker; reasoningSummary?: string };
+
+export type WorkerResultStatus = 'completed' | 'blocked' | 'failed';
+
+export interface WorkerResult {
+  status: WorkerResultStatus;
+  worker: WorkerKind;
+  objectiveId: string;
+  actions: WorkerAction[];
+  facts: Fact[];
+  evidence: Evidence[];
+  artifacts: Artifact[];
+  blockers: Blocker[];
+  environmentChanged: boolean;
+  suggestedNextInformation?: string;
+  reasoningSummary?: string;
+}
+
 export interface Thread {
   id: string;
   title: string;
@@ -58,6 +257,10 @@ export interface TaskDefinition {
   threadId: string;
   goal: string;
   criteria: CompletionCriterion[];
+  originalRequest?: string;
+  requirements?: TaskRequirement[];
+  constraints?: TaskConstraint[];
+  isConversation?: boolean;
   maxSteps?: number;
 }
 
@@ -92,6 +295,23 @@ export interface EnvironmentObservation {
     url?: string;
     title?: string;
     loaded?: boolean;
+    pageCount?: number;
+    domFingerprint?: string;
+    main?: {
+      heading?: string;
+      text?: string;
+    };
+    interactiveElements?: Array<{
+      ref: string;
+      role: string;
+      name: string;
+      value?: string;
+      text?: string;
+      enabled: boolean;
+      href?: string;
+      checked?: boolean;
+      selected?: boolean;
+    }>;
   };
   lastToolResult?: ToolResult;
   task: {
@@ -109,6 +329,12 @@ export interface VerificationResult {
   complete: boolean;
   criteria: Array<{
     criterion: CompletionCriterion;
+    passed: boolean;
+    message: string;
+    evidence?: unknown;
+  }>;
+  requirements?: Array<{
+    requirement: TaskRequirement;
     passed: boolean;
     message: string;
     evidence?: unknown;
@@ -162,6 +388,8 @@ export interface Run {
   goal: string;
   status: RunStatus;
   criteria: CompletionCriterion[];
+  task?: TaskDefinition;
+  state?: TaskState;
   error?: ToolError;
   createdAt: string;
   startedAt?: string;
@@ -174,6 +402,11 @@ export interface RunStep {
   stepIndex: number;
   phase: RunStepPhase;
   decision?: AgentDecision;
+  orchestratorDecision?: OrchestratorDecision;
+  objective?: WorkerObjective;
+  worker?: WorkerKind;
+  workerResult?: WorkerResult;
+  progress?: ProgressState;
   toolName?: string;
   toolInput?: Record<string, unknown>;
   toolResult?: ToolResult;
@@ -226,6 +459,7 @@ export type GuestMethod =
   | 'browser.getState'
   | 'browser.snapshot'
   | 'browser.extractText'
+  | 'browser.download'
   | 'browser.click'
   | 'browser.type'
   | 'app.launch'

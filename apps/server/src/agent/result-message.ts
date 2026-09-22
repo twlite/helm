@@ -13,6 +13,14 @@ function successfulData(step: RunStep, toolName: string): Record<string, unknown
   return isRecord(step.toolResult.data) ? step.toolResult.data : undefined;
 }
 
+function successfulWorkerData(result: AgentRuntimeResult, toolName: string): Record<string, unknown> | undefined {
+  for (const step of [...result.steps].reverse()) {
+    const action = [...(step.workerResult?.actions ?? [])].reverse().find(candidate => candidate.tool === toolName && candidate.result.ok);
+    if (action && isRecord(action.result.data)) return action.result.data;
+  }
+  return undefined;
+}
+
 function boundedText(value: string): string {
   if (value.length <= MAX_RESULT_MESSAGE_LENGTH) return value;
   return `${value.slice(0, MAX_RESULT_MESSAGE_LENGTH - 40).trimEnd()}\n\n[Output truncated by Helm.]`;
@@ -26,7 +34,8 @@ export function assistantMessageForResult(result: AgentRuntimeResult): string {
 
   const extracted = [...result.steps].reverse()
     .map(step => successfulData(step, 'browser.extractText'))
-    .find((data): data is Record<string, unknown> => data !== undefined);
+    .find((data): data is Record<string, unknown> => data !== undefined)
+    ?? successfulWorkerData(result, 'browser.extractText');
   if (extracted) {
     const title = typeof extracted.title === 'string' ? extracted.title.trim() : '';
     const url = typeof extracted.url === 'string' ? extracted.url.trim() : '';
@@ -37,13 +46,14 @@ export function assistantMessageForResult(result: AgentRuntimeResult): string {
 
   const file = [...result.steps].reverse()
     .map(step => successfulData(step, 'fs.read'))
-    .find((data): data is Record<string, unknown> => data !== undefined);
+    .find((data): data is Record<string, unknown> => data !== undefined)
+    ?? successfulWorkerData(result, 'fs.read');
   if (file && typeof file.content === 'string') {
     const path = typeof file.path === 'string' ? file.path : 'the requested file';
     return `Here is ${path}:\n\n${boundedText(file.content)}`;
   }
 
-  if (result.task.criteria.length === 0) {
+  if (result.task.criteria.length === 0 && (result.task.requirements?.length ?? 0) === 0) {
     return 'I’m Helm, a local desktop agent. I can browse websites, work with files, and interact with the controlled desktop.';
   }
 

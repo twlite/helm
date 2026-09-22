@@ -1,4 +1,5 @@
 import { posix } from 'node:path';
+import { createHash } from 'node:crypto';
 
 import type { GuestMethod, WindowInfo } from '@helm/shared';
 import { guestMethodSchemas } from '@helm/shared';
@@ -34,6 +35,7 @@ const EMPTY_PNG_DATA_URL =
 export interface MockGuestOptions {
   initialFiles?: Record<string, string>;
   delayMs?: number;
+  downloads?: Record<string, { finalUrl?: string; filename: string; content?: string; context?: string }>;
 }
 
 interface MockBrowserElement {
@@ -41,6 +43,11 @@ interface MockBrowserElement {
   role: string;
   name?: string;
   value?: string;
+  text?: string;
+  enabled?: boolean;
+  href?: string;
+  checked?: boolean;
+  selected?: boolean;
 }
 
 interface MockBrowserState {
@@ -49,6 +56,9 @@ interface MockBrowserState {
   loaded: boolean;
   text: string;
   elements: MockBrowserElement[];
+  pageCount: number;
+  main?: { heading?: string; text?: string };
+  domFingerprint?: string;
 }
 
 function decodeHtml(value: string): string {
@@ -94,6 +104,10 @@ function parseElements(html: string): MockBrowserElement[] {
   return elements;
 }
 
+function browserFingerprint(browser: Pick<MockBrowserState, 'text' | 'elements'>): string {
+  return JSON.stringify({ text: browser.text, elements: browser.elements });
+}
+
 function basename(path: string): string {
   return path.slice(path.lastIndexOf('/') + 1) || path;
 }
@@ -108,7 +122,8 @@ function normalizeGuestPath(input: string): string {
   if (!input || input.includes('\0')) {
     throw new GuestTransportError('INVALID_PATH', 'Guest path is invalid');
   }
-  const normalized = posix.normalize(input);
+  const expanded = input === '~' ? MOCK_GUEST_ROOT : input.startsWith('~/') ? `${MOCK_GUEST_ROOT}/${input.slice(2)}` : input;
+  const normalized = posix.normalize(expanded);
   if (normalized !== MOCK_GUEST_ROOT && !normalized.startsWith(`${MOCK_GUEST_ROOT}/`)) {
     throw new GuestTransportError('PATH_OUTSIDE_ALLOWED_ROOT', 'Guest path is outside /home/helm');
   }
@@ -136,17 +151,20 @@ function isToolMethod(method: GuestMethod): method is GuestMethod {
 export class MockGuestTransport implements GuestTransport {
   private readonly files = new Map<string, string>();
   private readonly delayMs: number;
+  private readonly downloads: Record<string, { finalUrl?: string; filename: string; content?: string; context?: string }>;
   private readonly windows = new Map<string, WindowInfo>();
   private browser: MockBrowserState = {
     loaded: false,
     text: '',
     elements: [],
+    pageCount: 1,
   };
   private screenshotCounter = 0;
   private screenshotId?: string;
 
   constructor(options: MockGuestOptions = {}) {
     this.delayMs = Math.max(0, options.delayMs ?? 0);
+    this.downloads = options.downloads ?? {};
     this.files.set(DEMO_PAGE_PATH, DEMO_PAGE_HTML);
     for (const [path, content] of Object.entries(options.initialFiles ?? {})) {
       this.setFile(path, content);
@@ -180,7 +198,7 @@ export class MockGuestTransport implements GuestTransport {
     this.files.clear();
     this.files.set(DEMO_PAGE_PATH, DEMO_PAGE_HTML);
     this.windows.clear();
-    this.browser = { loaded: false, text: '', elements: [] };
+    this.browser = { loaded: false, text: '', elements: [], pageCount: 1 };
     this.screenshotCounter = 0;
     this.screenshotId = undefined;
   }
@@ -223,7 +241,7 @@ export class MockGuestTransport implements GuestTransport {
         return {
           guestVersion: 'mock-1',
           capabilities: Object.keys(guestMethodSchemas) as GuestMethod[],
-        } as GuestMethodResult[M];
+        } as unknown as GuestMethodResult[M];
       case 'fs.read': {
         const path = normalizeGuestPath((params as GuestMethodParams['fs.read']).path);
         const content = this.files.get(path);
@@ -235,8 +253,14 @@ export class MockGuestTransport implements GuestTransport {
       case 'fs.write': {
         const input = params as GuestMethodParams['fs.write'];
         const path = normalizeGuestPath(input.path);
+        const existedBefore = this.files.has(path);
         this.files.set(path, input.content);
-        return { path, size: input.content.length } as GuestMethodResult[M];
+        return {
+          path,
+          size: Buffer.byteLength(input.content, 'utf8'),
+          sha256: createHash('sha256').update(input.content, 'utf8').digest('hex'),
+          existedBefore,
+        } as GuestMethodResult[M];
       }
       case 'fs.exists': {
         const path = normalizeGuestPath((params as GuestMethodParams['fs.exists']).path);
@@ -289,6 +313,14 @@ export class MockGuestTransport implements GuestTransport {
           loaded: true,
           text: readableText(document),
           elements: parseElements(document),
+          pageCount: 1,
+          main: {
+            heading: document.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/i)?.[1]
+              ? readableText(document.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/i)?.[0] ?? '')
+              : undefined,
+            text: readableText(document).slice(0, 2_000),
+          },
+          domFingerprint: browserFingerprint({ text: readableText(document), elements: parseElements(document) }),
         };
         this.upsertWindow('browser', 'Chromium', title, true);
         return { url, title, loaded: true } as GuestMethodResult[M];
@@ -298,11 +330,15 @@ export class MockGuestTransport implements GuestTransport {
           url: this.browser.url,
           title: this.browser.title,
           loaded: this.browser.loaded,
+          pageCount: this.browser.pageCount,
+          domFingerprint: this.browser.domFingerprint,
         } as GuestMethodResult[M];
       case 'browser.snapshot':
         return {
           url: this.browser.url,
           title: this.browser.title,
+          pageCount: this.browser.pageCount,
+          main: this.browser.main,
           elements: this.browser.elements.map(element => ({ ...element })),
         } as GuestMethodResult[M];
       case 'browser.extractText': {
@@ -313,6 +349,37 @@ export class MockGuestTransport implements GuestTransport {
           url: this.browser.url,
           title: this.browser.title ?? '',
           text: this.browser.text,
+        } as GuestMethodResult[M];
+      }
+      case 'browser.download': {
+        const input = params as GuestMethodParams['browser.download'];
+        const element = input.ref === undefined
+          ? undefined
+          : this.browser.elements.find(candidate => candidate.ref === input.ref);
+        if (input.ref !== undefined && element === undefined) {
+          throw new GuestTransportError('ELEMENT_NOT_FOUND', `Browser element does not exist: ${input.ref}`);
+        }
+        const rawSourceUrl = input.url ?? element?.href ?? this.browser.url ?? 'about:blank';
+        let sourceUrl = rawSourceUrl;
+        try {
+          sourceUrl = new URL(rawSourceUrl, this.browser.url ?? undefined).toString();
+        } catch {
+          // Keep the raw value in the mock for diagnostics when a fixture uses
+          // a non-URL href.
+        }
+        const configured = this.downloads[sourceUrl];
+        const filename = configured?.filename ?? basename(sourceUrl.split('?')[0] ?? 'download');
+        const path = normalizeGuestPath(`/home/helm/Downloads/${filename}`);
+        const content = configured?.content ?? `Downloaded from ${sourceUrl}\n`;
+        this.files.set(path, content);
+        return {
+          sourceUrl,
+          ...(configured?.finalUrl ? { finalUrl: configured.finalUrl } : {}),
+          suggestedFilename: filename,
+          savedPath: path,
+          size: Buffer.byteLength(content, 'utf8'),
+          context: configured?.context ?? 'mock-browser',
+          startedAt: new Date().toISOString(),
         } as GuestMethodResult[M];
       }
       case 'browser.click': {
@@ -329,6 +396,7 @@ export class MockGuestTransport implements GuestTransport {
         }
         const element = this.browser.elements.find(candidate => candidate.ref === input.ref);
         if (element) element.value = input.text;
+        this.browser.domFingerprint = browserFingerprint({ text: this.browser.text, elements: this.browser.elements });
         return { ref: input.ref, text: input.text, typed: true } as GuestMethodResult[M];
       }
       case 'app.launch': {
