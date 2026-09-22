@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 
 import {
+  browserUrlsMatch,
+  completionCriterionSchema,
   guestResponseSchema,
+  normalizeBrowserUrl,
   parseGuestRequest,
   webSocketEventSchema,
 } from '@helm/shared';
@@ -31,5 +34,11 @@ describe('shared protocol schemas', () => {
       payload: { complete: true },
     }).success).toBe(true);
     expect(webSocketEventSchema.safeParse({ type: 'run.completed', timestamp: 'not-a-date', payload: {} }).success).toBe(false);
+  });
+
+  it('accepts hostname shorthand and compares it with the canonical browser URL', () => {
+    expect(normalizeBrowserUrl('twlite.dev')).toBe('https://twlite.dev/');
+    expect(browserUrlsMatch('https://twlite.dev/', 'twlite.dev')).toBe(true);
+    expect(completionCriterionSchema.safeParse({ type: 'browser.url', url: 'twlite.dev' }).success).toBe(true);
   });
 });

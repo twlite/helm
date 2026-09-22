@@ -43,6 +43,19 @@ describe('criterion verification and mock guest state', () => {
     ).rejects.toMatchObject({ code: 'PATH_OUTSIDE_ALLOWED_ROOT' });
   });
 
+  it('matches a bare hostname criterion to the canonical browser URL', async () => {
+    const guest = new MockGuestTransport();
+    await guest.request('browser.navigate', { url: 'https://twlite.dev' });
+
+    const verifier = new CriterionVerifierRegistry(guest);
+    const result = await verifier.verifyTask({
+      criteria: [{ type: 'browser.url', url: 'twlite.dev' }],
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.criteria[0]?.passed).toBe(true);
+  });
+
   it('reports missing criteria instead of treating them as complete', async () => {
     const guest = new MockGuestTransport();
     const verifier = new CriterionVerifierRegistry(guest);
@@ -54,4 +67,3 @@ describe('criterion verification and mock guest state', () => {
     expect(result.criteria[0]?.passed).toBe(false);
   });
 });
-

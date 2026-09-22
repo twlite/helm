@@ -1,9 +1,21 @@
 import { z } from 'zod';
+import { normalizeBrowserUrl } from './browser-url';
 
 const pathSchema = z.string().min(1);
+const browserUrlSchema = z.string().min(1).refine(
+  value => {
+    try {
+      normalizeBrowserUrl(value);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  'Expected a valid browser URL or hostname.',
+);
 
 export const completionCriterionSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('browser.url'), url: z.string().url().or(z.string().startsWith('file://')) }),
+  z.object({ type: z.literal('browser.url'), url: browserUrlSchema }),
   z.object({ type: z.literal('file.exists'), path: pathSchema }),
   z.object({ type: z.literal('file.contains'), path: pathSchema, expected: z.string() }),
   z.object({

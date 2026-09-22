@@ -1,5 +1,6 @@
 import { GuestRpcError } from "./errors";
 import type { GuestSandbox } from "./sandbox";
+import { normalizeBrowserUrl } from "../../../packages/shared/src/browser-url";
 
 type WaitUntil = "commit" | "domcontentloaded" | "load" | "networkidle";
 
@@ -108,22 +109,13 @@ async function loadPlaywright(): Promise<PlaywrightModule> {
 }
 
 function safeUrl(value: string): string {
-  if (value.length > 8_192 || /[\u0000-\u001f\u007f]/.test(value)) {
-    throw new GuestRpcError("INVALID_PARAMS", "url is too long or contains control characters.", {
-      httpStatus: 400,
-    });
-  }
   try {
-    const parsed = new URL(value);
-    if (!["http:", "https:", "file:", "about:"].includes(parsed.protocol)) {
-      throw new Error("unsupported protocol");
-    }
-  } catch {
-    throw new GuestRpcError("INVALID_PARAMS", "url must be a valid http, https, file, or about URL.", {
+    return normalizeBrowserUrl(value);
+  } catch (error) {
+    throw new GuestRpcError("INVALID_PARAMS", error instanceof Error ? error.message : "url must be a valid http, https, file, or about URL.", {
       httpStatus: 400,
     });
   }
-  return value;
 }
 
 function browserLaunchError(error: unknown): GuestRpcError {
@@ -170,8 +162,8 @@ export class BrowserController {
     waitUntil?: WaitUntil;
     timeoutMs?: number;
   }): Promise<BrowserState> {
-    const page = await this.ensurePage();
     const url = safeUrl(input.url);
+    const page = await this.ensurePage();
     const waitUntil = input.waitUntil ?? "domcontentloaded";
     const timeoutMs = input.timeoutMs ?? 30_000;
     this.loading = true;

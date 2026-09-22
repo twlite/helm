@@ -5,6 +5,7 @@ import type {
   ToolResult,
   VerificationResult,
 } from '@helm/shared';
+import { browserUrlsMatch } from '@helm/shared';
 
 import type { GuestTransport } from './guest-transport';
 
@@ -154,7 +155,7 @@ export class CriterionVerifierRegistry {
     this.register('browser.url', async criterion => {
       const guest = this.requireGuest();
       const state = await guest.request('browser.getState', {});
-      const passed = state.url === criterion.url;
+      const passed = browserUrlsMatch(state.url, criterion.url);
       return {
         passed,
         message: passed ? `Browser URL is ${criterion.url}.` : `Browser URL is not ${criterion.url}.`,
