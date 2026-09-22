@@ -23,7 +23,7 @@ import type {
   WorkerContext,
   WorkerProvider,
 } from '../agent/types';
-import { allowedWorkerTool, fallbackObjective, objectiveForRequirement } from '../agent/orchestrator';
+import { allowedWorkerTool, fallbackObjective, objectiveForRequirement, recoverOrchestratorBlocker } from '../agent/orchestrator';
 import { requirementsForTask, trustedFacts } from '../agent/task-state';
 import {
   BROWSER_RESEARCH_CRITERION_ID,
@@ -384,6 +384,25 @@ function explicitPaths(request: string): string[] {
   return [...new Set(request.match(/(?:~\/|\/home\/helm\/)[A-Za-z0-9._~/-]+/gu)?.map(value => value.replace(/[),.;!?]+$/u, '')) ?? [])];
 }
 
+type DesktopOutputPaths = {
+  filePath?: string;
+  directoryPath?: string;
+};
+
+function inferredDesktopOutputPaths(request: string): DesktopOutputPaths {
+  if (!/\b(?:on|in|to)\s+(?:the\s+)?desktop\b/iu.test(request)) return {};
+
+  const folderName = request.match(/\b(?:folder|directory)\s+(?:called|named)\s+["'`]?([A-Za-z0-9][A-Za-z0-9._-]*)/iu)?.[1];
+  const fileName = request.match(/\b([A-Za-z0-9][A-Za-z0-9_-]*\.(?:md|txt|json|csv|log|html?))\b/iu)?.[1];
+  if (!folderName && !fileName) return {};
+
+  const directoryPath = `~/Desktop${folderName ? `/${folderName}` : ''}`;
+  return {
+    directoryPath,
+    ...(fileName ? { filePath: `${directoryPath}/${fileName}` } : {}),
+  };
+}
+
 function toJsonValue(value: unknown): JsonValue {
   if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
   if (Array.isArray(value)) return value.map(toJsonValue);
@@ -454,25 +473,38 @@ function compiledRequirements(request: string, criteria: CompletionCriterion[]):
   if (repository && /\b(?:repo(?:sitory)?|project|github|release|version)\b/iu.test(request)) {
     add({ id: 'repositoryName', description: 'Know the repository name requested by the user.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'repositoryName' } });
   }
+  if (criteria.some(criterion => criterion.type === 'custom' && criterion.id === BROWSER_RESEARCH_CRITERION_ID)) {
+    // Page content is an actionable prerequisite for all browser-derived
+    // facts. Keep it ahead of those facts so a deterministic fallback starts
+    // research instead of treating the prerequisite as a terminal blocker.
+    add({ id: 'browserResearch', description: 'Collect readable evidence from the relevant public web page.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'pageContent' } });
+  }
   if (asksRelease) {
     add({ id: 'latestReleaseVersion', description: 'Determine the latest stable release version from an authoritative release page.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'latestReleaseVersion' } });
     add({ id: 'releaseUrl', description: 'Capture the URL of the release page used for the observed version.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'releaseUrl' } });
   }
-  if (/\b(?:today|current date|today's date|date)\b/iu.test(request)) {
+  if (/\b(?:release|version)\b[^.\n]{0,80}\bdate\b|\bdate\b[^.\n]{0,80}\b(?:release|version)\b/iu.test(request)) {
+    add({ id: 'releaseDate', description: 'Determine the release date from the authoritative release page.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'releaseDate' } });
+  }
+  if (/\b(?:today|current\s+date|today's\s+date|date\s+today)\b/iu.test(request)) {
     add({ id: 'currentDate', description: 'Record the current date at runtime.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'currentDate' } });
   }
   const paths = explicitPaths(request);
-  const filePath = paths.find(path => /\.(?:txt|md|json|csv|log|html?)$/iu.test(path));
-  const directoryPath = paths.find(path => !/\.[A-Za-z0-9]{1,8}$/u.test(path))
-    ?? (filePath?.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/')) : undefined);
-  if (filePath && /\b(?:write|save|create|put|contain|containing|into)\b/iu.test(request)) {
-    const factIds = requirements
-      .filter(requirement => requirement.type === 'fact')
-      .map(requirement => requirement.id);
-    add({ id: 'outputFile', description: 'Create the requested output file with the facts collected during the task.', type: 'filesystem', mandatory: true, status: 'pending', target: { path: filePath, mode: factIds.length > 0 ? 'contains-facts' : 'exists', ...(factIds.length > 0 ? { factIds } : {}) } });
-  }
+  const inferredPaths = inferredDesktopOutputPaths(request);
+  const explicitFilePath = paths.find(path => /\.(?:txt|md|json|csv|log|html?)$/iu.test(path));
+  const explicitDirectoryPath = paths.find(path => !/\.[A-Za-z0-9]{1,8}$/u.test(path));
+  const filePath = explicitFilePath ?? inferredPaths.filePath;
+  const directoryPath = explicitDirectoryPath
+    ?? (explicitFilePath?.includes('/') ? explicitFilePath.slice(0, explicitFilePath.lastIndexOf('/')) : undefined)
+    ?? inferredPaths.directoryPath;
+  const factIds = requirements
+    .filter(requirement => requirement.type === 'fact' && requirement.id !== 'browserResearch')
+    .map(requirement => requirement.target?.factId ?? requirement.id);
   if (directoryPath && (!filePath || /\b(?:mkdir|folder|directory)\b/iu.test(request))) {
     add({ id: 'outputDirectory', description: 'Create the requested output directory.', type: 'filesystem', mandatory: true, status: 'pending', target: { path: directoryPath, mode: 'exists' } });
+  }
+  if (filePath && /\b(?:write|save|create|put|contain|containing|into)\b/iu.test(request)) {
+    add({ id: 'outputFile', description: 'Create the requested output file with the facts collected during the task.', type: 'filesystem', mandatory: true, status: 'pending', target: { path: filePath, mode: factIds.length > 0 ? 'contains-facts' : 'exists', ...(factIds.length > 0 ? { factIds } : {}) } });
   }
   if (/\bdownload\b/iu.test(request)) {
     add({ id: 'downloadArtifact', description: 'Download the requested artifact and retain its recorded file.', type: 'artifact', mandatory: true, status: 'pending', target: { mode: 'downloaded' } });
@@ -486,9 +518,6 @@ function compiledRequirements(request: string, criteria: CompletionCriterion[]):
       status: 'pending',
       criterion,
     });
-  }
-  if (criteria.some(criterion => criterion.type === 'custom' && criterion.id === BROWSER_RESEARCH_CRITERION_ID)) {
-    add({ id: 'browserResearch', description: 'Collect readable evidence from the relevant public web page.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'pageContent' } });
   }
   return requirements;
 }
@@ -683,6 +712,7 @@ export class AiSdkOrchestrator implements OrchestratorProvider {
           'Never invent a URL, filename, version, DOM ref, or expected content.',
           'Choose only an unmet requirementId from the supplied state. A worker may act, but it cannot complete the entire task.',
           'Return complete only when the supplied deterministic verification is complete; otherwise choose an unmet requirement.',
+          'An unmet requirement is actionable work, not a blocker. Do not return blocked merely because another requirement must be completed first; select that requirement instead.',
           'If the flow is genuinely blocked by missing user information or a safety boundary, return blocked with the exact blocker.',
           'When recoveryActive is true, do not select the same failed strategy again; replan around the current environment and observed errors.',
           'Keep reasoningSummary short and operational; do not include hidden chain-of-thought.',
@@ -700,6 +730,8 @@ export class AiSdkOrchestrator implements OrchestratorProvider {
       });
       if (result.type === 'complete') return result;
       if (result.type === 'blocked') {
+        const recovered = recoverOrchestratorBlocker(context.state, context.observation, result.reason);
+        if (recovered) return { ...recovered, reasoningSummary: result.reasoningSummary ?? recovered.reasoningSummary };
         return {
           type: 'blocked' as const,
           blocker: { code: 'ORCHESTRATOR_BLOCKED', message: result.reason },
@@ -784,6 +816,7 @@ export class AiSdkWorker implements WorkerProvider {
             'Do not redefine requirements and do not declare the entire task complete.',
             'Use semantic browser refs from the current snapshot; never invent selectors, URLs, filenames, or expected outcomes.',
             'After an action, use its actual result and the next observation. A model hypothesis is not an observed fact.',
+            'If the objective is browser research or page content, that is the work to perform, not a blocker: navigate to the relevant source and extract readable text.',
             'If you report a discovered fact, set evidenceId to the action receipt id whose actual result contains the value.',
             'When recoveryActive is true, do not repeat a failed strategy; choose a materially different action or report the concrete blocker.',
             'Keep reasoningSummary short and operational.',

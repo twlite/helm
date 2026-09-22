@@ -13,6 +13,7 @@ const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'guest.handshake': 'Check the guest protocol and capabilities.',
   'fs.read': 'Read a UTF-8 file inside the allowed guest filesystem root.',
   'fs.write': 'Write a UTF-8 file inside the allowed guest filesystem root.',
+  'fs.mkdir': 'Create a directory inside the allowed guest filesystem root.',
   'fs.exists': 'Check whether a guest filesystem path exists.',
   'fs.list': 'List immediate entries inside an allowed guest directory.',
   'fs.stat': 'Inspect whether a guest filesystem path exists and its type.',
@@ -76,7 +77,7 @@ async function boundarySnapshot(
       // The receipt still records the action if the browser was unavailable.
     }
   }
-  if (method === 'fs.write' || method === 'fs.read' || method === 'fs.stat' || method === 'fs.exists') {
+  if (method === 'fs.write' || method === 'fs.mkdir' || method === 'fs.read' || method === 'fs.stat' || method === 'fs.exists') {
     const path = typeof input.path === 'string' ? input.path : undefined;
     if (path) {
       try {

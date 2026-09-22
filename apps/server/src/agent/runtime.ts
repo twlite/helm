@@ -27,7 +27,7 @@ import {
 import { fingerprintAction, LoopDetector } from './fingerprint';
 import { DEFAULT_RUNTIME_BUDGETS, RunBudget, RunCancellation } from './limits';
 import { GuestObservationProvider } from './observation';
-import { allowedWorkerTool, FallbackOrchestrator, objectiveForRequirement } from './orchestrator';
+import { allowedWorkerTool, FallbackOrchestrator, objectiveForRequirement, recoverOrchestratorBlocker } from './orchestrator';
 import {
   addFailedStrategy,
   artifactsFromResult,
@@ -930,14 +930,25 @@ export class AgentRuntime {
         }
 
         if (decision.type === 'blocked') {
-          state.blockers = [...state.blockers, decision.blocker].slice(-12);
-          await persistState();
-          await this.persistStep(steps, { runId, stepIndex, phase: 'blocked', orchestratorDecision: decision, observation, verification, progress: state.progress });
-          await this.block(run, error(decision.blocker.code, decision.blocker.message));
-          await this.emit('run.step.completed', { stepIndex, decision }, run.id);
-          break;
+          const recovered = recoverOrchestratorBlocker(state, observation, decision.blocker.message);
+          if (recovered) {
+            state.blockers = [...state.blockers, blocker(
+              'ORCHESTRATOR_BLOCKED_RECOVERED',
+              decision.blocker.message,
+              decision.blocker.requirementIds,
+            )].slice(-12);
+            decision = recovered;
+          } else {
+            state.blockers = [...state.blockers, decision.blocker].slice(-12);
+            await persistState();
+            await this.persistStep(steps, { runId, stepIndex, phase: 'blocked', orchestratorDecision: decision, observation, verification, progress: state.progress });
+            await this.block(run, error(decision.blocker.code, decision.blocker.message));
+            await this.emit('run.step.completed', { stepIndex, decision }, run.id);
+            break;
+          }
         }
 
+        if (decision.type !== 'objective') continue;
         const objective = decision.objective;
         state.currentObjective = objective;
         const beforeFingerprint = progressFingerprint(state, observation, objective);

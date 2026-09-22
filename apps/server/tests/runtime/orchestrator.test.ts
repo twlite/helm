@@ -66,6 +66,26 @@ function taskWithRequirements(overrides: Partial<TaskDefinition> = {}): TaskDefi
   };
 }
 
+function desktopReleaseTask(): TaskDefinition {
+  return {
+    id: 'desktop-release-task',
+    threadId: 'desktop-release-thread',
+    goal: 'Find the latest oven-sh/bun release and write it to the requested Desktop file.',
+    originalRequest: 'Open GitHub and go to the oven-sh/bun repository. Find the latest release version and its release date. Then create a folder called helm-demo on the Desktop and write a bun-release.md file containing the repository name, latest version, release date, release URL, and the current date.',
+    criteria: [],
+    requirements: [
+      { id: 'browserResearch', description: 'Collect readable evidence from the relevant public web page.', type: 'fact', mandatory: true, target: { factId: 'pageContent' } },
+      { id: 'latestReleaseVersion', description: 'Determine the latest stable release version.', type: 'fact', mandatory: true, target: { factId: 'latestReleaseVersion' } },
+      { id: 'releaseDate', description: 'Determine the release date.', type: 'fact', mandatory: true, target: { factId: 'releaseDate' } },
+      { id: 'releaseUrl', description: 'Capture the release URL.', type: 'fact', mandatory: true, target: { factId: 'releaseUrl' } },
+      { id: 'repositoryName', description: 'Know the repository name.', type: 'fact', mandatory: true, target: { factId: 'repositoryName' } },
+      { id: 'currentDate', description: 'Record the current date.', type: 'fact', mandatory: true, target: { factId: 'currentDate' } },
+      { id: 'outputDirectory', description: 'Create the requested output directory.', type: 'filesystem', mandatory: true, target: { path: '~/Desktop/helm-demo', mode: 'exists' } },
+      { id: 'outputFile', description: 'Create the requested output file with the collected facts.', type: 'filesystem', mandatory: true, target: { path: '~/Desktop/helm-demo/bun-release.md', mode: 'contains-facts', factIds: ['repositoryName', 'latestReleaseVersion', 'releaseDate', 'releaseUrl', 'currentDate'] } },
+    ],
+  };
+}
+
 function runtimeFor(
   guest: MockGuestTransport,
   decisions: readonly OrchestratorDecision[],
@@ -85,6 +105,107 @@ function runtimeFor(
 }
 
 describe('orchestrated agent loop', () => {
+  it('recovers when the orchestrator mistakes an unmet browser requirement for a blocker', async () => {
+    const guest = new MockGuestTransport();
+    const worker = new FunctionalWorker([async context => {
+      const navigate = await executeAction(context, 'browser.navigate', { url: 'https://github.com/oven-sh/bun' }, 'navigate');
+      const extract = await executeAction(context, 'browser.extractText', {}, 'extract');
+      return {
+        status: 'completed', worker: 'browser', objectiveId: context.objective.id,
+        actions: [navigate, extract], facts: [], evidence: [], artifacts: [], blockers: [], environmentChanged: true,
+      };
+    }]);
+    const researchOnlyTask = {
+      ...desktopReleaseTask(),
+      id: 'browser-blocker-recovery-task',
+      threadId: 'browser-blocker-recovery',
+      requirements: [{
+        id: 'browserResearch',
+        description: 'Collect readable evidence from the relevant public web page.',
+        type: 'fact' as const,
+        mandatory: true,
+        target: { factId: 'pageContent' },
+      }],
+    };
+    const result = await runtimeFor(guest, [{
+      type: 'blocked',
+      blocker: {
+        code: 'ORCHESTRATOR_BLOCKED',
+        message: 'Cannot proceed without completing the browserResearch requirement. Need to perform web research first.',
+        requirementIds: ['browserResearch'],
+      },
+    }], worker, { maxSteps: 2 }).run({
+      threadId: 'browser-blocker-recovery',
+      userMessage: 'Open GitHub and research the repository.',
+      task: researchOnlyTask,
+    });
+
+    expect(result.status).not.toBe('blocked');
+    expect(result.steps.some(step => step.workerResult?.actions.some(action => action.tool === 'browser.extractText'))).toBe(true);
+    expect(result.run.state?.blockers.some(item => item.code === 'ORCHESTRATOR_BLOCKED_RECOVERED')).toBe(true);
+  });
+
+  it('completes the GitHub release to Desktop folder and file workflow', async () => {
+    const releaseUrl = 'https://github.com/oven-sh/bun/releases/tag/bun-v1.2.3';
+    const guest = new MockGuestTransport({
+      pages: {
+        [releaseUrl]: '<html><body><h1>oven-sh/bun bun-v1.2.3</h1><p>Released 2026-09-20</p></body></html>',
+      },
+    });
+    const browserObjective = objective('research', 'browser', 'Collect and record the release facts.', 'browserResearch');
+    const directoryObjective = objective('directory', 'filesystem', 'Create the requested output directory.', 'outputDirectory');
+    const fileObjective = objective('file', 'filesystem', 'Write the requested output file.', 'outputFile');
+    const worker = new FunctionalWorker([
+      async context => {
+        const navigate = await executeAction(context, 'browser.navigate', { url: releaseUrl }, 'navigate');
+        const extract = await executeAction(context, 'browser.extractText', {}, 'extract');
+        const evidence = extract.result.evidence as { receipt?: { id: string } };
+        const evidenceId = evidence.receipt?.id ?? 'missing-receipt';
+        return {
+          status: 'completed', worker: 'browser', objectiveId: context.objective.id,
+          actions: [navigate, extract], facts: [
+            fact('latestReleaseVersion', 'bun-v1.2.3', evidenceId),
+            fact('releaseDate', '2026-09-20', evidenceId),
+            fact('releaseUrl', releaseUrl, evidenceId),
+          ], evidence: [], artifacts: [], blockers: [], environmentChanged: true,
+        };
+      },
+      async context => {
+        const action = await executeAction(context, 'fs.mkdir', { path: '~/Desktop/helm-demo' }, 'mkdir');
+        return { status: 'completed', worker: 'filesystem', objectiveId: context.objective.id, actions: [action], facts: [], evidence: [], artifacts: [], blockers: [], environmentChanged: true };
+      },
+      async context => {
+        const values = new Map(context.state.facts.map(item => [item.id, String(item.value)]));
+        const content = [
+          `Repository: ${values.get('repositoryName')}`,
+          `Latest version: ${values.get('latestReleaseVersion')}`,
+          `Release date: ${values.get('releaseDate')}`,
+          `Release URL: ${values.get('releaseUrl')}`,
+          `Current date: ${values.get('currentDate')}`,
+        ].join('\n');
+        const action = await executeAction(context, 'fs.write', { path: '~/Desktop/helm-demo/bun-release.md', content }, 'write');
+        return { status: 'completed', worker: 'filesystem', objectiveId: context.objective.id, actions: [action], facts: [], evidence: [], artifacts: [], blockers: [], environmentChanged: true };
+      },
+    ]);
+
+    const result = await runtimeFor(guest, [
+      { type: 'objective', objective: browserObjective },
+      { type: 'objective', objective: directoryObjective },
+      { type: 'objective', objective: fileObjective },
+    ], worker, { maxSteps: 3 }).run({
+      threadId: 'desktop-release-thread',
+      userMessage: 'Open GitHub and go to the oven-sh/bun repository.',
+      task: desktopReleaseTask(),
+    });
+
+    expect(result.status).toBe('completed');
+    expect(guest.getFile('~/Desktop/helm-demo/bun-release.md')).toContain('Release date: 2026-09-20');
+    expect((await guest.request('fs.stat', { path: '~/Desktop/helm-demo' })).type).toBe('directory');
+    expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining([
+      'browserResearch', 'releaseDate', 'outputDirectory', 'outputFile',
+    ]));
+  });
+
   it('runs the benchmark shape from observed browser facts to a verified file', async () => {
     const releaseUrl = 'file:///home/helm/release.html';
     const guest = new MockGuestTransport({

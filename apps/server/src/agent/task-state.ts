@@ -458,7 +458,10 @@ async function requirementCheck(
           ? { passed: true, message: `Download was recorded at ${target.path}.`, evidence: artifact }
           : { passed: false, message: `No recorded download exists at ${target.path}.`, evidence: stat };
       }
-      return { passed: stat.type === 'file' || (requirement.type === 'artifact' && stat.type === 'directory'), message: `Path exists: ${target.path}.`, evidence: stat };
+      const pathExists = target.mode === 'exists'
+        ? stat.type === 'file' || stat.type === 'directory'
+        : stat.type === 'file' || (requirement.type === 'artifact' && stat.type === 'directory');
+      return { passed: pathExists, message: `Path exists: ${target.path}.`, evidence: stat };
     } catch (error) {
       return { passed: false, message: error instanceof Error ? error.message : String(error) };
     }

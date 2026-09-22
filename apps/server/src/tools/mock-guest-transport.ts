@@ -34,6 +34,7 @@ const EMPTY_PNG_DATA_URL =
 
 export interface MockGuestOptions {
   initialFiles?: Record<string, string>;
+  pages?: Record<string, string>;
   delayMs?: number;
   downloads?: Record<string, { finalUrl?: string; filename: string; content?: string; context?: string }>;
 }
@@ -150,6 +151,8 @@ function isToolMethod(method: GuestMethod): method is GuestMethod {
  */
 export class MockGuestTransport implements GuestTransport {
   private readonly files = new Map<string, string>();
+  private readonly directories = new Set<string>([MOCK_GUEST_ROOT]);
+  private readonly pages: Record<string, string>;
   private readonly delayMs: number;
   private readonly downloads: Record<string, { finalUrl?: string; filename: string; content?: string; context?: string }>;
   private readonly windows = new Map<string, WindowInfo>();
@@ -164,8 +167,10 @@ export class MockGuestTransport implements GuestTransport {
 
   constructor(options: MockGuestOptions = {}) {
     this.delayMs = Math.max(0, options.delayMs ?? 0);
+    this.pages = { ...(options.pages ?? {}) };
     this.downloads = options.downloads ?? {};
     this.files.set(DEMO_PAGE_PATH, DEMO_PAGE_HTML);
+    this.addDirectoryParents(DEMO_PAGE_PATH);
     for (const [path, content] of Object.entries(options.initialFiles ?? {})) {
       this.setFile(path, content);
     }
@@ -176,7 +181,9 @@ export class MockGuestTransport implements GuestTransport {
   }
 
   setFile(path: string, content: string): void {
-    this.files.set(normalizeGuestPath(path), content);
+    const normalized = normalizeGuestPath(path);
+    this.addDirectoryParents(normalized);
+    this.files.set(normalized, content);
   }
 
   hasFile(path: string): boolean {
@@ -196,7 +203,10 @@ export class MockGuestTransport implements GuestTransport {
 
   reset(): void {
     this.files.clear();
+    this.directories.clear();
+    this.directories.add(MOCK_GUEST_ROOT);
     this.files.set(DEMO_PAGE_PATH, DEMO_PAGE_HTML);
+    this.addDirectoryParents(DEMO_PAGE_PATH);
     this.windows.clear();
     this.browser = { loaded: false, text: '', elements: [], pageCount: 1 };
     this.screenshotCounter = 0;
@@ -254,6 +264,7 @@ export class MockGuestTransport implements GuestTransport {
         const input = params as GuestMethodParams['fs.write'];
         const path = normalizeGuestPath(input.path);
         const existedBefore = this.files.has(path);
+        this.addDirectoryParents(path);
         this.files.set(path, input.content);
         return {
           path,
@@ -262,14 +273,29 @@ export class MockGuestTransport implements GuestTransport {
           existedBefore,
         } as GuestMethodResult[M];
       }
+      case 'fs.mkdir': {
+        const path = normalizeGuestPath((params as GuestMethodParams['fs.mkdir']).path);
+        if (this.files.has(path)) {
+          throw new GuestTransportError('NOT_A_DIRECTORY', `${path} is a file`);
+        }
+        const existedBefore = this.directories.has(path);
+        this.addDirectoryParents(path);
+        this.directories.add(path);
+        return { path, existedBefore } as GuestMethodResult[M];
+      }
       case 'fs.exists': {
         const path = normalizeGuestPath((params as GuestMethodParams['fs.exists']).path);
-        return { path, exists: this.files.has(path) } as GuestMethodResult[M];
+        return { path, exists: this.files.has(path) || this.directories.has(path) } as GuestMethodResult[M];
       }
       case 'fs.list': {
         const path = normalizeGuestPath((params as GuestMethodParams['fs.list']).path);
         const prefix = path === MOCK_GUEST_ROOT ? `${path}/` : `${path}/`;
         const entries = new Set<string>();
+        for (const directory of this.directories) {
+          if (!directory.startsWith(prefix)) continue;
+          const remainder = directory.slice(prefix.length);
+          if (remainder && !remainder.includes('/')) entries.add(remainder);
+        }
         for (const file of this.files.keys()) {
           if (!file.startsWith(prefix)) continue;
           const remainder = file.slice(prefix.length);
@@ -288,8 +314,17 @@ export class MockGuestTransport implements GuestTransport {
             size: content.length,
           } as GuestMethodResult[M];
         }
+        if (this.directories.has(path)) {
+          return {
+            path,
+            exists: true,
+            type: 'directory',
+            size: 0,
+          } as GuestMethodResult[M];
+        }
         const isDirectory =
           path === MOCK_GUEST_ROOT ||
+          this.directories.has(path) ||
           [...this.files.keys()].some(file => file.startsWith(`${path}/`));
         return {
           path,
@@ -301,7 +336,7 @@ export class MockGuestTransport implements GuestTransport {
       case 'browser.navigate': {
         const url = (params as GuestMethodParams['browser.navigate']).url;
         const path = pathFromFileUrl(url);
-        const html = path ? this.files.get(path) : undefined;
+        const html = path ? this.files.get(path) : this.pages[url];
         if (path && html === undefined) {
           throw new GuestTransportError('PAGE_NOT_FOUND', `Page does not exist: ${path}`);
         }
@@ -371,6 +406,7 @@ export class MockGuestTransport implements GuestTransport {
         const filename = configured?.filename ?? basename(sourceUrl.split('?')[0] ?? 'download');
         const path = normalizeGuestPath(`/home/helm/Downloads/${filename}`);
         const content = configured?.content ?? `Downloaded from ${sourceUrl}\n`;
+        this.addDirectoryParents(path);
         this.files.set(path, content);
         return {
           sourceUrl,
@@ -496,6 +532,17 @@ export class MockGuestTransport implements GuestTransport {
       windows,
       screenshotId: this.screenshotId,
     };
+  }
+
+  private addDirectoryParents(path: string): void {
+    let parent = posix.dirname(path);
+    while (parent.startsWith(`${MOCK_GUEST_ROOT}/`) || parent === MOCK_GUEST_ROOT) {
+      this.directories.add(parent);
+      if (parent === MOCK_GUEST_ROOT) break;
+      const next = posix.dirname(parent);
+      if (next === parent) break;
+      parent = next;
+    }
   }
 }
 

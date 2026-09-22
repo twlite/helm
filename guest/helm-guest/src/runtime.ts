@@ -108,6 +108,8 @@ export class GuestRuntime {
           requiredString(params, "path", { maxLength: 16_384 }),
           requiredString(params, "content", { maxLength: 50 * 1024 * 1024 }),
         );
+      case "fs.mkdir":
+        return this.sandbox.mkdir(requiredString(params, "path", { maxLength: 16_384 }));
       case "fs.exists":
         return this.sandbox.exists(requiredString(params, "path", { maxLength: 16_384 }));
       case "fs.list":

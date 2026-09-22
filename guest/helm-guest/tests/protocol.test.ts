@@ -178,4 +178,38 @@ describe('helm-guest RPC', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('creates and verifies an empty directory through the filesystem protocol', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-guest-'));
+    const runtime = new GuestRuntime({
+      sandbox: new GuestSandbox({ root, workspace: join(root, 'workspace') }),
+    });
+
+    try {
+      const mkdir = await runtime.dispatch({
+        id: 'mkdir-1',
+        method: 'fs.mkdir',
+        params: { path: 'Desktop/helm-demo' },
+      });
+      expect(mkdir).toMatchObject({
+        id: 'mkdir-1',
+        ok: true,
+        result: { path: join(root, 'workspace/Desktop/helm-demo'), existedBefore: false },
+      });
+
+      const stat = await runtime.dispatch({
+        id: 'mkdir-stat-1',
+        method: 'fs.stat',
+        params: { path: 'Desktop/helm-demo' },
+      });
+      expect(stat).toMatchObject({
+        id: 'mkdir-stat-1',
+        ok: true,
+        result: { exists: true, type: 'directory' },
+      });
+    } finally {
+      await runtime.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

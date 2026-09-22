@@ -1,14 +1,16 @@
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { asSchema, embed, type EmbeddingModel } from 'ai';
 import { describe, expect, it } from 'bun:test';
-import type { AgentTurnContext } from '@helm/shared';
+import type { AgentTurnContext, EnvironmentObservation, TaskDefinition } from '@helm/shared';
 
+import { createTaskState } from '../src/agent/task-state';
 import type { AgentRuntimeResult } from '../src/agent/types';
 import { BROWSER_RESEARCH_CRITERION_ID, browserResearchStartUrl, isBrowserResearchRequest } from '../src/agent/browser-research';
 import {
   AiSdkDecisionProvider,
   AiSdkEmbeddingProvider,
   AiSdkMemoryExtractor,
+  AiSdkOrchestrator,
   AiSdkResponseGenerator,
   AiSdkTaskPlanner,
   AiSdkThreadTitleGenerator,
@@ -459,6 +461,124 @@ describe('LM Studio AI adapters', () => {
       description: 'Read current public web information with the browser before answering.',
     });
     expect(JSON.stringify(requestBody)).toContain('open a relevant result site');
+  });
+
+  it('compiles the GitHub release workflow into executable research and Desktop requirements', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-bun-release-plan',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({
+              mode: 'task',
+              goal: 'Research the requested GitHub release and write the result file.',
+              criteria: [],
+            }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const planner = new AiSdkTaskPlanner({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 256,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    const userMessage = 'Open GitHub and go to the oven-sh/bun repository. Find the latest release version and its release date. Then create a folder called helm-demo on the Desktop and write a bun-release.md file containing the repository name, latest version, release date, release URL, and the current date.';
+    const task = await planner.createTask({ threadId: 'bun-release-plan', userMessage });
+    const requirements = task.requirements ?? [];
+
+    expect(requirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'browserResearch', target: { factId: 'pageContent' } }),
+      expect.objectContaining({ id: 'latestReleaseVersion', target: { factId: 'latestReleaseVersion' } }),
+      expect.objectContaining({ id: 'releaseDate', target: { factId: 'releaseDate' } }),
+      expect.objectContaining({ id: 'releaseUrl', target: { factId: 'releaseUrl' } }),
+      expect.objectContaining({ id: 'outputDirectory', target: { path: '~/Desktop/helm-demo', mode: 'exists' } }),
+      expect.objectContaining({ id: 'outputFile', target: expect.objectContaining({ path: '~/Desktop/helm-demo/bun-release.md', mode: 'contains-facts' }) }),
+    ]));
+    expect(requirements.find(requirement => requirement.id === 'outputFile')?.target?.factIds).toEqual(expect.arrayContaining([
+      'repositoryName', 'latestReleaseVersion', 'releaseDate', 'releaseUrl', 'currentDate',
+    ]));
+    expect(requirements.find(requirement => requirement.id === 'outputFile')?.target?.factIds).not.toContain('pageContent');
+    expect(browserResearchStartUrl(userMessage)).toBe('https://github.com/oven-sh/bun');
+    expect(requirements.findIndex(requirement => requirement.id === 'browserResearch')).toBeLessThan(
+      requirements.findIndex(requirement => requirement.id === 'latestReleaseVersion'),
+    );
+  });
+
+  it('turns a procedural browserResearch blocker into the next orchestrator objective', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-orchestrator-blocker',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({
+              type: 'blocked',
+              reason: 'Cannot proceed without completing the browserResearch requirement. Need to perform web research first.',
+            }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const orchestrator = new AiSdkOrchestrator({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    const task: TaskDefinition = {
+      id: 'orchestrator-blocker-task',
+      threadId: 'orchestrator-blocker-thread',
+      goal: 'Research a public GitHub release.',
+      originalRequest: 'Find the latest release on GitHub.',
+      criteria: [],
+      requirements: [{
+        id: 'browserResearch',
+        description: 'Collect readable evidence from the relevant public web page.',
+        type: 'fact',
+        mandatory: true,
+        target: { factId: 'pageContent' },
+      }],
+    };
+    const observation: EnvironmentObservation = {
+      timestamp: 1,
+      task: { completedCriteria: [], remainingCriteria: ['browserResearch'] },
+    };
+    const result = await orchestrator.next({
+      task,
+      state: createTaskState(task),
+      observation,
+      verification: { complete: false, criteria: [], requirements: [], summary: '0/1 requirements passed.' },
+      memories: [],
+      stepIndex: 0,
+    });
+
+    expect(result).toMatchObject({
+      type: 'objective',
+      objective: { kind: 'browser', requirementIds: ['browserResearch'] },
+    });
   });
 
   it('keeps the runtime safety budget under Helm control', async () => {

@@ -154,6 +154,31 @@ export class GuestSandbox {
     }
   }
 
+  async mkdir(inputPath: string): Promise<{ path: string; existedBefore: boolean }> {
+    const target = this.lexicalPath(inputPath);
+    await this.assertLexicallyInside(target);
+    await this.assertExistingParentInside(target);
+
+    let existedBefore = false;
+    try {
+      const metadata = await lstat(target);
+      if (!metadata.isDirectory()) {
+        throw new GuestRpcError("NOT_A_DIRECTORY", `${target} is not a directory.`);
+      }
+      existedBefore = true;
+    } catch (error) {
+      if (!this.isMissing(error)) throw error;
+    }
+
+    try {
+      await mkdir(target, { recursive: true });
+      await this.assertExistingTargetInside(target);
+      return { path: target, existedBefore };
+    } catch (error) {
+      throw this.fileError(error, "DIRECTORY_CREATE_FAILED", `Could not create ${target}.`);
+    }
+  }
+
   async exists(inputPath: string): Promise<{ path: string; exists: boolean }> {
     const target = this.lexicalPath(inputPath);
     await this.assertLexicallyInside(target);

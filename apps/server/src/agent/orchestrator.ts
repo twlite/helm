@@ -54,6 +54,63 @@ export function fallbackObjective(state: TaskState, observation: EnvironmentObse
   return pending ? objectiveForRequirement(state, observation, pending.id) : undefined;
 }
 
+function normalizedWords(value: string): string[] {
+  return value.toLocaleLowerCase().match(/[a-z0-9]+/gu) ?? [];
+}
+
+function hasRequirementReference(reason: string, requirement: TaskRequirement): boolean {
+  const lowerReason = reason.toLocaleLowerCase();
+  const lowerId = requirement.id.toLocaleLowerCase();
+  if (lowerReason.includes(lowerId)) return true;
+
+  const reasonWords = new Set(normalizedWords(reason));
+  const descriptionWords = normalizedWords([
+    requirement.description,
+    requirement.target?.factId ?? '',
+    requirement.target?.path ?? '',
+  ].join(' '));
+  const significantWords = descriptionWords.filter(word => word.length >= 4);
+  if (significantWords.some(word => reasonWords.has(word))) return true;
+
+  // Browser research is compiled as a page-content fact. Models often refer
+  // to that requirement by its purpose rather than by its internal ID.
+  return requirement.target?.factId === 'pageContent'
+    && /\b(?:browser|web|research|page|source|read|extract)\b/iu.test(reason);
+}
+
+/**
+ * Convert a model's procedural "blocked until X is done" response into the
+ * next bounded objective. An unmet requirement is work for the orchestrator,
+ * not a terminal blocker. Genuine user-information, permission, and safety
+ * blockers remain terminal.
+ */
+export function recoverOrchestratorBlocker(
+  state: TaskState,
+  observation: EnvironmentObservation,
+  reason: string,
+): OrchestratorDecision | undefined {
+  const pending = requirementsForTask(state.task)
+    .filter(requirement => requirement.mandatory && !state.completedRequirementIds.includes(requirement.id));
+  if (pending.length === 0) return undefined;
+
+  if (/(?:\buser\b.{0,40}\b(?:input|information|choice|specif(?:y|ied)|provide|tell|choose)\b)|\b(?:clarif(?:ication|y)|permission|consent|credential|password|safety|unsafe|policy|prohibited)\b/iu.test(reason)) {
+    return undefined;
+  }
+
+  const referencesRequirement = pending.some(requirement => hasRequirementReference(reason, requirement));
+  const describesPendingWork = /\b(?:cannot|can't|unable|need|needs|must|required|before|first|complete|perform|do|read|extract|research|collect|observe|inspect|open|navigate|use)\b/iu.test(reason);
+  if (!referencesRequirement || !describesPendingWork) return undefined;
+
+  const objective = fallbackObjective(state, observation);
+  return objective
+    ? {
+      type: 'objective',
+      objective,
+      reasoningSummary: 'The model described an unmet requirement as a blocker; continuing with the bounded requirement objective.',
+    }
+    : undefined;
+}
+
 export class FallbackOrchestrator implements OrchestratorProvider {
   async next(input: OrchestratorContext): Promise<OrchestratorDecision> {
     const objective = fallbackObjective(input.state, input.observation);

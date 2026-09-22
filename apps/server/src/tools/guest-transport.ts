@@ -7,6 +7,7 @@ export type GuestMethodParams = {
   'guest.handshake': Record<string, never>;
   'fs.read': { path: string };
   'fs.write': { path: string; content: string };
+  'fs.mkdir': { path: string };
   'fs.exists': { path: string };
   'fs.list': { path: string };
   'fs.stat': { path: string };
@@ -38,6 +39,7 @@ export type GuestMethodResult = {
   };
   'fs.read': { path: string; content: string; size: number };
   'fs.write': { path: string; size: number; sha256?: string; existedBefore?: boolean };
+  'fs.mkdir': { path: string; existedBefore: boolean };
   'fs.exists': { path: string; exists: boolean };
   'fs.list': { path: string; entries: string[] };
   'fs.stat': {

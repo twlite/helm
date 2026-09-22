@@ -25,8 +25,11 @@ in `TaskDefinition.originalRequest` and adds compiler-owned `requirements` and
 
 Requirements describe outcomes, not a guessed sequence of clicks. For example,
 a request to inspect a repository release and write a file produces fact
-requirements for the repository name, release version, release URL, and date,
-plus a filesystem requirement whose content is linked to those facts.
+requirements for the repository name, release version, release date, release
+URL, and current date, plus filesystem requirements for the requested Desktop
+directory and a file whose content is linked to those facts. Natural-language
+Desktop folder/file names are compiled into guest-sandbox paths; they are not
+left for the model to invent.
 Concrete URLs, filenames, and expected text are retained only when they are
 explicit in the user request or are subsequently observed.
 
@@ -102,7 +105,7 @@ a mandatory fact requirement.
 `verifyTaskState` is deterministic wherever the guest can answer mechanically:
 
 - fact requirements require a trusted fact with linked evidence;
-- file and directory requirements use `fs.stat`;
+- file and directory requirements use `fs.stat` after `fs.mkdir`/`fs.write` actions;
 - fact-backed file contents are read and compared to actual trusted fact values;
 - explicit text requirements compare the exact user-provided text;
 - downloads require a recorded artifact and saved file;
@@ -118,6 +121,12 @@ current state first and rejects the proposal while any mandatory requirement or
 criterion is incomplete. The run reaches `completed` only after all mandatory
 requirements pass. This prevents a successful navigation or a worker's
 optimistic `done` result from ending the task early.
+
+An orchestrator response such as “cannot proceed until the browser research
+requirement is complete” is treated as procedural guidance when it references
+an unmet actionable requirement. Helm records that response for diagnostics and
+continues with the deterministic fallback objective. Missing user input,
+permission, safety, and policy blockers remain terminal.
 
 ## 6. Progress and recovery
 

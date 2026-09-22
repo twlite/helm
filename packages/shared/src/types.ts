@@ -453,6 +453,7 @@ export type GuestMethod =
   | 'guest.handshake'
   | 'fs.read'
   | 'fs.write'
+  | 'fs.mkdir'
   | 'fs.exists'
   | 'fs.list'
   | 'fs.stat'

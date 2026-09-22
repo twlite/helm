@@ -20,6 +20,14 @@ describe('shared protocol schemas', () => {
       method: 'fs.write',
       params: { path: '/home/helm/workspace/demo.txt', content: 'hello' },
     });
+    expect(parseGuestRequest({
+      id: 'request-mkdir',
+      method: 'fs.mkdir',
+      params: { path: '/home/helm/Desktop/helm-demo' },
+    })).toMatchObject({
+      method: 'fs.mkdir',
+      params: { path: '/home/helm/Desktop/helm-demo' },
+    });
     expect(() => parseGuestRequest({ id: 'request-2', method: 'not-a-method', params: {} })).toThrow(/Unknown guest method/);
     expect(() => parseGuestRequest({ id: 'request-3', method: 'browser.click', params: {} })).toThrow();
   });

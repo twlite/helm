@@ -63,6 +63,10 @@ export function browserResearchStartUrl(input: string): string {
   if (/^(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?#][^\s]*)?$/iu.test(normalized)) {
     return `https://${normalized}`;
   }
+  const githubRepository = normalized.match(/(?<![~/])\b([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\b/u)?.[1];
+  if (githubRepository && /\bgithub\b/iu.test(normalized)) {
+    return `https://github.com/${githubRepository}`;
+  }
   return `https://www.google.com/search?q=${encodeURIComponent(input.trim())}`;
 }
 

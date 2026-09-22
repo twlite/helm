@@ -24,7 +24,7 @@ The guest rejects unknown methods, malformed parameters, traversal outside `/hom
 
 The initial method groups are:
 
-- `fs.read`, `fs.write`, `fs.exists`, `fs.list`, `fs.stat`
+- `fs.read`, `fs.write`, `fs.mkdir`, `fs.exists`, `fs.list`, `fs.stat`
 - `browser.navigate`, `browser.getState`, `browser.snapshot`, `browser.extractText`, `browser.click`, `browser.type`, `browser.download`
 - `app.launch`, `app.openFile`
 - `desktop.getState`, `desktop.listWindows`, `desktop.focusWindow`, `desktop.hotkey`, `desktop.type`, `desktop.click`, `desktop.screenshot`

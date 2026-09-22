@@ -37,6 +37,7 @@ export const guestMethodSchemas = {
   'guest.handshake': z.object({}),
   'fs.read': z.object({ path: pathSchema }),
   'fs.write': z.object({ path: pathSchema, content: z.string() }),
+  'fs.mkdir': z.object({ path: pathSchema }),
   'fs.exists': z.object({ path: pathSchema }),
   'fs.list': z.object({ path: pathSchema }),
   'fs.stat': z.object({ path: pathSchema }),

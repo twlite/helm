@@ -47,6 +47,7 @@ export const GuestMethodContracts: Readonly<
   "guest.handshake": { description: "Report guest runtime readiness and methods." },
   "fs.read": { description: "Read UTF-8 text from the guest sandbox." },
   "fs.write": { description: "Write UTF-8 text inside the guest sandbox." },
+  "fs.mkdir": { description: "Create a directory inside the guest sandbox." },
   "fs.exists": { description: "Check whether a sandbox path exists." },
   "fs.list": { description: "List entries in a sandbox directory." },
   "fs.stat": { description: "Inspect a sandbox path." },
