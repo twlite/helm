@@ -118,6 +118,33 @@ describe('AgentRuntime', () => {
     expect(result.history[1]?.verification?.criteria.every(criterion => !criterion.passed)).toBe(true);
   });
 
+  it('completes immediately when an action satisfies every criterion', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    const provider = new ScriptedDecisionProvider([
+      { type: 'action', tool: 'browser.navigate', input: { url: 'https://twlite.dev' } },
+    ]);
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: provider,
+    });
+
+    const result = await runtime.run({
+      id: 'auto-complete',
+      threadId: 'thread',
+      goal: 'Navigate to twlite.dev.',
+      criteria: [{ type: 'browser.url', url: 'twlite.dev' }],
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.finalVerification?.complete).toBe(true);
+    expect(result.history).toHaveLength(1);
+    expect(provider.index).toBe(1);
+  });
+
   it('enforces the step budget and detects repeated action/state loops', async () => {
     const loop = new LoopDetector(2);
     const fingerprint = 'same-action-and-state';

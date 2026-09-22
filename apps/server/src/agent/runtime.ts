@@ -334,6 +334,15 @@ export class AgentRuntime {
         });
         await this.emit('run.verification', verification, run.id);
 
+        // Verification is authoritative. Once an action has satisfied every
+        // criterion, finish the run immediately instead of asking the model
+        // for another turn that could repeat the same action.
+        if (verification.complete) {
+          await this.complete(run, verification);
+          await this.emit('run.step.completed', entry, run.id);
+          break;
+        }
+
         const loop = loopDetector.record(fingerprintAction(
           decision.tool,
           decision.input,
