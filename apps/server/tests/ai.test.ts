@@ -360,6 +360,98 @@ describe('LM Studio AI adapters', () => {
     expect(JSON.stringify(requestBody)).toContain('browser.extractText');
   });
 
+  it('marks explicit search-engine research as requiring page content', async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        requestBody = JSON.parse(await request.text()) as Record<string, unknown>;
+        return Response.json({
+          id: 'chatcmpl-search-plan',
+          object: 'chat.completion',
+          created: 1,
+          model: 'google/gemma-4-e2b',
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: JSON.stringify({
+                mode: 'task',
+                goal: 'Search DuckDuckGo and inspect relevant project pages.',
+                criteria: [{ type: 'browser.url', url: 'https://duckduckgo.com/?q=Neplex+Technologies' }],
+              }),
+            },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      },
+    });
+    const planner = new AiSdkTaskPlanner({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    const userMessage = 'See what projects Neplex Technologies makes. Use DuckDuckGo and look for them.';
+
+    expect(isBrowserResearchRequest(userMessage)).toBe(true);
+    const task = await planner.createTask({ threadId: 'thread-search', userMessage });
+
+    expect(task.criteria).toContainEqual({
+      type: 'custom',
+      id: BROWSER_RESEARCH_CRITERION_ID,
+      description: 'Read current public web information with the browser before answering.',
+    });
+    expect(JSON.stringify(requestBody)).toContain('open a relevant result site');
+  });
+
+  it('keeps the runtime safety budget under Helm control', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio',
+      baseURL: 'http://localhost:1234/v1',
+      supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-plan-budget',
+        object: 'chat.completion',
+        created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: JSON.stringify({
+              mode: 'task',
+              goal: 'Use the browser to inspect the requested page.',
+              criteria: [{ type: 'browser.url', url: 'https://example.com' }],
+              maxSteps: 1,
+            }),
+          },
+          finish_reason: 'stop',
+        }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const planner = new AiSdkTaskPlanner({
+      model: provider.chatModel('google/gemma-4-e2b'),
+      maxOutputTokens: 128,
+      temperature: 0,
+      requestTimeoutMs: 1000,
+      structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+
+    const task = await planner.createTask({
+      threadId: 'thread-budget',
+      userMessage: 'Open example.com and inspect it.',
+    });
+
+    expect(task).not.toHaveProperty('maxSteps');
+  });
+
   it('short-circuits clear identity chat before task planning', async () => {
     const planner = new AiSdkTaskPlanner({
       model: {} as never,

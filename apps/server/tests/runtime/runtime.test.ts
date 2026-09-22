@@ -44,6 +44,49 @@ describe('AgentRuntime', () => {
     expect(result.finalVerification?.complete).toBe(true);
   });
 
+  it('inspects a loaded search page instead of repeating or reopening its navigation', async () => {
+    const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    const searchUrl = 'https://duckduckgo.com/?q=Neplex+Technologies';
+    const resultUrl = 'https://neplextech.com/projects';
+    const provider = new ScriptedDecisionProvider([
+      { type: 'action', tool: 'browser.navigate', input: { url: searchUrl } },
+      // The runtime turns this search-engine home navigation into an extract.
+      { type: 'action', tool: 'browser.navigate', input: { url: 'https://duckduckgo.com' } },
+      // Once the result page has been read, the runtime exposes its links with
+      // a semantic snapshot instead of allowing another search cycle.
+      { type: 'action', tool: 'browser.navigate', input: { url: searchUrl } },
+      { type: 'action', tool: 'browser.navigate', input: { url: resultUrl } },
+      // The runtime reads the result page before allowing completion.
+      { type: 'complete' },
+      { type: 'complete' },
+    ]);
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: provider,
+    });
+
+    const result = await runtime.run({
+      threadId: 'search-workflow',
+      userMessage: 'See what projects Neplex Technologies makes. Use DuckDuckGo and look for them.',
+      task: browserResearchTask({
+        threadId: 'search-workflow',
+        userMessage: 'See what projects Neplex Technologies makes. Use DuckDuckGo and look for them.',
+      }),
+    });
+
+    expect(result.status).toBe('completed');
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.navigate').map(invocation => invocation.input)).toEqual([
+      { url: searchUrl },
+      { url: resultUrl },
+    ]);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.extractText')).toHaveLength(2);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.snapshot')).toHaveLength(1);
+  });
+
   it('answers conversational plans without executing computer-use tools', async () => {
     const guest = new MockGuestTransport();
     const tools = createGuestToolRegistry(guest);

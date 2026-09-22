@@ -1,3 +1,4 @@
+import { browserUrlsMatch } from '@helm/shared';
 import type {
   AgentDecision,
   AgentStep,
@@ -16,7 +17,12 @@ import type {
 import { CriterionVerifierRegistry } from '../tools/criterion-verifier';
 import type { GuestTransport } from '../tools/guest-transport';
 import { ToolRegistry } from '../tools/tool-registry';
-import { BROWSER_RESEARCH_CRITERION_ID, isBrowserResearchRequest } from './browser-research';
+import {
+  BROWSER_RESEARCH_CRITERION_ID,
+  isBrowserResearchRequest,
+  isSameSearchNavigation,
+  isSearchResultsUrl,
+} from './browser-research';
 import { fingerprintAction, LoopDetector } from './fingerprint';
 import { DEFAULT_RUNTIME_BUDGETS, RunBudget, RunCancellation } from './limits';
 import { GuestObservationProvider } from './observation';
@@ -69,6 +75,63 @@ function canExtractOpenPage(observation: EnvironmentObservation, lastToolResult?
   if (!observation.browser?.url || observation.browser.url === 'about:blank') return false;
   if (!/^https?:\/\//iu.test(observation.browser.url)) return false;
   return lastToolResult?.ok === true || observation.browser.loaded === true;
+}
+
+function hasReadableCurrentPage(
+  observation: EnvironmentObservation,
+  pageContentRead: boolean,
+  pageContentUrl: string | undefined,
+): boolean {
+  if (!pageContentRead || !pageContentUrl || !observation.browser?.url) return false;
+  return browserUrlsMatch(pageContentUrl, observation.browser.url);
+}
+
+function toolResultUrl(result: ToolResult | undefined): string | undefined {
+  if (!result?.ok || typeof result.data !== 'object' || result.data === null || Array.isArray(result.data)) {
+    return undefined;
+  }
+  const url = (result.data as Record<string, unknown>).url;
+  return typeof url === 'string' ? url : undefined;
+}
+
+/**
+ * A search-capable model can keep navigating to the already-loaded results
+ * page, or bounce between a search URL and the search-engine home page, when
+ * it has not been shown any page content yet. Turn that no-progress decision
+ * into an inspection operation. This keeps the model in control of choosing
+ * the next result while preventing another search cycle from consuming steps.
+ */
+function shouldInspectRepeatedBrowserNavigation(
+  decision: AgentDecision,
+  observation: EnvironmentObservation,
+  history: readonly AgentStep[],
+  lastToolResult: ToolResult | undefined,
+  pageContentRequired: boolean,
+  inspectedBrowserUrls: ReadonlySet<string>,
+): 'browser.extractText' | 'browser.snapshot' | undefined {
+  if (
+    !pageContentRequired
+    || decision.type !== 'action'
+    || decision.tool !== 'browser.navigate'
+  ) {
+    return undefined;
+  }
+
+  const targetUrl = typeof decision.input.url === 'string' ? decision.input.url : undefined;
+  const currentUrl = observation.browser?.url ?? toolResultUrl(lastToolResult);
+  if (!targetUrl || !currentUrl || currentUrl === 'about:blank') return undefined;
+
+  const lastStep = history[history.length - 1];
+  const repeatedCurrentPage = (
+    lastStep?.action?.tool === 'browser.navigate'
+    && lastToolResult?.ok === true
+    && browserUrlsMatch(currentUrl, targetUrl)
+  );
+  const returningToSearchPage = isSearchResultsUrl(currentUrl) && isSameSearchNavigation(currentUrl, targetUrl);
+  if (!repeatedCurrentPage && !returningToSearchPage) return undefined;
+
+  const inspected = [...inspectedBrowserUrls].some(url => browserUrlsMatch(url, currentUrl));
+  return inspected ? 'browser.snapshot' : 'browser.extractText';
 }
 
 function error(code: string, message: string): ToolError {
@@ -188,6 +251,7 @@ export class AgentRuntime {
     const steps: RunStep[] = [];
     const observations: EnvironmentObservation[] = [];
     const previousResults: ToolResult[] = [];
+    const inspectedBrowserUrls = new Set<string>();
     let finalVerification: VerificationResult | undefined;
     let completedCriteria: string[] = [];
     let remainingCriteria = task.criteria.map(criterionKey);
@@ -199,6 +263,7 @@ export class AgentRuntime {
     const pageContentRequired = taskRequiresPageContent(task, input.userMessage);
     const conversationalTask = task.criteria.length === 0;
     let pageContentRead = false;
+    let pageContentUrl: string | undefined;
     let prematureCompletionAttempts = 0;
     let rejectedCompletionAttempts = 0;
     const configuredMaxSteps = this.budgetOptions?.maxSteps ?? DEFAULT_RUNTIME_BUDGETS.maxSteps;
@@ -277,7 +342,7 @@ export class AgentRuntime {
         if (
           !conversationalTask
           && pageContentRequired
-          && !pageContentRead
+          && !hasReadableCurrentPage(observation, pageContentRead, pageContentUrl)
           && decision.type === 'complete'
           && canExtractOpenPage(observation, lastToolResult)
         ) {
@@ -289,12 +354,31 @@ export class AgentRuntime {
           };
         }
 
+        const repeatedInspectionTool = shouldInspectRepeatedBrowserNavigation(
+          decision,
+          observation,
+          history,
+          lastToolResult,
+          pageContentRequired,
+          inspectedBrowserUrls,
+        );
+        if (repeatedInspectionTool !== undefined) {
+          decision = {
+            type: 'action',
+            tool: repeatedInspectionTool,
+            input: {},
+            reasoningSummary: repeatedInspectionTool === 'browser.snapshot'
+              ? 'Inspecting the loaded search results for a relevant source link.'
+              : 'Reading the loaded search results before choosing a source page.',
+          };
+        }
+
         // Give the model one final turn after a successful action, but do not
         // execute the same already-verified action again if it repeats it.
         if (
           completionCandidate &&
           decision.type === 'action' &&
-          (!pageContentRequired || pageContentRead) &&
+          (!pageContentRequired || hasReadableCurrentPage(observation, pageContentRead, pageContentUrl)) &&
           fingerprintAction(decision.tool, decision.input) === completionCandidate.actionFingerprint
         ) {
           await this.complete(run, completionCandidate.verification);
@@ -304,7 +388,11 @@ export class AgentRuntime {
           }, run.id);
           break;
         }
-        if (completionCandidate && decision.type === 'blocked' && (!pageContentRequired || pageContentRead)) {
+        if (
+          completionCandidate
+          && decision.type === 'blocked'
+          && (!pageContentRequired || hasReadableCurrentPage(observation, pageContentRead, pageContentUrl))
+        ) {
           await this.complete(run, completionCandidate.verification);
           await this.emit('run.step.completed', {
             observation,
@@ -371,7 +459,12 @@ export class AgentRuntime {
           let verification = conversationalTask
             ? { complete: true, criteria: [], summary: 'Response ready.' }
             : await this.verify(task, observation, lastToolResult);
-          if (!conversationalTask && verification.complete && pageContentRequired && !pageContentRead) {
+          if (
+            !conversationalTask
+            && verification.complete
+            && pageContentRequired
+            && !hasReadableCurrentPage(observation, pageContentRead, pageContentUrl)
+          ) {
             prematureCompletionAttempts += 1;
             verification = {
               ...verification,
@@ -442,8 +535,13 @@ export class AgentRuntime {
         rejectedCompletionAttempts = 0;
         previousResults.push(clone(result));
         lastToolResult = result;
+        if (decision.tool === 'browser.navigate' && result.ok) {
+          pageContentRead = false;
+          pageContentUrl = undefined;
+        }
         if (decision.tool === 'browser.extractText' && result.ok) {
           pageContentRead = true;
+          pageContentUrl = toolResultUrl(result);
           prematureCompletionAttempts = 0;
         }
         const postActionObservation = await this.observationProvider.observe({
@@ -453,6 +551,13 @@ export class AgentRuntime {
           lastToolResult: result,
           signal: cancellation.signal,
         });
+        if (result.ok && (decision.tool === 'browser.extractText' || decision.tool === 'browser.snapshot')) {
+          const inspectedUrl = toolResultUrl(result) ?? postActionObservation.browser?.url;
+          if (inspectedUrl) inspectedBrowserUrls.add(inspectedUrl);
+        }
+        if (decision.tool === 'browser.extractText' && result.ok && pageContentUrl === undefined) {
+          pageContentUrl = postActionObservation.browser?.url;
+        }
         const verification = await this.verify(task, postActionObservation, result);
         finalVerification = verification;
         entry.observation = postActionObservation;
@@ -484,7 +589,11 @@ export class AgentRuntime {
         });
         await this.emit('run.verification', verification, run.id);
 
-        if (pageContentRequired && !pageContentRead && prematureCompletionAttempts >= maxRepeatedAction) {
+        if (
+          pageContentRequired
+          && !hasReadableCurrentPage(postActionObservation, pageContentRead, pageContentUrl)
+          && prematureCompletionAttempts >= maxRepeatedAction
+        ) {
           await this.fail(
             run,
             error('PAGE_CONTENT_NOT_READ', 'Helm could not complete the task because the requested page contents were not read.'),
@@ -494,7 +603,10 @@ export class AgentRuntime {
         }
 
         if (verification.complete && result.ok) {
-          if (pageContentRequired && !pageContentRead) {
+          if (
+            pageContentRequired
+            && !hasReadableCurrentPage(postActionObservation, pageContentRead, pageContentUrl)
+          ) {
             const repeatedCompletedAction = actionLoopDetector.record(fingerprintAction(
               decision.tool,
               decision.input,

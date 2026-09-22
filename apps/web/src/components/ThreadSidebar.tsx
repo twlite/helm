@@ -3,7 +3,6 @@ import type { Thread } from '../types';
 import { formatDate, formatTime } from '../format';
 import { Icon } from './Icon';
 import { Button } from './ui/button';
-import { ScrollArea } from './ui/scroll-area';
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from './ui/sheet';
 
 type ThreadSidebarProps = {
@@ -45,10 +44,9 @@ function isToday(value: string) {
   return date.toDateString() === now.toDateString();
 }
 
-function visibleThreadTitle(title: string): string {
+function normalizedThreadTitle(title: string): string {
   const normalized = title.trim().replace(/\s+/gu, ' ');
-  const maxLength = 30;
-  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength - 3).trimEnd()}...`;
+  return normalized || 'Untitled thread';
 }
 
 function ThreadRow({
@@ -62,6 +60,8 @@ function ThreadRow({
   onSelect: () => void;
   onContextMenu: (event: MouseEvent<HTMLDivElement>) => void;
 }) {
+  const title = normalizedThreadTitle(thread.title);
+
   function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
@@ -72,6 +72,7 @@ function ThreadRow({
   return (
     <div
       aria-current={selected ? 'page' : undefined}
+      aria-label={title}
       aria-haspopup="menu"
       className={`group box-border flex h-7 w-full min-w-0 max-w-full cursor-pointer items-center gap-2 overflow-hidden rounded-[4px] px-2 text-left transition-colors duration-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent)] ${selected ? 'bg-[var(--selected-bg)] text-[var(--text)]' : 'text-[var(--text-secondary)] hover:bg-[var(--hover-bg)] hover:text-[var(--text)]'}`}
       onClick={onSelect}
@@ -81,7 +82,7 @@ function ThreadRow({
       tabIndex={0}
     >
       <Icon className="shrink-0 text-[var(--text-muted)]" name="message" size={13} />
-      <span className="min-w-0 flex-1 truncate text-xs" title={thread.title}>{visibleThreadTitle(thread.title)}</span>
+      <span className="min-w-0 flex-1 truncate text-xs" title={thread.title}>{title}</span>
       <span className="shrink-0 text-[10px] tabular-nums text-[var(--text-muted)]">{isToday(thread.updatedAt) ? formatTime(thread.updatedAt) : formatDate(thread.updatedAt)}</span>
     </div>
   );
@@ -193,8 +194,8 @@ function SidebarContent({
         </Button>
       </div>
 
-      <ScrollArea className="min-h-0 w-full min-w-0 flex-1 overflow-x-hidden">
-        <div className="box-border min-w-0 max-w-full space-y-4 overflow-hidden px-2 pb-3 pt-2">
+      <div className="min-h-0 w-full min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain">
+        <div className="box-border w-full min-w-0 max-w-full space-y-4 overflow-hidden px-2 pb-3 pt-2">
           <div className="flex items-center justify-between px-2">
             <h2 className="text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--text-muted)]">Threads</h2>
             {threads.length > 0 ? <span className="text-[10px] text-[var(--text-muted)]">{threads.length}</span> : null}
@@ -205,7 +206,7 @@ function SidebarContent({
             <p className="px-2 text-xs leading-5 text-[var(--text-muted)]">Saved conversations appear here.</p>
           ) : null}
         </div>
-      </ScrollArea>
+      </div>
 
       <div className="border-t border-[var(--border)] px-2 py-2">
         <Button className="w-full justify-start" onClick={() => { onOpenMemory(); onCloseMobile(); }} size="sm" variant="ghost">
