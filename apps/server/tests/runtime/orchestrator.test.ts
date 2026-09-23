@@ -182,7 +182,7 @@ describe('orchestrated agent loop', () => {
     });
   });
 
-  it('gives page-to-file objectives deterministic write and viewer actions', () => {
+  it('keeps file contents under model control while retaining mechanical viewer actions', () => {
     const task = taskWithRequirements({
       id: 'page-file-task',
       threadId: 'page-file-thread',
@@ -261,10 +261,7 @@ describe('orchestrated agent loop', () => {
       timestamp: 1,
       desktop: { windows: [] },
       task: { completedCriteria: [], remainingCriteria: ['outputFile'] },
-    }, outputObjective)).toMatchObject({
-      tool: 'fs.write',
-      input: { path: '~/Desktop/twlite.md', content: 'The observed twlite page.' },
-    });
+    }, outputObjective)).toBeUndefined();
     expect(deterministicObjectiveAction(state, {
       timestamp: 1,
       desktop: { windows: [] },

@@ -1093,22 +1093,18 @@ describe('LM Studio AI adapters', () => {
     expect(result.status).toBe('completed');
   });
 
-  it('forces page-to-file workers to write the observed fact and open the viewer', async () => {
+  it('does not synthesize page-to-file contents from observed facts in the legacy worker', async () => {
     const provider = createOpenAICompatible({
       name: 'lmstudio',
       baseURL: 'http://localhost:1234/v1',
-      supportsStructuredOutputs: true,
       fetch: async () => Response.json({
-        id: 'chatcmpl-page-file-worker-done',
+        id: 'chatcmpl-legacy-worker-done',
         object: 'chat.completion',
         created: 1,
         model: 'google/gemma-4-e2b',
         choices: [{
           index: 0,
-          message: {
-            role: 'assistant',
-            content: JSON.stringify({ type: 'done', reasoningSummary: 'The requested operation is complete.' }),
-          },
+          message: { role: 'assistant', content: JSON.stringify({ type: 'done' }) },
           finish_reason: 'stop',
         }],
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
@@ -1117,86 +1113,52 @@ describe('LM Studio AI adapters', () => {
     const task: TaskDefinition = {
       id: 'page-file-worker-task',
       threadId: 'page-file-worker-thread',
-      goal: 'Save the observed page and open it.',
-      originalRequest: 'Go to https://twlite.dev, save the content in twlite.md, and open it in the text viewer.',
+      goal: 'Save the observed page.',
+      originalRequest: 'Save the observed page in twlite.md.',
       criteria: [],
-      requirements: [
-        { id: 'outputFile', description: 'Write the observed page content.', type: 'filesystem', mandatory: true, target: { path: 'twlite.md', mode: 'contains-facts', factIds: ['pageContent'] } },
-        { id: 'openFile', description: 'Open the file in the text viewer.', type: 'desktop', mandatory: true, target: { path: 'twlite.md', content: 'twlite.md' } },
-      ],
-      constraints: [],
+      requirements: [{
+        id: 'outputFile', description: 'Write the page.', type: 'filesystem', mandatory: true,
+        target: { path: 'twlite.md', mode: 'contains-facts', factIds: ['pageContent'] },
+      }],
     };
     const state = createTaskState(task);
     state.facts.push({
-      id: 'pageContent',
-      value: 'Observed page content.',
-      origin: 'observed',
-      confidence: 'observed',
-      evidenceIds: ['receipt-browser-extract'],
-      observedAt: new Date().toISOString(),
+      id: 'pageContent', value: 'Observed page content.', origin: 'observed', confidence: 'observed',
+      evidenceIds: ['receipt-browser-extract'], observedAt: new Date().toISOString(),
     });
-    const baseObservation: EnvironmentObservation = {
+    const observation: EnvironmentObservation = {
       timestamp: 1,
-      desktop: { windows: [] },
-      task: { completedCriteria: [], remainingCriteria: ['outputFile', 'openFile'] },
+      task: { completedCriteria: [], remainingCriteria: ['outputFile'] },
     };
     const worker = new AiSdkWorker({
       model: provider.chatModel('google/gemma-4-e2b'),
-      toolDefinitions: [
-        { name: 'fs.write', description: 'Write a file.', inputSchema: z.object({}), execute: async () => ({}) },
-        { name: 'app.openFile', description: 'Open a file.', inputSchema: z.object({}), execute: async () => ({}) },
-      ],
+      toolDefinitions: [{ name: 'fs.write', description: 'Write a file.', inputSchema: z.object({}) }],
       maxOutputTokens: 256,
       temperature: 0,
       requestTimeoutMs: 1000,
-      structuredOutputCompatibility: 'lmstudio-mlx',
     });
-    const writeTools: string[] = [];
-    const writeResult = await worker.execute({
-      objective: { id: 'objective-outputFile-0', kind: 'filesystem', description: 'Write the observed page content.', requirementIds: ['outputFile'], rationale: 'test' },
+    const executed: string[] = [];
+    const result = await worker.execute({
+      objective: { id: 'objective-outputFile-0', kind: 'filesystem', description: 'Write the page.', requirementIds: ['outputFile'], rationale: 'test' },
       task,
       state,
-      observation: baseObservation,
-      verification: { complete: false, criteria: [], requirements: [], summary: '0/2 requirements passed.' },
+      observation,
+      verification: { complete: false, criteria: [], requirements: [], summary: '0/1 requirements passed.' },
       memories: [],
       recentActions: [],
       failedStrategies: [],
       maxActions: 2,
       execute: {
-        execute: async tool => {
-          writeTools.push(tool);
-          return { ok: true, data: { path: 'twlite.md', size: 23 }, evidence: { receipt: { id: 'receipt-write' } } };
+        execute: async name => {
+          executed.push(name);
+          return { ok: true };
         },
-        observe: async () => baseObservation,
+        observe: async () => observation,
       },
     });
-    expect(writeTools).toEqual(['fs.write']);
-    expect(writeResult.status).toBe('completed');
 
-    const openTools: string[] = [];
-    const openResult = await worker.execute({
-      objective: { id: 'objective-openFile-0', kind: 'desktop', description: 'Open the file in the text viewer.', requirementIds: ['openFile'], rationale: 'test' },
-      task,
-      state,
-      observation: baseObservation,
-      verification: { complete: false, criteria: [], requirements: [], summary: '0/2 requirements passed.' },
-      memories: [],
-      recentActions: [],
-      failedStrategies: [],
-      maxActions: 2,
-      execute: {
-        execute: async tool => {
-          openTools.push(tool);
-          return { ok: true, data: { path: 'twlite.md', application: 'text-editor', title: 'twlite.md - Text Editor' }, evidence: { receipt: { id: 'receipt-open' } } };
-        },
-        observe: async () => ({
-          ...baseObservation,
-          desktop: { windows: [{ id: 'text-editor', title: 'twlite.md - Text Editor', focused: true }] },
-        }),
-      },
-    });
-    expect(openTools).toEqual(['app.openFile']);
-    expect(openResult.status).toBe('completed');
+    expect(executed).toEqual([]);
+    expect(result.actions).toEqual([]);
   });
 
   it('turns a procedural browserResearch blocker into the next orchestrator objective', async () => {

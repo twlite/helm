@@ -47,6 +47,7 @@ import {
   verifyTaskState,
 } from './task-state';
 import type {
+  ActingAgentProvider,
   AgentRuntimeOptions,
   AgentRuntimeResult,
   DecisionProvider,
@@ -56,6 +57,7 @@ import type {
   RuntimeEvent,
   RuntimeEventSink,
   RuntimeRepository,
+  RequestedToolEffect,
   OrchestratorProvider,
   TaskPlanner,
   TaskCompiler,
@@ -226,6 +228,77 @@ function error(code: string, message: string): ToolError {
   return { code, message };
 }
 
+function browserNavigationGuard(tool: string, input: Record<string, unknown>): ToolResult | undefined {
+  if (tool !== 'browser.navigate') return undefined;
+  const value = input.url;
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    return { ok: false, error: { code: 'INVALID_BROWSER_URL', message: 'browser.navigate requires a non-empty absolute URL.' } };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return { ok: false, error: { code: 'INVALID_BROWSER_URL', message: 'browser.navigate requires an absolute URL, not a filesystem path or bare hostname.' } };
+  }
+  if (!['http:', 'https:', 'file:', 'about:'].includes(parsed.protocol)) {
+    return { ok: false, error: { code: 'INVALID_BROWSER_PROTOCOL', message: `Browser navigation does not allow the ${parsed.protocol} protocol.` } };
+  }
+  return undefined;
+}
+
+function successfulReceiptEffect(result: ToolResult): Record<string, unknown> | undefined {
+  if (!result.evidence || typeof result.evidence !== 'object' || Array.isArray(result.evidence)) return undefined;
+  const receipt = (result.evidence as Record<string, unknown>).receipt;
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return undefined;
+  const effect = (receipt as Record<string, unknown>).effect;
+  return effect && typeof effect === 'object' && !Array.isArray(effect) ? effect as Record<string, unknown> : undefined;
+}
+
+function actionEffectChanged(result: ToolResult): boolean {
+  const effect = successfulReceiptEffect(result);
+  if (!effect) return false;
+  return Boolean(
+    effect.navigationOccurred
+    || effect.newTabOpened
+    || effect.domChanged
+    || effect.downloadStarted
+    || (typeof effect.existsBefore === 'boolean' && typeof effect.existsAfter === 'boolean' && effect.existsBefore !== effect.existsAfter)
+    || (effect.changed === true && effect.existsBefore === undefined && effect.existsAfter === undefined),
+  );
+}
+
+function compactAgentValue(value: unknown, depth = 0): unknown {
+  if (value === null || typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'string') return value.length <= 20_000 ? value : `${value.slice(0, 19_900).trimEnd()}\n...[truncated by Helm]`;
+  if (depth >= 5) return '[nested value omitted]';
+  if (Array.isArray(value)) return value.slice(0, 64).map(item => compactAgentValue(item, depth + 1));
+  if (typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .slice(0, 80)
+      .map(([key, item]) => [key, compactAgentValue(item, depth + 1)]));
+  }
+  return String(value);
+}
+
+function compactAgentToolResult(result: ToolResult): ToolResult {
+  const evidence = result.evidence && typeof result.evidence === 'object' && !Array.isArray(result.evidence)
+    ? result.evidence as Record<string, unknown>
+    : undefined;
+  const receipt = evidence?.receipt;
+  return {
+    ok: result.ok,
+    ...(result.data === undefined ? {} : { data: compactAgentValue(result.data) }),
+    ...(result.error === undefined ? {} : {
+      error: {
+        code: result.error.code,
+        message: result.error.message,
+        ...(result.error.details === undefined ? {} : { details: compactAgentValue(result.error.details) }),
+      },
+    }),
+    ...(receipt === undefined ? {} : { evidence: { receipt: compactAgentValue(receipt) } }),
+  };
+}
+
 function errorMessage(value: unknown): string {
   return value instanceof Error ? value.message : String(value);
 }
@@ -257,7 +330,8 @@ export class AgentRuntime {
   private readonly guest: GuestTransport;
   private readonly tools: ToolRegistry;
   private readonly verifier: CriterionVerifierRegistry | VerificationProvider;
-  private readonly decisionProvider: DecisionProvider;
+  private readonly decisionProvider?: DecisionProvider;
+  private readonly actingAgent?: ActingAgentProvider;
   private readonly taskPlanner?: TaskPlanner;
   private readonly taskCompiler?: TaskCompiler;
   private readonly orchestrator?: OrchestratorProvider;
@@ -277,6 +351,7 @@ export class AgentRuntime {
     this.tools = options.toolRegistry;
     this.verifier = options.verifier;
     this.decisionProvider = options.decisionProvider;
+    this.actingAgent = options.actingAgent;
     this.taskPlanner = options.taskPlanner;
     this.taskCompiler = options.taskCompiler;
     this.orchestrator = options.orchestrator;
@@ -325,10 +400,20 @@ export class AgentRuntime {
     // steering messages between tool turns without changing the persisted
     // thread or starting a second runtime against the same desktop.
     const conversation = [...(input.conversation ?? [])];
-    const task = input.task ?? await this.createTask(input, memories);
+    const task = input.task ?? (this.actingAgent
+      ? {
+        id: this.idFactory('task'),
+        threadId: input.threadId,
+        goal: input.userMessage,
+        originalRequest: input.userMessage,
+        criteria: [],
+      }
+      : await this.createTask(input, memories));
+    if (this.actingAgent) return this.runWithActingAgent(input, task, memories, conversation);
     if (this.orchestrator && this.worker) {
       return this.runOrchestrated(input, task, memories, conversation);
     }
+    if (!this.decisionProvider) throw new Error('A decision provider is required for the legacy runtime path.');
     const cancellation = new RunCancellation();
     const removeExternalAbort = this.attachExternalCancellation(cancellation, input.signal);
     this.activeCancellation = cancellation;
@@ -429,7 +514,7 @@ export class AgentRuntime {
         };
         let decision: AgentDecision = conversationalTask
           ? { type: 'complete', reasoningSummary: 'Responding to the conversation.' }
-          : await this.decisionProvider.next(context);
+          : await this.decisionProvider!.next(context);
         decision = normalizeBrowserNavigationDecision(decision, !conversationalTask);
 
         // A page-information task must return page contents, even when the
@@ -810,6 +895,223 @@ export class AgentRuntime {
 
   async runTask(input: RunTaskInput): Promise<AgentRuntimeResult> {
     return this.run(input);
+  }
+
+  private async runWithActingAgent(
+    input: RunTaskInput,
+    task: TaskDefinition,
+    memories: Memory[],
+    conversation: Message[],
+  ): Promise<AgentRuntimeResult> {
+    const cancellation = new RunCancellation();
+    const removeExternalAbort = this.attachExternalCancellation(cancellation, input.signal);
+    this.activeCancellation = cancellation;
+    const runId = input.runId ?? this.idFactory('run');
+    this.activeRunId = runId;
+    const startedAt = this.isoNow();
+    const run: Run = {
+      id: runId,
+      threadId: task.threadId,
+      ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}),
+      goal: task.goal,
+      status: 'pending',
+      criteria: clone(task.criteria),
+      task: clone(task),
+      createdAt: startedAt,
+    };
+    const history: AgentStep[] = [];
+    const steps: RunStep[] = [];
+    const observations: EnvironmentObservation[] = [];
+    const previousResults: ToolResult[] = [];
+    const successfulCalls = new Map<string, number>();
+    const noProgress = new Map<string, { result: string; count: number }>();
+    const maxSteps = this.budgetOptions?.maxSteps ?? DEFAULT_RUNTIME_BUDGETS.maxSteps;
+    const maxRepeatedAction = this.budgetOptions?.maxRepeatedAction ?? DEFAULT_RUNTIME_BUDGETS.maxRepeatedAction;
+    const maxConsecutiveFailures = this.budgetOptions?.maxConsecutiveFailures ?? DEFAULT_RUNTIME_BUDGETS.maxConsecutiveFailures;
+    let actionCount = 0;
+    let consecutiveFailures = 0;
+    let finalVerification: VerificationResult | undefined;
+    let assistantResponse: string | undefined;
+    let actionQueue: Promise<void> = Promise.resolve();
+
+    const executeToolNow = async (tool: string, toolInput: Record<string, unknown>): Promise<ToolResult> => {
+      cancellation.throwIfCancelled();
+      const stepIndex = actionCount;
+      actionCount += 1;
+      const action: AgentDecision = { type: 'action', tool, input: clone(toolInput) };
+      const actionKey = fingerprintAction(tool, toolInput);
+      const previousNoProgress = noProgress.get(actionKey);
+      await this.emit('run.step.started', { stepIndex, action }, runId);
+      let result: ToolResult;
+
+      if (stepIndex >= maxSteps) {
+        result = { ok: false, error: { code: 'ACTION_BUDGET_EXCEEDED', message: `The run reached its ${maxSteps}-action budget.` } };
+      } else if (previousNoProgress && previousNoProgress.count >= maxRepeatedAction) {
+        result = { ok: false, error: { code: 'REPEATED_ACTION', message: 'This exact action has already repeated without a concrete state change. Choose another action or report the blocker.' } };
+      } else if (consecutiveFailures >= maxConsecutiveFailures) {
+        result = { ok: false, error: { code: 'TOOL_FAILURE_BUDGET_EXCEEDED', message: `The run reached its ${maxConsecutiveFailures}-consecutive-failure bound.` } };
+      } else {
+        const invalidNavigation = browserNavigationGuard(tool, toolInput);
+        if (invalidNavigation) result = invalidNavigation;
+        else {
+          result = await this.tools.execute(tool, toolInput, {
+            signal: cancellation.signal,
+            runId,
+            stepIndex,
+            previousResults: clone(previousResults.slice(-12)),
+            timeoutMs: this.budgetOptions?.toolTimeoutMs,
+          });
+        }
+      }
+
+      const compactResult = compactAgentToolResult(result);
+      if (result.ok) {
+        consecutiveFailures = 0;
+        successfulCalls.set(tool, (successfulCalls.get(tool) ?? 0) + 1);
+      } else {
+        consecutiveFailures += 1;
+      }
+      const resultFingerprint = fingerprintAction(tool, toolInput, undefined, {
+        ok: compactResult.ok,
+        data: compactResult.data,
+        error: compactResult.error,
+      });
+      if (actionEffectChanged(result)) {
+        noProgress.delete(actionKey);
+      } else {
+        noProgress.set(actionKey, {
+          result: resultFingerprint,
+          count: previousNoProgress && previousNoProgress.result === resultFingerprint
+            ? previousNoProgress.count + 1
+            : 1,
+        });
+      }
+      previousResults.push(compactResult);
+      await this.persistStep(steps, {
+        runId,
+        stepIndex,
+        phase: 'act',
+        decision: action,
+        toolName: tool,
+        toolInput: clone(toolInput),
+        toolResult: compactResult,
+      });
+      history.push({ action: { tool, input: clone(toolInput) }, observation: compactResult });
+      await this.emit('run.step.completed', { stepIndex, action, toolResult: compactResult }, runId);
+      return compactResult;
+    };
+
+    const executeTool = (tool: string, toolInput: Record<string, unknown>): Promise<ToolResult> => {
+      const queued = actionQueue.then(() => executeToolNow(tool, toolInput));
+      actionQueue = queued.then(() => undefined, () => undefined);
+      return queued;
+    };
+
+    const verifyCompletion = async (candidate: {
+      response: string;
+      requiredEffects: readonly RequestedToolEffect[];
+    }): Promise<ToolResult<VerificationResult>> => {
+      // Native providers may return several tool calls in one assistant turn.
+      // Let sibling calls enter the serialized queue, then verify after they
+      // finish so a parallel completion cannot race a requested side effect.
+      await Promise.resolve();
+      await actionQueue;
+      const missing: Array<{ tool: string; required: number; observed: number }> = [];
+      for (const effect of candidate.requiredEffects) {
+        const required = effect.count ?? 1;
+        if (!Number.isInteger(required) || required < 1 || !this.tools.has(effect.tool)) {
+          return {
+            ok: false,
+            error: {
+              code: 'INVALID_REQUIRED_EFFECT',
+              message: `Completion listed an unavailable or invalid tool effect: ${effect.tool}. Use only registered Helm tool names.`,
+            },
+          };
+        }
+        const observed = successfulCalls.get(effect.tool) ?? 0;
+        if (observed < required) missing.push({ tool: effect.tool, required, observed });
+      }
+      if (missing.length > 0) {
+        return {
+          ok: false,
+          error: {
+            code: 'UNVERIFIED_SIDE_EFFECT',
+            message: 'Completion rejected because one or more requested tool effects have no successful receipt. Continue the work or report the concrete blocker.',
+            details: missing,
+          },
+        };
+      }
+      const effectCount = candidate.requiredEffects.reduce((total, effect) => total + (effect.count ?? 1), 0);
+      const verification: VerificationResult = {
+        complete: true,
+        criteria: [],
+        requirements: [],
+        summary: effectCount === 0
+          ? 'No external tool effect was required for this response.'
+          : `Verified ${effectCount} requested tool effect${effectCount === 1 ? '' : 's'} from successful tool results.`,
+      };
+      finalVerification = verification;
+      assistantResponse = candidate.response.trim();
+      await this.emit('run.verification', verification, runId);
+      return { ok: true, data: verification };
+    };
+
+    try {
+      run.status = 'running';
+      run.startedAt = startedAt;
+      await this.persistRun(run, true);
+      await this.emit('run.started', run, run.id);
+
+      const agentResult = await this.actingAgent!.execute({
+        userMessage: input.userMessage,
+        conversation: clone(conversation),
+        memories: clone(memories),
+        toolDefinitions: this.tools.list(),
+        executeTool,
+        verifyCompletion,
+        drainSteering: input.drainSteering,
+        maxSteps,
+        maxRepeatedAction,
+        maxConsecutiveFailures,
+        signal: cancellation.signal,
+      });
+      await actionQueue;
+
+      if (!agentResult.verification.complete || !assistantResponse) {
+        throw new Error('The acting model returned without a verified completion.');
+      }
+      finalVerification = agentResult.verification;
+      assistantResponse = agentResult.response;
+      await this.persistStep(steps, {
+        runId,
+        stepIndex: actionCount,
+        phase: 'complete',
+        verification: finalVerification,
+      });
+      await this.complete(run, finalVerification);
+    } catch (caught) {
+      await actionQueue;
+      if (cancellation.cancelled || input.signal?.aborted) {
+        await this.cancelled(run, error('RUN_CANCELLED', 'Run was cancelled.'));
+      } else if (!this.isTerminal(run.status)) {
+        await this.fail(run, error('ACTING_AGENT_ERROR', errorMessage(caught)));
+      }
+    } finally {
+      removeExternalAbort();
+      this.activeCancellation = undefined;
+      this.activeRunId = undefined;
+    }
+
+    return {
+      run: clone(run),
+      task: clone(task),
+      history: clone(history),
+      steps: clone(steps),
+      observations: clone(observations),
+      ...(finalVerification ? { finalVerification: clone(finalVerification) } : {}),
+      ...(assistantResponse ? { assistantResponse } : {}),
+      status: run.status,
+    };
   }
 
   /**

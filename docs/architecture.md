@@ -1,15 +1,13 @@
 # Helm architecture
 
-Helm is a single backend process with explicit boundaries. The model proposes
-objectives and bounded actions; the runtime owns execution, state, evidence,
-verification, and completion.
+Helm is a local computer-use assistant with a single acting model conversation
+and a guarded execution runtime.
 
 ```text
 browser UI -- REST + WebSocket --> Bun server
-                                   |- task compiler -> requirements
-                                   |- orchestrator -> one objective
-                                   |- bounded worker -> ToolRegistry
-                                   |- evidence/fact store -> verifier
+                                   |- acting model + native Helm tools
+                                   |- ToolRegistry -> validated guest RPC
+                                   |- action receipts + effect verification
                                    |- repositories -> better-sqlite3
                                    `- VmController -> typed guest transport
                                                         | JSON Lines
@@ -21,52 +19,52 @@ browser UI -- REST + WebSocket --> Bun server
 
 ## Responsibilities
 
-- `packages/shared` owns domain types and Zod guest protocol schemas.
-- `apps/server/src/agent` owns task state, orchestration, worker boundaries,
-  runtime budgets, progress fingerprints, recovery, and completion.
-- `apps/server/src/ai` owns LM Studio adapters. The compiler, orchestrator, and
-  workers can use the same model, but each has a separate schema, prompt, and
-  responsibility.
-- `apps/server/src/tools` owns typed tool validation, guest calls, and action
-  receipts.
-- `apps/server/src/db` persists task/state snapshots and structured run-step
-  observability.
-- `guest/helm-guest` performs sandboxed filesystem, visible-browser, and desktop
-  operations.
-- `apps/web` renders persisted and live objectives, actions, facts, progress,
-  and verification; it does not infer completion from UI state.
+- `packages/shared` owns protocol schemas and persisted conversation/run types.
+- `apps/server/src/ai/acting-agent.ts` owns the AI SDK tool-loop adapter. It
+  passes native function definitions to the configured LM Studio model and
+  returns AI SDK tool results to the same conversation.
+- `apps/server/src/agent/runtime.ts` owns cancellation, budgets, persistence,
+  action-loop protection, receipts, and generic completion checks.
+- `apps/server/src/tools` owns Zod input validation, guest calls, and action
+  receipt generation.
+- `apps/server/src/db` persists messages and run-step activity.
+- `guest/helm-guest` performs sandboxed filesystem, visible-browser, and
+  desktop operations.
+- `apps/web` renders persisted and live messages, runs, and activity. It does
+  not infer completion from UI state.
 
-## Model boundaries
+Production AI turns do not use a task compiler, orchestrator, bounded worker,
+or second response-generation model call. The runtime stores a minimal request
+envelope for the run; the complete user request and recent conversation go to
+the acting model. Scripted compatibility tests and the deterministic demo may
+still use the legacy interfaces.
 
-The task compiler answers “what requirements did the user request?” without
-choosing a rigid action sequence. The orchestrator answers “which one unmet
-objective should be attempted next?” A worker answers “which bounded tool
-actions can achieve that objective?” Runtime receipts answer “what happened?”
-The verifier answers “does that evidence satisfy the exact requirement?”
+## Model and runtime boundary
 
-No model response can promote its own guess into authoritative environment
-state, redefine requirements, or finish the entire run.
+The model decides what the user means, whether tools are needed, which actions
+to take, how to recover, and what semantic content to create. It may return an
+ordinary answer without invoking a computer tool.
 
-## Redesign mapping
+When it calls a tool, the runtime validates the input with the registered
+schema and executes through the existing guest boundary. Actual results,
+including failures and action receipts, return to the same model conversation.
+The runtime does not replace model-generated HTML, documents, reports, or
+other artifacts with content of its own.
 
-The former path coupled one model decision, one tool call, a text-oriented
-observation, and free-form completion criteria. It also treated repeated calls
-as loops before checking whether the environment changed. The new boundaries
-map those failures directly:
+Before Helm accepts the final answer, the model lists the concrete registered
+tool effects needed for its response through the internal completion tool. The
+runtime checks successful call counts against real results. A missing effect
+becomes a tool error in the same conversation, giving the acting model a chance
+to finish the work or report a blocker. This check does not decide what fields
+belong in an artifact or whether the response is semantically complete.
 
-- guessed URLs, filenames, and expected content are filtered at compilation;
-- observations and action receipts are produced by the guest/runtime;
-- browser snapshots use semantic Playwright state instead of body text alone;
-- facts carry origin and evidence links, so hypotheses cannot satisfy checks;
-- deterministic verification evaluates exact requirements rather than model
-  supplied acceptance criteria;
-- progress compares meaningful state, and recovery records failed strategies;
-- structured state is persisted and bounded before it is sent back to a model.
+## Persistence and limits
 
-## Persistence
+`runs.task_json` stores the request envelope. `run_steps` stores each validated
+tool invocation, its input and result, plus completion verification. The UI
+continues to receive live events and can reconcile durable run status and
+steps after reconnecting.
 
-Migrations 3 and 4 add task/state snapshots to `runs` and orchestration fields
-to `run_steps`. The compact state is durable and inspectable, while recent
-actions and receipts provide an audit trail. The API continues to expose the
-shared `Run` and `RunStep` shapes, so older runs without snapshots remain
-readable.
+Tool calls, model steps, consecutive tool errors, repeated no-progress actions,
+timeouts, and cancellation are bounded. Guest tools retain filesystem
+sandboxing, browser automation, desktop operations, and receipt evidence.

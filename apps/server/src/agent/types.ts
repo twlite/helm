@@ -26,6 +26,7 @@ import type {
 import type { GuestTransport } from '../tools/guest-transport';
 import type { ToolRegistry } from '../tools/tool-registry';
 import type { CriterionVerifierRegistry } from '../tools/criterion-verifier';
+import type { ToolDefinition } from '../tools/registry';
 
 export type {
   AgentDecision,
@@ -112,6 +113,39 @@ export interface WorkerProvider {
   execute(input: WorkerContext): Promise<WorkerResult>;
 }
 
+export interface RequestedToolEffect {
+  tool: string;
+  /** Number of successful calls to this tool needed for the requested result. */
+  count?: number;
+}
+
+export interface ActingAgentContext {
+  userMessage: string;
+  conversation: readonly Message[];
+  memories: readonly Memory[];
+  toolDefinitions: readonly ToolDefinition[];
+  executeTool(tool: string, input: Record<string, unknown>): Promise<ToolResult>;
+  verifyCompletion(input: {
+    response: string;
+    requiredEffects: readonly RequestedToolEffect[];
+  }): Promise<ToolResult<VerificationResult>>;
+  drainSteering?: () => Message[];
+  maxSteps: number;
+  maxRepeatedAction: number;
+  maxConsecutiveFailures: number;
+  signal?: AbortSignal;
+}
+
+export interface ActingAgentResult {
+  response: string;
+  verification: VerificationResult;
+}
+
+/** One coherent model conversation with native, runtime-validated Helm tools. */
+export interface ActingAgentProvider {
+  execute(input: ActingAgentContext): Promise<ActingAgentResult>;
+}
+
 export interface DecisionProvider {
   next(input: AgentTurnContext): Promise<AgentDecision>;
 }
@@ -188,7 +222,8 @@ export interface AgentRuntimeOptions {
   guestTransport: GuestTransport;
   toolRegistry: ToolRegistry;
   verifier: CriterionVerifierRegistry | VerificationProvider;
-  decisionProvider: DecisionProvider;
+  decisionProvider?: DecisionProvider;
+  actingAgent?: ActingAgentProvider;
   taskPlanner?: TaskPlanner;
   taskCompiler?: TaskCompiler;
   orchestrator?: OrchestratorProvider;
@@ -227,6 +262,8 @@ export interface AgentRuntimeResult {
   steps: RunStep[];
   observations: EnvironmentObservation[];
   finalVerification?: VerificationResult;
+  /** The acting model's final reply, accepted after effect verification. */
+  assistantResponse?: string;
   /** Convenience mirror for callers that do not unwrap `run`. */
   status: Run['status'];
 }

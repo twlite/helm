@@ -13,7 +13,6 @@ import type { OrchestratorContext, OrchestratorProvider, WorkerContext, WorkerPr
 import {
   browserDestinationReached,
   requirementsForTask,
-  trustedFact,
   type BrowserNavigationResolution,
 } from './task-state';
 
@@ -71,27 +70,6 @@ function readableBrowserUrl(value: string | undefined): boolean {
 
 function fileNameFromPath(value: string): string {
   return value.split(/[\\/]/u).at(-1) ?? value;
-}
-
-function factValueText(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (value === null || typeof value === 'number' || typeof value === 'boolean') return String(value);
-  try {
-    return JSON.stringify(value) ?? String(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function factLabel(id: string): string {
-  const labels: Record<string, string> = {
-    repositoryName: 'Repository',
-    latestReleaseVersion: 'Latest release version',
-    releaseDate: 'Release date',
-    releaseUrl: 'Release URL',
-    currentDate: 'Current date',
-  };
-  return labels[id] ?? id.replace(/([a-z])([A-Z])/gu, '$1 $2').replace(/^./u, value => value.toLocaleUpperCase());
 }
 
 /**
@@ -179,37 +157,6 @@ export function deterministicObjectiveAction(
       input: { path: outputDirectoryRequirement.target?.path },
       reasoningSummary: 'Creating the requested output directory.',
     };
-  }
-
-  const outputFileRequirement = requirements.find(requirement => (
-    objective.requirementIds.includes(requirement.id)
-    && requirement.type === 'filesystem'
-    && requirement.target?.mode === 'contains-facts'
-    && typeof requirement.target.path === 'string'
-  ));
-  if (outputFileRequirement) {
-    const factIds = outputFileRequirement.target?.factIds ?? [];
-    const facts = factIds.map(id => trustedFact(state.facts, id));
-    if (factIds.length === 1 && factIds[0] === 'pageContent' && typeof facts[0]?.value === 'string') {
-      return {
-        tool: 'fs.write',
-        input: {
-          path: outputFileRequirement.target?.path,
-          content: facts[0].value,
-        },
-        reasoningSummary: 'Writing the observed page content to the requested output file.',
-      };
-    }
-    if (factIds.length > 0 && facts.every(fact => fact !== undefined)) {
-      return {
-        tool: 'fs.write',
-        input: {
-          path: outputFileRequirement.target?.path,
-          content: facts.map((fact, index) => `${factLabel(factIds[index])}: ${factValueText(fact?.value)}`).join('\n'),
-        },
-        reasoningSummary: 'Writing the trusted observed facts to the requested output file.',
-      };
-    }
   }
 
   const openFileRequirement = requirements.find(requirement => (

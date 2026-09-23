@@ -21,9 +21,6 @@ import {
   assistantMessageForResult,
   createScriptedDemoDecisions,
   createScriptedDemoTask,
-  hasDeterministicFileEvidence,
-  hasVerifiedActionEvidence,
-  isUnsubstantiatedPlaceholder,
   ScriptedDecisionProvider,
   ScriptedTaskPlanner,
 } from './agent';
@@ -276,8 +273,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       options?.signal,
     ),
   };
-  const realToolDefinitions = createGuestToolRegistry(agentGuest, realToolOptions).list();
-  const models = createLmStudioModels(config, realToolDefinitions);
+  const models = createLmStudioModels(config);
   const memory = new MemoryService(database.sqlite, {
     embeddingProvider: models.embeddingProvider,
     sqliteVec: { dimensions: config.models.embeddingDimensions },
@@ -446,11 +442,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       guestTransport: agentGuest,
       toolRegistry: tools,
       verifier: new CriterionVerifierRegistry(agentGuest),
-      decisionProvider: models.decisionProvider,
-      taskPlanner: models.taskPlanner,
-      taskCompiler: models.taskPlanner,
-      orchestrator: models.orchestrator,
-      worker: models.worker,
+      actingAgent: models.actingAgent,
       repository: runAdapter,
       events: runtimeEvents,
       memories: async ({ userMessage }) => {
@@ -511,36 +503,18 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
     }).then(async result => {
       const persistedRun = database.runs.getById(result.run.id) ?? result.run;
       const fallbackResponse = assistantMessageForResult(result);
-      const active = activeRuns.get(runId);
-      const responseConversation = active
-        ? [...active.conversation, ...active.steeringHistory]
-        : conversation;
-      let generatedResponse = '';
-      let responseMessageId: string | undefined;
-      const hasRequirements = result.task.criteria.length > 0 || (result.task.requirements?.length ?? 0) > 0;
-      const canGenerateResponse = result.status === 'completed'
-        && !hasDeterministicFileEvidence(result)
-        && (!hasRequirements || hasVerifiedActionEvidence(result));
-      if (canGenerateResponse) {
-        responseMessageId = `message-${randomUUID()}`;
+      const generatedResponse = result.status === 'completed' ? result.assistantResponse ?? '' : '';
+      const responseMessageId = generatedResponse ? `message-${randomUUID()}` : undefined;
+      if (responseMessageId) {
         events.publish('assistant.message.started', jsonValue({
           threadId,
           messageId: responseMessageId,
         }), { runId });
-        generatedResponse = await models.responseGenerator.stream({
-          userMessage: sourceMessage.content,
-          conversation: responseConversation,
-          result,
-          signal: cancellation.signal,
-          onDelta: delta => {
-            events.publish('assistant.message.delta', jsonValue({
-              threadId,
-              messageId: responseMessageId,
-              delta,
-            }), { runId });
-          },
-        });
-        if (isUnsubstantiatedPlaceholder(generatedResponse)) generatedResponse = '';
+        events.publish('assistant.message.delta', jsonValue({
+          threadId,
+          messageId: responseMessageId,
+          delta: generatedResponse,
+        }), { runId });
       }
       const message = database.messages.create({
         ...(responseMessageId ? { id: responseMessageId } : {}),
@@ -557,12 +531,11 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
         events.publish('assistant.message.finished', jsonValue({
           threadId,
           messageId: responseMessageId,
-          status: cancellation.signal.aborted ? 'cancelled' : 'completed',
+          status: 'completed',
         }), { runId });
       }
-      // run.completed is emitted by the runtime before this asynchronous
-      // response-generation pass. This event lets clients refresh only after
-      // the conversational assistant message is durably persisted.
+      // The runtime emits run.completed before this response is durably
+      // persisted, so clients refresh after message.created as well.
       await updateThreadTitleAfterRun(threadId, sourceMessageId);
       events.publish('message.created', jsonValue(message), { runId });
     }).catch(async error => {

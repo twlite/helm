@@ -2,34 +2,25 @@ import { createOpenAICompatible, type OpenAICompatibleProvider } from '@ai-sdk/o
 import type { EmbeddingModel, LanguageModel } from 'ai';
 
 import type { HelmConfig } from '../config';
-import type { ToolDefinition } from '../tools/registry';
+import { AiSdkActingAgent } from './acting-agent';
 import {
-  AiSdkDecisionProvider,
   AiSdkEmbeddingProvider,
   AiSdkMemoryExtractor,
-  AiSdkOrchestrator,
-  AiSdkResponseGenerator,
-  AiSdkTaskPlanner,
   AiSdkThreadTitleGenerator,
-  AiSdkWorker,
 } from './adapter';
 
 export interface HelmAiModels {
   provider: OpenAICompatibleProvider;
   languageModel: LanguageModel;
   embeddingModel: EmbeddingModel;
-  decisionProvider: AiSdkDecisionProvider;
-  taskPlanner: AiSdkTaskPlanner;
-  orchestrator: AiSdkOrchestrator;
-  worker: AiSdkWorker;
-  responseGenerator: AiSdkResponseGenerator;
+  actingAgent: AiSdkActingAgent;
   titleGenerator: AiSdkThreadTitleGenerator;
   memoryExtractor: AiSdkMemoryExtractor;
   embeddingProvider: AiSdkEmbeddingProvider;
 }
 
 /** Build the configured LM Studio models without making a network request. */
-export function createLmStudioModels(config: HelmConfig, toolDefinitions: readonly ToolDefinition[]): HelmAiModels {
+export function createLmStudioModels(config: HelmConfig): HelmAiModels {
   const provider = createOpenAICompatible({
     name: config.models.providerName,
     baseURL: config.models.baseUrl,
@@ -51,21 +42,8 @@ export function createLmStudioModels(config: HelmConfig, toolDefinitions: readon
     provider,
     languageModel,
     embeddingModel,
-    decisionProvider: new AiSdkDecisionProvider({
+    actingAgent: new AiSdkActingAgent({
       ...sharedGenerationOptions,
-      toolDefinitions,
-    }),
-    taskPlanner: new AiSdkTaskPlanner(sharedGenerationOptions),
-    orchestrator: new AiSdkOrchestrator(sharedGenerationOptions),
-    worker: new AiSdkWorker({
-      ...sharedGenerationOptions,
-      toolDefinitions,
-    }),
-    responseGenerator: new AiSdkResponseGenerator({
-      model: languageModel,
-      maxOutputTokens: config.models.maxOutputTokens,
-      temperature: config.models.temperature,
-      requestTimeoutMs: config.models.requestTimeoutMs,
     }),
     titleGenerator: new AiSdkThreadTitleGenerator(sharedGenerationOptions),
     memoryExtractor: new AiSdkMemoryExtractor({

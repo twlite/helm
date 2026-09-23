@@ -126,7 +126,9 @@ function normalizeGuestPath(input: string): string {
     throw new GuestTransportError('INVALID_PATH', 'Guest path is invalid');
   }
   const expanded = input === '~' ? MOCK_GUEST_ROOT : input.startsWith('~/') ? `${MOCK_GUEST_ROOT}/${input.slice(2)}` : input;
-  const normalized = posix.normalize(expanded);
+  const normalized = posix.isAbsolute(expanded)
+    ? posix.normalize(expanded)
+    : posix.resolve(MOCK_WORKSPACE_ROOT, expanded);
   if (normalized !== MOCK_GUEST_ROOT && !normalized.startsWith(`${MOCK_GUEST_ROOT}/`)) {
     throw new GuestTransportError('PATH_OUTSIDE_ALLOWED_ROOT', 'Guest path is outside /home/helm');
   }
