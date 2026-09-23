@@ -13,27 +13,72 @@ const frontend = Bun.spawn(['node', 'node_modules/vite/bin/vite.js'], {
   stdin: 'inherit',
   stdout: 'inherit',
   stderr: 'inherit',
+  // Keep Vite and any runtime shim it starts in one process group so an
+  // unexpected backend exit cannot leave the frontend listener orphaned.
+  detached: true,
 });
 
-const children = [server, frontend];
-
 let shuttingDown = false;
+let shutdownExitCode = 0;
 const shutdown = (signal: NodeJS.Signals) => {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`\nReceived ${signal}; waiting for Helm development processes to shut down.`);
 
-  // Ctrl+C is broadcast to the foreground process group, so Vite is already
-  // stopping. Forward it only to the isolated backend, which owns the VM.
-  // For other signals, forward to both child processes.
-  const targets = signal === 'SIGINT' ? [server] : children;
-  for (const child of targets) {
-    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
-  }
+  // Both services are detached from the terminal process group, so signal
+  // them explicitly. The backend handles VM shutdown; Vite may have a runtime
+  // shim and needs a process-group signal.
+  if (server.exitCode === null && server.signalCode === null) server.kill(signal);
+  signalProcessGroup(frontend.pid, signal);
 };
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-const results = await Promise.all(children.map(child => child.exited));
-if (!shuttingDown && results.some(code => code !== 0)) process.exit(1);
+function signalProcessGroup(processId: number, signal: NodeJS.Signals): void {
+  if (process.platform === 'win32') return;
+  try {
+    process.kill(-processId, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+  }
+}
+
+function processGroupExists(processId: number): boolean {
+  if (process.platform === 'win32') return false;
+  try {
+    process.kill(-processId, 0);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    return true;
+  }
+}
+
+async function waitForFrontendProcessGroup(): Promise<void> {
+  if (process.platform === 'win32') return;
+  const deadline = Date.now() + 5_000;
+  while (processGroupExists(frontend.pid) && Date.now() < deadline) await Bun.sleep(25);
+  if (processGroupExists(frontend.pid)) signalProcessGroup(frontend.pid, 'SIGKILL');
+}
+
+const watchChild = async (name: string, child: Bun.Subprocess): Promise<void> => {
+  const exitCode = await child.exited;
+  if (shuttingDown) return;
+
+  shuttingDown = true;
+  shutdownExitCode = child.signalCode === null ? exitCode : 1;
+  const exitReason = child.signalCode ? `from signal ${child.signalCode}` : `with code ${exitCode}`;
+  console.error(`\nHelm ${name} process exited unexpectedly ${exitReason}; stopping the other development process.`);
+  if (child !== frontend) signalProcessGroup(frontend.pid, 'SIGTERM');
+  if (child !== server && server.exitCode === null && server.signalCode === null) {
+    server.kill('SIGTERM');
+  }
+};
+
+await Promise.all([
+  watchChild('backend', server),
+  watchChild('frontend', frontend),
+]);
+await waitForFrontendProcessGroup();
+process.exitCode = shutdownExitCode;

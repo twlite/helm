@@ -857,7 +857,7 @@ export function startHelmServer(config: HelmConfig = loadConfig()): HelmServer {
     server,
     close: async () => {
       clearInterval(eventHeartbeatTimer);
-      server.stop(true);
+      await server.stop(true);
       await application.close();
     },
   };
