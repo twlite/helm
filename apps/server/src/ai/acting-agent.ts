@@ -1,4 +1,4 @@
-import { generateText, isStepCount, tool, ToolLoopAgent, type ModelMessage, type ToolSet } from 'ai';
+import { isStepCount, tool, ToolLoopAgent, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
 import type { Message, ToolResult } from '@helm/shared';
 
@@ -6,15 +6,17 @@ import type { ActingAgentContext, ActingAgentProvider, ActingAgentResult, Reques
 import type { ToolDefinition } from '../tools/registry';
 
 const COMPLETE_TOOL = 'helm.complete';
+const PROGRESS_TOOL = 'helm.progress';
 const MAX_COMPLETION_STEPS = 4;
 
 const BASE_INSTRUCTIONS = [
   'You are Helm, a capable assistant with optional local computer-use tools.',
   'Use the conversation and current request to decide whether tools are needed; ordinary chat usually needs none.',
   'When a tool is useful, call the native Helm tool and use its actual result. Tool errors are available for recovery.',
+  'When you use tools, include one brief user-visible summary through helm.progress in the same turn as your first concrete tool action whenever you can name that action. This is public progress text, never private chain-of-thought or internal deliberation; do not claim success before a tool succeeds.',
   'Do not claim that an external action succeeded unless a tool returned success.',
   'A URL included as data for an artifact is not automatically a browser destination.',
-  'When you are ready to answer, call helm.complete with the user-facing response and the concrete Helm tool effects required to fulfill the request. Use only registered Helm tool names and include a count when more than one successful call is required.',
+  'When you are ready to answer, call helm.complete with the user-facing response and the concrete Helm tool effects required to fulfill the request. Use only registered Helm tool names and include a count when more than one successful call is required. When the final action batch is known, call helm.complete after those action calls in the same turn when possible; Helm waits for them to finish before checking their actual results.',
   'If helm.complete reports missing effects, continue the work with the available tools or report the actual blocker. The runtime checks concrete tool results; it does not decide what the user meant.',
 ].join(' ');
 
@@ -22,7 +24,7 @@ const FINALIZATION_INSTRUCTIONS = [
   BASE_INSTRUCTIONS,
   'Review the full conversation and the draft assistant response immediately before this turn.',
   'Determine every concrete external effect required to fulfill the latest user request, including effects the draft claims are already complete. List each by its registered Helm tool name; use an empty list only when no external tool effect is needed.',
-  'Call helm.complete now with an accurate final response. Do not call any external tool during this check.',
+  'Call helm.complete now with an accurate final response. Only helm.complete is available during this check; do not call any other tool.',
 ].join(' ');
 
 function instructionsFor(input: ActingAgentContext): { agent: string; finalization: string } {
@@ -43,6 +45,10 @@ const completionInputSchema = z.object({
     tool: z.string().min(1).describe('A registered Helm tool whose successful result is required.'),
     count: z.number().int().positive().optional().describe('How many successful calls are required; defaults to one.'),
   }).strict()).describe('Concrete requested tool effects that must have succeeded before completing.'),
+}).strict();
+
+const progressInputSchema = z.object({
+  summary: z.string().min(1).max(360).describe('A concise user-visible summary of the next concrete action or current progress.'),
 }).strict();
 
 function asModelMessages(messages: readonly Message[], userMessage: string): ModelMessage[] {
@@ -74,12 +80,15 @@ function modelToolSet(
   definitions: readonly ToolDefinition[],
   executeTool: ActingAgentContext['executeTool'],
   complete: (input: z.infer<typeof completionInputSchema>) => Promise<ToolResult>,
+  onProgress?: ActingAgentContext['onProgress'],
 ): ToolSet {
   const tools: Record<string, unknown> = {};
   for (const definition of definitions) {
     const inputSchema = definition.inputSchema ?? definition.schema;
     if (!inputSchema) throw new Error(`Missing input schema for Helm tool ${definition.name}`);
-    if (definition.name === COMPLETE_TOOL) throw new Error(`Helm tool name is reserved: ${COMPLETE_TOOL}`);
+    if (definition.name === COMPLETE_TOOL || definition.name === PROGRESS_TOOL) {
+      throw new Error(`Helm tool name is reserved: ${definition.name}`);
+    }
     tools[definition.name] = tool({
       description: definition.description,
       inputSchema,
@@ -90,6 +99,15 @@ function modelToolSet(
     description: 'Verify that the concrete tool effects needed for the request succeeded, then return the final user-facing response.',
     inputSchema: completionInputSchema,
     execute: complete,
+  });
+  tools[PROGRESS_TOOL] = tool({
+    description: 'Send the user a concise progress summary. This is public status text, not a place for hidden reasoning or chain-of-thought.',
+    inputSchema: progressInputSchema,
+    execute: async ({ summary }) => {
+      const cleanSummary = summary.trim();
+      if (cleanSummary) await onProgress?.(cleanSummary);
+      return { ok: true };
+    },
   });
   return tools as ToolSet;
 }
@@ -124,7 +142,7 @@ export class AiSdkActingAgent implements ActingAgentProvider {
       return checked;
     };
 
-    const tools = modelToolSet(input.toolDefinitions, input.executeTool, complete);
+    const tools = modelToolSet(input.toolDefinitions, input.executeTool, complete, input.onProgress);
     const totalStepLimit = input.maxSteps + MAX_COMPLETION_STEPS;
 
     while (totalModelSteps < totalStepLimit) {
@@ -158,22 +176,26 @@ export class AiSdkActingAgent implements ActingAgentProvider {
       const endedWithText = result.text.trim().length > 0 && result.finishReason !== 'tool-calls';
       if (!endedWithText) continue;
 
-      // A normal assistant answer is a proposal. Make the same model check its
-      // claimed effects through a forced native tool call before accepting it.
+      // A normal assistant answer is only a proposal. Ask the same model to
+      // verify it through the native completion tool. Keep tool selection on
+      // auto: OpenAI-compatible local servers do not all accept forced
+      // function-choice requests.
       if (completionAttempts >= MAX_COMPLETION_STEPS) break;
       completionAttempts += 1;
-      const finalize = await generateText({
+      const finalizer = new ToolLoopAgent<never, ToolSet>({
         model: this.options.model,
-        system: instructions.finalization,
-        messages,
-        tools: { [COMPLETE_TOOL]: tools[COMPLETE_TOOL] },
-        toolChoice: { type: 'tool', toolName: COMPLETE_TOOL },
+        instructions: instructions.finalization,
+        tools: { [COMPLETE_TOOL]: tools[COMPLETE_TOOL] } as ToolSet,
         stopWhen: isStepCount(1),
         maxOutputTokens: this.options.maxOutputTokens,
         temperature: this.options.temperature,
         timeout: this.options.requestTimeoutMs,
         maxRetries: 0,
+      });
+      const finalize = await finalizer.generate({
+        messages,
         abortSignal: input.signal,
+        timeout: this.options.requestTimeoutMs,
       });
       totalModelSteps += finalize.steps.length;
       messages.push(...finalize.responseMessages);

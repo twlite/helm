@@ -8,6 +8,8 @@ import { ThreadSidebar } from './components/ThreadSidebar';
 import { useHelmWebSocket } from './hooks/useHelmWebSocket';
 import type {
   AsyncState,
+  ChatProgress,
+  ChatToolCall,
   ConnectionState,
   HelmEvent,
   HealthStatus,
@@ -34,6 +36,65 @@ function fallbackThreadTitle(input: string): string {
   const trimmed = input.trim();
   if (trimmed.length <= 200) return trimmed;
   return `${trimmed.slice(0, 197).trimEnd()}...`;
+}
+
+function mergeMessages(current: Message[], incoming: Message[]): Message[] {
+  const merged = new Map(current.map((message) => [message.id, message]));
+  for (const message of incoming) merged.set(message.id, message);
+  return [...merged.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+}
+
+function toolCallFromEvent(payload: Record<string, unknown>): ChatToolCall | null {
+  const action = isRecord(payload.action) ? payload.action : undefined;
+  const toolName = asString(action?.tool) ?? asString(payload.toolName);
+  const stepIndex = typeof payload.stepIndex === 'number' ? payload.stepIndex : undefined;
+  if (!toolName || stepIndex === undefined) return null;
+  const input = isRecord(action?.input)
+    ? action.input
+    : isRecord(payload.toolInput)
+      ? payload.toolInput
+      : undefined;
+  const result = isRecord(payload.toolResult) ? payload.toolResult : undefined;
+  const status: ChatToolCall['status'] = result
+    ? result.ok === false ? 'failed' : 'succeeded'
+    : 'running';
+  return {
+    stepIndex,
+    toolName,
+    ...(input ? { input } : {}),
+    status,
+  };
+}
+
+function chatProgressFromRun(run: RunDetails): ChatProgress {
+  const toolCalls = run.steps.flatMap((step) => {
+    if (step.phase !== 'act' || !step.toolName) return [];
+    return [{
+      stepIndex: step.stepIndex,
+      toolName: step.toolName,
+      ...(step.toolInput ? { input: step.toolInput } : {}),
+      status: step.toolResult
+        ? step.toolResult.ok ? 'succeeded' : 'failed'
+        : 'running',
+    } satisfies ChatToolCall];
+  });
+  return { runId: run.id, summaries: [], toolCalls };
+}
+
+function mergeChatProgress(current: ChatProgress | null, run: RunDetails): ChatProgress {
+  const saved = chatProgressFromRun(run);
+  if (current?.runId !== run.id) return saved;
+
+  const toolCalls = new Map(saved.toolCalls.map((call) => [call.stepIndex, call]));
+  for (const call of current.toolCalls) {
+    const persisted = toolCalls.get(call.stepIndex);
+    if (!persisted || call.status === 'running') toolCalls.set(call.stepIndex, call);
+  }
+  return {
+    runId: run.id,
+    summaries: current.summaries,
+    toolCalls: [...toolCalls.values()].sort((left, right) => left.stepIndex - right.stepIndex),
+  };
 }
 
 function mergeVmStatus(payload: unknown, previous: VmStatus | null): VmStatus | null {
@@ -160,6 +221,7 @@ function App() {
   const [regeneratingTitleThreadId, setRegeneratingTitleThreadId] = useState<string | null>(null);
   const [run, setRun] = useState<RunDetails | null>(null);
   const [liveActivity, setLiveActivity] = useState<LiveActivity | null>(null);
+  const [chatProgress, setChatProgress] = useState<ChatProgress | null>(null);
   const [streamingAssistant, setStreamingAssistant] = useState<StreamingAssistantMessage | null>(null);
   const [stoppingRunId, setStoppingRunId] = useState<string | null>(null);
   const [vm, setVm] = useState<VmStatus | null>(null);
@@ -177,6 +239,8 @@ function App() {
 
   const selectedThreadIdRef = useRef<string | null>(null);
   const runRequestRef = useRef(0);
+  const runThreadByIdRef = useRef(new Map<string, string>());
+  const messageSendInFlightRef = useRef(false);
   const streamingAssistantRef = useRef<StreamingAssistantMessage | null>(null);
   selectedThreadIdRef.current = selectedThreadId;
   streamingAssistantRef.current = streamingAssistant;
@@ -199,8 +263,10 @@ function App() {
       if (!currentThreadId || !nextRun.threadId || currentThreadId !== nextRun.threadId) {
         return;
       }
+      runThreadByIdRef.current.set(nextRun.id, nextRun.threadId);
       setRun(nextRun);
       setLiveActivity((current) => liveActivityFromRun(nextRun, current));
+      setChatProgress((current) => mergeChatProgress(current, nextRun));
     } catch (error) {
       if (requestId === runRequestRef.current) {
         showError(error);
@@ -225,6 +291,51 @@ function App() {
       if (nextScreenshot) {
         setScreenshot(nextScreenshot);
         setVm((current) => current ? { ...current, screenshot: nextScreenshot } : current);
+      }
+    }
+    if (event.runId && event.type === 'run.started') {
+      const payload = isRecord(event.payload) ? event.payload : undefined;
+      const threadId = asString(payload?.threadId);
+      if (threadId) {
+        runThreadByIdRef.current.set(event.runId, threadId);
+        if (threadId === selectedThreadIdRef.current) {
+          setChatProgress({ runId: event.runId, summaries: [], toolCalls: [] });
+        }
+      }
+    }
+    if (event.runId && event.type === 'run.progress') {
+      const payload = isRecord(event.payload) ? event.payload : undefined;
+      const threadId = runThreadByIdRef.current.get(event.runId) ?? asString(payload?.threadId);
+      const summary = asString(payload?.summary)?.trim();
+      if (threadId === selectedThreadIdRef.current && summary) {
+        setChatProgress((current) => {
+          const base: ChatProgress = current && current.runId === event.runId
+            ? current
+            : { runId: event.runId!, summaries: [], toolCalls: [] };
+          if (base.summaries.at(-1) === summary) return base;
+          return { ...base, summaries: [...base.summaries, summary].slice(-8) };
+        });
+      }
+    }
+    if (event.runId && (event.type === 'run.step.started' || event.type === 'run.step.completed')) {
+      const payload = isRecord(event.payload) ? event.payload : undefined;
+      const toolCall = payload ? toolCallFromEvent(payload) : null;
+      const threadId = runThreadByIdRef.current.get(event.runId);
+      if (threadId === selectedThreadIdRef.current && toolCall) {
+        const nextCall = event.type === 'run.step.started'
+          ? { ...toolCall, status: 'running' as const }
+          : toolCall;
+        setChatProgress((current) => {
+          const base: ChatProgress = current && current.runId === event.runId
+            ? current
+            : { runId: event.runId!, summaries: [], toolCalls: [] };
+          const calls = new Map(base.toolCalls.map((call) => [call.stepIndex, call]));
+          calls.set(nextCall.stepIndex, nextCall);
+          return {
+            ...base,
+            toolCalls: [...calls.values()].sort((left, right) => left.stepIndex - right.stepIndex),
+          };
+        });
       }
     }
     if (event.type === 'assistant.message.started') {
@@ -269,7 +380,7 @@ function App() {
         void helmApi.listMessages(threadId)
           .then((nextMessages) => {
             if (selectedThreadIdRef.current === threadId) {
-              setMessages(nextMessages);
+              setMessages((current) => mergeMessages(current, nextMessages));
             }
           })
           .catch(() => undefined);
@@ -287,7 +398,9 @@ function App() {
         }
         const currentThreadId = selectedThreadIdRef.current;
         if (currentThreadId) {
-          void helmApi.listMessages(currentThreadId).then(setMessages).catch(() => undefined);
+          void helmApi.listMessages(currentThreadId)
+            .then((nextMessages) => setMessages((current) => mergeMessages(current, nextMessages)))
+            .catch(() => undefined);
         }
       }
     }
@@ -412,6 +525,7 @@ function App() {
     setSelectedThreadId(threadId);
     setRun(null);
     setLiveActivity(null);
+    setChatProgress(null);
     setStreamingAssistant(null);
     setDraft('');
     setNotice(null);
@@ -424,6 +538,7 @@ function App() {
     setDraft('');
     setRun(null);
     setLiveActivity(null);
+    setChatProgress(null);
     setStreamingAssistant(null);
     setNotice(null);
     setMessageState('idle');
@@ -443,6 +558,7 @@ function App() {
         setMessages([]);
         setRun(null);
         setLiveActivity(null);
+        setChatProgress(null);
         setStreamingAssistant(null);
       }
     } catch (error) {
@@ -473,6 +589,8 @@ function App() {
   }, [messages, regeneratingTitleThreadId, showError]);
 
   const handleSendMessage = useCallback(async (content: string, mode: ConversationSendMode) => {
+    if (messageSendInFlightRef.current) return;
+    messageSendInFlightRef.current = true;
     setMessageState('saving');
     setNotice(null);
     try {
@@ -490,10 +608,11 @@ function App() {
         setMessages([]);
         setRun(null);
         setLiveActivity(null);
+        setChatProgress(null);
         setStreamingAssistant(null);
       }
       const message = await helmApi.createMessage(threadId, content);
-      setMessages((current) => [...current, message]);
+      setMessages((current) => mergeMessages(current, [message]));
       setThreads((current) => current.map((thread) => thread.id === threadId ? { ...thread, updatedAt: message.createdAt } : thread));
       setDraft('');
       setMessageState('idle');
@@ -510,8 +629,10 @@ function App() {
           const queued = await helmApi.queueAgent(threadId, message.id);
           const queuedRun = queued.run;
           if (queuedRun) {
+            runThreadByIdRef.current.set(queuedRun.id, queuedRun.threadId);
             setRun((current) => current && current.id === queuedRun.id && current.steps.length > queuedRun.steps.length ? current : queuedRun);
             setLiveActivity((current) => current && current.runId === queuedRun.id && current.phase !== 'starting' ? current : { runId: queuedRun.id, phase: 'starting' });
+            setChatProgress((current) => current?.runId === queuedRun.id ? current : chatProgressFromRun(queuedRun));
           }
           setNotice({
             tone: 'info',
@@ -520,14 +641,18 @@ function App() {
           return;
         }
         const nextRun = await helmApi.runAgent(threadId, message.id);
+        runThreadByIdRef.current.set(nextRun.id, nextRun.threadId);
         setRun((current) => current?.id === nextRun.id && current.steps.length > nextRun.steps.length ? current : nextRun);
         setLiveActivity((current) => current?.runId === nextRun.id && current.phase !== 'starting' ? current : { runId: nextRun.id, phase: 'starting' });
+        setChatProgress((current) => current?.runId === nextRun.id ? current : chatProgressFromRun(nextRun));
       } catch (error) {
         showError(error);
       }
     } catch (error) {
       setMessageState('error');
       showError(error);
+    } finally {
+      messageSendInFlightRef.current = false;
     }
   }, [memoryQuery, run, showError, streamingAssistant]);
 
@@ -540,8 +665,10 @@ function App() {
     setNotice(null);
     try {
       const nextRun = await helmApi.runScriptedDemo(threadId);
+      runThreadByIdRef.current.set(nextRun.id, nextRun.threadId);
       setRun((current) => current?.id === nextRun.id && current.steps.length > nextRun.steps.length ? current : nextRun);
       setLiveActivity((current) => current?.runId === nextRun.id && current.phase !== 'starting' ? current : { runId: nextRun.id, phase: 'starting' });
+      setChatProgress((current) => current?.runId === nextRun.id ? current : chatProgressFromRun(nextRun));
     } catch (error) {
       showError(error);
     } finally {
@@ -581,8 +708,10 @@ function App() {
       }
 
       const nextRun = await helmApi.runAgent(threadId, sourceMessageId);
+      runThreadByIdRef.current.set(nextRun.id, nextRun.threadId);
       setRun((current) => current?.id === nextRun.id && current.steps.length > nextRun.steps.length ? current : nextRun);
       setLiveActivity((current) => current?.runId === nextRun.id && current.phase !== 'starting' ? current : { runId: nextRun.id, phase: 'starting' });
+      setChatProgress((current) => current?.runId === nextRun.id ? current : chatProgressFromRun(nextRun));
     } catch (error) {
       showError(error);
     } finally {
@@ -595,7 +724,10 @@ function App() {
       return;
     }
     try {
-      setRun(await helmApi.getRun(runId));
+      const nextRun = await helmApi.getRun(runId);
+      runThreadByIdRef.current.set(nextRun.id, nextRun.threadId);
+      setRun(nextRun);
+      setChatProgress(chatProgressFromRun(nextRun));
     } catch (error) {
       showError(error);
     }
@@ -716,6 +848,7 @@ function App() {
           isRunActive={isRunActive}
           isSending={messageState === 'saving'}
           isStoppingRun={stoppingRunId !== null && stoppingRunId === run?.id}
+          chatProgress={chatProgress}
           messages={messages}
           onCancelRun={handleCancelRun}
           onDraftChange={setDraft}

@@ -1069,6 +1069,10 @@ export class AgentRuntime {
         toolDefinitions: this.tools.list(),
         executeTool,
         verifyCompletion,
+        onProgress: summary => this.emit('run.progress', {
+          threadId: run.threadId,
+          summary,
+        }, runId),
         drainSteering: input.drainSteering,
         maxSteps,
         maxRepeatedAction,
@@ -1094,7 +1098,23 @@ export class AgentRuntime {
       if (cancellation.cancelled || input.signal?.aborted) {
         await this.cancelled(run, error('RUN_CANCELLED', 'Run was cancelled.'));
       } else if (!this.isTerminal(run.status)) {
-        await this.fail(run, error('ACTING_AGENT_ERROR', errorMessage(caught)));
+        if (finalVerification?.complete && assistantResponse) {
+          try {
+            if (!steps.some(step => step.phase === 'complete')) {
+              await this.persistStep(steps, {
+                runId,
+                stepIndex: actionCount,
+                phase: 'complete',
+                verification: finalVerification,
+              });
+            }
+            await this.complete(run, finalVerification);
+          } catch (completionError) {
+            await this.fail(run, error('ACTING_AGENT_ERROR', errorMessage(completionError)));
+          }
+        } else {
+          await this.fail(run, error('ACTING_AGENT_ERROR', errorMessage(caught)));
+        }
       }
     } finally {
       removeExternalAbort();

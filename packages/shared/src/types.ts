@@ -484,6 +484,7 @@ export interface WebSocketEvent {
     | 'guest.connected'
     | 'guest.disconnected'
     | 'run.started'
+    | 'run.progress'
     | 'run.step.started'
     | 'run.step.completed'
     | 'run.verification'

@@ -130,6 +130,8 @@ export interface ActingAgentContext {
     requiredEffects: readonly RequestedToolEffect[];
   }): Promise<ToolResult<VerificationResult>>;
   drainSteering?: () => Message[];
+  /** Emits a brief user-facing progress summary, never private model reasoning. */
+  onProgress?: (summary: string) => Promise<void> | void;
   maxSteps: number;
   maxRepeatedAction: number;
   maxConsecutiveFailures: number;
@@ -186,6 +188,7 @@ export type RuntimePersistence = RuntimeRepository;
 
 export type RuntimeEventType =
   | 'run.started'
+  | 'run.progress'
   | 'run.step.started'
   | 'run.step.completed'
   | 'run.verification'

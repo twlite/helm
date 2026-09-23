@@ -1,4 +1,4 @@
-import { memo, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { ComponentPropsWithoutRef, FormEvent, KeyboardEvent, Ref } from 'react';
 import {
   extractTableDataFromElement,
@@ -7,7 +7,7 @@ import {
   tableDataToMarkdown,
 } from 'streamdown';
 import type { Components, ExtraProps } from 'streamdown';
-import type { Message, RunDetails, StreamingAssistantMessage, Thread } from '../types';
+import type { ChatProgress, Message, RunDetails, StreamingAssistantMessage, Thread } from '../types';
 import { formatTime } from '../format';
 import { Icon } from './Icon';
 import { RunErrorCard } from './RunErrorCard';
@@ -44,6 +44,7 @@ type ConversationProps = {
   notice: ConversationNotice | null;
   onDismissNotice: () => void;
   isRunActive: boolean;
+  chatProgress?: ChatProgress | null;
   isStoppingRun?: boolean;
   streamingAssistant?: StreamingAssistantMessage | null;
 };
@@ -286,6 +287,114 @@ function TypingIndicator({ label }: { label: string }) {
   );
 }
 
+function toolInputPreview(input: Record<string, unknown> | undefined): string | undefined {
+  if (!input) return undefined;
+  const sensitive = /password|secret|token|authorization|cookie|credential|api.?key|content|text|body|base64|bytes|data/iu;
+  const entries = Object.entries(input).slice(0, 4).map(([key, value]) => {
+    if (sensitive.test(key)) return `${key}: hidden`;
+    let rendered: string;
+    if (typeof value === 'string') {
+      if (key.toLowerCase() === 'url') {
+        try {
+          const url = new URL(value);
+          rendered = `${url.origin}${url.pathname}${url.search ? '?…' : ''}`;
+        } catch {
+          rendered = value.split(/[?#]/u, 1)[0].slice(0, 72);
+        }
+      } else {
+        rendered = value.slice(0, 72);
+      }
+    } else if (value === null || typeof value === 'number' || typeof value === 'boolean') {
+      rendered = String(value);
+    } else if (Array.isArray(value)) {
+      rendered = `[${value.length} items]`;
+    } else if (typeof value === 'object') {
+      rendered = '{…}';
+    } else {
+      rendered = String(value);
+    }
+    return `${key}: ${rendered}`;
+  });
+  return entries.length > 0 ? entries.join(' · ') : undefined;
+}
+
+const ChatProgressPanel = memo(function ChatProgressPanel({
+  progress,
+  runId,
+  isRunActive,
+  hasAssistantResponse,
+}: {
+  progress: ChatProgress | null;
+  runId?: string;
+  isRunActive: boolean;
+  hasAssistantResponse: boolean;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const toolCalls = progress?.toolCalls ?? [];
+  const summaries = progress?.summaries ?? [];
+
+  useEffect(() => {
+    setExpanded(!hasAssistantResponse);
+  }, [runId, hasAssistantResponse]);
+
+  if (!isRunActive && toolCalls.length === 0 && summaries.length === 0) return null;
+
+  const latestSummary = summaries.at(-1);
+  return (
+    <section className="max-w-[780px] overflow-hidden rounded-md border border-[var(--border)] bg-[var(--pane-raised)]/60">
+      <button
+        aria-expanded={expanded}
+        className="flex w-full items-center gap-2 px-3 py-2 text-left"
+        onClick={() => setExpanded((current) => !current)}
+        type="button"
+      >
+        <Icon className={isRunActive ? 'animate-pulse text-[var(--accent)]' : 'text-[var(--text-muted)]'} name="spark" size={13} />
+        <span className="shrink-0 text-xs font-medium text-[var(--text-secondary)]">Helm progress</span>
+        {latestSummary && !expanded ? (
+          <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-muted)]">{latestSummary}</span>
+        ) : (
+          <span className="min-w-0 flex-1 text-[11px] text-[var(--text-muted)]">
+            {isRunActive ? 'Working' : `${toolCalls.length} tool call${toolCalls.length === 1 ? '' : 's'}`}
+          </span>
+        )}
+        <Icon className={`shrink-0 text-[var(--text-muted)] transition-transform ${expanded ? 'rotate-180' : ''}`} name="chevron-down" size={13} />
+      </button>
+      {expanded ? (
+        <div className="space-y-2 border-t border-[var(--border)] px-3 py-2.5" aria-live="polite">
+          {summaries.map((summary, index) => (
+            <p className="border-l border-[var(--border-strong)] pl-2.5 text-xs leading-5 text-[var(--text-muted)]" key={`${index}-${summary}`}>
+              {summary}
+            </p>
+          ))}
+          {toolCalls.map((call) => {
+            const preview = toolInputPreview(call.input);
+            const statusLabel = call.status === 'running' ? 'Running' : call.status === 'failed' ? 'Failed' : 'Done';
+            return (
+              <div className="flex min-w-0 items-start gap-2 text-xs" key={call.stepIndex}>
+                {call.status === 'running' ? (
+                  <span className="mt-1 size-2 shrink-0 animate-pulse rounded-full bg-[var(--accent)]" aria-hidden="true" />
+                ) : (
+                  <Icon className={`mt-0.5 shrink-0 ${call.status === 'failed' ? 'text-[var(--danger)]' : 'text-emerald-400'}`} name={call.status === 'failed' ? 'x' : 'check'} size={12} />
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                    <code className="font-mono text-[11px] text-[var(--text-secondary)]">{call.toolName}</code>
+                    <span className="text-[10px] text-[var(--text-muted)]">{statusLabel}</span>
+                  </div>
+                  {preview ? <p className="mt-0.5 break-words text-[10px] leading-4 text-[var(--text-muted)]">{preview}</p> : null}
+                </div>
+              </div>
+            );
+          })}
+          {isRunActive && toolCalls.length === 0 && summaries.length === 0 ? (
+            <TypingIndicator label="Helm is preparing the next step…" />
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+});
+
 const StreamingMessage = memo(function StreamingMessage({ message }: { message: StreamingAssistantMessage }) {
   return (
     <article className="flex min-w-0 w-full justify-start" aria-live="polite">
@@ -327,6 +436,7 @@ export function Conversation({
   notice,
   onDismissNotice,
   isRunActive,
+  chatProgress = null,
   isStoppingRun = false,
   streamingAssistant = null,
 }: ConversationProps) {
@@ -347,6 +457,8 @@ export function Conversation({
       event.currentTarget.form?.requestSubmit();
     }
   }
+
+  const currentProgress = chatProgress?.runId === run?.id ? chatProgress : null;
 
   return (
     <main className="flex min-w-[420px] flex-1 flex-col overflow-hidden bg-[var(--app-bg)]">
@@ -426,9 +538,15 @@ export function Conversation({
                     title={runErrorTitle(run.status)}
                   />
                 ) : null}
+                <ChatProgressPanel
+                  hasAssistantResponse={run?.status === 'completed' || streamingAssistant?.threadId === thread.id}
+                  isRunActive={isRunActive}
+                  progress={currentProgress}
+                  runId={run?.id}
+                />
                 {streamingAssistant?.threadId === thread.id ? <StreamingMessage message={streamingAssistant} /> : null}
-                {isRunActive && !streamingAssistant ? (
-                  <TypingIndicator label={run?.criteria.length ? 'Helm is working…' : 'Helm is thinking…'} />
+                {isRunActive && !streamingAssistant && !currentProgress ? (
+                  <TypingIndicator label="Helm is preparing the next step…" />
                 ) : null}
               </div>
             )}

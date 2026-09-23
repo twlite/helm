@@ -52,6 +52,19 @@ export type StreamingAssistantMessage = {
   status: 'writing' | 'finished';
 };
 
+export type ChatToolCall = {
+  stepIndex: number;
+  toolName: string;
+  input?: Record<string, unknown>;
+  status: 'running' | 'succeeded' | 'failed';
+};
+
+export type ChatProgress = {
+  runId: string;
+  summaries: string[];
+  toolCalls: ChatToolCall[];
+};
+
 export type WebSocketEventType = WebSocketEvent['type'];
 
 export type HelmEvent = {
