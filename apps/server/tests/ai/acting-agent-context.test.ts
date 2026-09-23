@@ -29,6 +29,71 @@ function reply(id: string, message: Record<string, unknown>, finishReason: 'stop
 }
 
 describe('acting agent context integration', () => {
+  it('reports the path when prepared conversation messages do not match the SDK schema', async () => {
+    let requestCount = 0;
+    const provider = createOpenAICompatible({
+      name: 'context-validation-test',
+      baseURL: 'http://localhost:1234/v1',
+      fetch: async () => {
+        requestCount += 1;
+        return Response.json(reply('unexpected', { role: 'assistant', content: 'unexpected' }, 'stop'));
+      },
+    });
+    const agent = new AiSdkActingAgent({
+      model: provider.chatModel('context-validation-test'),
+      maxOutputTokens: 1_000,
+      temperature: 0,
+      requestTimeoutMs: 1_000,
+    });
+    const currentRequest = 'Continue the earlier task.';
+    const conversation: Message[] = [
+      {
+        id: 'old-user',
+        threadId: 'invalid-context-thread',
+        role: 'user',
+        content: 'Earlier request.',
+        metadata: {},
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+      {
+        id: 'old-assistant',
+        threadId: 'invalid-context-thread',
+        role: 'assistant',
+        content: [{ type: 'text' }] as unknown as string,
+        metadata: {},
+        createdAt: '2026-01-01T00:00:01.000Z',
+      },
+    ];
+    const verification: VerificationResult = {
+      complete: true,
+      criteria: [],
+      requirements: [],
+      summary: 'No external effect was requested.',
+    };
+
+    let caught: unknown;
+    try {
+      await agent.execute({
+        userMessage: currentRequest,
+        conversation,
+        memories: [],
+        toolDefinitions: [],
+        executeTool: async () => ({ ok: false, error: { code: 'UNEXPECTED_TOOL', message: 'No tool was expected.' } }),
+        verifyCompletion: async () => ({ ok: true, data: verification }),
+        maxSteps: 2,
+        maxRepeatedAction: 2,
+        maxConsecutiveFailures: 2,
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toContain('Prepared acting-agent context failed ModelMessage[] validation');
+    expect((caught as Error).message).toContain('[1]');
+    expect(requestCount).toBe(0);
+  });
+
   it('runs structured compaction only at pressure and reports usage and the persisted event', async () => {
     const replies = [
       reply('summary', {

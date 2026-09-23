@@ -1,4 +1,4 @@
-import { generateText, isStepCount, Output, tool, ToolLoopAgent, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
+import { generateText, isStepCount, modelMessageSchema, Output, tool, ToolLoopAgent, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
 import type { Message, ToolResult } from '@helm/shared';
 
@@ -149,6 +149,16 @@ function flattenExchanges(exchanges: readonly ContextExchange[]): ModelMessage[]
   return exchanges.flatMap(exchange => exchange.messages);
 }
 
+function assertModelMessages(messages: readonly ModelMessage[], source: string): void {
+  const validation = modelMessageSchema.array().safeParse(messages);
+  if (validation.success) return;
+
+  const issues = validation.error.issues.slice(0, 8).map(issue => (
+    `${JSON.stringify(issue.path)} ${issue.code}: ${issue.message}`
+  ));
+  throw new Error(`${source} failed ModelMessage[] validation: ${issues.join('; ')}`);
+}
+
 function toolDefinitionsDescription(definitions: readonly ToolDefinition[]): string {
   return JSON.stringify(definitions.map(definition => {
     const schema = definition.inputSchema ?? definition.schema;
@@ -248,7 +258,9 @@ export class AiSdkActingAgent implements ActingAgentProvider {
       compactionCount = result.usage.compactions;
       await input.onContextUsage?.(result.usage);
       if (result.compaction) await input.onContextCompacted?.(result.compaction);
-      return flattenExchanges(exchanges);
+      const messages = flattenExchanges(exchanges);
+      assertModelMessages(messages, 'Prepared acting-agent context');
+      return messages;
     };
 
     const complete = async (value: z.infer<typeof completionInputSchema>): Promise<ToolResult> => {
@@ -289,6 +301,7 @@ export class AiSdkActingAgent implements ActingAgentProvider {
         abortSignal: input.signal,
         timeout: this.options.requestTimeoutMs,
       });
+      assertModelMessages(result.responseMessages, 'Acting-agent response history');
       totalModelSteps += result.steps.length;
       exchanges.push({ messages: result.responseMessages, kind: 'tool' });
 
@@ -326,6 +339,7 @@ export class AiSdkActingAgent implements ActingAgentProvider {
         abortSignal: input.signal,
         timeout: this.options.requestTimeoutMs,
       });
+      assertModelMessages(finalize.responseMessages, 'Acting-agent finalization history');
       totalModelSteps += finalize.steps.length;
       exchanges.push({ messages: finalize.responseMessages, kind: 'tool' });
 
