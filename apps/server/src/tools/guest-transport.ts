@@ -18,8 +18,8 @@ export type GuestMethodParams = {
   'browser.getState': Record<string, never>;
   'browser.snapshot': { maxRegions?: number };
   'browser.searchPage': { query: string; kinds?: import('@helm/shared').BrowserRegionKind[]; maxResults?: number };
-  'browser.inspectRegion': { ref: string; format?: 'auto' | 'text' | 'table' | 'links'; maxChars?: number };
-  'browser.extractText': { query?: string; maxChars?: number; mode?: 'relevant' | 'full' };
+  'browser.inspectRegion': { ref: string; format?: 'auto' | 'text' | 'table' | 'links'; maxChars?: number; offset?: number; limit?: number };
+  'browser.extractText': { query: string; maxChars?: number };
   'browser.download': { ref?: string; url?: string };
   'browser.click': { ref?: string; x?: number; y?: number };
   'browser.type': { ref: string; text: string };
@@ -66,7 +66,7 @@ export type GuestMethodResult = {
   'browser.snapshot': BrowserSnapshot;
   'browser.searchPage': BrowserSearchPageResult;
   'browser.inspectRegion': BrowserRegionInspection;
-  'browser.extractText': { url: string; title: string; mode: 'relevant' | 'full'; query?: string; text: string; truncated: boolean; matches?: number };
+  'browser.extractText': { url: string; title: string; query: string; text: string; truncated: boolean; matches: number };
   'browser.download': {
     sourceUrl: string;
     finalUrl?: string;

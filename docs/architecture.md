@@ -86,19 +86,29 @@ browser.getState -> browser.snapshot -> browser.searchPage -> browser.inspectReg
 indexes visible semantic elements such as main/article/section content,
 headings, tables, lists, forms, navigation, and large otherwise-unstructured
 text blocks. Region previews are short; the outline does not include full
-region text. Region search runs locally in the guest and ranks query-token
-overlap, heading/header matches, term proximity, and table headers. A selected
-region can be read as bounded text, links, or structured table columns and
-rows. Search and inspection results are persisted in the normal tool receipts
-and shown in the run activity feed.
+region text. For a query, the guest creates bounded windows around query hits
+inside indexed regions and sends only those windows to its local ranker. Search
+uses BM25-like IDF weighting for body terms, stronger heading, table-header,
+and form-label fields, phrase and proximity signals, and semantic-kind boosts.
+Nested results with substantially overlapping query matches are deduplicated
+in favor of the more specific useful region. Search returns five matches by
+default.
+
+`browser.inspectRegion` reads one selected region as bounded text, local links,
+or structured table columns and rows. Text inspection defaults to 8,000
+characters. Table inspection defaults to 50 rows and supports `offset` and
+`limit` pagination; it reports total and returned row counts and truncation.
+Search and inspection results are persisted in normal tool receipts and shown
+in the run activity feed.
 
 Region and interactive refs encode the current DOM revision. Navigation and
 observed DOM changes invalidate earlier refs; the guest rejects expired refs
 instead of acting on a control from an older page state. `browser.extractText`
-remains a fallback: query mode returns matching passages across the page,
-queryless mode samples readable main content, and full-page extraction requires
-`mode: "full"`. The default is 8,000 characters and the hard maximum is
-100,000 characters.
+is a targeted fallback that requires a query, retrieves matching semantic
+regions, defaults to 6,000 characters, and has an 8,000-character maximum. The
+guest reads candidate region text locally to build bounded query-hit windows; it
+does not send or return a full-page `body.innerText` dump. No whole-page
+extraction mode is present in the acting-agent catalog.
 
 ## Model context management
 
@@ -109,6 +119,11 @@ provider tokenizer. The configured context window is in `config/models.json` or
 can be overridden with `HELM_LLM_CONTEXT_WINDOW_TOKENS`. The model config also
 sets compaction and critical-pressure ratios and how many recent exchanges to
 keep raw.
+
+Before context estimation, the context manager bounds tool results to 24,000
+characters, caps oversized strings and arrays, and preserves useful structure
+such as table columns, row counts, and truncation state. This is a final safety
+net after browser-specific retrieval limits.
 
 At the configured pressure threshold, Helm first prunes duplicate browser
 observations and snapshots/search results from older DOM revisions. At higher

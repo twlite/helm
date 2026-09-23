@@ -6,7 +6,7 @@ import type {
   GuestMethod,
   WindowInfo,
 } from '@helm/shared';
-import { extractRelevantPassages, rankPageRegions, sampleReadableText, type IndexedBrowserRegion } from '@helm/shared';
+import { extractRelevantPassages, rankPageRegions, type IndexedBrowserRegion } from '@helm/shared';
 import { guestMethodSchemas } from '@helm/shared';
 import type {
   GuestMethodParams,
@@ -180,7 +180,12 @@ function mockOutlinePriority(kind: BrowserRegionKind): number {
   return 5;
 }
 
-function boundedTable(region: MockBrowserState['regions'][number], maxChars: number) {
+function boundedTable(
+  region: MockBrowserState['regions'][number],
+  maxChars: number,
+  offset = 0,
+  limit = 50,
+) {
   const sourceColumns = region.tableHeaders ?? [];
   const sourceRows = region.tableRows ?? [];
   const maxColumns = Math.max(1, Math.min(80, Math.floor(maxChars / 100)));
@@ -189,7 +194,7 @@ function boundedTable(region: MockBrowserState['regions'][number], maxChars: num
   const maxCellChars = Math.max(16, Math.min(256, Math.floor(maxChars * 0.4 / Math.max(1, columns.length))));
   let chars = JSON.stringify(columns).length;
   const rows: string[][] = [];
-  for (const sourceRow of sourceRows) {
+  for (const sourceRow of sourceRows.slice(offset, offset + limit)) {
     const row = sourceRow.slice(0, columns.length).map(value => value.slice(0, maxCellChars));
     const size = JSON.stringify(row).length + 1;
     if (chars + size > maxChars) break;
@@ -199,7 +204,10 @@ function boundedTable(region: MockBrowserState['regions'][number], maxChars: num
   return {
     columns,
     rows,
-    truncated: columns.length < sourceColumns.length || rows.length < sourceRows.length,
+    rowCount: sourceRows.length,
+    returnedRowCount: rows.length,
+    offset,
+    truncated: columns.length < sourceColumns.length || offset > 0 || offset + rows.length < sourceRows.length,
   };
 }
 
@@ -546,19 +554,23 @@ export class MockGuestTransport implements GuestTransport {
           return { ...common, format: 'links', links, linkCount: (region.links ?? []).length, truncated: links.length < (region.links ?? []).length } as GuestMethodResult[M];
         }
         if (format === 'table' && region.kind === 'table') {
-          const maxChars = Math.max(1_000, Math.min(20_000, input.maxChars ?? 12_000));
-          const table = boundedTable(region, maxChars);
+          const maxChars = Math.max(1_000, Math.min(12_000, input.maxChars ?? 8_000));
+          const offset = Math.max(0, Math.min(1_000_000, input.offset ?? 0));
+          const limit = Math.max(1, Math.min(100, input.limit ?? 50));
+          const table = boundedTable(region, maxChars, offset, limit);
           return {
             ...common,
             format: 'table',
             columns: table.columns,
             rows: table.rows,
-            rowCount: region.rowCount ?? region.tableRows?.length ?? 0,
+            rowCount: table.rowCount,
+            returnedRowCount: table.returnedRowCount,
+            offset: table.offset,
             columnCount: region.columnCount ?? region.tableHeaders?.length ?? 0,
             truncated: table.truncated,
           } as GuestMethodResult[M];
         }
-        const maxChars = Math.max(1_000, Math.min(20_000, input.maxChars ?? 12_000));
+        const maxChars = Math.max(1_000, Math.min(12_000, input.maxChars ?? 8_000));
         return { ...common, format: 'text', text: region.searchText.slice(0, maxChars), truncated: region.searchText.length > maxChars } as GuestMethodResult[M];
       }
       case 'browser.extractText': {
@@ -566,21 +578,55 @@ export class MockGuestTransport implements GuestTransport {
           throw new GuestTransportError('BROWSER_NOT_READY', 'Navigate the browser before extracting text');
         }
         const input = params as GuestMethodParams['browser.extractText'];
-        const mode = input.mode ?? 'relevant';
-        const maxChars = Math.max(1, Math.min(100_000, input.maxChars ?? 8_000));
-        const extracted = input.query && mode === 'relevant'
-          ? extractRelevantPassages({ text: this.browser.text, query: input.query, maxChars })
-          : mode === 'full'
-            ? { text: this.browser.text.slice(0, maxChars), truncated: this.browser.text.length > maxChars }
-            : sampleReadableText(this.browser.text, maxChars);
+        const maxChars = Math.max(1, Math.min(8_000, input.maxChars ?? 6_000));
+        const ranked = rankPageRegions({ query: input.query, regions: this.browser.regions, maxResults: 5 });
+        const sections: string[] = [];
+        let truncated = false;
+        for (const result of ranked.results) {
+          const region = this.browser.regions.find(candidate => candidate.ref === result.ref);
+          if (!region) continue;
+          const remaining = maxChars - sections.join('\n\n').length - (sections.length > 0 ? 2 : 0);
+          if (remaining <= 0) {
+            truncated = true;
+            break;
+          }
+          let text: string;
+          let sectionTruncated = false;
+          if (region.kind === 'table') {
+            const table = boundedTable(region, Math.max(1_000, Math.min(8_000, remaining)), 0, 30);
+            text = JSON.stringify({
+              heading: region.heading,
+              columns: table.columns,
+              rows: table.rows,
+              rowCount: table.rowCount,
+              returnedRowCount: table.returnedRowCount,
+              offset: table.offset,
+              truncated: table.truncated,
+            });
+            sectionTruncated = table.truncated;
+          } else {
+            const extracted = extractRelevantPassages({ text: region.searchText, query: input.query, maxChars: remaining });
+            const selectedRegionText = extracted.text || region.searchText.slice(0, remaining);
+            text = region.heading && !selectedRegionText.toLocaleLowerCase().includes(region.heading.toLocaleLowerCase())
+              ? `${region.heading}\n${selectedRegionText}`
+              : selectedRegionText;
+            sectionTruncated = extracted.truncated || selectedRegionText.length < region.searchText.length;
+          }
+          const rawSection = region.kind === 'table' && region.heading
+            ? `${region.heading}\n${text}`
+            : text;
+          const section = rawSection.slice(0, remaining);
+          sections.push(section);
+          truncated ||= sectionTruncated || section.length < rawSection.length;
+        }
+        truncated ||= ranked.results.length > sections.length;
         return {
           url: this.browser.url,
           title: this.browser.title ?? '',
-          text: extracted.text,
-          truncated: extracted.truncated,
-          mode,
-          ...(input.query ? { query: input.query } : {}),
-          ...('matches' in extracted && extracted.matches !== undefined ? { matches: extracted.matches } : {}),
+          text: sections.join('\n\n'),
+          truncated,
+          query: input.query,
+          matches: ranked.results.length,
         } as GuestMethodResult[M];
       }
       case 'browser.download': {

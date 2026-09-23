@@ -230,7 +230,7 @@ function browserObservationKey(tool: string, data: Record<string, unknown> | und
     case 'browser.inspectRegion':
       return `${tool}|${url}|${revision}|${data.ref ?? ''}|${stringify(data)}`;
     case 'browser.extractText':
-      return `${tool}|${url}|${revision}|${data.query ?? ''}|${data.mode ?? ''}|${data.text ?? ''}`;
+      return `${tool}|${url}|${revision}|${data.query ?? ''}|${data.text ?? ''}`;
     default:
       return undefined;
   }
@@ -243,6 +243,176 @@ function replaceToolResult(part: Record<string, unknown>, result: Record<string,
     part.output = { ...wrapped, value: result };
   } else {
     part.output = result;
+  }
+}
+
+const CONTEXT_TOOL_RESULT_CHARS = 24_000;
+const CONTEXT_TOOL_DATA_CHARS = CONTEXT_TOOL_RESULT_CHARS - 4_000;
+const CONTEXT_TOOL_STRING_CHARS = 8_000;
+const CONTEXT_ARRAY_LIMITS: Readonly<Record<string, number>> = {
+  columns: 80,
+  elements: 80,
+  links: 80,
+  outline: 60,
+  results: 20,
+  rows: 100,
+};
+
+function serializedLength(value: unknown): number {
+  try {
+    return JSON.stringify(value).length;
+  } catch {
+    return 0;
+  }
+}
+
+function boundedString(value: string, state: { remaining: number; truncated: boolean }): string {
+  const fullLength = serializedLength(value);
+  if (value.length <= CONTEXT_TOOL_STRING_CHARS && fullLength <= state.remaining) {
+    state.remaining -= fullLength;
+    return value;
+  }
+
+  state.truncated = true;
+  const marker = '\n...[bounded by context manager]';
+  const maxContentLength = Math.min(value.length, CONTEXT_TOOL_STRING_CHARS);
+  let low = 0;
+  let high = maxContentLength;
+  let best = '';
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const candidate = `${value.slice(0, middle).trimEnd()}${marker}`;
+    if (serializedLength(candidate) <= state.remaining) {
+      best = candidate;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  if (!best) {
+    low = 0;
+    high = maxContentLength;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const candidate = value.slice(0, middle);
+      if (serializedLength(candidate) <= state.remaining) {
+        best = candidate;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+  }
+  state.remaining -= serializedLength(best);
+  return best;
+}
+
+function boundValue(
+  value: unknown,
+  state: { remaining: number; truncated: boolean },
+  depth = 0,
+  key = '',
+): unknown {
+  if (typeof value === 'string') {
+    return boundedString(value, state);
+  }
+  if (value === null || typeof value === 'number' || typeof value === 'boolean') {
+    const size = serializedLength(value);
+    if (size > state.remaining) {
+      state.truncated = true;
+      return null;
+    }
+    state.remaining -= size;
+    return value;
+  }
+  if (depth >= 8 || state.remaining <= 0) {
+    state.truncated = true;
+    return boundedString('[value omitted by context manager]', state);
+  }
+  if (Array.isArray(value)) {
+    const itemLimit = CONTEXT_ARRAY_LIMITS[key] ?? 64;
+    const output: unknown[] = [];
+    if (state.remaining < 2) {
+      state.truncated = true;
+      return output;
+    }
+    state.remaining -= 2;
+    for (const item of value.slice(0, itemLimit)) {
+      const separatorLength = output.length > 0 ? 1 : 0;
+      if (state.remaining <= separatorLength) break;
+      state.remaining -= separatorLength;
+      output.push(boundValue(item, state, depth + 1));
+    }
+    if (output.length < value.length) state.truncated = true;
+    state.remaining -= 2;
+    return output;
+  }
+  const object = record(value);
+  if (!object) return value;
+  const priority = [
+    'url', 'title', 'query', 'revision', 'ref', 'kind', 'heading', 'format', 'score',
+    'truncated', 'columns', 'rowCount', 'returnedRowCount', 'offset', 'columnCount', 'rows',
+    'results', 'outline', 'elements', 'text', 'ok', 'error', 'evidence',
+  ];
+  const priorityIndex = (property: string) => {
+    const index = priority.indexOf(property);
+    return index < 0 ? priority.length : index;
+  };
+  const output: Record<string, unknown> = {};
+  if (state.remaining < 2) {
+    state.truncated = true;
+    return output;
+  }
+  state.remaining -= 2;
+  const entries = Object.entries(object).sort((left, right) => priorityIndex(left[0]) - priorityIndex(right[0]));
+  for (const [property, child] of entries.slice(0, 80)) {
+    const keyLength = serializedLength(property) + 1 + (Object.keys(output).length > 0 ? 1 : 0);
+    if (state.remaining <= keyLength) {
+      state.truncated = true;
+      break;
+    }
+    state.remaining -= keyLength;
+    output[property] = boundValue(child, state, depth + 1, property);
+  }
+  if (entries.length > 80) state.truncated = true;
+  state.remaining -= 2;
+  return output;
+}
+
+/** Last line of defense for unexpectedly large guest results before model context is built. */
+function boundModelToolResults(exchanges: ContextExchange[]): void {
+  for (const exchange of exchanges) {
+    for (const message of exchange.messages) {
+      if (message.role !== 'tool') continue;
+      for (const part of partsOf(message)) {
+        if (part.type !== 'tool-result' || typeof part.toolName !== 'string') continue;
+        const result = toolResult(part);
+        if (!result) continue;
+        const state = {
+          remaining: CONTEXT_TOOL_DATA_CHARS,
+          truncated: false,
+        };
+        const bounded: Record<string, unknown> = { ok: result.ok };
+        if (result.data !== undefined) {
+          const data = boundValue(result.data, state);
+          if (state.truncated) {
+            const boundedData = record(data);
+            if (boundedData) {
+              if ('truncated' in boundedData) boundedData.truncated = true;
+              if (Array.isArray(boundedData.rows)) boundedData.returnedRowCount = boundedData.rows.length;
+              boundedData.contextTruncated = true;
+            }
+          }
+          bounded.data = data;
+        }
+        if (result.error !== undefined) {
+          bounded.error = boundValue(result.error, { remaining: 1_500, truncated: false });
+        }
+        const receipt = receiptFrom(result);
+        if (receipt) bounded.evidence = { receipt: boundValue(receipt, { remaining: 1_500, truncated: false }) };
+        replaceToolResult(part, bounded);
+      }
+    }
   }
 }
 
@@ -495,6 +665,7 @@ function summaryMessage(summary: ContextSummary): ModelMessage {
 
 export async function prepareModelContext(input: ContextPreparationInput): Promise<ContextPreparationResult> {
   let exchanges = structuredClone(input.exchanges);
+  boundModelToolResults(exchanges);
   const beforePruningTokens = estimateContextTokens({
     instructions: input.instructions,
     toolDescription: input.toolDescription,

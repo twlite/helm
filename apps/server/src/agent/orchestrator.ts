@@ -59,13 +59,9 @@ export function fallbackObjective(state: TaskState, observation: EnvironmentObse
 }
 
 export interface DeterministicObjectiveAction {
-  tool: 'browser.navigate' | 'browser.extractText' | 'fs.mkdir' | 'fs.write' | 'app.openFile';
+  tool: 'browser.navigate' | 'fs.mkdir' | 'fs.write' | 'app.openFile';
   input: Record<string, unknown>;
   reasoningSummary: string;
-}
-
-function readableBrowserUrl(value: string | undefined): boolean {
-  return value !== undefined && /^(?:https?|file):\/\//iu.test(value);
 }
 
 function fileNameFromPath(value: string): string {
@@ -73,10 +69,9 @@ function fileNameFromPath(value: string): string {
 }
 
 /**
- * Some objectives have a mechanical first action that must not be delegated
- * to a model guess. Page-content research is one of those objectives: a
- * snapshot is useful perception, but it is not the page-content evidence that
- * can satisfy the requirement.
+ * Some objectives have a mechanical first action, such as opening an
+ * explicitly requested URL or creating an output directory. Semantic page
+ * retrieval remains a decision for the acting model.
  */
 export function deterministicObjectiveAction(
   state: TaskState,
@@ -102,44 +97,6 @@ export function deterministicObjectiveAction(
         tool: 'browser.navigate',
         input: { url: destinationUrl },
         reasoningSummary: 'Opening the URL explicitly requested by the user.',
-      };
-    }
-  }
-
-  const pageContentRequirement = requirements.find(requirement => (
-    objective.requirementIds.includes(requirement.id)
-    && requirement.target?.factId === 'pageContent'
-  ));
-  if (pageContentRequirement) {
-    const destination = requirements.find(requirement => (
-      requirement.type === 'browser'
-      && typeof requirement.target?.url === 'string'
-    ));
-    const destinationUrl = typeof destination?.target?.url === 'string' ? destination.target.url : undefined;
-    const currentUrl = observation.browser?.url;
-    const pageIsOpen = readableBrowserUrl(currentUrl);
-    const pageIsDestination = destinationUrl === undefined
-      ? pageIsOpen
-      : browserDestinationReached(
-        currentUrl,
-        destinationUrl,
-        state.recentActions,
-        navigationResolutions,
-      );
-
-    if (destinationUrl !== undefined && (!pageIsOpen || !pageIsDestination)) {
-      return {
-        tool: 'browser.navigate',
-        input: { url: destinationUrl },
-        reasoningSummary: 'Opening the compiled research source before extracting its contents.',
-      };
-    }
-
-    if (pageIsOpen && pageIsDestination) {
-      return {
-        tool: 'browser.extractText',
-        input: {},
-        reasoningSummary: 'Extracting readable page content for the browserResearch requirement.',
       };
     }
   }

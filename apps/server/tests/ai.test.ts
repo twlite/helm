@@ -490,7 +490,8 @@ describe('LM Studio AI adapters', () => {
       id: BROWSER_RESEARCH_CRITERION_ID,
       description: 'Read current public web information with the browser before answering.',
     });
-    expect(JSON.stringify(requestBody)).toContain('open a relevant result site');
+    expect(JSON.stringify(requestBody)).toContain('browser.searchPage');
+    expect(JSON.stringify(requestBody)).toContain('browser.inspectRegion');
   });
 
   it('compiles the GitHub release workflow into executable research and Desktop requirements', async () => {
@@ -911,7 +912,7 @@ describe('LM Studio AI adapters', () => {
     ]));
   });
 
-  it('forces a browserResearch worker to extract content instead of accepting done', async () => {
+  it('does not inject queryless extraction when a legacy browser worker hands control back', async () => {
     const provider = createOpenAICompatible({
       name: 'lmstudio',
       baseURL: 'http://localhost:1234/v1',
@@ -994,12 +995,12 @@ describe('LM Studio AI adapters', () => {
       },
     });
 
-    expect(executed).toEqual(['browser.extractText']);
-    expect(result.actions[0]?.tool).toBe('browser.extractText');
+    expect(executed).toEqual([]);
+    expect(result.actions).toEqual([]);
     expect(result.status).toBe('completed');
   });
 
-  it('continues from a redirect target instead of navigating the source URL again', async () => {
+  it('does not force page extraction or navigation after a legacy worker reports done', async () => {
     const provider = createOpenAICompatible({
       name: 'lmstudio',
       baseURL: 'http://localhost:1234/v1',
@@ -1087,8 +1088,8 @@ describe('LM Studio AI adapters', () => {
       },
     });
 
-    expect(executed).toEqual(['browser.navigate', 'browser.extractText']);
-    expect(result.actions.map(action => action.tool)).toEqual(executed);
+    expect(executed).toEqual([]);
+    expect(result.actions).toEqual([]);
     expect(result.status).toBe('completed');
   });
 

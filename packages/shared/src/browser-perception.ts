@@ -7,7 +7,10 @@ import type {
 export interface IndexedBrowserRegion extends BrowserPageRegion {
   searchText: string;
   tableHeaders?: string[];
+  formLabels?: string[];
   domOrder: number;
+  /** Internal DOM ancestry used to suppress overlapping search results. */
+  ancestorRefs?: string[];
 }
 
 const STOP_WORDS = new Set([
@@ -29,59 +32,167 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function overlapRatio(needles: readonly string[], haystack: ReadonlySet<string>): number {
-  if (needles.length === 0) return 0;
-  return needles.reduce((count, token) => count + Number(haystack.has(token)), 0) / needles.length;
+function weightedCoverage(
+  queryTokens: readonly string[],
+  fieldTokens: ReadonlySet<string>,
+  inverseDocumentFrequency: ReadonlyMap<string, number>,
+): number {
+  if (queryTokens.length === 0) return 0;
+  const totalWeight = queryTokens.reduce((sum, token) => sum + (inverseDocumentFrequency.get(token) ?? 1), 0);
+  if (totalWeight === 0) return 0;
+  const matchedWeight = queryTokens.reduce((sum, token) => (
+    sum + (fieldTokens.has(token) ? inverseDocumentFrequency.get(token) ?? 1 : 0)
+  ), 0);
+  return matchedWeight / totalWeight;
 }
 
-export function scorePageRegion(query: string, region: IndexedBrowserRegion): number {
-  const queryTokens = [...new Set(usefulTokens(query))];
+function makeIdf(
+  regions: readonly IndexedBrowserRegion[],
+  queryTokens: readonly string[],
+): Map<string, number> {
+  const documentFrequency = new Map(queryTokens.map(token => [token, 0]));
+  for (const region of regions) {
+    const fields = new Set([
+      ...tokens(region.searchText),
+      ...usefulTokens(region.heading ?? ""),
+      ...usefulTokens((region.tableHeaders ?? []).join(" ")),
+      ...usefulTokens((region.formLabels ?? []).join(" ")),
+    ]);
+    for (const token of queryTokens) {
+      if (fields.has(token)) documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);
+    }
+  }
+  const count = Math.max(1, regions.length);
+  return new Map(queryTokens.map(token => {
+    const frequency = documentFrequency.get(token) ?? 0;
+    return [token, Math.log((count - frequency + 0.5) / (frequency + 0.5) + 1)];
+  }));
+}
+
+function scoreWithIdf(
+  queryTokens: readonly string[],
+  region: IndexedBrowserRegion,
+  inverseDocumentFrequency: ReadonlyMap<string, number>,
+  averageDocumentLength: number,
+): number {
   if (queryTokens.length === 0) return 0;
 
   const bodyTokens = tokens(region.searchText);
   const bodySet = new Set(bodyTokens);
-  const querySet = new Set(queryTokens);
   const headingTokens = usefulTokens(region.heading ?? "");
   const headingSet = new Set(headingTokens);
   const headerText = (region.tableHeaders ?? []).join(" ");
-  const headerTokens = usefulTokens(headerText);
-  const headerSet = new Set(headerTokens);
-  const coverage = overlapRatio(queryTokens, bodySet);
-  const headingMatch = overlapRatio(queryTokens, headingSet);
-  const headerMatch = overlapRatio(queryTokens, headerSet);
-  if (coverage === 0 && headingMatch === 0 && headerMatch === 0) return 0;
+  const headerSet = new Set(usefulTokens(headerText));
+  const formLabelText = (region.formLabels ?? []).join(" ");
+  const formLabelSet = new Set(usefulTokens(formLabelText));
+  const bodyCoverage = weightedCoverage(queryTokens, bodySet, inverseDocumentFrequency);
+  const headingMatch = weightedCoverage(queryTokens, headingSet, inverseDocumentFrequency);
+  const headerMatch = weightedCoverage(queryTokens, headerSet, inverseDocumentFrequency);
+  const formLabelMatch = weightedCoverage(queryTokens, formLabelSet, inverseDocumentFrequency);
+  if (bodyCoverage === 0 && headingMatch === 0 && headerMatch === 0 && formLabelMatch === 0) return 0;
 
-  const positions = new Map<string, number[]>();
   const frequencies = new Map<string, number>();
+  const positions = new Map<string, number>();
   for (let index = 0; index < bodyTokens.length; index += 1) {
     const token = bodyTokens[index]!;
-    if (!querySet.has(token)) continue;
+    if (!inverseDocumentFrequency.has(token)) continue;
     frequencies.set(token, (frequencies.get(token) ?? 0) + 1);
-    const found = positions.get(token) ?? [];
-    if (found.length < 8) found.push(index);
-    positions.set(token, found);
+    if (!positions.has(token)) positions.set(token, index);
   }
-  const firstHits = queryTokens.flatMap(token => positions.get(token)?.slice(0, 1) ?? []);
+  const idfTotal = queryTokens.reduce((sum, token) => sum + (inverseDocumentFrequency.get(token) ?? 0), 0);
+  const k1 = 1.2;
+  const b = 0.75;
+  const lengthRatio = bodyTokens.length / Math.max(1, averageDocumentLength);
+  const bm25 = queryTokens.reduce((sum, token) => {
+    const frequency = frequencies.get(token) ?? 0;
+    if (frequency === 0) return sum;
+    const idf = inverseDocumentFrequency.get(token) ?? 0;
+    const normalizedFrequency = frequency * (k1 + 1) / (frequency + k1 * (1 - b + b * lengthRatio));
+    return sum + idf * normalizedFrequency;
+  }, 0);
+  const bm25Coverage = idfTotal === 0 ? 0 : clamp(bm25 / (idfTotal * (k1 + 1)), 0, 1);
+  const firstHits = queryTokens.flatMap(token => {
+    const position = positions.get(token);
+    return position === undefined ? [] : [position];
+  });
   const spread = firstHits.length < 2 ? 0 : Math.max(...firstHits) - Math.min(...firstHits);
-  const proximity = firstHits.length < 2 ? 0.5 : 1 / (1 + spread / (queryTokens.length * 8));
-  const normalizedQuery = usefulTokens(query).join(" ");
-  const headingPhrase = usefulTokens(region.heading ?? "").join(" ").includes(normalizedQuery);
-  const headerPhrase = usefulTokens(headerText).join(" ").includes(normalizedQuery);
-  const termFrequency = queryTokens.reduce((sum, token) => {
-    return sum + Math.min(1, Math.log1p(frequencies.get(token) ?? 0) / 3);
-  }, 0) / queryTokens.length;
-  const tableHeaderBoost = region.kind === "table" && headerMatch >= 0.5 ? 0.08 : 0;
+  const proximity = firstHits.length < 2 ? 0.45 : 1 / (1 + spread / (queryTokens.length * 8));
+  const normalizedQuery = queryTokens.join(" ");
+  const headingPhrase = normalizedQuery.length > 0 && headingTokens.join(" ").includes(normalizedQuery);
+  const headerPhrase = normalizedQuery.length > 0 && usefulTokens(headerText).join(" ").includes(normalizedQuery);
+  const formLabelPhrase = normalizedQuery.length > 0 && usefulTokens(formLabelText).join(" ").includes(normalizedQuery);
+
+  // The body contributes most of the score. Distinctive terms weigh more
+  // through IDF, while headings and especially table headers carry stronger
+  // information-density signals than incidental prose.
+  const semanticBoost = region.kind === "table"
+    ? headerMatch > 0 ? 0.18 + headerMatch * 0.1 : 0
+    : region.kind === "form"
+      ? formLabelMatch > 0 ? 0.18 + formLabelMatch * 0.08 : 0
+      : region.kind === "article"
+        ? headingMatch > 0 ? 0.08 : 0
+        : region.kind === "section"
+          ? headingMatch > 0 ? 0.06 : 0
+          : region.kind === "list" && bodyCoverage > 0 ? 0.04 : 0;
   const score = (
-    coverage * 0.42
-    + headingMatch * 0.18
-    + headerMatch * 0.16
-    + proximity * 0.08
-    + termFrequency * 0.08
+    bodyCoverage * 0.3
+    + bm25Coverage * 0.12
+    + headingMatch * 0.24
+    + headerMatch * 0.32
+    + formLabelMatch * 0.32
+    + proximity * 0.04
     + Number(headingPhrase) * 0.04
-    + Number(headerPhrase) * 0.04
-    + tableHeaderBoost
+    + Number(headerPhrase) * 0.06
+    + Number(formLabelPhrase) * 0.08
+    + semanticBoost
   );
   return Number(clamp(score, 0, 1).toFixed(3));
+}
+
+export function scorePageRegion(query: string, region: IndexedBrowserRegion): number {
+  const queryTokens = [...new Set(usefulTokens(query))];
+  const idf = makeIdf([region], queryTokens);
+  const averageLength = tokens(region.searchText).length;
+  return scoreWithIdf(queryTokens, region, idf, averageLength);
+}
+
+function matchedQueryTerms(region: IndexedBrowserRegion, queryTokens: readonly string[]): Set<string> {
+  const terms = new Set([
+    ...tokens(region.searchText),
+    ...usefulTokens(region.heading ?? ""),
+    ...usefulTokens((region.tableHeaders ?? []).join(" ")),
+    ...usefulTokens((region.formLabels ?? []).join(" ")),
+  ]);
+  return new Set(queryTokens.filter(token => terms.has(token)));
+}
+
+function semanticallyMoreSpecific(left: IndexedBrowserRegion, right: IndexedBrowserRegion): boolean {
+  const specificity: Record<BrowserRegionKind, number> = {
+    table: 7,
+    form: 7,
+    article: 6,
+    list: 5,
+    heading: 5,
+    section: 4,
+    text: 3,
+    navigation: 2,
+    aside: 2,
+    footer: 1,
+  };
+  return specificity[left.kind] > specificity[right.kind];
+}
+
+function nestedDuplicate(
+  candidate: IndexedBrowserRegion,
+  current: IndexedBrowserRegion,
+  candidateTerms: ReadonlySet<string>,
+  currentTerms: ReadonlySet<string>,
+): boolean {
+  const nested = candidate.ancestorRefs?.includes(current.ref) || current.ancestorRefs?.includes(candidate.ref);
+  if (!nested || candidateTerms.size === 0 || currentTerms.size === 0) return false;
+  const common = [...candidateTerms].filter(token => currentTerms.has(token)).length;
+  const overlap = common / Math.min(candidateTerms.size, currentTerms.size);
+  return overlap >= 0.8;
 }
 
 export function rankPageRegions(input: {
@@ -91,14 +202,45 @@ export function rankPageRegions(input: {
   maxResults?: number;
 }): { indexedRegionCount: number; results: BrowserSearchResult[] } {
   const kinds = input.kinds ? new Set(input.kinds) : undefined;
-  const maxResults = clamp(Math.trunc(input.maxResults ?? 8), 1, 20);
-  const results = input.regions
+  const maxResults = clamp(Math.trunc(input.maxResults ?? 5), 1, 20);
+  const queryTokens = [...new Set(usefulTokens(input.query))];
+  const inverseDocumentFrequency = makeIdf(input.regions, queryTokens);
+  const averageDocumentLength = input.regions.length === 0 ? 0 : input.regions.reduce(
+    (total, region) => total + tokens(region.searchText).length,
+    0,
+  ) / input.regions.length;
+  const ranked = input.regions
     .filter(region => kinds === undefined || kinds.has(region.kind))
-    .map(region => ({ region, score: scorePageRegion(input.query, region) }))
+    .map(region => ({
+      region,
+      score: scoreWithIdf(queryTokens, region, inverseDocumentFrequency, averageDocumentLength),
+      terms: matchedQueryTerms(region, queryTokens),
+    }))
     .filter(item => item.score > 0)
-    .sort((left, right) => right.score - left.score || left.region.domOrder - right.region.domOrder)
-    .slice(0, maxResults)
-    .map(({ region, score }) => ({
+    .sort((left, right) => right.score - left.score || left.region.domOrder - right.region.domOrder);
+  const selected: typeof ranked = [];
+  for (const candidate of ranked) {
+    const duplicateIndex = selected.findIndex(current => nestedDuplicate(
+      candidate.region,
+      current.region,
+      candidate.terms,
+      current.terms,
+    ));
+    if (duplicateIndex < 0) {
+      selected.push(candidate);
+      continue;
+    }
+    const current = selected[duplicateIndex]!;
+    const candidateIsSpecific = semanticallyMoreSpecific(candidate.region, current.region);
+    const currentIsSpecific = semanticallyMoreSpecific(current.region, candidate.region);
+    if (candidateIsSpecific && candidate.score >= current.score * 0.55) {
+      selected.splice(duplicateIndex, 1, candidate);
+    } else if (!currentIsSpecific && candidate.score > current.score) {
+      selected.splice(duplicateIndex, 1, candidate);
+    }
+  }
+  selected.sort((left, right) => right.score - left.score || left.region.domOrder - right.region.domOrder);
+  const results = selected.slice(0, maxResults).map(({ region, score }) => ({
       ref: region.ref,
       kind: region.kind,
       ...(region.heading ? { heading: region.heading } : {}),
@@ -157,7 +299,7 @@ export function extractRelevantPassages(input: {
   maxChars: number;
   maxResults?: number;
 }): { text: string; matches: number; truncated: boolean } {
-  const maxChars = clamp(Math.trunc(input.maxChars), 1, 100_000);
+  const maxChars = clamp(Math.trunc(input.maxChars), 1, 8_000);
   const maxResults = clamp(Math.trunc(input.maxResults ?? 8), 1, 20);
   const ranked = passagePieces(input.text, input.query)
     .filter(passage => passage.score > 0)
@@ -189,7 +331,7 @@ export function extractRelevantPassages(input: {
 }
 
 export function sampleReadableText(text: string, maxChars: number): { text: string; truncated: boolean } {
-  const limit = clamp(Math.trunc(maxChars), 1, 100_000);
+  const limit = clamp(Math.trunc(maxChars), 1, 8_000);
   const normalized = text.replace(/\r\n?/gu, "\n").trim();
   if (normalized.length <= limit) return { text: normalized, truncated: false };
   if (limit <= 3) return { text: normalized.slice(0, limit), truncated: true };

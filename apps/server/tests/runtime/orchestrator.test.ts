@@ -105,7 +105,7 @@ function runtimeFor(
 }
 
 describe('orchestrated agent loop', () => {
-  it('gives browserResearch a deterministic navigate-then-extract action', () => {
+  it('navigates explicit destinations but leaves semantic page retrieval to the model', () => {
     const task = taskWithRequirements({
       id: 'deterministic-browser-research',
       requirements: [
@@ -115,18 +115,19 @@ describe('orchestrated agent loop', () => {
     });
     const state = createTaskState(task);
     const research = objectiveForRequirement(state, { timestamp: 1, task: { completedCriteria: [], remainingCriteria: ['browserResearch'] } }, 'browserResearch');
-    if (!research) throw new Error('Expected a browser research objective.');
+    const destination = objectiveForRequirement(state, { timestamp: 1, task: { completedCriteria: [], remainingCriteria: ['browserDestination'] } }, 'browserDestination');
+    if (!research || !destination) throw new Error('Expected browser objectives.');
 
     expect(deterministicObjectiveAction(state, {
       timestamp: 1,
       browser: { url: 'https://twlite.dev', loaded: true },
       task: { completedCriteria: [], remainingCriteria: ['browserResearch'] },
-    }, research)).toMatchObject({ tool: 'browser.extractText', input: {} });
+    }, research)).toBeUndefined();
     expect(deterministicObjectiveAction(state, {
       timestamp: 1,
       browser: { url: 'about:blank', loaded: true },
       task: { completedCriteria: [], remainingCriteria: ['browserDestination', 'browserResearch'] },
-    }, research)).toMatchObject({ tool: 'browser.navigate', input: { url: 'https://twlite.dev' } });
+    }, destination)).toMatchObject({ tool: 'browser.navigate', input: { url: 'https://twlite.dev' } });
   });
 
   it('treats a successful redirect as the requested browser destination', async () => {
@@ -281,7 +282,7 @@ describe('orchestrated agent loop', () => {
     const guest = new MockGuestTransport();
     const worker = new FunctionalWorker([async context => {
       const navigate = await executeAction(context, 'browser.navigate', { url: 'https://github.com/oven-sh/bun' }, 'navigate');
-      const extract = await executeAction(context, 'browser.extractText', {}, 'extract');
+      const extract = await executeAction(context, 'browser.extractText', { query: 'repository information' }, 'extract');
       return {
         status: 'completed', worker: 'browser', objectiveId: context.objective.id,
         actions: [navigate, extract], facts: [], evidence: [], artifacts: [], blockers: [], environmentChanged: true,
@@ -383,7 +384,7 @@ describe('orchestrated agent loop', () => {
     const worker = new FunctionalWorker([
       async context => {
         const navigate = await executeAction(context, 'browser.navigate', { url: releaseUrl }, 'navigate');
-        const extract = await executeAction(context, 'browser.extractText', {}, 'extract');
+        const extract = await executeAction(context, 'browser.extractText', { query: 'bun v1.2.3 released 2026-09-20' }, 'extract');
         const evidence = extract.result.evidence as { receipt?: { id: string } };
         const evidenceId = evidence.receipt?.id ?? 'missing-receipt';
         return {
@@ -447,7 +448,7 @@ describe('orchestrated agent loop', () => {
     const worker = new FunctionalWorker([
       async context => {
         const navigate = await executeAction(context, 'browser.navigate', { url: releaseUrl }, 'navigate');
-        const extract = await executeAction(context, 'browser.extractText', {}, 'extract');
+        const extract = await executeAction(context, 'browser.extractText', { query: 'latest release version' }, 'extract');
         const evidenceId = typeof extract.result.evidence === 'object' && extract.result.evidence !== null && 'receipt' in extract.result.evidence
           ? (extract.result.evidence.receipt as { id: string }).id
           : 'missing-receipt';
@@ -649,7 +650,7 @@ describe('orchestrated agent loop', () => {
         return { status: 'completed', worker: 'browser', objectiveId: context.objective.id, actions: [action], facts: [fact('latestReleaseVersion', 'v0.0.0', evidence.receipt?.id ?? 'missing')], evidence: [], artifacts: [], blockers: [], environmentChanged: true };
       },
       async context => {
-        const action = await executeAction(context, 'browser.extractText', {}, 'read');
+        const action = await executeAction(context, 'browser.extractText', { query: 'v9.9.9' }, 'read');
         const evidence = action.result.evidence as { receipt?: { id: string } };
         return { status: 'completed', worker: 'browser', objectiveId: context.objective.id, actions: [action], facts: [fact('latestReleaseVersion', 'v9.9.9', evidence.receipt?.id ?? 'missing')], evidence: [], artifacts: [], blockers: [], environmentChanged: true };
       },

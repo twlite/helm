@@ -115,6 +115,31 @@ function requestTools(request: CapturedRequest): string[] {
 }
 
 describe('native acting agent', () => {
+  it('exposes only query-targeted, bounded text extraction to the acting model', async () => {
+    const guest = new MockGuestTransport();
+    const requests: CapturedRequest[] = [];
+    const { runtime, tools } = createRuntime(guest, [
+      toolReply('catalog-complete', 'helm.complete', { response: 'Ready.', requiredEffects: [] }),
+    ], requests);
+
+    const result = await runtime.run({ threadId: 'browser-catalog', userMessage: 'Find useful information on a webpage.' });
+
+    expect(result.status).toBe('completed');
+    const definitions = requests[0]!.body.tools as Array<{ function?: { name?: string; parameters?: Record<string, unknown> } }>;
+    const extractDefinition = definitions.find(definition => definition.function?.name === 'browser.extractText');
+    expect(extractDefinition).toBeDefined();
+    const parameters = extractDefinition!.function!.parameters!;
+    const properties = parameters.properties as Record<string, Record<string, unknown>>;
+    expect(properties).toHaveProperty('query');
+    expect(properties).not.toHaveProperty('mode');
+    expect(properties.maxChars?.maximum).toBe(8_000);
+    expect(parameters.required).toContain('query');
+
+    const rejected = await tools.execute('browser.extractText', { query: 'exchange rates', mode: 'full' });
+    expect(rejected).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+    expect(guest.browser.url).toBeUndefined();
+  });
+
   it('answers a conversational poem request without invoking computer tools', async () => {
     const guest = new MockGuestTransport();
     const requests: CapturedRequest[] = [];
@@ -242,7 +267,7 @@ describe('native acting agent', () => {
     const response = `The profile currently shows ${followerCount} followers.`;
     const { runtime, tools } = createRuntime(guest, [
       toolReply('followers-nav', 'browser.navigate', { url: profileUrl }),
-      toolReply('followers-text', 'browser.extractText', {}),
+      toolReply('followers-text', 'browser.extractText', { query: 'followers count' }),
       toolReply('followers-complete', 'helm.complete', {
         response,
         requiredEffects: [{ tool: 'browser.navigate' }, { tool: 'browser.extractText' }],
@@ -325,7 +350,7 @@ describe('native acting agent', () => {
     const requests: CapturedRequest[] = [];
     const { runtime, tools } = createRuntime(guest, [
       toolReply('profile-nav', 'browser.navigate', { url: profileUrl }),
-      toolReply('profile-text', 'browser.extractText', {}),
+      toolReply('profile-text', 'browser.extractText', { query: 'followers pinned repository detail' }),
       toolReply('portfolio-write', 'fs.write', { path: 'twlite.html', content: portfolio }),
       toolReply('portfolio-complete', 'helm.complete', {
         response: 'Created twlite.html using the observed profile information.',
@@ -376,7 +401,7 @@ describe('native acting agent', () => {
       let tools: ReturnType<typeof createGuestToolRegistry> | undefined;
       const { runtime, tools: runtimeTools } = createRuntime(guest, [
         toolReply('acme-nav', 'browser.navigate', { url: sourceUrl }),
-        toolReply('acme-text', 'browser.extractText', {}),
+        toolReply('acme-text', 'browser.extractText', { query: 'published benchmark value' }),
         () => {
           const evidenceIds = tools?.invocations.flatMap(invocation => {
             const result = invocation.result;

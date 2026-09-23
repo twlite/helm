@@ -42,9 +42,10 @@ There is no unrestricted host shell tool.
 The prompt is intentionally short. It establishes Helm's role, says to use
 actual results and not claim unverified effects, and tells the model how to
 finish. It does not prescribe browser sequences, artifact formats, or domain
-facts. For browser tasks, the model has bounded outline, local page search, and
-region inspection tools; it can use query extraction or explicit full-page
-extraction when those are needed.
+facts. For browser tasks, it recommends a bounded outline, local semantic
+region search, and region inspection. Targeted text extraction requires a
+query and has a fixed 8,000-character maximum; the model has no full-page
+extraction mode.
 
 ## Completion and concrete evidence
 
@@ -64,9 +65,12 @@ is semantically good.
 
 Guest calls produce action receipts with real success/failure and available
 effects such as navigation, filesystem changes, downloads, and desktop state.
-Run steps persist tool names, inputs, results, and receipts. Tool output sent
-back to the model is bounded; it keeps useful data and the receipt while
-dropping duplicate boundary snapshots. Repeated identical actions without a
+Run steps persist tool names, inputs, results, and receipts. Before context is
+estimated or passed to the model, tool results receive a 24,000-character
+last-resort bound, with string and array limits that preserve structured fields
+such as table columns, row counts, and truncation state. Browser tools already
+apply tighter retrieval limits; this context cap handles unexpected results.
+Duplicate boundary snapshots are dropped. Repeated identical actions without a
 concrete state change, tool failures, model steps, and tool execution time are
 bounded. Cancellation is passed through to both model and guest calls.
 
@@ -74,11 +78,21 @@ bounded. Cancellation is passed through to both model and guest calls.
 
 Ordinary environment reads do not fetch page text or a snapshot. They carry
 only URL, title, loading state, page count, and DOM revision. The model chooses
-when to request the bounded page outline, search visible regions with lexical
-ranking, and inspect a matching region. Tables are returned as bounded column
-and row arrays. `browser.extractText` remains available for pages whose
-structure is insufficient; queryless output is small by default and a full
-read requires `mode: "full"` with an explicit character limit.
+when to request the bounded page outline, search visible regions with local
+lexical ranking, and inspect a matching region. The guest indexes semantic DOM
+regions and sends bounded query-hit windows to its local ranker instead of
+sending the complete `body.innerText`. Ranking combines IDF/BM25-like body
+relevance with heading, table-header, and form-label field boosts, phrase and
+proximity signals, and semantic region kinds. Nested matches with substantially
+overlapping query terms are deduplicated in favor of the more specific useful
+region.
+
+Tables are returned as structured columns and rows. Inspection defaults to an
+8,000-character response and 50 rows; `offset` and `limit` paginate larger
+tables, which report total row count, returned row count, offset, and
+truncation. `browser.extractText` is a bounded fallback that requires a focused
+query, searches the semantic region index, and returns at most 8,000 characters.
+There is no acting-agent path for a whole-page text dump.
 
 Semantic region and element refs are tied to the observed DOM revision. A
 navigation or meaningful DOM mutation expires them, and the guest returns a
@@ -129,9 +143,10 @@ the complete lifecycle and ranking details.
   the isolated VM.
 
 The older planner, orchestrator, and worker interfaces remain for scripted
-compatibility tests and the deterministic demo. `createAiRuntime` does not
-instantiate them. Legacy state and verification utilities are not on the
-production AI execution path.
+compatibility tests and the deterministic demo. Their previous queryless
+whole-page extraction rewrites have been removed. `createAiRuntime` uses the
+native acting-agent path; legacy state and verification utilities do not
+influence its tool catalog or execution.
 
 ## Current limits
 
@@ -140,6 +155,8 @@ OpenAI-compatible function definitions and return function calls. Helm does
 not fall back to synthetic JSON tool calling. Tool output is bounded to protect
 the model context, and the acting model supplies the effect list used by the
 generic completion check. The runtime verifies that list against receipts; it
-does not independently infer task meaning.
+does not independently infer task meaning. Local lexical ranking uses the
+visible page DOM and does not handle content available only after client-side
+actions the model has not taken.
 
 Behavior-focused tests live in `apps/server/tests/runtime/acting-agent.test.ts`.

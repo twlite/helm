@@ -245,4 +245,60 @@ describe('model context management', () => {
     const next = await prepareModelContext({ ...input, exchanges: result.exchanges });
     expect(next.compaction).toBeUndefined();
   });
+
+  it('bounds an unexpectedly large structured browser result while preserving table metadata', async () => {
+    const currentRequest = 'Read the relevant table rows.';
+    const oversized = toolExchange({
+      tool: 'browser.inspectRegion',
+      args: { ref: 'r3-1', format: 'table' },
+      data: {
+        url: 'https://example.test/data',
+        title: 'Data',
+        revision: 3,
+        ref: 'r3-1',
+        kind: 'table',
+        format: 'table',
+        columns: ['Code', 'Description'],
+        rows: Array.from({ length: 500 }, (_, index) => [`Item ${index}`, 'Long cell value. '.repeat(80)]),
+        rowCount: 500,
+        returnedRowCount: 500,
+        offset: 0,
+        columnCount: 2,
+        truncated: false,
+      },
+      receiptId: 'ev-large-table',
+    });
+    const result = await prepareModelContext({
+      exchanges: groupConversation([{ role: 'user', content: currentRequest }], currentRequest).concat(oversized),
+      instructions: 'Use structured page regions.',
+      currentRequest,
+      toolDescription: 'browser tools',
+      budget: {
+        contextWindowTokens: 100_000,
+        contextCompactAtRatio: 0.8,
+        contextCriticalAtRatio: 0.95,
+        contextRecentExchanges: 4,
+        contextCriticalRecentExchanges: 2,
+      },
+      compactionCount: 0,
+      summarize: async () => { throw new Error('No compaction expected.'); },
+    });
+    const serialized = JSON.stringify(result.exchanges);
+    const output = result.exchanges.flatMap(exchange => exchange.messages)
+      .flatMap(message => (message as unknown as { content?: Array<Record<string, unknown>> }).content ?? [])
+      .find(part => part.type === 'tool-result')?.output as { type?: string; value?: { data?: Record<string, unknown> } } | undefined;
+    const data = output?.value?.data;
+
+    expect(serialized.length).toBeLessThan(30_000);
+    expect(JSON.stringify(output).length).toBeLessThanOrEqual(24_000);
+    expect(data).toMatchObject({
+      columns: ['Code', 'Description'],
+      rowCount: 500,
+      columnCount: 2,
+      truncated: true,
+      contextTruncated: true,
+    });
+    expect(data?.rows).toHaveLength(data?.returnedRowCount as number);
+    expect((data?.rows as unknown[]).length).toBeLessThan(500);
+  });
 });

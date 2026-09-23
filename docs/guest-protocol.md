@@ -36,21 +36,30 @@ visible semantic regions plus a bounded list of interactive elements and their
 roles, accessible names, values, links, enabled state, checked state, and
 selected state. Region previews do not contain the full region content.
 
-`browser.searchPage` performs local lexical ranking over visible regions in the
-current page. It considers query-token overlap, heading and table-header
-matches, term proximity, and region order, then returns a bounded set of
-matching refs and previews. `browser.inspectRegion` reads one selected region
-as bounded text, local links, or structured table columns and rows.
+`browser.searchPage` performs local lexical ranking over visible semantic
+regions in the current page. The guest builds bounded query-hit windows inside
+those regions, then scores body text with BM25-like IDF weighting and field
+boosts for headings, table headers, and form labels. Phrase, proximity, region
+kind, and DOM ancestry also affect ranking. Nested matches with substantially
+overlapping query terms are deduplicated in favor of a more specific useful
+region. The default is five results.
+
+`browser.inspectRegion` reads one selected region as bounded text, local links,
+or structured table columns and rows. Text responses default to 8,000
+characters. Table responses default to 50 rows and accept `offset` and `limit`
+for pagination; they report total row count, returned row count, offset, and
+whether additional content remains.
 
 Region and interactive element refs include the DOM revision, for example
 `r12-8` or `e12-3`. Navigation or a detected DOM mutation invalidates refs from
 the previous revision; using one returns a stale-ref error. The model should
 request a fresh snapshot or search result after that error.
 
-`browser.extractText` is the fallback for pages whose structure is not enough.
-Query mode ranks matching passages across the page. Without a query it samples
-readable content and defaults to 8,000 characters. A full read requires
-`{"mode":"full","maxChars":...}` and remains capped at 100,000 characters.
+`browser.extractText` requires a non-empty query and is a bounded fallback for
+pages whose semantic regions are insufficient. It searches the same semantic
+region index, defaults to 6,000 characters, and accepts at most 8,000
+characters. There is no `mode: "full"` parameter and no acting-agent method
+that returns an entire page text dump.
 
 `browser.download` accepts a semantic element ref or an explicit URL. The guest
 waits for Playwright's download event and returns the source URL, final URL,

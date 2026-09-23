@@ -55,13 +55,14 @@ export const guestMethodSchemas = {
   'browser.inspectRegion': z.object({
     ref: z.string().regex(/^r\d+-[1-9]\d*$/u),
     format: z.enum(['auto', 'text', 'table', 'links']).optional(),
-    maxChars: z.number().int().min(1_000).max(20_000).optional(),
+    maxChars: z.number().int().min(1_000).max(12_000).optional(),
+    offset: z.number().int().min(0).max(1_000_000).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
   }),
   'browser.extractText': z.object({
-    query: z.string().trim().min(1).max(1_000).optional(),
-    maxChars: z.number().int().min(1).max(100_000).optional(),
-    mode: z.enum(['relevant', 'full']).optional(),
-  }),
+    query: z.string().trim().min(1).max(1_000),
+    maxChars: z.number().int().min(1).max(8_000).optional(),
+  }).strict(),
   'browser.download': z.object({
     ref: z.string().min(1).optional(),
     url: z.string().min(1).optional(),

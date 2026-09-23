@@ -152,20 +152,23 @@ export class GuestRuntime {
       }
       case "browser.inspectRegion":
         return this.browser.inspectRegion((() => {
-          const maxChars = optionalInteger(params, "maxChars", { min: 1_000, max: 20_000 });
+          const maxChars = optionalInteger(params, "maxChars", { min: 1_000, max: 12_000 });
+          const offset = optionalInteger(params, "offset", { min: 0, max: 1_000_000 });
+          const limit = optionalInteger(params, "limit", { min: 1, max: 100 });
           return {
             ref: requiredString(params, "ref", { maxLength: 64 }),
             format: enumValue(params, "format", ["auto", "text", "table", "links"] as const, "auto"),
             ...(maxChars === undefined ? {} : { maxChars }),
+            ...(offset === undefined ? {} : { offset }),
+            ...(limit === undefined ? {} : { limit }),
           };
         })());
       case "browser.extractText": {
-        const query = optionalString(params, "query", { maxLength: 1_000 });
-        const maxChars = optionalInteger(params, "maxChars", { min: 1, max: 100_000 });
+        const query = requiredString(params, "query", { maxLength: 1_000 });
+        const maxChars = optionalInteger(params, "maxChars", { min: 1, max: 8_000 });
         return this.browser.extractText({
-          ...(query === undefined ? {} : { query }),
+          query,
           ...(maxChars === undefined ? {} : { maxChars }),
-          mode: enumValue(params, "mode", ["relevant", "full"] as const, "relevant"),
         });
       }
       case "browser.download":

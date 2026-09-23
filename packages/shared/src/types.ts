@@ -583,6 +583,8 @@ export type BrowserRegionInspection =
       columns: string[];
       rows: string[][];
       rowCount: number;
+      returnedRowCount: number;
+      offset: number;
       columnCount: number;
       truncated: boolean;
     }

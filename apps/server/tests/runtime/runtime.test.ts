@@ -8,6 +8,7 @@ import { ScriptedDecisionProvider } from '../../src/agent/planner';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
 import { createGuestToolRegistry } from '../../src/tools/guest-tools';
 import {
+  DEMO_PAGE_TEXT,
   DEMO_PAGE_URL,
   MockGuestTransport,
 } from '../../src/tools/mock-guest-transport';
@@ -15,7 +16,7 @@ import { createScriptedDemo } from '../../src/agent/demo';
 import { ToolRegistry } from '../../src/tools/tool-registry';
 
 describe('AgentRuntime', () => {
-  it('completes a browser research task only after extracting readable page content', async () => {
+  it('completes browser research after a model-selected targeted extraction', async () => {
     const guest = new MockGuestTransport();
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
@@ -25,7 +26,7 @@ describe('AgentRuntime', () => {
       verifier,
       decisionProvider: new ScriptedDecisionProvider([
         { type: 'action', tool: 'browser.navigate', input: { url: 'https://www.google.com/search?q=example' } },
-        { type: 'complete' },
+        { type: 'action', tool: 'browser.extractText', input: { query: 'mock page' } },
         { type: 'complete' },
       ]),
     });
@@ -47,7 +48,7 @@ describe('AgentRuntime', () => {
     expect(result.finalVerification?.complete).toBe(true);
   });
 
-  it('inspects a loaded search page instead of repeating or reopening its navigation', async () => {
+  it('uses explicit semantic search and targeted reads without runtime-injected extraction', async () => {
     const guest = new MockGuestTransport();
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
@@ -55,14 +56,9 @@ describe('AgentRuntime', () => {
     const resultUrl = 'https://neplextech.com/projects';
     const provider = new ScriptedDecisionProvider([
       { type: 'action', tool: 'browser.navigate', input: { url: searchUrl } },
-      // The runtime turns this search-engine home navigation into an extract.
-      { type: 'action', tool: 'browser.navigate', input: { url: 'https://duckduckgo.com' } },
-      // Once the result page has been read, the runtime exposes its links with
-      // a semantic snapshot instead of allowing another search cycle.
-      { type: 'action', tool: 'browser.navigate', input: { url: searchUrl } },
+      { type: 'action', tool: 'browser.searchPage', input: { query: 'Neplex Technologies projects' } },
       { type: 'action', tool: 'browser.navigate', input: { url: resultUrl } },
-      // The runtime reads the result page before allowing completion.
-      { type: 'complete' },
+      { type: 'action', tool: 'browser.extractText', input: { query: 'projects made by Neplex Technologies' } },
       { type: 'complete' },
     ]);
     const runtime = new AgentRuntime({
@@ -86,8 +82,9 @@ describe('AgentRuntime', () => {
       { url: searchUrl },
       { url: resultUrl },
     ]);
-    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.extractText')).toHaveLength(2);
-    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.snapshot')).toHaveLength(1);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.searchPage')).toHaveLength(1);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.extractText')).toHaveLength(1);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.snapshot')).toHaveLength(0);
   });
 
   it('continues from a redirected page instead of repeating the source URL', async () => {
@@ -105,9 +102,7 @@ describe('AgentRuntime', () => {
       verifier,
       decisionProvider: new ScriptedDecisionProvider([
         { type: 'action', tool: 'browser.navigate', input: { url: sourceUrl } },
-        // This repeated source navigation is rewritten to extractText because
-        // the first navigation already reached its redirect target.
-        { type: 'action', tool: 'browser.navigate', input: { url: sourceUrl } },
+        { type: 'action', tool: 'browser.extractText', input: { query: 'profile image page' } },
         { type: 'complete' },
       ]),
     });
@@ -324,14 +319,10 @@ describe('AgentRuntime', () => {
 
     expect(result.status).toBe('completed');
     expect(result.finalVerification?.complete).toBe(true);
-    expect(demo.guest.getFile('/home/helm/workspace/demo.txt')).toBe(
-      'Helm deterministic demo Helm deterministic demo content.',
-    );
+    expect(demo.guest.getFile('/home/helm/workspace/demo.txt')).toContain(DEMO_PAGE_TEXT);
     const write = demo.tools.invocations.find(invocation => invocation.tool === 'fs.write');
-    expect(write?.input).toEqual({
-      path: '/home/helm/workspace/demo.txt',
-      content: 'Helm deterministic demo Helm deterministic demo content.',
-    });
+    expect(write?.input).toMatchObject({ path: '/home/helm/workspace/demo.txt' });
+    expect((write?.input as { content?: string } | undefined)?.content).toContain(DEMO_PAGE_TEXT);
   });
 
   it('cannot silently accept a premature completion request', async () => {
@@ -399,7 +390,7 @@ describe('AgentRuntime', () => {
     const verifier = new CriterionVerifierRegistry(guest);
     const provider = new ScriptedDecisionProvider([
       { type: 'action', tool: 'browser.navigate', input: { url: 'https://twlite.dev' } },
-      { type: 'action', tool: 'browser.extractText', input: {} },
+      { type: 'action', tool: 'browser.extractText', input: { query: 'page contents' } },
       { type: 'complete' },
     ]);
     const runtime = new AgentRuntime({
@@ -420,14 +411,12 @@ describe('AgentRuntime', () => {
     expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(true);
   });
 
-  it('does not complete a page-information task from URL verification alone', async () => {
+  it('does not infer extra page-reading work from prose in a legacy task', async () => {
     const guest = new MockGuestTransport();
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
     const provider = new ScriptedDecisionProvider([
       { type: 'action', tool: 'browser.navigate', input: { url: 'https://twlite.dev' } },
-      { type: 'complete' },
-      { type: 'action', tool: 'browser.extractText', input: {} },
       { type: 'complete' },
     ]);
     const runtime = new AgentRuntime({
@@ -445,10 +434,10 @@ describe('AgentRuntime', () => {
     });
 
     expect(result.status).toBe('completed');
-    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(true);
+    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(false);
   });
 
-  it('automatically reads an open page when the model completes before extracting it', async () => {
+  it('does not inject queryless extraction when the decision provider completes', async () => {
     const guest = new MockGuestTransport();
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
@@ -473,8 +462,59 @@ describe('AgentRuntime', () => {
     });
 
     expect(result.status).toBe('completed');
-    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(true);
+    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(false);
     expect(result.steps.filter(step => step.phase === 'act' && step.toolName === 'browser.navigate')).toHaveLength(1);
+  });
+
+  it('rejects unrestricted extraction at the runtime boundary with a permissive tool schema', async () => {
+    const guest = new MockGuestTransport();
+    const tools = new ToolRegistry();
+    tools.register({
+      name: 'browser.extractText',
+      description: 'Test-only permissive extraction tool.',
+      inputSchema: z.record(z.string(), z.unknown()),
+      execute: async () => {
+        throw new Error('The unrestricted extraction handler must not run.');
+      },
+    });
+    tools.register({
+      name: 'browser.navigate',
+      description: 'Test navigation so the run can finish after the rejected action.',
+      inputSchema: z.object({ url: z.string() }),
+      execute: async ({ url }) => guest.request('browser.navigate', { url }),
+    });
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier: new CriterionVerifierRegistry(guest),
+      decisionProvider: new ScriptedDecisionProvider([
+        { type: 'action', tool: 'browser.extractText', input: { query: 'forex rates', mode: 'full' } },
+        { type: 'action', tool: 'browser.extractText', input: { query: 'forex rates', maxChars: 100_000 } },
+        { type: 'action', tool: 'browser.navigate', input: { url: 'https://example.com' } },
+        { type: 'complete' },
+      ]),
+    });
+
+    const result = await runtime.run({
+      threadId: 'extraction-guard',
+      userMessage: 'Search for forex rates.',
+      task: {
+        id: 'extraction-guard-task',
+        threadId: 'extraction-guard',
+        goal: 'Search for forex rates.',
+        originalRequest: 'Search for forex rates.',
+        criteria: [{ type: 'browser.url', url: 'example.com' }],
+        requirements: [],
+        constraints: [],
+      },
+    });
+
+    expect(result.status).toBe('completed');
+    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['browser.navigate']);
+    const rejectedExtractions = result.steps.filter(step => step.phase === 'act' && step.toolName === 'browser.extractText');
+    expect(rejectedExtractions).toHaveLength(2);
+    expect(rejectedExtractions.map(step => step.toolResult?.error?.code))
+      .toEqual(['UNSUPPORTED_BROWSER_EXTRACTION', 'UNSUPPORTED_BROWSER_EXTRACTION']);
   });
 
   it('detects repeated actions even when the observed browser state changes', async () => {

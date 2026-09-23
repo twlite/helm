@@ -35,7 +35,7 @@ export function createScriptedDemoDecisions(): ScriptedDecision[] {
     {
       type: 'action',
       tool: 'browser.extractText',
-      input: {},
+      input: { query: 'Helm deterministic demo content' },
       reasoningSummary: 'Extract readable page text from the loaded browser.',
     },
     {
@@ -100,4 +100,3 @@ export function createScriptedDemo(threadId = 'demo-thread'): ScriptedDemo {
 }
 
 export { DEMO_PAGE_PATH, DEMO_PAGE_TEXT, DEMO_PAGE_URL };
-

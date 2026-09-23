@@ -9,9 +9,7 @@ import type {
   BrowserSnapshot as SharedBrowserSnapshot,
 } from "../../../packages/shared/src/types";
 import {
-  extractRelevantPassages,
   rankPageRegions,
-  sampleReadableText,
   type IndexedBrowserRegion,
 } from "../../../packages/shared/src/browser-perception";
 
@@ -121,9 +119,12 @@ const REGION_SELECTOR = [
 const MAX_INDEXED_REGIONS = 1_200;
 const DEFAULT_OUTLINE_REGIONS = 60;
 const MAX_INTERACTIVE_ELEMENTS = 80;
-const DEFAULT_EXTRACT_CHARS = 8_000;
-const MAX_FULL_EXTRACT_CHARS = 100_000;
-const DEFAULT_REGION_CHARS = 12_000;
+const MAX_SEARCH_INDEX_CHARS = 1_024_000;
+const MAX_SEARCH_REGION_CHARS = 800;
+const DEFAULT_EXTRACT_CHARS = 6_000;
+const MAX_EXTRACT_CHARS = 8_000;
+const DEFAULT_REGION_CHARS = 8_000;
+const DEFAULT_TABLE_ROWS = 50;
 const BROWSER_OPERATION_TIMEOUT_MS = 10_000;
 const BROWSER_CONTEXT_RESET_TIMEOUT_MS = 1_000;
 
@@ -204,7 +205,7 @@ export class BrowserController {
   private lastDomMutationCount: number | undefined;
   private references = new Map<string, BrowserReference>();
   private outlineCache: { revision: number; records: PageRegionRecord[]; regionCount: number; truncated: boolean } | undefined;
-  private searchCache: { revision: number; records: PageRegionRecord[]; regionCount: number; truncated: boolean } | undefined;
+  private searchCache: { revision: number; query: string; records: PageRegionRecord[]; regionCount: number; truncated: boolean } | undefined;
 
   constructor(
     private readonly sandbox: GuestSandbox,
@@ -480,7 +481,7 @@ export class BrowserController {
     const revision = this.referenceRevision;
     const url = page.url();
     const title = await this.readTitle(page);
-    const indexed = await this.getRegionRecords(page, true);
+    const indexed = await this.getRegionRecords(page, true, input.query);
     const ranked = rankPageRegions({
       query: input.query,
       regions: indexed.records,
@@ -519,6 +520,8 @@ export class BrowserController {
     ref: string;
     format?: "auto" | "text" | "table" | "links";
     maxChars?: number;
+    offset?: number;
+    limit?: number;
   }): Promise<BrowserRegionInspection> {
     return this.withWatchdog(() => this.inspectRegionInternal(input), "browser.inspectRegion");
   }
@@ -527,13 +530,17 @@ export class BrowserController {
     ref: string;
     format?: "auto" | "text" | "table" | "links";
     maxChars?: number;
+    offset?: number;
+    limit?: number;
   }): Promise<BrowserRegionInspection> {
     const page = await this.ensurePage();
     const reference = await this.resolveReference(input.ref);
     if (reference.kind !== "region" || reference.regionKind === undefined) {
       throw new GuestRpcError("INVALID_REGION_REF", `${input.ref} is not a semantic region ref.`, { httpStatus: 400 });
     }
-    const maxChars = Math.max(1_000, Math.min(20_000, Math.trunc(input.maxChars ?? DEFAULT_REGION_CHARS)));
+    const maxChars = Math.max(1_000, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_REGION_CHARS)));
+    const offset = Math.max(0, Math.min(1_000_000, Math.trunc(input.offset ?? 0)));
+    const limit = Math.max(1, Math.min(100, Math.trunc(input.limit ?? DEFAULT_TABLE_ROWS)));
     const format = input.format ?? "auto";
     const requestedFormat = format === "auto"
       ? reference.regionKind === "table" ? "table" : "text"
@@ -545,6 +552,12 @@ export class BrowserController {
       const maxChars = typeof options === "object" && options !== null && "maxChars" in options
         ? Number((options as { maxChars: number }).maxChars)
         : 12_000;
+      const offset = typeof options === "object" && options !== null && "offset" in options
+        ? Number((options as { offset: number }).offset)
+        : 0;
+      const rowLimit = typeof options === "object" && options !== null && "limit" in options
+        ? Number((options as { limit: number }).limit)
+        : 50;
       const clean = (value: string | null | undefined, max = 1_000) => {
         const normalized = (value ?? "").replace(/\s+/g, " ").trim();
         return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
@@ -590,10 +603,18 @@ export class BrowserController {
           let truncated = columns.length < columnCount;
           const rows: string[][] = [];
           const maxCellChars = Math.max(16, Math.min(256, Math.floor(maxChars * 0.4 / Math.max(1, columns.length))));
+          let dataRowIndex = 0;
           for (const row of allRows) {
             if (row === headerRow) continue;
             const cells = Array.from(row.querySelectorAll("th,td")).slice(0, columns.length).map(cell => clean(cell.textContent, maxCellChars));
             if (cells.length === 0) continue;
+            const currentIndex = dataRowIndex;
+            dataRowIndex += 1;
+            if (currentIndex < offset) continue;
+            if (rows.length >= rowLimit) {
+              truncated = true;
+              break;
+            }
             const size = JSON.stringify(cells).length + 1;
             if (chars + size > maxChars) {
               truncated = true;
@@ -608,14 +629,16 @@ export class BrowserController {
             columns,
             rows,
             rowCount: dataRowCount,
+            returnedRowCount: rows.length,
+            offset,
             columnCount,
-            truncated: truncated || rows.length < dataRowCount,
+            truncated: truncated || offset > 0 || offset + rows.length < dataRowCount,
           };
         }
       }
       const text = node.innerText.replace(/\r\n?/g, "\n").trim();
       return { heading, text: text.slice(0, maxChars), truncated: text.length > maxChars };
-    }, { format: requestedFormat, maxChars });
+    }, { format: requestedFormat, maxChars, offset, limit });
     if (regionInfo.missing) {
       throw new GuestRpcError("STALE_REGION_REF", `Browser region ${input.ref} is no longer available.`, { httpStatus: 409 });
     }
@@ -639,6 +662,8 @@ export class BrowserController {
         columns: string[];
         rows: string[][];
         rowCount: number;
+        returnedRowCount: number;
+        offset: number;
         columnCount: number;
         truncated: boolean;
       };
@@ -649,6 +674,8 @@ export class BrowserController {
         columns: tableInfo.columns,
         rows: tableInfo.rows,
         rowCount: tableInfo.rowCount,
+        returnedRowCount: tableInfo.returnedRowCount,
+        offset: tableInfo.offset,
         columnCount: tableInfo.columnCount,
         truncated: tableInfo.truncated,
       };
@@ -721,76 +748,79 @@ export class BrowserController {
     }
   }
 
-  async extractText(input: { query?: string; maxChars?: number; mode?: "relevant" | "full" } = {}): Promise<{
+  async extractText(input: { query: string; maxChars?: number }): Promise<{
     text: string;
     truncated: boolean;
     url: string;
     title: string;
-    mode: "relevant" | "full";
-    query?: string;
-    matches?: number;
+    query: string;
+    matches: number;
   }> {
     return this.withWatchdog(() => this.extractTextInternal(input), "browser.extractText");
   }
 
-  private async extractTextInternal(input: { query?: string; maxChars?: number; mode?: "relevant" | "full" }): Promise<{
+  private async extractTextInternal(input: { query: string; maxChars?: number }): Promise<{
     text: string;
     truncated: boolean;
     url: string;
     title: string;
-    mode: "relevant" | "full";
-    query?: string;
-    matches?: number;
+    query: string;
+    matches: number;
   }> {
     const page = await this.ensurePage();
-    const mode = input.mode ?? "relevant";
-    const maxChars = Math.max(1, Math.min(MAX_FULL_EXTRACT_CHARS, Math.trunc(input.maxChars ?? DEFAULT_EXTRACT_CHARS)));
-    let text = "";
-    try {
-      if (mode === "full") {
-        text = await page.locator("body").evaluateAll((nodes) => {
-          const bodyNode = nodes[0];
-          return bodyNode instanceof HTMLElement ? bodyNode.innerText : "";
+    const maxChars = Math.max(1, Math.min(MAX_EXTRACT_CHARS, Math.trunc(input.maxChars ?? DEFAULT_EXTRACT_CHARS)));
+    const search = await this.searchPageInternal({ query: input.query, maxResults: 5 });
+    const records = this.searchCache?.revision === search.revision && this.searchCache.query === input.query
+      ? this.searchCache.records
+      : [];
+    const sections: string[] = [];
+    let chars = 0;
+    let truncated = false;
+    for (const result of search.results) {
+      const record = records.find(candidate => candidate.ref === result.ref);
+      if (!record) continue;
+      const remaining = maxChars - chars - (sections.length > 0 ? 2 : 0);
+      if (remaining <= 0) {
+        truncated = true;
+        break;
+      }
+
+      let content: string;
+      if (record.kind === "table") {
+        const inspected = await this.inspectRegionInternal({
+          ref: record.ref,
+          format: "table",
+          maxChars: Math.max(1_000, Math.min(12_000, remaining)),
+          limit: 30,
         });
-      } else if (input.query) {
-        text = await page.locator("body").evaluateAll((nodes) => {
-          const bodyNode = nodes[0];
-          return bodyNode instanceof HTMLElement ? bodyNode.innerText : "";
-        });
+        content = JSON.stringify(inspected);
+        truncated ||= inspected.format === "table" && inspected.truncated;
       } else {
-        text = await page.locator("main, article").evaluateAll((nodes) => {
-          const candidates = nodes.filter((node): node is HTMLElement => node instanceof HTMLElement);
-          const main = candidates.find(node => node.matches("main,[role='main']")) ?? candidates[0];
-          return main?.innerText ?? "";
-        });
-        if (!text) {
-          text = await page.locator("body").evaluateAll((nodes) => {
-            const bodyNode = nodes[0];
-            return bodyNode instanceof HTMLElement ? bodyNode.innerText : "";
-          });
+        content = record.searchText;
+        if (record.heading && !content.toLocaleLowerCase().includes(record.heading.toLocaleLowerCase())) {
+          content = `${record.heading}\n${content}`;
         }
       }
-    } catch (error) {
-      throw new GuestRpcError(
-        "BROWSER_TEXT_EXTRACTION_FAILED",
-        error instanceof Error ? error.message.slice(0, 500) : "Could not extract page text.",
-      );
-    }
 
-    const normalized = text.replace(/\r\n?/g, "\n").trim();
-    const extracted = input.query && mode === "relevant"
-      ? extractRelevantPassages({ text: normalized, query: input.query, maxChars })
-      : mode === "full"
-        ? { text: normalized.slice(0, maxChars), matches: undefined, truncated: normalized.length > maxChars }
-        : { ...sampleReadableText(normalized, maxChars), matches: undefined };
+      const section = record.kind === "table" && result.heading
+        ? `${result.heading}\n${content}`
+        : content;
+      const bounded = section.slice(0, remaining);
+      sections.push(bounded);
+      chars += bounded.length + (sections.length > 1 ? 2 : 0);
+      if (bounded.length < section.length) {
+        truncated = true;
+        break;
+      }
+    }
+    if (search.results.length > sections.length) truncated = true;
     return {
-      text: extracted.text,
-      truncated: extracted.truncated,
-      url: page.url(),
+      text: sections.join("\n\n"),
+      truncated,
+      url: search.url,
       title: await this.readTitle(page),
-      mode,
-      ...(input.query ? { query: input.query } : {}),
-      ...(extracted.matches === undefined ? {} : { matches: extracted.matches }),
+      query: input.query,
+      matches: search.results.length,
     };
   }
 
@@ -981,14 +1011,16 @@ export class BrowserController {
     return this.referenceRevision;
   }
 
-  private async getRegionRecords(page: PlaywrightPage, includeText: boolean): Promise<{
+  private async getRegionRecords(page: PlaywrightPage, includeText: boolean, query = ""): Promise<{
     records: PageRegionRecord[];
     regionCount: number;
     truncated: boolean;
   }> {
     const revision = this.referenceRevision;
-    const cache = includeText ? this.searchCache : this.outlineCache;
-    if (cache?.revision === revision) return cache;
+    const cache = includeText
+      ? this.searchCache?.revision === revision && this.searchCache.query === query ? this.searchCache : undefined
+      : this.outlineCache;
+    if (cache) return cache;
     if (includeText && this.outlineCache?.revision === revision) {
       // The outline index is deliberately text-light; search builds its own
       // local searchable region data only when requested.
@@ -1001,6 +1033,48 @@ export class BrowserController {
       const regionLimit = typeof options === "object" && options !== null && "limit" in options
         ? Number((options as { limit: number }).limit)
         : 1_200;
+      const query = typeof options === "object" && options !== null && "query" in options
+        ? String((options as { query: string }).query)
+        : "";
+      const maxSearchChars = typeof options === "object" && options !== null && "maxSearchChars" in options
+        ? Number((options as { maxSearchChars: number }).maxSearchChars)
+        : 800;
+      const totalSearchCharsLimit = typeof options === "object" && options !== null && "totalSearchCharsLimit" in options
+        ? Number((options as { totalSearchCharsLimit: number }).totalSearchCharsLimit)
+        : 256_000;
+      const queryTokens = [...new Set(query.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])]
+        .filter(token => token.length > 1);
+      const excerpt = (value: string): string => {
+        if (!includeText) return "";
+        if (queryTokens.length === 0) return value.slice(0, maxSearchChars);
+        const lower = value.toLocaleLowerCase();
+        const windows: Array<{ start: number; end: number }> = [];
+        for (const token of queryTokens) {
+          let position = 0;
+          let found = 0;
+          while (found < 3) {
+            const match = lower.indexOf(token, position);
+            if (match < 0) break;
+            windows.push({ start: Math.max(0, match - 100), end: Math.min(value.length, match + token.length + 180) });
+            position = match + token.length;
+            found += 1;
+          }
+        }
+        windows.sort((left, right) => left.start - right.start);
+        let output = "";
+        let consumedUntil = -1;
+        for (const window of windows) {
+          if (window.end <= consumedUntil) continue;
+          const start = Math.max(window.start, consumedUntil);
+          const piece = `${output.length > 0 && start > consumedUntil ? " … " : ""}${value.slice(start, window.end)}`;
+          const remaining = maxSearchChars - output.length;
+          if (remaining <= 0) break;
+          output += piece.slice(0, remaining);
+          consumedUntil = window.end;
+          if (output.length >= maxSearchChars) break;
+        }
+        return output.replace(/\s+/gu, " ").trim();
+      };
       const clean = (value: string | null | undefined, max = 220) => {
         const normalized = (value ?? "").replace(/\s+/g, " ").trim();
         return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
@@ -1029,16 +1103,23 @@ export class BrowserController {
       };
       const records: Array<{
         candidateIndex: number;
+        ancestorIndexes: number[];
         kind: BrowserRegionKind;
         heading?: string;
         preview?: string;
         searchText: string;
         tableHeaders?: string[];
+        formLabels?: string[];
         rowCount?: number;
         columnCount?: number;
         domOrder: number;
       }> = [];
       let visibleCount = 0;
+      let totalSearchChars = 0;
+      const candidateIndexByElement = new Map<HTMLElement, number>();
+      nodes.forEach((candidate, candidateIndex) => {
+        if (candidate instanceof HTMLElement) candidateIndexByElement.set(candidate, candidateIndex);
+      });
       const priority = (node: unknown) => {
         if (!(node instanceof HTMLElement)) return 99;
         const tag = node.tagName.toLowerCase();
@@ -1090,26 +1171,66 @@ export class BrowserController {
         const tableHeaders = kind === "table" && headerRow
           ? Array.from(headerRow.querySelectorAll("th,td")).map(cell => clean(cell.textContent, 120))
           : undefined;
+        const formLabels = kind === "form"
+          ? Array.from(node.querySelectorAll("input,textarea,select,button,[role='textbox'],[role='combobox']"))
+            .flatMap(control => {
+              const names: string[] = [];
+              const ariaLabel = control.getAttribute("aria-label");
+              if (ariaLabel) names.push(ariaLabel);
+              const labelledBy = control.getAttribute("aria-labelledby")?.split(/\s+/u) ?? [];
+              for (const id of labelledBy) {
+                const label = document.getElementById(id)?.textContent;
+                if (label) names.push(label);
+              }
+              const nativeLabels = (control as HTMLInputElement).labels;
+              if (nativeLabels) {
+                for (const label of Array.from(nativeLabels)) names.push(label.innerText);
+              }
+              return names;
+            })
+            .map(label => clean(label, 120))
+            .filter(Boolean)
+            .slice(0, 80)
+          : undefined;
         const dataRows = rows.filter(row => row !== headerRow && row.querySelector("th,td"));
         const columnCount = Math.max(0, ...rows.map(row => row.querySelectorAll("th,td").length));
         const previewSource = kind === "table" && tableHeaders
           ? `${tableHeaders.join(" ")} ${dataRows[0]?.innerText ?? ""}`
           : text;
         const preview = clean(previewSource, 180);
+        const ancestorIndexes: number[] = [];
+        for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+          const ancestorIndex = candidateIndexByElement.get(ancestor);
+          if (ancestorIndex !== undefined) ancestorIndexes.push(ancestorIndex);
+        }
+        let searchText = excerpt(text);
+        if (totalSearchChars + searchText.length > totalSearchCharsLimit) {
+          searchText = searchText.slice(0, Math.max(0, totalSearchCharsLimit - totalSearchChars));
+          truncated = true;
+        }
+        totalSearchChars += searchText.length;
         visibleCount += 1;
         records.push({
           candidateIndex: index,
+          ancestorIndexes,
           kind,
           ...(heading ? { heading } : {}),
           ...(preview ? { preview } : {}),
-          searchText: includeText ? text : "",
+          searchText,
           ...(tableHeaders ? { tableHeaders } : {}),
+          ...(formLabels && formLabels.length > 0 ? { formLabels } : {}),
           ...(kind === "table" ? { rowCount: dataRows.length, columnCount } : {}),
           domOrder: index,
         });
       }
       return { records, regionCount: visibleCount, truncated: truncated || nodes.length > regionLimit };
-    }, { includeText, limit: MAX_INDEXED_REGIONS });
+    }, {
+      includeText,
+      query,
+      limit: MAX_INDEXED_REGIONS,
+      maxSearchChars: MAX_SEARCH_REGION_CHARS,
+      totalSearchCharsLimit: MAX_SEARCH_INDEX_CHARS,
+    });
     const records: PageRegionRecord[] = result.records.map(record => ({
       ref: `r${revision}-${record.candidateIndex + 1}`,
       kind: record.kind,
@@ -1119,11 +1240,15 @@ export class BrowserController {
       ...(record.columnCount === undefined ? {} : { columnCount: record.columnCount }),
       searchText: record.searchText,
       ...(record.tableHeaders ? { tableHeaders: record.tableHeaders } : {}),
+      ...(record.formLabels ? { formLabels: record.formLabels } : {}),
       domOrder: record.domOrder,
       candidateIndex: record.candidateIndex,
+      ...(record.ancestorIndexes.length > 0
+        ? { ancestorRefs: record.ancestorIndexes.map(index => `r${revision}-${index + 1}`) }
+        : {}),
     }));
     const normalized = { records, regionCount: result.regionCount, truncated: result.truncated };
-    if (includeText) this.searchCache = { revision, ...normalized };
+    if (includeText) this.searchCache = { revision, query, ...normalized };
     else this.outlineCache = { revision, ...normalized };
     return normalized;
   }
