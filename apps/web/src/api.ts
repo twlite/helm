@@ -68,7 +68,11 @@ function asJsonObject(value: unknown): JsonObject {
 }
 
 function asJsonValue(value: unknown): JsonValue | undefined {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean'
+  ) {
     return value;
   }
   if (typeof value === 'number' && Number.isFinite(value)) {
@@ -232,12 +236,18 @@ function parseRun(value: unknown): RunDetails | null {
   return {
     id: value.id,
     threadId: asString(value.threadId ?? value.thread_id),
-    sourceMessageId: asOptionalString(value.sourceMessageId ?? value.source_message_id),
+    sourceMessageId: asOptionalString(
+      value.sourceMessageId ?? value.source_message_id,
+    ),
     goal: asString(value.goal),
     status: parseRunStatus(value.status),
     criteria,
-    ...(isRecord(value.task) ? { task: value.task as unknown as RunDetails['task'] } : {}),
-    ...(isRecord(value.state) ? { state: value.state as unknown as RunDetails['state'] } : {}),
+    ...(isRecord(value.task)
+      ? { task: value.task as unknown as RunDetails['task'] }
+      : {}),
+    ...(isRecord(value.state)
+      ? { state: value.state as unknown as RunDetails['state'] }
+      : {}),
     error: parseToolError(value.error),
     createdAt: asString(value.createdAt ?? value.created_at),
     startedAt: asOptionalString(value.startedAt ?? value.started_at),
@@ -265,7 +275,9 @@ function parseRunStep(value: unknown): RunDetails['steps'][number] | null {
     return null;
   }
   const phase = parseRunStepPhase(value.phase);
-  const decision = isRecord(value.decision) ? parseDecision(value.decision) : undefined;
+  const decision = isRecord(value.decision)
+    ? parseDecision(value.decision)
+    : undefined;
   return {
     id: value.id,
     runId: asString(value.runId ?? value.run_id),
@@ -273,21 +285,23 @@ function parseRunStep(value: unknown): RunDetails['steps'][number] | null {
     phase,
     decision,
     orchestratorDecision: isRecord(value.orchestratorDecision)
-      ? value.orchestratorDecision as RunDetails['steps'][number]['orchestratorDecision']
+      ? (value.orchestratorDecision as RunDetails['steps'][number]['orchestratorDecision'])
       : undefined,
     objective: isRecord(value.objective)
-      ? value.objective as unknown as RunDetails['steps'][number]['objective']
+      ? (value.objective as unknown as RunDetails['steps'][number]['objective'])
       : undefined,
-    worker: asOptionalString(value.worker) as RunDetails['steps'][number]['worker'],
+    worker: asOptionalString(
+      value.worker,
+    ) as RunDetails['steps'][number]['worker'],
     workerResult: isRecord(value.workerResult)
-      ? value.workerResult as unknown as RunDetails['steps'][number]['workerResult']
+      ? (value.workerResult as unknown as RunDetails['steps'][number]['workerResult'])
       : undefined,
     progress: isRecord(value.progress)
-      ? value.progress as unknown as RunDetails['steps'][number]['progress']
+      ? (value.progress as unknown as RunDetails['steps'][number]['progress'])
       : undefined,
     toolName: asOptionalString(value.toolName ?? value.tool_name),
     toolInput: isRecord(value.toolInput ?? value.tool_input)
-      ? (value.toolInput ?? value.tool_input) as Record<string, unknown>
+      ? ((value.toolInput ?? value.tool_input) as Record<string, unknown>)
       : undefined,
     toolResult: parseToolResult(value.toolResult ?? value.tool_result),
     observation: value.observation,
@@ -297,7 +311,9 @@ function parseRunStep(value: unknown): RunDetails['steps'][number] | null {
   };
 }
 
-function parseRunStepPhase(value: unknown): RunDetails['steps'][number]['phase'] {
+function parseRunStepPhase(
+  value: unknown,
+): RunDetails['steps'][number]['phase'] {
   switch (value) {
     case 'observe':
     case 'reason':
@@ -312,32 +328,42 @@ function parseRunStepPhase(value: unknown): RunDetails['steps'][number]['phase']
   }
 }
 
-function parseDecision(value: RecordValue): import('@helm/shared').AgentDecision | undefined {
+function parseDecision(
+  value: RecordValue,
+): import('@helm/shared').AgentDecision | undefined {
   switch (value.type) {
     case 'action':
       return {
         type: 'action',
         tool: asString(value.tool),
         input: isRecord(value.input) ? value.input : {},
-        reasoningSummary: asOptionalString(value.reasoningSummary ?? value.reasoning_summary),
+        reasoningSummary: asOptionalString(
+          value.reasoningSummary ?? value.reasoning_summary,
+        ),
       };
     case 'complete':
       return {
         type: 'complete',
-        reasoningSummary: asOptionalString(value.reasoningSummary ?? value.reasoning_summary),
+        reasoningSummary: asOptionalString(
+          value.reasoningSummary ?? value.reasoning_summary,
+        ),
       };
     case 'blocked':
       return {
         type: 'blocked',
         reason: asString(value.reason),
-        reasoningSummary: asOptionalString(value.reasoningSummary ?? value.reasoning_summary),
+        reasoningSummary: asOptionalString(
+          value.reasoningSummary ?? value.reasoning_summary,
+        ),
       };
     default:
       return undefined;
   }
 }
 
-function parseToolResult(value: unknown): import('@helm/shared').ToolResult | undefined {
+function parseToolResult(
+  value: unknown,
+): import('@helm/shared').ToolResult | undefined {
   if (!isRecord(value) || typeof value.ok !== 'boolean') {
     return undefined;
   }
@@ -349,7 +375,9 @@ function parseToolResult(value: unknown): import('@helm/shared').ToolResult | un
   };
 }
 
-function parseVerification(value: unknown): import('@helm/shared').VerificationResult | undefined {
+function parseVerification(
+  value: unknown,
+): import('@helm/shared').VerificationResult | undefined {
   if (!isRecord(value) || typeof value.complete !== 'boolean') {
     return undefined;
   }
@@ -375,12 +403,15 @@ function parseVerification(value: unknown): import('@helm/shared').VerificationR
   const requirements = Array.isArray(value.requirements)
     ? value.requirements.flatMap((check) => {
         if (!isRecord(check) || !isRecord(check.requirement)) return [];
-        return [{
-          requirement: check.requirement as unknown as import('@helm/shared').TaskRequirement,
-          passed: asBoolean(check.passed),
-          message: asString(check.message),
-          evidence: check.evidence,
-        }];
+        return [
+          {
+            requirement:
+              check.requirement as unknown as import('@helm/shared').TaskRequirement,
+            passed: asBoolean(check.passed),
+            message: asString(check.message),
+            evidence: check.evidence,
+          },
+        ];
       })
     : undefined;
   return {
@@ -409,16 +440,18 @@ function parseVmStatus(value: unknown): VmStatus {
     state,
     helperAvailable: asBoolean(input.helperAvailable ?? input.helper_available),
     guestConnected: asBoolean(input.guestConnected ?? input.guest_connected),
-    uncleanShutdownDetected: typeof input.uncleanShutdownDetected === 'boolean'
-      ? input.uncleanShutdownDetected
-      : undefined,
+    uncleanShutdownDetected:
+      typeof input.uncleanShutdownDetected === 'boolean'
+        ? input.uncleanShutdownDetected
+        : undefined,
     message: asOptionalString(input.message),
     screenshot: asOptionalString(input.screenshot),
   };
 }
 
 function parseHealth(value: unknown): HealthStatus {
-  const input = isRecord(value) && isRecord(value.health) ? value.health : value;
+  const input =
+    isRecord(value) && isRecord(value.health) ? value.health : value;
   const vm = parseVmStatus(input);
   if (!isRecord(input)) {
     return {
@@ -464,7 +497,8 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
     }
   }
   if (!response.ok) {
-    const errorPayload = isRecord(payload) && isRecord(payload.error) ? payload.error : payload;
+    const errorPayload =
+      isRecord(payload) && isRecord(payload.error) ? payload.error : payload;
     const error = isRecord(errorPayload) ? errorPayload : {};
     throw new ApiError(
       asString(error.message, `Request failed with status ${response.status}`),
@@ -482,10 +516,18 @@ function jsonBody(value: Record<string, unknown>): RequestInit {
   };
 }
 
-function parseSingle<T>(payload: unknown, key: string, parser: (value: unknown) => T | null): T {
+function parseSingle<T>(
+  payload: unknown,
+  key: string,
+  parser: (value: unknown) => T | null,
+): T {
   const result = parser(readEnvelope(payload, key));
   if (result === null) {
-    throw new ApiError(`The server returned an invalid ${key} response`, 200, 'INVALID_RESPONSE');
+    throw new ApiError(
+      `The server returned an invalid ${key} response`,
+      200,
+      'INVALID_RESPONSE',
+    );
   }
   return result;
 }
@@ -504,7 +546,11 @@ export const helmApi = {
     return parseSingle(payload, 'thread', parseThread);
   },
 
-  async generateThreadTitle(threadId: string, sourceMessageId: string, force = false): Promise<Thread> {
+  async generateThreadTitle(
+    threadId: string,
+    sourceMessageId: string,
+    force = false,
+  ): Promise<Thread> {
     const payload = await request(
       `/api/threads/${encodeURIComponent(threadId)}/title`,
       jsonBody({ sourceMessageId, ...(force ? { force: true } : {}) }),
@@ -513,11 +559,15 @@ export const helmApi = {
   },
 
   async deleteThread(threadId: string): Promise<void> {
-    await request(`/api/threads/${encodeURIComponent(threadId)}`, { method: 'DELETE' });
+    await request(`/api/threads/${encodeURIComponent(threadId)}`, {
+      method: 'DELETE',
+    });
   },
 
   async listMessages(threadId: string): Promise<Message[]> {
-    const payload = await request(`/api/threads/${encodeURIComponent(threadId)}/messages`);
+    const payload = await request(
+      `/api/threads/${encodeURIComponent(threadId)}/messages`,
+    );
     return readArrayEnvelope(payload, 'messages').flatMap((item) => {
       const message = parseMessage(item);
       return message ? [message] : [];
@@ -538,17 +588,32 @@ export const helmApi = {
   },
 
   async runScriptedDemo(threadId: string): Promise<RunDetails> {
-    const payload = await request('/api/runs/scripted-demo', jsonBody({ threadId }));
+    const payload = await request(
+      '/api/runs/scripted-demo',
+      jsonBody({ threadId }),
+    );
     return parseSingle(payload, 'run', parseRun);
   },
 
-  async runAgent(threadId: string, sourceMessageId: string): Promise<RunDetails> {
-    const payload = await request('/api/runs/agent', jsonBody({ threadId, sourceMessageId }));
+  async runAgent(
+    threadId: string,
+    sourceMessageId: string,
+  ): Promise<RunDetails> {
+    const payload = await request(
+      '/api/runs/agent',
+      jsonBody({ threadId, sourceMessageId }),
+    );
     return parseSingle(payload, 'run', parseRun);
   },
 
-  async queueAgent(threadId: string, sourceMessageId: string): Promise<{ queued: boolean; position: number; run?: RunDetails }> {
-    const payload = await request('/api/runs/queue', jsonBody({ threadId, sourceMessageId }));
+  async queueAgent(
+    threadId: string,
+    sourceMessageId: string,
+  ): Promise<{ queued: boolean; position: number; run?: RunDetails }> {
+    const payload = await request(
+      '/api/runs/queue',
+      jsonBody({ threadId, sourceMessageId }),
+    );
     const record = isRecord(payload) ? payload : {};
     const run = parseRun(record.run);
     return {
@@ -567,11 +632,15 @@ export const helmApi = {
   },
 
   async cancelRun(runId: string): Promise<void> {
-    await request(`/api/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
+    await request(`/api/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+    });
   },
 
   async listMemories(query?: string): Promise<Memory[]> {
-    const path = query ? `/api/memories/search?q=${encodeURIComponent(query)}` : '/api/memories';
+    const path = query
+      ? `/api/memories/search?q=${encodeURIComponent(query)}`
+      : '/api/memories';
     const payload = await request(path);
     return readArrayEnvelope(payload, 'memories').flatMap((item) => {
       const memory = parseMemory(item);
@@ -589,7 +658,9 @@ export const helmApi = {
   },
 
   async deleteMemory(memoryId: string): Promise<void> {
-    await request(`/api/memories/${encodeURIComponent(memoryId)}`, { method: 'DELETE' });
+    await request(`/api/memories/${encodeURIComponent(memoryId)}`, {
+      method: 'DELETE',
+    });
   },
 
   async health(): Promise<HealthStatus> {
@@ -601,7 +672,9 @@ export const helmApi = {
   },
 
   async vmAction(action: VmAction): Promise<VmStatus> {
-    return parseVmStatus(await request(`/api/vm/${action}`, { method: 'POST' }));
+    return parseVmStatus(
+      await request(`/api/vm/${action}`, { method: 'POST' }),
+    );
   },
 };
 
@@ -609,6 +682,11 @@ export function getWebSocketUrl(): string {
   const configuredWebSocketUrl = import.meta.env.VITE_WS_URL?.trim();
   if (configuredWebSocketUrl) {
     return configuredWebSocketUrl;
+  }
+  if (API_ROOT) {
+    const apiUrl = new URL('/api/events', API_ROOT);
+    apiUrl.protocol = apiUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+    return apiUrl.toString();
   }
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${protocol}//${window.location.host}/api/events`;

@@ -13,12 +13,14 @@ export * from './vm/vm-controller';
 if (import.meta.main) {
   const server = startHelmServer();
   let shuttingDown = false;
-  const shutdown = async () => {
+  const shutdown = async (signal: NodeJS.Signals) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    console.info(`Received ${signal}; shutting down Helm server and VM.`);
     await server.close();
+    console.info('Helm server shutdown complete.');
     process.exit(0);
   };
-  process.once('SIGINT', () => void shutdown());
-  process.once('SIGTERM', () => void shutdown());
+  process.once('SIGINT', () => void shutdown('SIGINT'));
+  process.once('SIGTERM', () => void shutdown('SIGTERM'));
 }

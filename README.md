@@ -43,6 +43,9 @@ bun dev
 ```
 
 The server listens on `http://127.0.0.1:8787` and Vite normally listens on `http://127.0.0.1:5173`.
+The web app calls the server directly. Set `VITE_API_URL` in
+`apps/web/.env.local`; copy
+[`apps/web/.env.example`](apps/web/.env.example) to get the local default.
 
 By default Helm reads [`config/models.json`](config/models.json) and connects to an OpenAI-compatible LM Studio server at `http://localhost:1234/v1`. Load the configured language model and embedding model in LM Studio before sending a task. The server does not require an API key for this local connection.
 

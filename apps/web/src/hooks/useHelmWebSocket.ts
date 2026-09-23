@@ -38,7 +38,6 @@ export function useHelmWebSocket(onEvent: (event: HelmEvent) => void) {
 
   const connect = useCallback(() => {
     if (stoppedRef.current) return;
-    stoppedRef.current = false;
     if (reconnectTimerRef.current !== undefined) {
       window.clearTimeout(reconnectTimerRef.current);
       reconnectTimerRef.current = undefined;
@@ -99,11 +98,15 @@ export function useHelmWebSocket(onEvent: (event: HelmEvent) => void) {
   }, []);
 
   useEffect(() => {
-    connect();
+    stoppedRef.current = false;
+    // Deferring the first connection lets Strict Mode replay this effect's
+    // setup and cleanup without opening a socket that cleanup immediately aborts.
+    reconnectTimerRef.current = window.setTimeout(connect, 0);
     return () => {
       stoppedRef.current = true;
       if (reconnectTimerRef.current !== undefined) {
         window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = undefined;
       }
       const activeSocket = socketRef.current;
       socketRef.current = null;
