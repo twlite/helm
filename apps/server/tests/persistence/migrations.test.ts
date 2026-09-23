@@ -1,14 +1,16 @@
 import { describe, expect, it } from 'bun:test';
 
-import { getAppliedMigrations, runMigrations } from '../../src/db/migrations';
+import { getAppliedMigrations, migrations, runMigrations } from '../../src/db/migrations';
+import { PersistenceDatabase } from '../../src/db/database';
+import { MemoryRepository } from '../../src/memory/repository';
 import { testDatabase } from './helpers';
 
 describe('persistence migrations', () => {
   it('creates all persistence tables and is idempotent', () => {
     const persistence = testDatabase();
     try {
-      expect(persistence.migrations.currentVersion).toBe(4);
-      expect(persistence.migrations.applied.map(migration => migration.version)).toEqual([1, 2, 3, 4]);
+      expect(persistence.migrations.currentVersion).toBe(5);
+      expect(persistence.migrations.applied.map(migration => migration.version)).toEqual([1, 2, 3, 4, 5]);
 
       const tables = persistence.sqlite
         .prepare(
@@ -27,9 +29,35 @@ describe('persistence migrations', () => {
         'threads',
       ]);
 
-      expect(runMigrations(persistence.sqlite)).toEqual({ applied: [], currentVersion: 4 });
-      expect(getAppliedMigrations(persistence.sqlite)).toHaveLength(4);
-      expect(persistence.sqlite.prepare('PRAGMA user_version').get()).toEqual({ user_version: 4 });
+      expect(runMigrations(persistence.sqlite)).toEqual({ applied: [], currentVersion: 5 });
+      expect(getAppliedMigrations(persistence.sqlite)).toHaveLength(5);
+      expect(persistence.sqlite.prepare('PRAGMA user_version').get()).toEqual({ user_version: 5 });
+    } finally {
+      persistence.close();
+    }
+  });
+
+  it('upgrades older memory rows without losing content and backfills provenance', () => {
+    const persistence = new PersistenceDatabase(':memory:', { migrate: false });
+    try {
+      runMigrations(persistence.sqlite, migrations.slice(0, 4));
+      persistence.sqlite.prepare(`INSERT INTO memories
+        (id, content, kind, importance, metadata_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run('legacy-memory', 'The durable project convention.', 'instruction', 0.8,
+          JSON.stringify({ source: 'automatic-user-memory' }), '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z');
+
+      expect(runMigrations(persistence.sqlite)).toEqual({
+        applied: [{ version: 5, name: 'persistent-memory-provenance-and-keys' }],
+        currentVersion: 5,
+      });
+      const memories = new MemoryRepository(persistence.sqlite);
+      expect(memories.getById('legacy-memory')).toMatchObject({
+        id: 'legacy-memory',
+        content: 'The durable project convention.',
+        source: 'passive-extraction',
+      });
+      expect(memories.search('project convention')).toHaveLength(1);
     } finally {
       persistence.close();
     }

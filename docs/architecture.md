@@ -28,6 +28,8 @@ browser UI -- REST + WebSocket --> Bun server
   action-loop protection, receipts, and generic completion checks.
 - `apps/server/src/tools` owns Zod input validation, guest calls, and action
   receipt generation.
+- `apps/server/src/memory` owns persistent memory, its native acting-agent
+  tools, contextual retrieval, and conservative post-run extraction.
 - `apps/server/src/db` persists messages and run-step activity.
 - `guest/helm-guest` performs sandboxed filesystem, visible-browser, and
   desktop operations.
@@ -124,3 +126,13 @@ compaction is persisted with its pressure reason, before/after estimates,
 pruning counts, kept raw exchanges, and preserved/removed state. This is
 run-local continuity. Persistent memory is retrieved separately as a hint for
 future runs and is not treated as proof that an external fact remains current.
+
+## Persistent memory
+
+Persistent memory has an independent lifecycle from message history and
+run-local context compaction. The acting agent can search, remember, update, and
+forget memories through validated host tools in the same native tool loop.
+Observed memories retain source URLs and successful action receipt IDs. Memory
+retrieval combines full-text and optional vector results; the detailed lifecycle,
+ranking, provenance, UI, and migration behavior is documented in
+[`memory.md`](./memory.md).

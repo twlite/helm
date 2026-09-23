@@ -59,6 +59,11 @@ function toolTitle(toolName: string): string {
     'app.launch': 'Opened application',
     'app.openFile': 'Opened file',
     'desktop.screenshot': 'Captured desktop',
+    'memory.search': 'Searched memory',
+    'memory.remember': 'Remembered memory',
+    'memory.update': 'Updated memory',
+    'memory.forget': 'Forgot memory',
+    'memory.recall': 'Recalled relevant memories',
     'context.compaction': 'Compacted model context',
     'desktop.getState': 'Checked desktop',
     'desktop.click': 'Clicked desktop',
@@ -66,6 +71,20 @@ function toolTitle(toolName: string): string {
     'desktop.hotkey': 'Used keyboard shortcut',
   };
   return titles[toolName] ?? humanize(toolName);
+}
+
+function memoryActivityTitle(toolName: string, resultStep?: RunStep): string | undefined {
+  if (!toolName.startsWith('memory.')) return undefined;
+  if (resultStep?.toolResult?.ok === false) return 'Memory operation failed';
+  if (toolName === 'memory.remember') {
+    const data = resultStep?.toolResult?.data;
+    if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+      const action = (data as Record<string, unknown>).action;
+      if (action === 'updated') return 'Updated memory';
+      if (action === 'already-present') return 'Memory already present';
+    }
+  }
+  return toolTitle(toolName);
 }
 
 function criterionLabel(criterion: CompletionCriterion): string {
@@ -128,7 +147,9 @@ function stepForGroup(steps: RunStep[]): RunStep {
 function activityRows(run: RunDetails, liveActivity?: LiveActivity): ActivityRow[] {
   const groups = new Map<string, { stepIndex: number; steps: RunStep[] }>();
   for (const step of [...run.steps].sort((left, right) => left.stepIndex - right.stepIndex)) {
-    const key = step.toolName === 'context.compaction' ? `context:${step.id}` : `step:${step.stepIndex}`;
+    const key = step.toolName === 'context.compaction' || step.toolName === 'memory.recall'
+      ? `operation:${step.id}`
+      : `step:${step.stepIndex}`;
     const group = groups.get(key) ?? { stepIndex: step.stepIndex, steps: [] };
     group.steps.push(step);
     groups.set(key, group);
@@ -152,7 +173,7 @@ function activityRows(run: RunDetails, liveActivity?: LiveActivity): ActivityRow
     return {
       id: step.id,
       stepIndex,
-      title: objective?.description ?? (toolName ? toolTitle(toolName) : step.orchestratorDecision?.type === 'complete' ? 'Verified completion proposal' : humanize(step.phase)),
+      title: objective?.description ?? (toolName ? memoryActivityTitle(toolName, resultStep) ?? toolTitle(toolName) : step.orchestratorDecision?.type === 'complete' ? 'Verified completion proposal' : humanize(step.phase)),
       ...(worker ? { worker } : {}),
       ...(toolName ? { toolName } : {}),
       step,

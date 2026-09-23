@@ -124,6 +124,86 @@ export const migrations: readonly DatabaseMigration[] = [
       `);
     },
   },
+  {
+    version: 5,
+    name: 'persistent-memory-provenance-and-keys',
+    up(database) {
+      database.exec(`
+        ALTER TABLE memories ADD COLUMN memory_key TEXT;
+        ALTER TABLE memories ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'
+          CHECK (source IN ('user', 'observed', 'manual', 'passive-extraction'));
+        ALTER TABLE memories ADD COLUMN source_url TEXT;
+        ALTER TABLE memories ADD COLUMN evidence_ids_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE memories ADD COLUMN durability TEXT
+          CHECK (durability IS NULL OR durability IN ('durable', 'refreshable'));
+        ALTER TABLE memories ADD COLUMN last_verified_at TEXT;
+        ALTER TABLE memories ADD COLUMN last_accessed_at TEXT;
+        ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0 CHECK (access_count >= 0);
+      `);
+
+      const rows = database.prepare('SELECT id, metadata_json AS metadataJson FROM memories').all() as Array<{
+        id: string;
+        metadataJson: string;
+      }>;
+      const backfill = database.prepare(`
+        UPDATE memories
+           SET source = ?,
+               source_url = ?,
+               evidence_ids_json = ?,
+               durability = ?,
+               last_verified_at = ?
+         WHERE id = ?
+      `);
+      for (const row of rows) {
+        let metadata: Record<string, unknown> = {};
+        try {
+          const parsed = JSON.parse(row.metadataJson) as unknown;
+          if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+            metadata = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // Malformed historical metadata must not prevent the schema upgrade.
+        }
+        const historicalSource = metadata.source;
+        const source = historicalSource === 'automatic-user-memory'
+          ? 'passive-extraction'
+          : historicalSource === 'observed' || historicalSource === 'user'
+            ? historicalSource
+            : 'manual';
+        const evidenceIds = Array.isArray(metadata.evidenceIds)
+          ? metadata.evidenceIds.filter((value): value is string => typeof value === 'string').slice(0, 20)
+          : [];
+        const durability = metadata.durability === 'durable' || metadata.durability === 'refreshable'
+          ? metadata.durability
+          : null;
+        backfill.run(
+          source,
+          typeof metadata.sourceUrl === 'string' ? metadata.sourceUrl : null,
+          JSON.stringify(evidenceIds),
+          durability,
+          typeof metadata.lastVerifiedAt === 'string' ? metadata.lastVerifiedAt : null,
+          row.id,
+        );
+      }
+
+      database.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_key
+          ON memories(memory_key) WHERE memory_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_memories_source_durability
+          ON memories(source, durability, updated_at DESC);
+        DROP TABLE IF EXISTS memory_fts;
+        CREATE VIRTUAL TABLE memory_fts USING fts5(
+          memory_id UNINDEXED,
+          content,
+          kind UNINDEXED,
+          memory_key,
+          tokenize = 'unicode61'
+        );
+        INSERT INTO memory_fts (memory_id, content, kind, memory_key)
+          SELECT id, content, kind, COALESCE(memory_key, '') FROM memories;
+      `);
+    },
+  },
 ];
 
 export const MIGRATIONS = migrations;

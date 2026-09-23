@@ -24,12 +24,14 @@ describe('memory FTS5', () => {
     }
   });
 
-  it('does not interpret punctuation as an unsafe FTS expression', () => {
+  it('quotes punctuation and operators before building an FTS query', () => {
     const persistence = testDatabase();
     try {
       const memories = new MemoryRepository(persistence.sqlite);
       const memory = memories.create({ content: 'safe query handling', kind: 'note' });
-      expect(memories.search('safe:"query" OR *')).toEqual([]);
+      const unrelated = memories.create({ content: 'another stored note', kind: 'note' });
+      expect(memories.search('safe:"query" OR *')).toEqual([memory]);
+      expect(memories.search('safe:"query" OR *')).not.toContainEqual(unrelated);
       expect(memories.search('safe query')).toEqual([memory]);
     } finally {
       persistence.close();

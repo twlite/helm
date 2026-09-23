@@ -278,11 +278,14 @@ export const aiThreadTitleSchema = z.object({
 });
 
 export const aiMemoryExtractionSchema = z.object({
-  remember: z.boolean(),
-  content: z.string().max(4_000),
-  kind: z.enum(['fact', 'preference', 'instruction', 'note']),
-  importance: z.number().min(0).max(1),
-});
+  operations: z.array(z.object({
+    type: z.literal('upsert'),
+    key: z.string().trim().min(1).max(200).optional(),
+    content: z.string().trim().min(1).max(4_000),
+    kind: z.enum(['fact', 'preference', 'instruction', 'note']),
+    importance: z.number().min(0).max(1),
+  }).strict()).max(3),
+}).strict();
 
 const MAX_THREAD_TITLE_LENGTH = 200;
 
@@ -1377,13 +1380,13 @@ export interface AiSdkMemoryExtractionInput {
   signal?: AbortSignal;
 }
 
-export type AiSdkMemoryCandidate = Pick<Memory, 'content' | 'kind' | 'importance'>;
+export type AiSdkMemoryCandidate = Pick<Memory, 'content' | 'kind' | 'importance'> & { key?: string };
 
 /** Selects durable user context without making memory persistence part of planning. */
 export class AiSdkMemoryExtractor {
   constructor(public readonly options: AiSdkMemoryExtractorOptions) {}
 
-  async extract(input: AiSdkMemoryExtractionInput): Promise<AiSdkMemoryCandidate | undefined> {
+  async extract(input: AiSdkMemoryExtractionInput): Promise<AiSdkMemoryCandidate[]> {
     try {
       const result = await generateStructured({
         model: this.options.model,
@@ -1394,37 +1397,29 @@ export class AiSdkMemoryExtractor {
         abortSignal: input.signal,
         schema: aiMemoryExtractionSchema,
         system: [
-          'You decide whether a user message contains durable context Helm should remember across threads.',
-          'Remember only explicit requests to remember something, corrections to previous mistakes, stable user preferences, stable facts about the user or their project, or durable workflow instructions that will help future tasks.',
-          'Do not remember one-off tasks, transient run status, greetings, ordinary questions, or claims made only by the assistant.',
-          'When the user corrects a source, URL, name, value, or procedure, remember the corrected value and the future behavior it implies.',
-          'When remember is true, write one concise, standalone memory that another agent can apply later without seeing this conversation.',
-          'Write the durable rule or fact directly. Do not quote the user and do not include meta phrases such as "User correction to remember", "User instruction to remember", "Related request context", "oops", "could you remember", or "for the future" unless those words are themselves the thing being remembered.',
-          'For a corrected URL, state what the URL is the authoritative source for and what Helm should do on future relevant requests. Example shape: "For Nepal Rastra Bank forex requests, use https://www.nrb.org.np/forex/ as the official source."',
-          'Use the recent conversation to resolve what a correction refers to, while preserving exact URLs, names, paths, and values from the user message; never invent or silently replace them.',
-          'When remember is false, return an empty content string and importance 0.',
+          'You run only after a completed turn and conservatively extract durable user context for future unrelated tasks.',
+          'This is passive extraction, not an explicit memory action. Do not process explicit requests to remember, update, or forget; the acting agent handles those through memory tools.',
+          'Extract at most three concise standalone preferences, durable user or project facts, reusable workflow instructions, or clear corrections that future tasks can use.',
+          'Do not save one-off tasks, web observations, current prices or values, transient run state, ordinary questions, greetings, speculation, or claims made only by the assistant. When uncertain, return no operation.',
+          'Use only information stated by the user. Preserve exact names, URLs, paths, and values. Do not infer or invent facts.',
+          'Choose a stable optional key only when it clearly represents one concept whose value may be corrected later. Do not force unrelated facts into a taxonomy.',
+          'Write each memory directly and concisely without quoting the user or adding labels such as "user correction" or "remember this".',
+          'Return operations as an empty array when nothing is durable. Do not summarize the conversation.',
         ].join(' '),
         prompt: [
           `Current user message:\n${promptJson(input.userMessage, 8_000)}`,
-          `Recent conversation:\n${promptJson(conversationContext(input.conversation ?? []), 8_000)}`,
+          `Recent user conversation:\n${promptJson(conversationContext((input.conversation ?? []).filter(message => message.role === 'user')), 8_000)}`,
         ].join('\n\n'),
       });
-      const content = result.content.trim().replace(/\s+/gu, ' ');
-      if (!result.remember || content.length === 0) return undefined;
-      if (/\b(?:User correction|User instruction) to remember:|\bRelated request context:/iu.test(content)) {
-        // Do not persist a model response that merely echoed the transport
-        // wrapper. The caller will use its clean deterministic fallback.
-        return undefined;
-      }
-      return {
-        content: content.length <= 4_000 ? content : `${content.slice(0, 3_997).trimEnd()}...`,
-        kind: result.kind,
-        importance: result.importance,
-      };
+      return result.operations.slice(0, 3).map(operation => ({
+        content: operation.content.trim().replace(/\s+/gu, ' ').slice(0, 4_000),
+        kind: operation.kind,
+        importance: operation.importance,
+        ...(operation.key ? { key: operation.key.trim() } : {}),
+      }));
     } catch {
-      // Automatic memory is best-effort. The caller can use the deterministic
-      // extraction path in memory/remember.ts when model summarization fails.
-      return undefined;
+      // Passive memory is optional; a model failure leaves the completed turn intact.
+      return [];
     }
   }
 }

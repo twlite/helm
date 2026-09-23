@@ -341,6 +341,21 @@ function App() {
         });
       }
     }
+    if (event.runId && event.type === 'run.memory.recalled') {
+      const payload = isRecord(event.payload) ? event.payload : undefined;
+      const threadId = runThreadByIdRef.current.get(event.runId) ?? asString(payload?.threadId);
+      const count = typeof payload?.count === 'number' ? payload.count : 0;
+      if (threadId === selectedThreadIdRef.current && count > 0) {
+        const summary = `Recalled ${count} relevant memor${count === 1 ? 'y' : 'ies'}`;
+        setChatProgress((current) => {
+          const base: ChatProgress = current && current.runId === event.runId
+            ? current
+            : { runId: event.runId!, summaries: [], toolCalls: [] };
+          if (base.summaries.at(-1) === summary) return base;
+          return { ...base, summaries: [...base.summaries, summary].slice(-8) };
+        });
+      }
+    }
     if (event.runId && (event.type === 'run.step.started' || event.type === 'run.step.completed')) {
       const payload = isRecord(event.payload) ? event.payload : undefined;
       const toolCall = payload ? toolCallFromEvent(payload) : null;
@@ -811,11 +826,18 @@ function App() {
     }
   }, [showError]);
 
-  const handleAddMemory = useCallback(async (input: { content: string; kind: MemoryKind; importance: number }): Promise<boolean> => {
+  const handleAddMemory = useCallback(async (input: {
+    content: string;
+    kind: MemoryKind;
+    importance: number;
+    key?: string;
+    sourceUrl?: string;
+    durability: 'durable' | 'refreshable';
+  }): Promise<boolean> => {
     setMemoryActionId('new');
     try {
       const memory = await helmApi.createMemory(input);
-      setMemories((current) => [memory, ...current]);
+      setMemories((current) => [memory, ...current.filter((item) => item.id !== memory.id)]);
       return true;
     } catch (error) {
       showError(error);
@@ -824,6 +846,27 @@ function App() {
       setMemoryActionId(null);
     }
   }, [showError]);
+
+  const handleUpdateMemory = useCallback(async (memoryId: string, input: {
+    content: string;
+    kind: MemoryKind;
+    importance: number;
+    key: string | null;
+    sourceUrl: string | null;
+    durability: 'durable' | 'refreshable' | null;
+  }): Promise<boolean> => {
+    setMemoryActionId(memoryId);
+    try {
+      await helmApi.updateMemory(memoryId, input);
+      setMemories(await helmApi.listMemories(memoryQuery || undefined));
+      return true;
+    } catch (error) {
+      showError(error);
+      return false;
+    } finally {
+      setMemoryActionId(null);
+    }
+  }, [memoryQuery, showError]);
 
   const handleDeleteMemory = useCallback(async (memoryId: string) => {
     setMemoryActionId(memoryId);
@@ -906,6 +949,7 @@ function App() {
         memoryQuery={memoryQuery}
         onAddMemory={handleAddMemory}
         onDeleteMemory={handleDeleteMemory}
+        onUpdateMemory={handleUpdateMemory}
         onMemoryQueryChange={setMemoryQuery}
         onOpenChange={setIsMemoryOpen}
         onSearchMemories={handleMemorySearch}

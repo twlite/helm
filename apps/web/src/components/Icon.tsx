@@ -14,6 +14,7 @@ export type IconName =
   | 'copy'
   | 'database'
   | 'download'
+  | 'edit'
   | 'file'
   | 'flask'
   | 'folder'
@@ -56,6 +57,7 @@ const paths: Record<IconName, string[]> = {
   copy: ['M8 8h10v12H8z', 'M6 16H4V4h10v2'],
   database: ['M4 5c0 1.1 3.6 2 8 2s8-.9 8-2-3.6-2-8-2-8 .9-8 2Z', 'M4 5v7c0 1.1 3.6 2 8 2s8-.9 8-2V5', 'M4 12v7c0 1.1 3.6 2 8 2s8-.9 8-2v-7'],
   download: ['M12 3v12', 'm7 10 5 5 5-5', 'M5 21h14'],
+  edit: ['M12 20h9', 'm16.5 3.5 4 4L9 19l-5 1 1-5z'],
   file: ['M6 3h8l4 4v14H6z', 'M14 3v5h5', 'M9 13h6', 'M9 17h6'],
   flask: ['M9 3h6', 'M10 3v6l-5 8a3 3 0 0 0 2.6 4.5h8.8A3 3 0 0 0 19 17l-5-8V3', 'M8 16h8'],
   folder: ['M3 6h6l2 2h10v10H3z'],

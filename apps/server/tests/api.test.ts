@@ -54,21 +54,22 @@ describe('Helm HTTP API', () => {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            content: 'Actually use https://www.nrb.org.np/forex/ for the Nepal Rastra Bank exchange rate; remember this for the future.',
+            content: 'After you discover a useful source, remember it for future tasks.',
           }),
         })),
       );
       expect(correction.message.id).toBeString();
-      const automaticMemorySearch = await readJson<{ memories: Array<{ content: string }> }>(
-        await application.handle(new Request('http://helm.test/api/memories/search?q=Nepal%20Rastra%20Bank%20exchange%20rate')),
+      const beforeTaskMemorySearch = await readJson<{ memories: Array<{ content: string }> }>(
+        await application.handle(new Request('http://helm.test/api/memories/search?q=useful%20source')),
       );
-      expect(automaticMemorySearch.memories.some(memory => memory.content.includes('https://www.nrb.org.np/forex/'))).toBe(true);
+      expect(beforeTaskMemorySearch.memories).toEqual([]);
+      expect(application.memory.list()).toEqual([]);
 
       const createdMemory = await readJson<{ memory: { id: string } }>(
         await application.handle(new Request('http://helm.test/api/memories', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ content: 'The API test remembers FTS5', kind: 'fact' }),
+          body: JSON.stringify({ content: 'The API test remembers FTS5', kind: 'fact', key: 'project:api-test:fts', durability: 'durable' }),
         })),
       );
       expect(createdMemory.memory.id).toBeString();
@@ -77,6 +78,22 @@ describe('Helm HTTP API', () => {
         await application.handle(new Request('http://helm.test/api/memories/search?q=FTS5')),
       );
       expect(search.memories.some(memory => memory.id === createdMemory.memory.id)).toBe(true);
+
+      const updatedMemory = await readJson<{ memory: { content: string; key: string; source: string } }>(
+        await application.handle(new Request(`http://helm.test/api/memories/${createdMemory.memory.id}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ content: 'The API test now remembers durable FTS5 persistence', key: 'project:api-test:database' }),
+        })),
+      );
+      expect(updatedMemory.memory).toMatchObject({
+        content: 'The API test now remembers durable FTS5 persistence',
+        key: 'project:api-test:database',
+        source: 'manual',
+      });
+      const deletedMemory = await application.handle(new Request(`http://helm.test/api/memories/${createdMemory.memory.id}`, { method: 'DELETE' }));
+      expect(deletedMemory?.status).toBe(200);
+      expect(application.memory.get(createdMemory.memory.id)).toBeUndefined();
 
       const demo = await readJson<{
         run: { status: string; sourceMessageId?: string; steps: Array<{ phase: string }> };

@@ -43,7 +43,7 @@ function fakeEmbeddingModel(values: number[]): EmbeddingModel {
 }
 
 describe('LM Studio AI adapters', () => {
-  it('extracts durable user context while preserving corrected URLs', async () => {
+  it('extracts multiple bounded durable user facts for passive memory', async () => {
     const provider = createOpenAICompatible({
       name: 'lmstudio',
       baseURL: 'http://localhost:1234/v1',
@@ -58,10 +58,10 @@ describe('LM Studio AI adapters', () => {
           message: {
             role: 'assistant',
             content: JSON.stringify({
-              remember: true,
-              content: 'For Nepal Rastra Bank forex requests, use https://www.nrb.org.np/forex/.',
-              kind: 'instruction',
-              importance: 0.95,
+              operations: [
+                { type: 'upsert', key: 'preference:browser', content: 'The user prefers Firefox for research.', kind: 'preference', importance: 0.8 },
+                { type: 'upsert', key: 'project:language', content: 'The user’s project uses TypeScript.', kind: 'fact', importance: 0.7 },
+              ],
             }),
           },
           finish_reason: 'stop',
@@ -78,12 +78,11 @@ describe('LM Studio AI adapters', () => {
     });
 
     await expect(extractor.extract({
-      userMessage: 'Oops, remember the correct Nepal Rastra Bank URL for future requests.',
-    })).resolves.toEqual({
-      content: 'For Nepal Rastra Bank forex requests, use https://www.nrb.org.np/forex/.',
-      kind: 'instruction',
-      importance: 0.95,
-    });
+      userMessage: 'I prefer Firefox, and our project uses TypeScript.',
+    })).resolves.toEqual([
+      { content: 'The user prefers Firefox for research.', kind: 'preference', importance: 0.8, key: 'preference:browser' },
+      { content: 'The user’s project uses TypeScript.', kind: 'fact', importance: 0.7, key: 'project:language' },
+    ]);
   });
 
   it('keeps arbitrary action input keys while adapting the MLX schema', async () => {

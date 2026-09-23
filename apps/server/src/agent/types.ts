@@ -64,6 +64,7 @@ export interface TaskPlannerInput {
 export interface MemoryRecallInput {
   threadId: string;
   userMessage: string;
+  conversation?: readonly Message[];
   signal?: AbortSignal;
 }
 
@@ -194,6 +195,7 @@ export type RuntimeEventType =
   | 'run.progress'
   | 'run.context.usage'
   | 'run.context.compacted'
+  | 'run.memory.recalled'
   | 'run.step.started'
   | 'run.step.completed'
   | 'run.verification'

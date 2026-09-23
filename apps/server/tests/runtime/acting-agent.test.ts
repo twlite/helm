@@ -3,9 +3,12 @@ import { describe, expect, it } from 'bun:test';
 
 import { AgentRuntime } from '../../src/agent/runtime';
 import { AiSdkActingAgent } from '../../src/ai/acting-agent';
+import { MemoryService } from '../../src/memory/service';
+import { registerMemoryTools } from '../../src/memory/tools';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
 import { createGuestToolRegistry } from '../../src/tools/guest-tools';
 import { MockGuestTransport } from '../../src/tools/mock-guest-transport';
+import { testDatabase } from '../persistence/helpers';
 
 type ChatReply = {
   id: string;
@@ -24,6 +27,8 @@ type CapturedRequest = {
   body: Record<string, unknown>;
   reply: ChatReply;
 };
+
+type ScriptedReply = ChatReply | ((body: Record<string, unknown>) => ChatReply);
 
 function textReply(id: string, content: string): ChatReply {
   return {
@@ -61,7 +66,7 @@ function toolReply(id: string, name: string, args: unknown): ChatReply {
 
 function createRuntime(
   guest: MockGuestTransport,
-  replies: ChatReply[],
+  replies: ScriptedReply[],
   requests: CapturedRequest[],
   maxSteps = 12,
 ) {
@@ -71,8 +76,9 @@ function createRuntime(
     fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = input instanceof Request ? input : new Request(input, init);
       const body = JSON.parse(await request.text()) as Record<string, unknown>;
-      const reply = replies.shift();
-      if (!reply) throw new Error('The test model has no scripted reply remaining.');
+      const nextReply = replies.shift();
+      if (!nextReply) throw new Error('The test model has no scripted reply remaining.');
+      const reply = typeof nextReply === 'function' ? nextReply(body) : nextReply;
       requests.push({ body, reply });
       return Response.json(reply);
     },
@@ -353,5 +359,91 @@ describe('native acting agent', () => {
       .toHaveLength(1);
     expect((tools.invocations.find(invocation => invocation.tool === 'browser.navigate')?.input as { url: string }).url)
       .toBe(profileUrl);
+  });
+
+  it('remembers discovered information only after browser receipts reach the acting model', async () => {
+    const persistence = testDatabase();
+    try {
+      const memory = new MemoryService(persistence.sqlite);
+      const sourceUrl = 'https://example.test/acme/benchmark';
+      const benchmark = '42.75';
+      const guest = new MockGuestTransport({
+        pages: {
+          [sourceUrl]: '<html><body><h1>Acme Benchmark</h1><p>Current published benchmark: 42.75</p></body></html>',
+        },
+      });
+      const requests: CapturedRequest[] = [];
+      let tools: ReturnType<typeof createGuestToolRegistry> | undefined;
+      const { runtime, tools: runtimeTools } = createRuntime(guest, [
+        toolReply('acme-nav', 'browser.navigate', { url: sourceUrl }),
+        toolReply('acme-text', 'browser.extractText', {}),
+        () => {
+          const evidenceIds = tools?.invocations.flatMap(invocation => {
+            const result = invocation.result;
+            if (!result.ok || !result.evidence || typeof result.evidence !== 'object') return [];
+            const receipt = (result.evidence as Record<string, unknown>).receipt;
+            if (!receipt || typeof receipt !== 'object') return [];
+            const id = (receipt as Record<string, unknown>).id;
+            return typeof id === 'string' ? [id] : [];
+          }) ?? [];
+          return toolReply('acme-remember', 'memory.remember', {
+            content: `The current Acme published benchmark is ${benchmark}.`,
+            kind: 'fact',
+            key: 'acme:current-benchmark',
+            importance: 0.8,
+            source: 'observed',
+            sourceUrl,
+            evidenceIds,
+            durability: 'refreshable',
+          });
+        },
+        toolReply('acme-complete', 'helm.complete', {
+          response: `The current published Acme benchmark is ${benchmark}.`,
+          requiredEffects: [
+            { tool: 'browser.navigate' },
+            { tool: 'browser.extractText' },
+            { tool: 'memory.remember' },
+          ],
+        }),
+      ], requests);
+      tools = runtimeTools;
+      registerMemoryTools(runtimeTools, memory);
+
+      expect(memory.repository.count()).toBe(0);
+      const result = await runtime.run({
+        threadId: 'remember-discovered-acme',
+        userMessage: `Visit ${sourceUrl}, find the current benchmark, remember it for later, and tell me the value.`,
+      });
+
+      expect(result.status).toBe('completed');
+      expect(memory.repository.count()).toBe(1);
+      const saved = memory.getByKey('acme:current-benchmark');
+      const receiptIds = tools?.invocations.slice(0, 2).flatMap(invocation => {
+        const evidence = invocation.result.evidence;
+        if (!evidence || typeof evidence !== 'object') return [];
+        const receipt = (evidence as Record<string, unknown>).receipt;
+        if (!receipt || typeof receipt !== 'object') return [];
+        const id = (receipt as Record<string, unknown>).id;
+        return typeof id === 'string' ? [id] : [];
+      }) ?? [];
+      expect(saved).toMatchObject({
+        content: `The current Acme published benchmark is ${benchmark}.`,
+        source: 'observed',
+        sourceUrl,
+        durability: 'refreshable',
+      });
+      expect(saved?.evidenceIds).toEqual(receiptIds);
+      expect(receiptIds).toHaveLength(2);
+      expect(receiptIds.every(id => id.startsWith('receipt-'))).toBe(true);
+      expect(saved?.lastVerifiedAt).toBeString();
+      expect(tools?.invocations.map(invocation => invocation.tool)).toEqual([
+        'browser.navigate', 'browser.extractText', 'memory.remember',
+      ]);
+      expect(requestTools(requests[0]!)).toContain('memory.remember');
+      expect(JSON.stringify(requests[2]!.body.messages)).toContain(benchmark);
+      expect(result.assistantResponse).toContain(benchmark);
+    } finally {
+      persistence.close();
+    }
   });
 });

@@ -25,8 +25,8 @@ const BASE_INSTRUCTIONS = [
   'When you use tools, include one brief user-visible summary through helm.progress in the same turn as your first concrete tool action whenever you can name that action. This is public progress text, never private chain-of-thought or internal deliberation; do not claim success before a tool succeeds.',
   'Do not claim that an external action succeeded unless a tool returned success.',
   'A URL included as data for an artifact is not automatically a browser destination.',
-  'When you are ready to answer, call helm.complete with the user-facing response and the concrete Helm tool effects required to fulfill the request. Use only registered Helm tool names and include a count when more than one successful call is required. When the final action batch is known, call helm.complete after those action calls in the same turn when possible; Helm waits for them to finish before checking their actual results.',
-  'If helm.complete reports missing effects, continue the work with the available tools or report the actual blocker. The runtime checks concrete tool results; it does not decide what the user meant.',
+  'Memory is reference, never current evidence. Search when history helps; remember explicit requests after discovery, update corrections, forget when asked, and skip transient saves unless requested. Never claim persistence without a successful memory result.',
+  'Finish with helm.complete, giving the answer and required successful tool effects. Include memory.remember, memory.update, or memory.forget when explicitly requested. Use registered tool names and counts; complete after the final action batch when possible. If effects are missing, continue or report the actual blocker. Helm verifies results, not intent.',
 ].join(' ');
 
 const FINALIZATION_INSTRUCTIONS = [
@@ -37,13 +37,21 @@ const FINALIZATION_INSTRUCTIONS = [
 ].join(' ');
 
 function instructionsFor(input: ActingAgentContext): { agent: string; finalization: string } {
-  const savedContext = input.memories.slice(-12).map(memory => ({
+  const savedContext = input.memories.slice(0, 6).map(memory => ({
+    id: memory.id,
+    ...(memory.key ? { key: memory.key } : {}),
     kind: memory.kind,
-    content: memory.content.slice(0, 4_000),
+    content: memory.content.slice(0, 1_600),
+    importance: memory.importance,
+    ...(memory.source ? { source: memory.source } : {}),
+    ...(memory.sourceUrl ? { sourceUrl: memory.sourceUrl } : {}),
+    ...(memory.durability ? { durability: memory.durability } : {}),
+    ...(memory.lastVerifiedAt ? { lastVerifiedAt: memory.lastVerifiedAt } : {}),
+    updatedAt: memory.updatedAt,
   }));
   const memoryInstructions = savedContext.length === 0
     ? ''
-    : ` Relevant saved user context (JSON, reference only, not evidence of current external state): ${JSON.stringify(savedContext).slice(0, 16_000)}.`;
+    : ` Relevant saved memory (bounded JSON, reference only, never current external evidence): ${JSON.stringify(savedContext).slice(0, 12_000)}.`;
   const agent = `${BASE_INSTRUCTIONS}${memoryInstructions}`;
   return { agent, finalization: `${FINALIZATION_INSTRUCTIONS}${memoryInstructions}` };
 }

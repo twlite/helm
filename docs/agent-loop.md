@@ -110,6 +110,13 @@ This summary is local to one run. The separate persistent memory system stores
 selected information for later runs; recalled memory is a hint that may need
 live verification, never current external evidence.
 
+The acting agent can manage persistent memory with the native `memory.search`,
+`memory.remember`, `memory.update`, and `memory.forget` tools. Explicit writes
+can happen after the agent discovers information during the run, with observed
+facts linked to successful tool receipts. Retrieval uses the current request
+and nearby user/assistant subject context. See [`memory.md`](./memory.md) for
+the complete lifecycle and ranking details.
+
 ## Ownership
 
 - The model owns semantic reasoning, choosing whether and how to use tools,

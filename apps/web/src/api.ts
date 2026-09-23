@@ -110,6 +110,8 @@ function readArrayEnvelope(payload: unknown, key: string): unknown[] {
 
 const messageRoles: MessageRole[] = ['user', 'assistant', 'system', 'tool'];
 const memoryKinds: MemoryKind[] = ['fact', 'preference', 'instruction', 'note'];
+const memorySources = ['user', 'observed', 'manual', 'passive-extraction'] as const;
+const memoryDurabilities = ['durable', 'refreshable'] as const;
 const vmStates: VmStatus['state'][] = [
   'stopped',
   'starting',
@@ -155,12 +157,27 @@ function parseMemory(value: unknown): Memory | null {
   const kind = memoryKinds.includes(value.kind as MemoryKind)
     ? (value.kind as MemoryKind)
     : 'note';
+  const key = asOptionalString(value.key ?? value.memoryKey ?? value.memory_key);
+  const sourceUrl = asOptionalString(value.sourceUrl ?? value.source_url);
+  const evidenceValue = value.evidenceIds ?? value.evidence_ids;
+  const lastVerifiedAt = asOptionalString(value.lastVerifiedAt ?? value.last_verified_at);
+  const lastAccessedAt = asOptionalString(value.lastAccessedAt ?? value.last_accessed_at);
   return {
     id: value.id,
     content: asString(value.content),
     kind,
     importance: Math.min(1, Math.max(0, asNumber(value.importance, 0.5))),
     metadata: asJsonObject(value.metadata ?? value.metadata_json),
+    ...(key ? { key } : {}),
+    ...(memorySources.includes(value.source as typeof memorySources[number]) ? { source: value.source as Memory['source'] } : {}),
+    ...(sourceUrl ? { sourceUrl } : {}),
+    ...(Array.isArray(evidenceValue)
+      ? { evidenceIds: evidenceValue.filter((item): item is string => typeof item === 'string') }
+      : {}),
+    ...(memoryDurabilities.includes(value.durability as typeof memoryDurabilities[number]) ? { durability: value.durability as Memory['durability'] } : {}),
+    ...(lastVerifiedAt ? { lastVerifiedAt } : {}),
+    ...(lastAccessedAt ? { lastAccessedAt } : {}),
+    ...(typeof (value.accessCount ?? value.access_count) === 'number' ? { accessCount: asNumber(value.accessCount ?? value.access_count) } : {}),
     createdAt: asString(value.createdAt ?? value.created_at),
     updatedAt: asString(value.updatedAt ?? value.updated_at),
   };
@@ -509,9 +526,9 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
   return payload;
 }
 
-function jsonBody(value: Record<string, unknown>): RequestInit {
+function jsonBody(value: Record<string, unknown>, method = 'POST'): RequestInit {
   return {
-    method: 'POST',
+    method,
     body: JSON.stringify(value),
   };
 }
@@ -652,8 +669,23 @@ export const helmApi = {
     content: string;
     kind: MemoryKind;
     importance: number;
+    key?: string;
+    sourceUrl?: string;
+    durability?: 'durable' | 'refreshable';
   }): Promise<Memory> {
     const payload = await request('/api/memories', jsonBody(input));
+    return parseSingle(payload, 'memory', parseMemory);
+  },
+
+  async updateMemory(memoryId: string, input: {
+    content?: string;
+    kind?: MemoryKind;
+    importance?: number;
+    key?: string | null;
+    sourceUrl?: string | null;
+    durability?: 'durable' | 'refreshable' | null;
+  }): Promise<Memory> {
+    const payload = await request(`/api/memories/${encodeURIComponent(memoryId)}`, jsonBody(input, 'PUT'));
     return parseSingle(payload, 'memory', parseMemory);
   },
 

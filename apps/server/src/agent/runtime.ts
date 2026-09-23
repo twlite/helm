@@ -394,6 +394,7 @@ export class AgentRuntime {
     const memories = await this.loadMemories({
       threadId: input.threadId,
       userMessage: input.userMessage,
+      conversation: input.conversation,
       signal: input.signal,
     });
     // Keep a mutable per-run conversation window. The server can inject
@@ -1061,6 +1062,33 @@ export class AgentRuntime {
       run.startedAt = startedAt;
       await this.persistRun(run, true);
       await this.emit('run.started', run, run.id);
+      if (memories.length > 0) {
+        await this.emit('run.memory.recalled', {
+          threadId: run.threadId,
+          count: memories.length,
+        }, runId);
+        const recallAction: AgentDecision = {
+          type: 'action',
+          tool: 'memory.recall',
+          input: { count: memories.length },
+        };
+        const recallResult: ToolResult = { ok: true, data: { count: memories.length } };
+        await this.emit('run.step.started', { stepIndex: actionCount, action: recallAction }, runId);
+        await this.persistStep(steps, {
+          runId,
+          stepIndex: actionCount,
+          phase: 'act',
+          decision: recallAction,
+          toolName: recallAction.tool,
+          toolInput: {},
+          toolResult: recallResult,
+        });
+        await this.emit('run.step.completed', {
+          stepIndex: actionCount,
+          action: recallAction,
+          toolResult: recallResult,
+        }, runId);
+      }
 
       const agentResult = await this.actingAgent!.execute({
         userMessage: input.userMessage,

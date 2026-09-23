@@ -350,12 +350,24 @@ export type AgentDecision =
   | { type: 'complete'; reasoningSummary?: string }
   | { type: 'blocked'; reason: string; reasoningSummary?: string };
 
+export type MemorySource = 'user' | 'observed' | 'manual' | 'passive-extraction';
+
+export type MemoryDurability = 'durable' | 'refreshable';
+
 export interface Memory {
   id: string;
   content: string;
   kind: 'fact' | 'preference' | 'instruction' | 'note';
   importance: number;
   metadata: JsonObject;
+  key?: string;
+  source?: MemorySource;
+  sourceUrl?: string;
+  evidenceIds?: string[];
+  durability?: MemoryDurability;
+  lastVerifiedAt?: string;
+  lastAccessedAt?: string;
+  accessCount?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -476,6 +488,7 @@ export interface WebSocketEvent {
     | 'run.progress'
     | 'run.context.usage'
     | 'run.context.compacted'
+    | 'run.memory.recalled'
     | 'run.step.started'
     | 'run.step.completed'
     | 'run.verification'

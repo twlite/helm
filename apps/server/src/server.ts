@@ -4,7 +4,6 @@ import { z } from 'zod';
 import type {
   JsonValue,
   GuestMethod,
-  Memory,
   Message,
   MessageRole,
   Run,
@@ -26,9 +25,11 @@ import {
 } from './agent';
 import type { RuntimeEvent, RuntimeEventSink, RuntimeRepository } from './agent';
 import { PersistenceDatabase } from './db/database';
-import type { CreateMemoryInput } from './memory/repository';
-import { extractExplicitMemory, shouldAttemptModelMemoryExtraction } from './memory/remember';
+import { MemoryKeyConflictError } from './memory/repository';
+import { shouldAttemptModelMemoryExtraction } from './memory/remember';
+import { buildMemoryRetrievalQuery } from './memory/retrieval-query';
 import { MemoryService } from './memory/service';
+import { registerMemoryTools } from './memory/tools';
 import { EventHub, type EventSocket } from './events';
 import { loadConfig, type HelmConfig } from './config';
 import { logger } from './logger';
@@ -47,12 +48,32 @@ const messageInputSchema = z.object({
 });
 
 const threadInputSchema = z.object({ title: z.string().trim().min(1).max(200) });
+const memorySourceUrlSchema = z.string().url().max(4_000).refine(value => {
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}, 'Expected an HTTP or HTTPS URL without credentials.');
 const memoryInputSchema = z.object({
   content: z.string().trim().min(1).max(100_000),
   kind: z.enum(['fact', 'preference', 'instruction', 'note']).default('note'),
   importance: z.number().min(0).max(1).default(0.5),
+  key: z.string().trim().min(1).max(200).optional(),
+  sourceUrl: memorySourceUrlSchema.optional(),
+  durability: z.enum(['durable', 'refreshable']).optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
+const memoryUpdateSchema = z.object({
+  content: z.string().trim().min(1).max(100_000).optional(),
+  kind: z.enum(['fact', 'preference', 'instruction', 'note']).optional(),
+  importance: z.number().min(0).max(1).optional(),
+  key: z.string().trim().min(1).max(200).nullable().optional(),
+  sourceUrl: memorySourceUrlSchema.nullable().optional(),
+  durability: z.enum(['durable', 'refreshable']).nullable().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+}).refine(input => Object.keys(input).length > 0, 'Provide at least one memory field to update.');
 const scriptedDemoInputSchema = z.object({ threadId: z.string().min(1).optional() });
 const agentRunInputSchema = z.object({
   threadId: z.string().min(1),
@@ -279,85 +300,16 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
     sqliteVec: { dimensions: config.models.embeddingDimensions },
   });
 
-  const isLegacyAutomaticMemory = (candidate: Memory): boolean => (
-    candidate.metadata.source === 'automatic-user-memory'
-    && /^(?:User correction|User instruction) to remember:/u.test(candidate.content)
-  );
-
-  let legacyMemoryUpgradePromise: Promise<void> | undefined;
-  const upgradeLegacyMemories = async (): Promise<void> => {
-    for (const candidate of memory.list(1_000).filter(isLegacyAutomaticMemory)) {
-      const sourceMessageId = candidate.metadata.sourceMessageId;
-      if (typeof sourceMessageId !== 'string') continue;
-      const sourceMessage = database.messages.getById(sourceMessageId);
-      if (!sourceMessage || sourceMessage.role !== 'user') continue;
-      try {
-        const summary = await models.memoryExtractor.extract({
-          userMessage: sourceMessage.content,
-          conversation: database.messages.listByThread(sourceMessage.threadId),
-        });
-        if (!summary) continue;
-        await memory.update(candidate.id, summary);
-        logger.info('Legacy automatic memory summarized', {
-          component: 'memory',
-          memoryId: candidate.id,
-        });
-      } catch (error) {
-        // A legacy row remains usable if the local model is unavailable. It can
-        // be retried after the next server restart without blocking the API.
-        logger.warn('Legacy automatic memory summarization failed', {
-          component: 'memory',
-          memoryId: candidate.id,
-          error,
-        });
-      }
-    }
-  };
-  const ensureLegacyMemoryUpgrade = async (): Promise<void> => {
-    if (!legacyMemoryUpgradePromise) {
-      legacyMemoryUpgradePromise = upgradeLegacyMemories().catch(error => {
-        logger.warn('Legacy memory upgrade failed', { component: 'memory', error });
+  const capturePassiveMemories = async (userMessage: string, conversation: readonly Message[]): Promise<void> => {
+    if (!shouldAttemptModelMemoryExtraction(userMessage)) return;
+    const operations = await models.memoryExtractor.extract({ userMessage, conversation });
+    for (const operation of operations) {
+      await memory.remember({
+        ...operation,
+        source: 'passive-extraction',
+        durability: 'durable',
       });
     }
-    await legacyMemoryUpgradePromise;
-  };
-
-  const rememberUserMessage = async (message: Message): Promise<void> => {
-    if (message.role !== 'user') return;
-    const metadata = {
-      source: 'automatic-user-memory',
-      threadId: message.threadId,
-      sourceMessageId: message.id,
-    } satisfies Record<string, JsonValue>;
-    const relatedUserMessages = database.messages
-      .listByThread(message.threadId)
-      .filter(candidate => candidate.role === 'user' && candidate.id !== message.id)
-      .map(candidate => candidate.content);
-    const explicitMemory = extractExplicitMemory(message.content, relatedUserMessages);
-    const shouldExtract = explicitMemory !== undefined || shouldAttemptModelMemoryExtraction(message.content);
-    const modelCandidate = shouldExtract
-      ? await models.memoryExtractor.extract({
-        userMessage: message.content,
-        conversation: database.messages.listByThread(message.threadId),
-      })
-      : undefined;
-    // Explicit memory intent wins even if the local model is temporarily
-    // unavailable. The deterministic candidate is only a conservative
-    // fallback; successful model extraction is what normally gets persisted.
-    const candidate = modelCandidate ?? explicitMemory;
-    if (!candidate) return;
-    const existingAutomaticMemory = memory.list(1_000).find(existing => (
-      existing.metadata.source === metadata.source
-      && existing.metadata.sourceMessageId === message.id
-    ));
-    if (existingAutomaticMemory) {
-      await memory.update(existingAutomaticMemory.id, candidate);
-      return;
-    }
-    await memory.saveIfNew({
-      ...candidate,
-      metadata,
-    });
   };
 
   const updateThreadTitleAfterRun = async (threadId: string, sourceMessageId: string): Promise<void> => {
@@ -438,6 +390,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
 
   const createAiRuntime = (): AgentRuntime => {
     const tools = createGuestToolRegistry(agentGuest, realToolOptions);
+    registerMemoryTools(tools, memory);
     return new AgentRuntime({
       guestTransport: agentGuest,
       toolRegistry: tools,
@@ -445,9 +398,9 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       actingAgent: models.actingAgent,
       repository: runAdapter,
       events: runtimeEvents,
-      memories: async ({ userMessage }) => {
-        await ensureLegacyMemoryUpgrade();
-        return memory.recall(userMessage);
+      memories: async ({ userMessage, conversation }) => {
+        const query = buildMemoryRetrievalQuery(userMessage, conversation);
+        return memory.recall(query, { limit: 6 });
       },
       budgets: {
         maxSteps: config.maxSteps,
@@ -527,6 +480,21 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
           status: persistedRun.status,
         },
       });
+      const memoryWasExplicitlyManaged = result.steps.some(step => (
+        step.phase === 'act' && step.toolName?.startsWith('memory.') && step.toolName !== 'memory.recall'
+      ));
+      if (result.status === 'completed' && !memoryWasExplicitlyManaged) {
+        const userConversation = database.messages.listByThread(threadId)
+          .filter(candidate => candidate.role === 'user');
+        void capturePassiveMemories(sourceMessage.content, userConversation).catch(error => {
+          logger.warn('Passive memory extraction failed', {
+            component: 'memory',
+            threadId,
+            sourceMessageId,
+            error,
+          });
+        });
+      }
       if (responseMessageId) {
         events.publish('assistant.message.finished', jsonValue({
           threadId,
@@ -632,7 +600,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       if (!server?.upgrade(request)) return errorResponse('WEBSOCKET_UPGRADE_FAILED', 'Could not upgrade the WebSocket.', 400);
       return undefined;
     }
-    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS', 'access-control-allow-headers': 'content-type' } });
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS', 'access-control-allow-headers': 'content-type' } });
     if (!url.pathname.startsWith('/api/')) return notFound();
 
     try {
@@ -699,18 +667,6 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
             content: input.content,
             metadata: jsonObject(input.metadata),
           });
-          if (message.role === 'user') {
-            try {
-              await rememberUserMessage(message);
-            } catch (error) {
-              logger.warn('Automatic memory capture failed', {
-                component: 'memory',
-                threadId,
-                sourceMessageId: message.id,
-                error,
-              });
-            }
-          }
           return jsonResponse({ message }, 201);
         }
       }
@@ -761,17 +717,30 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       }
 
       if (request.method === 'GET' && url.pathname === '/api/memories') {
-        await ensureLegacyMemoryUpgrade();
         return jsonResponse({ memories: memory.list() });
       }
       if (request.method === 'GET' && url.pathname === '/api/memories/search') {
-        await ensureLegacyMemoryUpgrade();
         return jsonResponse({ memories: await memory.search(url.searchParams.get('q') ?? '') });
       }
       if (request.method === 'POST' && url.pathname === '/api/memories') {
         const input = memoryInputSchema.parse(await parseBody(request));
-        const created = await memory.save(input as CreateMemoryInput);
-        return jsonResponse({ memory: created }, 201);
+        const { metadata, ...fields } = input;
+        const result = await memory.remember({
+          ...fields,
+          source: 'manual',
+          ...(metadata === undefined ? {} : { metadata: jsonObject(metadata) }),
+        });
+        return jsonResponse({ memory: result.memory, action: result.action }, result.action === 'remembered' ? 201 : 200);
+      }
+      if (request.method === 'PUT' && segments[0] === 'api' && segments[1] === 'memories' && segments.length === 3) {
+        const input = memoryUpdateSchema.parse(await parseBody(request));
+        const { metadata, ...fields } = input;
+        const updated = await memory.update(segments[2], {
+          ...fields,
+          ...(metadata === undefined ? {} : { metadata: jsonObject(metadata) }),
+        });
+        if (!updated) return notFound('Memory not found.');
+        return jsonResponse({ memory: updated });
       }
       if (request.method === 'DELETE' && segments[0] === 'api' && segments[1] === 'memories' && segments.length === 3) {
         if (!(await memory.delete(segments[2]))) return notFound('Memory not found.');
@@ -794,6 +763,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       return notFound();
     } catch (error) {
       if (error instanceof ApiFailure) return errorResponse(error.code, error.message, error.status, error.details);
+      if (error instanceof MemoryKeyConflictError) return errorResponse('MEMORY_KEY_CONFLICT', error.message, 409);
       const normalized = errorDetails(error);
       logger.error('API request failed', { component: 'api', error });
       return errorResponse(normalized.code, normalized.message, normalized.code === 'INTERNAL_ERROR' ? 500 : 400, normalized.details);
