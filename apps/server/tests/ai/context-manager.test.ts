@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import type { ModelMessage } from 'ai';
+import { modelMessageSchema, type ModelMessage } from 'ai';
 
 import {
   estimateContextTokens,
@@ -300,5 +300,68 @@ describe('model context management', () => {
     });
     expect(data?.rows).toHaveLength(data?.returnedRowCount as number);
     expect((data?.rows as unknown[]).length).toBeLessThan(500);
+  });
+
+  it('bounds SDK error outputs without corrupting the ModelMessage wrapper', async () => {
+    const currentRequest = 'Save the file and report any error.';
+    const exchange: ContextExchange = {
+      kind: 'tool',
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', toolCallId: 'call-failed-write', toolName: 'fs.write', input: { path: 'report.txt' } },
+            { type: 'tool-call', toolCallId: 'call-failed-read', toolName: 'fs.read', input: { path: 'missing.txt' } },
+          ],
+        },
+        {
+          role: 'tool',
+          content: [
+            {
+              type: 'tool-result',
+              toolCallId: 'call-failed-write',
+              toolName: 'fs.write',
+              output: { type: 'error-json', value: { code: 'TOOL_ERROR', message: 'x'.repeat(50_000) } },
+            },
+            {
+              type: 'tool-result',
+              toolCallId: 'call-failed-read',
+              toolName: 'fs.read',
+              output: { type: 'error-text', value: 'y'.repeat(50_000) },
+            },
+          ],
+        },
+      ] as unknown as ModelMessage[],
+    };
+    const result = await prepareModelContext({
+      exchanges: groupConversation([{ role: 'user', content: currentRequest }], currentRequest).concat(exchange),
+      instructions: 'Use the tool result to recover.',
+      currentRequest,
+      toolDescription: 'filesystem tools',
+      budget: {
+        contextWindowTokens: 100_000,
+        contextCompactAtRatio: 0.8,
+        contextCriticalAtRatio: 0.95,
+        contextRecentExchanges: 4,
+        contextCriticalRecentExchanges: 2,
+      },
+      compactionCount: 0,
+      summarize: async () => { throw new Error('No compaction expected.'); },
+    });
+
+    const message = result.exchanges.flatMap(item => item.messages)
+      .find(item => item.role === 'tool') as ModelMessage | undefined;
+    const outputs = message && Array.isArray(message.content)
+      ? message.content.map(part => (part as { toolName: string; output: unknown }))
+      : [];
+    const errorJson = outputs.find(part => part.toolName === 'fs.write')?.output as { type?: string; value?: { code?: string; message?: string } } | undefined;
+    const errorText = outputs.find(part => part.toolName === 'fs.read')?.output as { type?: string; value?: string } | undefined;
+
+    expect(errorJson?.type).toBe('error-json');
+    expect(errorJson?.value?.code).toBe('TOOL_ERROR');
+    expect(errorJson?.value?.message?.length).toBeLessThan(10_000);
+    expect(errorText?.type).toBe('error-text');
+    expect(errorText?.value?.length).toBeLessThan(10_000);
+    expect(result.exchanges.flatMap(item => item.messages).every(item => modelMessageSchema.safeParse(item).success)).toBe(true);
   });
 });

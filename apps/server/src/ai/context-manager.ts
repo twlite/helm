@@ -383,9 +383,21 @@ function boundValue(
 function boundModelToolResults(exchanges: ContextExchange[]): void {
   for (const exchange of exchanges) {
     for (const message of exchange.messages) {
-      if (message.role !== 'tool') continue;
       for (const part of partsOf(message)) {
         if (part.type !== 'tool-result' || typeof part.toolName !== 'string') continue;
+        const output = record(part.output);
+        if (output && output.type === 'error-json' && 'value' in output) {
+          part.output = {
+            ...output,
+            value: boundValue(output.value, { remaining: 1_500, truncated: false }),
+          };
+          continue;
+        }
+        if (output && (output.type === 'text' || output.type === 'error-text') && typeof output.value === 'string') {
+          const state = { remaining: CONTEXT_TOOL_DATA_CHARS, truncated: false };
+          part.output = { ...output, value: boundedString(output.value, state) };
+          continue;
+        }
         const result = toolResult(part);
         if (!result) continue;
         const state = {
