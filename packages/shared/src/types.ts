@@ -119,6 +119,8 @@ export interface ActionEffect {
   navigationOccurred?: boolean;
   newTabOpened?: boolean;
   domChanged?: boolean;
+  browserRevisionBefore?: number;
+  browserRevisionAfter?: number;
   path?: string;
   existsBefore?: boolean;
   existsAfter?: boolean;
@@ -298,24 +300,9 @@ export interface EnvironmentObservation {
   browser?: {
     url?: string;
     title?: string;
-    loaded?: boolean;
+    loading?: boolean;
     pageCount?: number;
-    domFingerprint?: string;
-    main?: {
-      heading?: string;
-      text?: string;
-    };
-    interactiveElements?: Array<{
-      ref: string;
-      role: string;
-      name: string;
-      value?: string;
-      text?: string;
-      enabled: boolean;
-      href?: string;
-      checked?: boolean;
-      selected?: boolean;
-    }>;
+    revision?: number;
   };
   lastToolResult?: ToolResult;
   task: {
@@ -464,6 +451,8 @@ export type GuestMethod =
   | 'browser.navigate'
   | 'browser.getState'
   | 'browser.snapshot'
+  | 'browser.searchPage'
+  | 'browser.inspectRegion'
   | 'browser.extractText'
   | 'browser.download'
   | 'browser.click'
@@ -485,6 +474,8 @@ export interface WebSocketEvent {
     | 'guest.disconnected'
     | 'run.started'
     | 'run.progress'
+    | 'run.context.usage'
+    | 'run.context.compacted'
     | 'run.step.started'
     | 'run.step.completed'
     | 'run.verification'
@@ -500,3 +491,97 @@ export interface WebSocketEvent {
   runId?: string;
   payload: JsonValue;
 }
+
+export type BrowserRegionKind =
+  | 'heading'
+  | 'section'
+  | 'article'
+  | 'table'
+  | 'list'
+  | 'form'
+  | 'navigation'
+  | 'text'
+  | 'footer'
+  | 'aside';
+
+export interface BrowserPageRegion {
+  ref: string;
+  kind: BrowserRegionKind;
+  heading?: string;
+  preview?: string;
+  rowCount?: number;
+  columnCount?: number;
+}
+
+export interface BrowserSnapshot {
+  url: string;
+  title: string;
+  pageCount: number;
+  revision: number;
+  regionCount: number;
+  outlineTruncated: boolean;
+  outline: BrowserPageRegion[];
+  elements: Array<{
+    ref: string;
+    role: string;
+    name: string;
+    value?: string;
+    text?: string;
+    enabled: boolean;
+    href?: string;
+    checked?: boolean;
+    selected?: boolean;
+  }>;
+}
+
+export interface BrowserSearchResult extends BrowserPageRegion {
+  score: number;
+}
+
+export interface BrowserSearchPageResult {
+  url: string;
+  title: string;
+  revision: number;
+  query: string;
+  indexedRegionCount: number;
+  results: BrowserSearchResult[];
+}
+
+export type BrowserRegionInspection =
+  | {
+      url: string;
+      title: string;
+      revision: number;
+      ref: string;
+      kind: BrowserRegionKind;
+      heading?: string;
+      format: 'text';
+      text: string;
+      truncated: boolean;
+    }
+  | {
+      url: string;
+      title: string;
+      revision: number;
+      ref: string;
+      kind: 'table';
+      heading?: string;
+      format: 'table';
+      columns: string[];
+      rows: string[][];
+      rowCount: number;
+      columnCount: number;
+      truncated: boolean;
+    }
+  | {
+      url: string;
+      title: string;
+      revision: number;
+      ref: string;
+      kind: BrowserRegionKind;
+      heading?: string;
+      format: 'links';
+      links: Array<{ text: string; href: string }>;
+      linkCount: number;
+      truncated: boolean;
+    };

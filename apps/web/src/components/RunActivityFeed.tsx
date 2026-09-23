@@ -2,6 +2,7 @@ import { useState } from 'react';
 import type { CompletionCriterion } from '@helm/shared';
 import type { LiveActivity, RunDetails, RunStep } from '../types';
 import { humanize } from '../format';
+import { browserInspectionSummary, browserSearchDisplay, contextCompactionDisplay, contextUsageLabel } from '../run-context';
 import { Icon } from './Icon';
 import { Button } from './ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './ui/collapsible';
@@ -45,6 +46,8 @@ function toolTitle(toolName: string): string {
     'browser.navigate': 'Opened webpage',
     'browser.extractText': 'Read page contents',
     'browser.snapshot': 'Inspected webpage',
+    'browser.searchPage': 'Searched current page',
+    'browser.inspectRegion': 'Inspected page region',
     'browser.download': 'Recorded browser download',
     'browser.click': 'Clicked webpage element',
     'browser.type': 'Entered text in browser',
@@ -56,6 +59,7 @@ function toolTitle(toolName: string): string {
     'app.launch': 'Opened application',
     'app.openFile': 'Opened file',
     'desktop.screenshot': 'Captured desktop',
+    'context.compaction': 'Compacted model context',
     'desktop.getState': 'Checked desktop',
     'desktop.click': 'Clicked desktop',
     'desktop.type': 'Typed on desktop',
@@ -122,14 +126,15 @@ function stepForGroup(steps: RunStep[]): RunStep {
 }
 
 function activityRows(run: RunDetails, liveActivity?: LiveActivity): ActivityRow[] {
-  const groups = new Map<number, RunStep[]>();
+  const groups = new Map<string, { stepIndex: number; steps: RunStep[] }>();
   for (const step of [...run.steps].sort((left, right) => left.stepIndex - right.stepIndex)) {
-    const group = groups.get(step.stepIndex) ?? [];
-    group.push(step);
-    groups.set(step.stepIndex, group);
+    const key = step.toolName === 'context.compaction' ? `context:${step.id}` : `step:${step.stepIndex}`;
+    const group = groups.get(key) ?? { stepIndex: step.stepIndex, steps: [] };
+    group.steps.push(step);
+    groups.set(key, group);
   }
 
-  return [...groups.entries()].map(([stepIndex, steps]) => {
+  return [...groups.values()].map(({ stepIndex, steps }): ActivityRow => {
     const step = stepForGroup(steps);
     const toolName = step.toolName ?? (step.decision?.type === 'action' ? step.decision.tool : undefined);
     const verificationStep = steps.find((candidate) => candidate.verification);
@@ -156,7 +161,14 @@ function activityRows(run: RunDetails, liveActivity?: LiveActivity): ActivityRow
       ...(elapsed === undefined ? {} : { duration: elapsed < 1000 ? `${elapsed}ms` : `${(elapsed / 1000).toFixed(1)}s` }),
       status: failed ? 'failed' : active ? 'active' : 'complete',
     };
-  });
+  }).sort((left, right) => left.stepIndex - right.stepIndex);
+}
+
+function resultData(row: ActivityRow): Record<string, unknown> | undefined {
+  const data = row.resultStep?.toolResult?.data;
+  return typeof data === 'object' && data !== null && !Array.isArray(data)
+    ? data as Record<string, unknown>
+    : undefined;
 }
 
 function StepMark({ status }: { status: ActivityRow['status'] }) {
@@ -175,6 +187,12 @@ function ActivityRowView({ row }: { row: ActivityRow }) {
   const reasoning = row.step.decision?.reasoningSummary;
   const objective = row.step.objective;
   const workerResult = row.step.workerResult;
+  const searchResult = row.toolName === 'browser.searchPage' ? resultData(row) : undefined;
+  const inspectedRegion = row.toolName === 'browser.inspectRegion' ? resultData(row) : undefined;
+  const compaction = row.toolName === 'context.compaction' ? contextCompactionDisplay(row.step.observation) : undefined;
+  const searchInput = row.step.toolInput;
+  const searchDisplay = searchResult ? browserSearchDisplay(searchResult, searchInput?.query) : undefined;
+  const inspectionSummary = browserInspectionSummary(inspectedRegion);
   return (
     <Collapsible className="border-b border-[var(--border)] last:border-b-0" onOpenChange={setExpanded} open={expanded}>
       <CollapsibleTrigger className="flex min-h-8 w-full min-w-0 items-center gap-2 py-1.5 text-left outline-none transition-colors hover:bg-[var(--hover-bg)] focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[var(--accent)]">
@@ -190,7 +208,25 @@ function ActivityRowView({ row }: { row: ActivityRow }) {
           {objective?.rationale ? <Detail label="Why this objective" value={objective.rationale} /> : null}
           {row.toolName ? <Detail label="Tool" value={row.toolName} /> : null}
           {row.step.toolInput ? <Detail label="Input" value={displayValue(row.step.toolInput)} pre /> : null}
-          {row.resultStep?.observation !== undefined ? <Detail label="Observation" value={displayValue(row.resultStep.observation)} pre /> : null}
+          {row.toolName === 'browser.searchPage' ? (
+            <>
+              <Detail label="Query" value={searchDisplay?.query ?? 'Page search'} />
+              <Detail label="Coverage" value={searchDisplay?.coverage ?? '0 regions indexed · 0 matches'} />
+              {searchDisplay?.matches ? <Detail label="Matches" value={searchDisplay.matches} pre /> : null}
+            </>
+          ) : null}
+          {inspectionSummary ? <Detail label="Inspected region" value={inspectionSummary} /> : null}
+          {compaction ? (
+            <>
+              <Detail label="Reason" value={typeof compaction.reason === 'string' ? compaction.reason : 'Context pressure'} />
+              <Detail label="Estimated input" value={compaction.estimatedInput} />
+              <Detail label="Exchanges" value={compaction.exchanges} />
+              {compaction.preserved.length > 0 ? <Detail label="Preserved" value={compaction.preserved.join('\n')} /> : null}
+              {compaction.removed.length > 0 ? <Detail label="Removed from active context" value={compaction.removed.join('\n')} /> : null}
+              {compaction.findings.length > 0 ? <Detail label="Evidence-linked findings" value={displayValue(compaction.findings)} pre /> : null}
+            </>
+          ) : null}
+          {row.toolName !== 'context.compaction' && row.resultStep?.observation !== undefined ? <Detail label="Observation" value={displayValue(row.resultStep.observation)} pre /> : null}
           {row.resultStep?.toolResult ? <Detail label="Result" value={displayValue(row.resultStep.toolResult)} pre /> : null}
           {workerResult?.actions.length ? <Detail label="Worker actions" value={displayValue(workerResult.actions.map((action) => ({ tool: action.tool, input: action.input, ok: action.result.ok })))} pre /> : null}
           {workerResult?.facts.length ? <Detail label="Facts proposed from receipts" value={displayValue(workerResult.facts.map((fact) => ({ id: fact.id, value: fact.value, origin: fact.origin })))} pre /> : null}
@@ -229,6 +265,18 @@ export function RunActivityFeed({
   const rows = activityRows(run, liveActivity);
   const status = statusClasses(run.status);
   const liveForRun = liveActivity?.runId === run.id ? liveActivity : undefined;
+  const latestCompaction = [...run.steps].reverse().find((step) => step.toolName === 'context.compaction');
+  const compactionData = typeof latestCompaction?.observation === 'object' && latestCompaction.observation !== null
+    ? latestCompaction.observation as Record<string, unknown>
+    : undefined;
+  const contextUsage = liveForRun?.contextUsage
+    ?? (typeof compactionData?.estimatedTokensAfter === 'number' && typeof compactionData.contextWindowTokens === 'number'
+      ? {
+        estimatedTokens: compactionData.estimatedTokensAfter,
+        contextWindowTokens: compactionData.contextWindowTokens,
+        compactions: typeof compactionData.compactions === 'number' ? compactionData.compactions : 1,
+      }
+      : undefined);
   const latestVerification = [...run.steps]
     .sort((left, right) => right.stepIndex - left.stepIndex)
     .find((step) => step.verification)?.verification;
@@ -262,6 +310,9 @@ export function RunActivityFeed({
       </div>
 
       {liveForRun?.reasoningSummary ? <p className="text-xs leading-5 text-[#929aa5]">{liveForRun.reasoningSummary}</p> : null}
+      {contextUsage ? (
+        <p className="text-[10px] text-[#606975]">{contextUsageLabel(contextUsage)}</p>
+      ) : null}
 
       {rows.length > 0 ? (
         <div>

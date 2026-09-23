@@ -1,9 +1,17 @@
-import { isStepCount, tool, ToolLoopAgent, type ModelMessage, type ToolSet } from 'ai';
+import { generateText, isStepCount, Output, tool, ToolLoopAgent, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
 import type { Message, ToolResult } from '@helm/shared';
 
 import type { ActingAgentContext, ActingAgentProvider, ActingAgentResult, RequestedToolEffect } from '../agent/types';
 import type { ToolDefinition } from '../tools/registry';
+import {
+  groupConversation,
+  prepareModelContext,
+  contextSummarySchema,
+  type ContextBudgetOptions,
+  type ContextExchange,
+} from './context-manager';
+import { structuredOutputSchema, type StructuredOutputCompatibility } from './structured-output';
 
 const COMPLETE_TOOL = 'helm.complete';
 const PROGRESS_TOOL = 'helm.progress';
@@ -13,6 +21,7 @@ const BASE_INSTRUCTIONS = [
   'You are Helm, a capable assistant with optional local computer-use tools.',
   'Use the conversation and current request to decide whether tools are needed; ordinary chat usually needs none.',
   'When a tool is useful, call the native Helm tool and use its actual result. Tool errors are available for recovery.',
+  'Use browser.snapshot for a bounded page overview, browser.searchPage to locate matching regions, and browser.inspectRegion to read a selected section, table, or its local links. Use browser.extractText as a bounded fallback; mode full is only for an explicitly requested full-page read.',
   'When you use tools, include one brief user-visible summary through helm.progress in the same turn as your first concrete tool action whenever you can name that action. This is public progress text, never private chain-of-thought or internal deliberation; do not claim success before a tool succeeds.',
   'Do not claim that an external action succeeded unless a tool returned success.',
   'A URL included as data for an artifact is not automatically a browser destination.',
@@ -56,7 +65,6 @@ function asModelMessages(messages: readonly Message[], userMessage: string): Mod
     .filter((message): message is Message & { role: 'user' | 'assistant' } => (
       message.role === 'user' || message.role === 'assistant'
     ))
-    .slice(-48)
     .map(message => ({
       role: message.role,
       content: message.content,
@@ -113,10 +121,73 @@ function modelToolSet(
 }
 
 export interface AiSdkActingAgentOptions {
-  model: import('ai').LanguageModel;
+  model: LanguageModel;
   maxOutputTokens: number;
   temperature: number;
   requestTimeoutMs: number;
+  contextBudget?: ContextBudgetOptions;
+  structuredOutputCompatibility?: StructuredOutputCompatibility;
+}
+
+const DEFAULT_CONTEXT_BUDGET: ContextBudgetOptions = {
+  contextWindowTokens: 32_768,
+  contextCompactAtRatio: 0.68,
+  contextCriticalAtRatio: 0.86,
+  contextRecentExchanges: 6,
+  contextCriticalRecentExchanges: 2,
+};
+
+function flattenExchanges(exchanges: readonly ContextExchange[]): ModelMessage[] {
+  return exchanges.flatMap(exchange => exchange.messages);
+}
+
+function toolDefinitionsDescription(definitions: readonly ToolDefinition[]): string {
+  return JSON.stringify(definitions.map(definition => {
+    const schema = definition.inputSchema ?? definition.schema;
+    let inputSchema: unknown = { type: 'object' };
+    if (schema) {
+      try {
+        inputSchema = z.toJSONSchema(schema as z.ZodType);
+      } catch {
+        inputSchema = { type: 'object' };
+      }
+    }
+    return { name: definition.name, description: definition.description, inputSchema };
+  }));
+}
+
+function contextBudget(options?: ContextBudgetOptions): ContextBudgetOptions {
+  const merged = { ...DEFAULT_CONTEXT_BUDGET, ...options };
+  const contextCompactAtRatio = Math.max(0.3, Math.min(0.85, merged.contextCompactAtRatio));
+  return {
+    ...merged,
+    contextWindowTokens: Math.max(1, Math.trunc(merged.contextWindowTokens)),
+    contextCompactAtRatio,
+    contextCriticalAtRatio: Math.max(contextCompactAtRatio + 0.05, Math.min(0.97, merged.contextCriticalAtRatio)),
+    contextRecentExchanges: Math.max(1, Math.trunc(merged.contextRecentExchanges)),
+    contextCriticalRecentExchanges: Math.max(1, Math.trunc(merged.contextCriticalRecentExchanges)),
+  };
+}
+
+function contextSummaryPrompt(currentRequest: string, previousSummary: unknown, messages: readonly ModelMessage[], evidenceCatalog: unknown, environment: unknown): string {
+  return JSON.stringify({
+    currentRequest,
+    previousSummary: previousSummary ?? null,
+    olderMessages: messages,
+    evidenceCatalog,
+    currentEnvironment: environment,
+  });
+}
+
+function contextSummaryInstructions(): string {
+  return [
+    'You are compacting older conversation and tool history for Helm continuity at a context-pressure boundary.',
+    'Return only the requested structured summary. Do not expose private reasoning or write chain-of-thought.',
+    'Preserve earlier user intent, useful findings, unresolved work, actual artifacts, and failed attempts that affect continuation.',
+    'A summary is lossy context, never evidence. Findings and completion claims must cite only receipt IDs provided in evidenceCatalog. Do not invent or reuse an ID that is not listed.',
+    'Do not include browser element or region refs; every old DOM ref is stale after compaction.',
+    'Do not add external facts, URLs, artifacts, or environment state that do not appear in the supplied messages or currentEnvironment.',
+  ].join(' ');
 }
 
 /** Runs one coherent conversation with native SDK tool calls and bounded continuation. */
@@ -124,12 +195,53 @@ export class AiSdkActingAgent implements ActingAgentProvider {
   constructor(public readonly options: AiSdkActingAgentOptions) {}
 
   async execute(input: ActingAgentContext): Promise<ActingAgentResult> {
-    let messages = asModelMessages(input.conversation, input.userMessage);
+    let exchanges = groupConversation(asModelMessages(input.conversation, input.userMessage), input.userMessage);
     let acceptedResponse: string | undefined;
     let acceptedVerification: ActingAgentResult['verification'] | undefined;
     let totalModelSteps = 0;
     let completionAttempts = 0;
+    let compactionCount = 0;
     const instructions = instructionsFor(input);
+    const budget = contextBudget(this.options.contextBudget);
+
+    const prepare = async (currentInstructions: string, descriptions: string): Promise<ModelMessage[]> => {
+      const result = await prepareModelContext({
+        exchanges,
+        instructions: currentInstructions,
+        currentRequest: input.userMessage,
+        toolDescription: descriptions,
+        budget,
+        compactionCount,
+        signal: input.signal,
+        summarize: async summaryInput => {
+          const summarized = await generateText({
+            model: this.options.model,
+            system: contextSummaryInstructions(),
+            prompt: contextSummaryPrompt(
+              summaryInput.currentRequest,
+              summaryInput.previousSummary,
+              summaryInput.messages,
+              summaryInput.evidenceCatalog,
+              summaryInput.environment,
+            ),
+            output: Output.object({
+              schema: structuredOutputSchema(contextSummarySchema, this.options.structuredOutputCompatibility),
+            }),
+            maxOutputTokens: Math.min(1_200, Math.max(256, this.options.maxOutputTokens)),
+            temperature: 0,
+            timeout: this.options.requestTimeoutMs,
+            maxRetries: 0,
+            abortSignal: summaryInput.signal,
+          });
+          return contextSummarySchema.parse(summarized.output);
+        },
+      });
+      exchanges = result.exchanges;
+      compactionCount = result.usage.compactions;
+      await input.onContextUsage?.(result.usage);
+      if (result.compaction) await input.onContextCompacted?.(result.compaction);
+      return flattenExchanges(exchanges);
+    };
 
     const complete = async (value: z.infer<typeof completionInputSchema>): Promise<ToolResult> => {
       const response = value.response.trim();
@@ -143,13 +255,16 @@ export class AiSdkActingAgent implements ActingAgentProvider {
     };
 
     const tools = modelToolSet(input.toolDefinitions, input.executeTool, complete, input.onProgress);
+    const toolContext = toolDefinitionsDescription(input.toolDefinitions);
     const totalStepLimit = input.maxSteps + MAX_COMPLETION_STEPS;
 
     while (totalModelSteps < totalStepLimit) {
       if (input.signal?.aborted) throw input.signal.reason ?? new Error('Agent run cancelled');
 
       const steering = input.drainSteering?.() ?? [];
-      if (steering.length > 0) messages.push(...toModelMessages(steering));
+      if (steering.length > 0) exchanges.push({ messages: toModelMessages(steering), kind: 'conversation' });
+
+      const messages = await prepare(instructions.agent, toolContext);
 
       const agent = new ToolLoopAgent<never, ToolSet>({
         model: this.options.model,
@@ -167,7 +282,7 @@ export class AiSdkActingAgent implements ActingAgentProvider {
         timeout: this.options.requestTimeoutMs,
       });
       totalModelSteps += result.steps.length;
-      messages.push(...result.responseMessages);
+      exchanges.push({ messages: result.responseMessages, kind: 'tool' });
 
       if (acceptedResponse !== undefined && acceptedVerification !== undefined) {
         return { response: acceptedResponse, verification: acceptedVerification };
@@ -192,13 +307,19 @@ export class AiSdkActingAgent implements ActingAgentProvider {
         timeout: this.options.requestTimeoutMs,
         maxRetries: 0,
       });
+      const finalizationToolContext = JSON.stringify([{
+        name: COMPLETE_TOOL,
+        description: 'Verify concrete tool effects and return the final answer.',
+        inputSchema: z.toJSONSchema(completionInputSchema),
+      }]);
+      const finalizationMessages = await prepare(instructions.finalization, finalizationToolContext);
       const finalize = await finalizer.generate({
-        messages,
+        messages: finalizationMessages,
         abortSignal: input.signal,
         timeout: this.options.requestTimeoutMs,
       });
       totalModelSteps += finalize.steps.length;
-      messages.push(...finalize.responseMessages);
+      exchanges.push({ messages: finalize.responseMessages, kind: 'tool' });
 
       if (acceptedResponse !== undefined && acceptedVerification !== undefined) {
         return { response: acceptedResponse, verification: acceptedVerification };

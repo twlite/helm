@@ -42,7 +42,9 @@ There is no unrestricted host shell tool.
 The prompt is intentionally short. It establishes Helm's role, says to use
 actual results and not claim unverified effects, and tells the model how to
 finish. It does not prescribe browser sequences, artifact formats, or domain
-facts.
+facts. For browser tasks, the model has bounded outline, local page search, and
+region inspection tools; it can use query extraction or explicit full-page
+extraction when those are needed.
 
 ## Completion and concrete evidence
 
@@ -67,6 +69,46 @@ back to the model is bounded; it keeps useful data and the receipt while
 dropping duplicate boundary snapshots. Repeated identical actions without a
 concrete state change, tool failures, model steps, and tool execution time are
 bounded. Cancellation is passed through to both model and guest calls.
+
+## Progressive browser inspection
+
+Ordinary environment reads do not fetch page text or a snapshot. They carry
+only URL, title, loading state, page count, and DOM revision. The model chooses
+when to request the bounded page outline, search visible regions with lexical
+ranking, and inspect a matching region. Tables are returned as bounded column
+and row arrays. `browser.extractText` remains available for pages whose
+structure is insufficient; queryless output is small by default and a full
+read requires `mode: "full"` with an explicit character limit.
+
+Semantic region and element refs are tied to the observed DOM revision. A
+navigation or meaningful DOM mutation expires them, and the guest returns a
+stale-ref error so the model can inspect the current page again.
+
+## Context budgeting and compaction
+
+Before each model request, Helm estimates input from instructions, native tool
+descriptions/schemas, and serialized retained messages. The default estimate is
+one token per four characters with 12% overhead. The context window and
+pressure thresholds live in `config/models.json`; deployments can override
+`HELM_LLM_CONTEXT_WINDOW_TOKENS`, `HELM_LLM_CONTEXT_COMPACT_AT_RATIO`,
+`HELM_LLM_CONTEXT_CRITICAL_AT_RATIO`, `HELM_LLM_CONTEXT_RECENT_EXCHANGES`, and
+`HELM_LLM_CONTEXT_CRITICAL_RECENT_EXCHANGES`.
+
+When pressure reaches the configured threshold, deterministic pruning removes
+duplicate browser observations and page outlines/search results from older
+revisions, while retaining their source receipts. If context is still high,
+Helm uses a structured summary call for older exchanges and preserves the
+current request, recent raw exchanges, verified receipt IDs, actual artifacts,
+the latest browser URL/revision, focused desktop window, and unresolved work.
+The model summary is lossy working context, not evidence: each carried finding
+or completed action must cite a receipt ID that was previously validated.
+Obsolete browser refs are removed. The call happens only at a context-pressure
+boundary, and persisted compaction events expose what was kept and pruned in the
+run activity UI.
+
+This summary is local to one run. The separate persistent memory system stores
+selected information for later runs; recalled memory is a hint that may need
+live verification, never current external evidence.
 
 ## Ownership
 

@@ -18,9 +18,11 @@ const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'fs.list': 'List immediate entries inside an allowed guest directory.',
   'fs.stat': 'Inspect whether a guest filesystem path exists and its type.',
   'browser.navigate': 'Navigate the visible guest browser to a URL.',
-  'browser.getState': 'Read the visible guest browser URL and loading state.',
-  'browser.snapshot': 'Return a compact semantic snapshot of browser controls.',
-  'browser.extractText': 'Extract readable text from the current browser page.',
+  'browser.getState': 'Read the visible browser URL, title, loading state, page count, and current DOM revision without reading page text.',
+  'browser.snapshot': 'Return a bounded semantic outline of the current page and its visible interactive elements.',
+  'browser.searchPage': 'Search visible semantic regions on the current page with local lexical ranking and return bounded matches.',
+  'browser.inspectRegion': 'Inspect one current page region as bounded text, structured table rows, or local links.',
+  'browser.extractText': 'Extract relevant page passages, or bounded full page text when mode is full.',
   'browser.download': 'Start and record a browser download from a semantic element or URL.',
   'browser.click': 'Click a semantic browser element or desktop coordinate fallback.',
   'browser.type': 'Type into a semantic browser element.',
@@ -57,7 +59,7 @@ function transportFailure(error: unknown): ToolResult {
 }
 
 type BoundarySnapshot = {
-  browser?: { url?: string; title?: string; pageCount?: number; domFingerprint?: string };
+  browser?: { url?: string; title?: string; pageCount?: number; revision?: number };
   filesystem?: { path: string; exists: boolean; type?: string; size?: number };
   desktop?: unknown;
 };
@@ -69,10 +71,12 @@ async function boundarySnapshot(
   signal: AbortSignal,
 ): Promise<BoundarySnapshot> {
   const snapshot: BoundarySnapshot = {};
-  if (method.startsWith('browser.') && !['browser.extractText', 'browser.snapshot', 'browser.getState'].includes(method)) {
+  if (method.startsWith('browser.') && ![
+    'browser.extractText', 'browser.snapshot', 'browser.searchPage', 'browser.inspectRegion', 'browser.getState',
+  ].includes(method)) {
     try {
       const state = await guest.request('browser.getState', {}, { signal });
-      snapshot.browser = { url: state.url, title: state.title, pageCount: state.pageCount, domFingerprint: state.domFingerprint };
+      snapshot.browser = { url: state.url, title: state.title, pageCount: state.pageCount, revision: state.revision };
     } catch {
       // The receipt still records the action if the browser was unavailable.
     }
@@ -139,7 +143,9 @@ function receiptEffect(
       || effect.navigationOccurred
       || effect.newTabOpened,
     );
-    if (before.browser?.domFingerprint !== after.browser?.domFingerprint) effect.domChanged = true;
+    effect.browserRevisionBefore = before.browser?.revision;
+    effect.browserRevisionAfter = after.browser?.revision;
+    if (before.browser?.revision !== after.browser?.revision) effect.domChanged = true;
     if (method === 'browser.download') {
       effect.downloadStarted = typeof dataRecord?.savedPath === 'string';
       if (dataRecord) effect.download = dataRecord as unknown as NonNullable<ActionReceipt['effect']>['download'];

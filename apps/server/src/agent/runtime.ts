@@ -100,7 +100,7 @@ function taskRequiresPageContent(task: TaskDefinition, userMessage = ''): boolea
 function canExtractOpenPage(observation: EnvironmentObservation, lastToolResult?: ToolResult): boolean {
   if (!observation.browser?.url || observation.browser.url === 'about:blank') return false;
   if (!/^https?:\/\//iu.test(observation.browser.url)) return false;
-  return lastToolResult?.ok === true || observation.browser.loaded === true;
+  return lastToolResult?.ok === true || observation.browser.loading === false;
 }
 
 function hasReadableCurrentPage(
@@ -1073,6 +1073,24 @@ export class AgentRuntime {
           threadId: run.threadId,
           summary,
         }, runId),
+        onContextUsage: usage => this.emit('run.context.usage', {
+          threadId: run.threadId,
+          ...usage,
+        }, runId),
+        onContextCompacted: async event => {
+          await this.persistStep(steps, {
+            runId,
+            stepIndex: actionCount,
+            phase: 'observe',
+            toolName: 'context.compaction',
+            toolInput: { reason: event.reason },
+            observation: event,
+          });
+          await this.emit('run.context.compacted', {
+            threadId: run.threadId,
+            ...event,
+          }, runId);
+        },
         drainSteering: input.drainSteering,
         maxSteps,
         maxRepeatedAction,

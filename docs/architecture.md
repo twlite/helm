@@ -21,8 +21,9 @@ browser UI -- REST + WebSocket --> Bun server
 
 - `packages/shared` owns protocol schemas and persisted conversation/run types.
 - `apps/server/src/ai/acting-agent.ts` owns the AI SDK tool-loop adapter. It
-  passes native function definitions to the configured LM Studio model and
-  returns AI SDK tool results to the same conversation.
+  passes native function definitions to the configured LM Studio model,
+  budgets the retained conversation, and returns AI SDK tool results to the
+  same conversation.
 - `apps/server/src/agent/runtime.ts` owns cancellation, budgets, persistence,
   action-loop protection, receipts, and generic completion checks.
 - `apps/server/src/tools` owns Zod input validation, guest calls, and action
@@ -68,3 +69,58 @@ steps after reconnecting.
 Tool calls, model steps, consecutive tool errors, repeated no-progress actions,
 timeouts, and cancellation are bounded. Guest tools retain filesystem
 sandboxing, browser automation, desktop operations, and receipt evidence.
+
+## Browser perception
+
+Normal environment observations include only browser URL, title, loading state,
+page count, and DOM revision. They do not request or attach a semantic page
+snapshot. The acting model can request progressive detail when it needs it:
+
+```text
+browser.getState -> browser.snapshot -> browser.searchPage -> browser.inspectRegion
+```
+
+`browser.snapshot` returns a bounded outline and visible controls. The guest
+indexes visible semantic elements such as main/article/section content,
+headings, tables, lists, forms, navigation, and large otherwise-unstructured
+text blocks. Region previews are short; the outline does not include full
+region text. Region search runs locally in the guest and ranks query-token
+overlap, heading/header matches, term proximity, and table headers. A selected
+region can be read as bounded text, links, or structured table columns and
+rows. Search and inspection results are persisted in the normal tool receipts
+and shown in the run activity feed.
+
+Region and interactive refs encode the current DOM revision. Navigation and
+observed DOM changes invalidate earlier refs; the guest rejects expired refs
+instead of acting on a control from an older page state. `browser.extractText`
+remains a fallback: query mode returns matching passages across the page,
+queryless mode samples readable main content, and full-page extraction requires
+`mode: "full"`. The default is 8,000 characters and the hard maximum is
+100,000 characters.
+
+## Model context management
+
+The acting agent estimates input use from its instructions, registered tool
+definitions, and serialized retained messages. The current estimate is roughly
+one token per four characters plus 12% overhead; it is an estimate, not a
+provider tokenizer. The configured context window is in `config/models.json` or
+can be overridden with `HELM_LLM_CONTEXT_WINDOW_TOKENS`. The model config also
+sets compaction and critical-pressure ratios and how many recent exchanges to
+keep raw.
+
+At the configured pressure threshold, Helm first prunes duplicate browser
+observations and snapshots/search results from older DOM revisions. At higher
+pressure it keeps the current request, recent raw exchanges, and current
+operational state, then replaces older exchanges with a structured continuity
+summary. A structured model call is made only at that boundary, not after each
+tool result. The summary can retain findings and completed work only when they
+cite receipt IDs already present in tool evidence. Artifacts and the latest
+browser/desktop state are reconstructed from observed results. Summary text is
+never promoted to a receipt or trusted evidence, and stale DOM refs are removed
+from compacted context.
+
+`run.context.usage` reports estimates to the activity UI. A completed
+compaction is persisted with its pressure reason, before/after estimates,
+pruning counts, kept raw exchanges, and preserved/removed state. This is
+run-local continuity. Persistent memory is retrieved separately as a hint for
+future runs and is not treated as proof that an external fact remains current.

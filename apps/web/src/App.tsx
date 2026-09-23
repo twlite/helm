@@ -6,6 +6,7 @@ import { MemoryDialog } from './components/MemoryDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { ThreadSidebar } from './components/ThreadSidebar';
 import { useHelmWebSocket } from './hooks/useHelmWebSocket';
+import { contextUsageFromEvent } from './run-context';
 import type {
   AsyncState,
   ChatProgress,
@@ -145,10 +146,19 @@ function liveActivityFromEvent(event: HelmEvent, previous: LiveActivity | null):
       ? payload.toolName
       : undefined;
   const reasoningSummary = typeof payload?.reasoningSummary === 'string' ? payload.reasoningSummary : undefined;
-
   switch (event.type) {
     case 'run.started':
       return { runId: event.runId, phase: 'starting' };
+    case 'run.context.usage':
+      return {
+        ...(previous?.runId === event.runId ? previous : { runId: event.runId, phase: 'thinking' as const }),
+        contextUsage: contextUsageFromEvent(event.type, payload, previous?.runId === event.runId ? previous.contextUsage : undefined),
+      };
+    case 'run.context.compacted':
+      return {
+        ...(previous?.runId === event.runId ? previous : { runId: event.runId, phase: 'thinking' as const }),
+        contextUsage: contextUsageFromEvent(event.type, payload, previous?.runId === event.runId ? previous.contextUsage : undefined),
+      };
     case 'run.step.started':
       return {
         runId: event.runId,
@@ -201,12 +211,26 @@ function liveActivityFromRun(run: RunDetails, previous: LiveActivity | null): Li
   const reasoningSummary = latestStep.decision?.reasoningSummary
     ?? latestStep.orchestratorDecision?.reasoningSummary
     ?? latestStep.workerResult?.reasoningSummary;
+  const compactionStep = [...run.steps].reverse().find(step => step.toolName === 'context.compaction');
+  const compactionObservation = isRecord(compactionStep?.observation) ? compactionStep.observation : undefined;
+  const savedContextUsage = compactionObservation
+    && typeof compactionObservation.estimatedTokensAfter === 'number'
+    && typeof compactionObservation.contextWindowTokens === 'number'
+    ? {
+      estimatedTokens: compactionObservation.estimatedTokensAfter,
+      contextWindowTokens: compactionObservation.contextWindowTokens,
+      compactions: typeof compactionObservation.compactions === 'number' ? compactionObservation.compactions : 1,
+    }
+    : undefined;
   return {
     runId: run.id,
     phase: latestStep.phase === 'verify' ? 'verifying' : 'thinking',
     stepIndex: latestStep.stepIndex,
     ...(toolName ? { toolName } : {}),
     ...(reasoningSummary ? { reasoningSummary } : {}),
+    ...(savedContextUsage || (previous?.runId === run.id ? previous.contextUsage : undefined)
+      ? { contextUsage: savedContextUsage ?? previous?.contextUsage }
+      : {}),
   };
 }
 
@@ -391,7 +415,7 @@ function App() {
     }
     if (event.runId && event.type.startsWith('run.')) {
       setLiveActivity((current) => liveActivityFromEvent(event, current));
-      void refreshRun(event.runId);
+      if (event.type !== 'run.context.usage') void refreshRun(event.runId);
       if (['run.completed', 'run.failed', 'run.cancelled'].includes(event.type)) {
         if (event.type !== 'run.completed' && streamingAssistantRef.current?.runId === event.runId) {
           setStreamingAssistant(null);

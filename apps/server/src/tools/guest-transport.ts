@@ -1,4 +1,7 @@
 import type {
+  BrowserRegionInspection,
+  BrowserSearchPageResult,
+  BrowserSnapshot,
   GuestMethod,
   WindowInfo,
 } from '@helm/shared';
@@ -13,8 +16,10 @@ export type GuestMethodParams = {
   'fs.stat': { path: string };
   'browser.navigate': { url: string };
   'browser.getState': Record<string, never>;
-  'browser.snapshot': Record<string, never>;
-  'browser.extractText': Record<string, never>;
+  'browser.snapshot': { maxRegions?: number };
+  'browser.searchPage': { query: string; kinds?: import('@helm/shared').BrowserRegionKind[]; maxResults?: number };
+  'browser.inspectRegion': { ref: string; format?: 'auto' | 'text' | 'table' | 'links'; maxChars?: number };
+  'browser.extractText': { query?: string; maxChars?: number; mode?: 'relevant' | 'full' };
   'browser.download': { ref?: string; url?: string };
   'browser.click': { ref?: string; x?: number; y?: number };
   'browser.type': { ref: string; text: string };
@@ -48,32 +53,20 @@ export type GuestMethodResult = {
     type: 'file' | 'directory' | 'other' | 'missing';
     size: number;
   };
-  'browser.navigate': { url: string; title: string; loaded: boolean };
+  'browser.navigate': { url: string; title: string; loading: boolean; pageCount: number; revision: number };
   'browser.getState': {
-    url?: string;
-    title?: string;
-    loaded?: boolean;
-    pageCount?: number;
-    domFingerprint?: string;
+    ready: boolean;
+    visible: true;
+    url: string;
+    title: string;
+    loading: boolean;
+    pageCount: number;
+    revision: number;
   };
-  'browser.snapshot': {
-    url?: string;
-    title?: string;
-    pageCount?: number;
-    main?: { heading?: string; text?: string };
-    elements: Array<{
-      ref: string;
-      role: string;
-      name?: string;
-      value?: string;
-      text?: string;
-      enabled?: boolean;
-      href?: string;
-      checked?: boolean;
-      selected?: boolean;
-    }>;
-  };
-  'browser.extractText': { url: string; title: string; text: string };
+  'browser.snapshot': BrowserSnapshot;
+  'browser.searchPage': BrowserSearchPageResult;
+  'browser.inspectRegion': BrowserRegionInspection;
+  'browser.extractText': { url: string; title: string; mode: 'relevant' | 'full'; query?: string; text: string; truncated: boolean; matches?: number };
   'browser.download': {
     sourceUrl: string;
     finalUrl?: string;

@@ -41,6 +41,13 @@ function nonNegativeNumber(value: unknown, name: string): number {
   return value;
 }
 
+function contextRatio(value: unknown, name: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value >= 1) {
+    throw new Error(`Model configuration field "${name}" must be greater than 0 and less than 1`);
+  }
+  return value;
+}
+
 export interface HelmModelsConfig {
   providerName: string;
   baseUrl: string;
@@ -51,6 +58,11 @@ export interface HelmModelsConfig {
   maxOutputTokens: number;
   temperature: number;
   requestTimeoutMs: number;
+  contextWindowTokens: number;
+  contextCompactAtRatio: number;
+  contextCriticalAtRatio: number;
+  contextRecentExchanges: number;
+  contextCriticalRecentExchanges: number;
   supportsStructuredOutputs: boolean;
   structuredOutputCompatibility: StructuredOutputCompatibility;
 }
@@ -65,6 +77,11 @@ interface ModelConfigFile {
   maxOutputTokens?: unknown;
   temperature?: unknown;
   requestTimeoutMs?: unknown;
+  contextWindowTokens?: unknown;
+  contextCompactAtRatio?: unknown;
+  contextCriticalAtRatio?: unknown;
+  contextRecentExchanges?: unknown;
+  contextCriticalRecentExchanges?: unknown;
   supportsStructuredOutputs?: unknown;
   structuredOutputCompatibility?: unknown;
 }
@@ -110,6 +127,18 @@ function loadModelsConfig(env: NodeJS.ProcessEnv): HelmModelsConfig {
     );
   }
 
+  const contextCompactAtRatio = contextRatio(
+    env.HELM_LLM_CONTEXT_COMPACT_AT_RATIO === undefined ? file.contextCompactAtRatio ?? 0.68 : Number(env.HELM_LLM_CONTEXT_COMPACT_AT_RATIO),
+    'contextCompactAtRatio',
+  );
+  const contextCriticalAtRatio = contextRatio(
+    env.HELM_LLM_CONTEXT_CRITICAL_AT_RATIO === undefined ? file.contextCriticalAtRatio ?? 0.86 : Number(env.HELM_LLM_CONTEXT_CRITICAL_AT_RATIO),
+    'contextCriticalAtRatio',
+  );
+  if (contextCriticalAtRatio <= contextCompactAtRatio) {
+    throw new Error('Model configuration field "contextCriticalAtRatio" must be greater than "contextCompactAtRatio"');
+  }
+
   return {
     providerName: requiredString(env.HELM_LLM_PROVIDER ?? file.providerName, 'providerName'),
     baseUrl: requiredString(env.HELM_LLM_BASE_URL ?? file.baseUrl, 'baseUrl').replace(/\/$/u, ''),
@@ -131,6 +160,20 @@ function loadModelsConfig(env: NodeJS.ProcessEnv): HelmModelsConfig {
     requestTimeoutMs: positiveInteger(
       env.HELM_LLM_TIMEOUT_MS === undefined ? file.requestTimeoutMs : Number(env.HELM_LLM_TIMEOUT_MS),
       'requestTimeoutMs',
+    ),
+    contextWindowTokens: positiveInteger(
+      env.HELM_LLM_CONTEXT_WINDOW_TOKENS === undefined ? file.contextWindowTokens ?? 32_768 : Number(env.HELM_LLM_CONTEXT_WINDOW_TOKENS),
+      'contextWindowTokens',
+    ),
+    contextCompactAtRatio,
+    contextCriticalAtRatio,
+    contextRecentExchanges: positiveInteger(
+      env.HELM_LLM_CONTEXT_RECENT_EXCHANGES === undefined ? file.contextRecentExchanges ?? 6 : Number(env.HELM_LLM_CONTEXT_RECENT_EXCHANGES),
+      'contextRecentExchanges',
+    ),
+    contextCriticalRecentExchanges: positiveInteger(
+      env.HELM_LLM_CONTEXT_CRITICAL_RECENT_EXCHANGES === undefined ? file.contextCriticalRecentExchanges ?? 2 : Number(env.HELM_LLM_CONTEXT_CRITICAL_RECENT_EXCHANGES),
+      'contextCriticalRecentExchanges',
     ),
     supportsStructuredOutputs,
     structuredOutputCompatibility,

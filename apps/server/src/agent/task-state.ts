@@ -383,21 +383,9 @@ function compactBrowser(observation: EnvironmentObservation['browser']): unknown
   return {
     url: observation.url,
     title: observation.title,
-    loaded: observation.loaded,
+    loading: observation.loading,
     pageCount: observation.pageCount,
-    domFingerprint: observation.domFingerprint,
-    main: observation.main,
-    interactiveElements: observation.interactiveElements?.map(element => ({
-      ref: element.ref,
-      role: element.role,
-      name: element.name,
-      text: element.text,
-      href: element.href,
-      value: element.value,
-      enabled: element.enabled,
-      checked: element.checked,
-      selected: element.selected,
-    })),
+    revision: observation.revision,
   };
 }
 

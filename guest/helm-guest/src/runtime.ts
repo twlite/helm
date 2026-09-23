@@ -138,11 +138,36 @@ export class GuestRuntime {
       case "browser.getState":
         return this.browser.getState();
       case "browser.snapshot":
-        return this.browser.snapshot();
-      case "browser.extractText":
-        return this.browser.extractText(
-          optionalInteger(params, "maxChars", { min: 1, max: 1_000_000 }) ?? 100_000,
-        );
+        return this.browser.snapshot((() => {
+          const maxRegions = optionalInteger(params, "maxRegions", { min: 1, max: 100 });
+          return maxRegions === undefined ? {} : { maxRegions };
+        })());
+      case "browser.searchPage": {
+        const maxResults = optionalInteger(params, "maxResults", { min: 1, max: 20 });
+        return this.browser.searchPage({
+          query: requiredString(params, "query", { maxLength: 1_000 }),
+          ...(Array.isArray(params.kinds) ? { kinds: params.kinds as import("../../../packages/shared/src/types").BrowserRegionKind[] } : {}),
+          ...(maxResults === undefined ? {} : { maxResults }),
+        });
+      }
+      case "browser.inspectRegion":
+        return this.browser.inspectRegion((() => {
+          const maxChars = optionalInteger(params, "maxChars", { min: 1_000, max: 20_000 });
+          return {
+            ref: requiredString(params, "ref", { maxLength: 64 }),
+            format: enumValue(params, "format", ["auto", "text", "table", "links"] as const, "auto"),
+            ...(maxChars === undefined ? {} : { maxChars }),
+          };
+        })());
+      case "browser.extractText": {
+        const query = optionalString(params, "query", { maxLength: 1_000 });
+        const maxChars = optionalInteger(params, "maxChars", { min: 1, max: 100_000 });
+        return this.browser.extractText({
+          ...(query === undefined ? {} : { query }),
+          ...(maxChars === undefined ? {} : { maxChars }),
+          mode: enumValue(params, "mode", ["relevant", "full"] as const, "relevant"),
+        });
+      }
       case "browser.download":
         return this.browser.download((() => {
           const ref = optionalString(params, "ref", { maxLength: 64 });

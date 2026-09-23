@@ -7,6 +7,11 @@
   "maxOutputTokens": 2048,
   "temperature": 0,
   "requestTimeoutMs": 120000,
+  "contextWindowTokens": 32768,
+  "contextCompactAtRatio": 0.68,
+  "contextCriticalAtRatio": 0.86,
+  "contextRecentExchanges": 6,
+  "contextCriticalRecentExchanges": 2,
   "supportsStructuredOutputs": true,
   "structuredOutputCompatibility": "lmstudio-mlx"
 }

@@ -10,6 +10,7 @@ import type {
   VmStatus,
   WebSocketEvent,
 } from '@helm/shared';
+import type { ContextUsageIndicator } from './run-context';
 
 export type {
   AgentDecision,
@@ -42,6 +43,7 @@ export type LiveActivity = {
   stepIndex?: number;
   toolName?: string;
   reasoningSummary?: string;
+  contextUsage?: ContextUsageIndicator;
 };
 
 export type StreamingAssistantMessage = {

@@ -1,6 +1,19 @@
 import { GuestRpcError } from "./errors";
 import type { GuestSandbox } from "./sandbox";
 import { normalizeBrowserUrl } from "../../../packages/shared/src/browser-url";
+import type {
+  BrowserPageRegion,
+  BrowserRegionInspection,
+  BrowserRegionKind,
+  BrowserSearchPageResult,
+  BrowserSnapshot as SharedBrowserSnapshot,
+} from "../../../packages/shared/src/types";
+import {
+  extractRelevantPassages,
+  rankPageRegions,
+  sampleReadableText,
+  type IndexedBrowserRegion,
+} from "../../../packages/shared/src/browser-perception";
 
 type WaitUntil = "commit" | "domcontentloaded" | "load" | "networkidle";
 
@@ -9,7 +22,10 @@ interface PlaywrightLocator {
   fill(value: string, options?: { timeout?: number }): Promise<void>;
   pressSequentially(value: string, options?: { timeout?: number }): Promise<void>;
   nth(index: number): PlaywrightLocator;
-  evaluateAll<T>(pageFunction: (elements: readonly unknown[]) => T): Promise<T>;
+  evaluateAll<T>(
+    pageFunction: (elements: readonly unknown[], arg?: unknown) => T,
+    arg?: unknown,
+  ): Promise<T>;
   getAttribute(name: string): Promise<string | null>;
 }
 
@@ -45,7 +61,7 @@ interface PlaywrightChromium {
   launchPersistentContext(
     userDataDir: string,
     options: {
-      headless: false;
+      headless: boolean;
       viewport: null;
       executablePath?: string;
       args?: readonly string[];
@@ -69,6 +85,19 @@ interface SemanticElement {
   selected?: boolean;
 }
 
+interface PageRegionRecord extends IndexedBrowserRegion {
+  candidateIndex: number;
+}
+
+interface BrowserReference {
+  locator: PlaywrightLocator;
+  revision: number;
+  url: string;
+  kind: "element" | "region";
+  regionKind?: BrowserRegionKind;
+  heading?: string;
+}
+
 export interface BrowserState {
   ready: boolean;
   visible: true;
@@ -76,32 +105,25 @@ export interface BrowserState {
   title: string;
   loading: boolean;
   pageCount: number;
-  domFingerprint?: string;
+  revision: number;
 }
 
-export interface BrowserSnapshot {
-  url: string;
-  title: string;
-  pageCount: number;
-  main: {
-    heading?: string;
-    text?: string;
-  };
-  elements: Array<{
-    ref: string;
-    role: string;
-    name: string;
-    value?: string;
-    text?: string;
-    enabled: boolean;
-    href?: string;
-    checked?: boolean;
-    selected?: boolean;
-  }>;
-}
+export type BrowserSnapshot = SharedBrowserSnapshot;
 
 const INTERACTIVE_SELECTOR =
   "button, input, textarea, select, a[href], summary, [role], [contenteditable='true']";
+const REGION_SELECTOR = [
+  "main", "article", "section", "table", "ul", "ol", "form", "nav", "aside", "footer",
+  "h1", "h2", "h3", "h4", "h5", "h6", "[role='main']", "[role='article']", "[role='region']", "[role='heading']", "[role='table']",
+  "[role='navigation']", "[role='contentinfo']", "[role='complementary']", "[role='list']", "[role='form']",
+  "p", "blockquote", "pre", "dl", "div",
+].join(", ");
+const MAX_INDEXED_REGIONS = 1_200;
+const DEFAULT_OUTLINE_REGIONS = 60;
+const MAX_INTERACTIVE_ELEMENTS = 80;
+const DEFAULT_EXTRACT_CHARS = 8_000;
+const MAX_FULL_EXTRACT_CHARS = 100_000;
+const DEFAULT_REGION_CHARS = 12_000;
 const BROWSER_OPERATION_TIMEOUT_MS = 10_000;
 const BROWSER_CONTEXT_RESET_TIMEOUT_MS = 1_000;
 
@@ -179,7 +201,10 @@ export class BrowserController {
   private loading = false;
   private referenceRevision = 0;
   private referenceUrl = "";
-  private references = new Map<string, { locator: PlaywrightLocator; revision: number; url: string }>();
+  private lastDomMutationCount: number | undefined;
+  private references = new Map<string, BrowserReference>();
+  private outlineCache: { revision: number; records: PageRegionRecord[]; regionCount: number; truncated: boolean } | undefined;
+  private searchCache: { revision: number; records: PageRegionRecord[]; regionCount: number; truncated: boolean } | undefined;
 
   constructor(
     private readonly sandbox: GuestSandbox,
@@ -187,6 +212,8 @@ export class BrowserController {
       profilePath?: string;
       executablePath?: string;
       extraArgs?: readonly string[];
+      /** Headless mode is used by local browser-perception integration tests. */
+      headless?: boolean;
     } = {},
   ) {}
 
@@ -204,6 +231,7 @@ export class BrowserController {
     const page = await this.ensurePage();
     const waitUntil = input.waitUntil ?? "domcontentloaded";
     const timeoutMs = input.timeoutMs ?? 30_000;
+    this.invalidateReferences();
     this.loading = true;
 
     try {
@@ -234,7 +262,6 @@ export class BrowserController {
       );
     } finally {
       this.loading = false;
-      this.invalidateReferences();
     }
   }
 
@@ -244,37 +271,7 @@ export class BrowserController {
 
   private async getStateInternal(): Promise<BrowserState> {
     const page = await this.ensurePage();
-    let domFingerprint: string | undefined;
-    try {
-      const text = await page.locator("body").evaluateAll((nodes) => {
-        const body = nodes[0];
-        if (!(body instanceof HTMLElement)) return "";
-        const elements = Array.from(body.querySelectorAll("button, input, textarea, select, a[href], summary, [role], [contenteditable='true']"))
-          .slice(0, 200)
-          .map(node => ({
-            tag: node.tagName.toLowerCase(),
-            text: node.textContent?.replace(/\s+/g, " ").trim().slice(0, 160),
-            value: node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement || node instanceof HTMLSelectElement
-              ? node.value.slice(0, 240)
-              : undefined,
-            checked: node instanceof HTMLInputElement && (node.type === "checkbox" || node.type === "radio")
-              ? node.checked
-              : undefined,
-            selected: node instanceof HTMLOptionElement ? node.selected : undefined,
-            disabled: node instanceof HTMLButtonElement || node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement || node instanceof HTMLSelectElement
-              ? node.disabled
-              : node.getAttribute("aria-disabled") === "true",
-            href: node instanceof HTMLAnchorElement ? node.href : undefined,
-          }));
-        return JSON.stringify({
-          text: body.innerText.replace(/\s+/g, " ").trim().slice(0, 4_000),
-          elements,
-        }).slice(0, 8_000);
-      });
-      domFingerprint = text.length > 0 ? text : undefined;
-    } catch {
-      domFingerprint = undefined;
-    }
+    await this.refreshDomRevision(page);
     return {
       ready: true,
       visible: true,
@@ -282,31 +279,29 @@ export class BrowserController {
       title: await this.readTitle(page),
       loading: this.loading,
       pageCount: this.context?.pages().length ?? 1,
-      ...(domFingerprint === undefined ? {} : { domFingerprint }),
+      revision: this.referenceRevision,
     };
   }
 
-  async snapshot(): Promise<BrowserSnapshot> {
-    return this.withWatchdog(() => this.snapshotInternal(), "browser.snapshot");
+  async snapshot(input: { maxRegions?: number } = {}): Promise<BrowserSnapshot> {
+    return this.withWatchdog(() => this.snapshotInternal(input), "browser.snapshot");
   }
 
-  private async snapshotInternal(): Promise<BrowserSnapshot> {
+  private async snapshotInternal(input: { maxRegions?: number }, attempt = 0): Promise<BrowserSnapshot> {
     const page = await this.ensurePage();
     const url = page.url();
     const title = await this.readTitle(page);
     const candidates = page.locator(INTERACTIVE_SELECTOR);
-    const main = await page.locator("main, body").evaluateAll((nodes) => {
-      const node = nodes[0];
-      if (!(node instanceof HTMLElement)) return {};
-      const heading = node.querySelector("h1, h2, [role='heading']")?.textContent;
-      return {
-        ...(heading ? { heading: cleanTextForSnapshot(heading, 200) } : {}),
-        text: cleanTextForSnapshot(node.innerText, 2_000),
-      };
-    });
+    await this.refreshDomRevision(page);
+    const revision = this.referenceRevision;
+    const regionIndex = await this.getRegionRecords(page, false);
+    const prioritized = [...regionIndex.records]
+      .sort((left, right) => outlinePriority(left.kind) - outlinePriority(right.kind) || left.domOrder - right.domOrder);
+    const maxRegions = Math.max(1, Math.min(100, Math.trunc(input.maxRegions ?? DEFAULT_OUTLINE_REGIONS)));
+    const outline = prioritized.slice(0, maxRegions).sort((left, right) => left.domOrder - right.domOrder);
     let elements: SemanticElement[];
     try {
-      elements = await candidates.evaluateAll((nodes) =>
+      elements = await candidates.evaluateAll((nodes, limit) =>
         nodes.flatMap((node, index) => {
           if (!(node instanceof HTMLElement)) return [];
           const style = window.getComputedStyle(node);
@@ -397,7 +392,8 @@ export class BrowserController {
               ...(selected === undefined ? {} : { selected }),
             },
           ];
-        }),
+        }).slice(0, Number(limit)),
+        MAX_INTERACTIVE_ELEMENTS,
       );
     } catch (error) {
       throw new GuestRpcError(
@@ -406,15 +402,14 @@ export class BrowserController {
       );
     }
 
-    this.invalidateReferences();
-    this.referenceUrl = url;
     const output: BrowserSnapshot["elements"] = [];
     for (const [position, element] of elements.entries()) {
-      const ref = `e${position + 1}`;
+      const ref = `e${revision}-${position + 1}`;
       this.references.set(ref, {
         locator: candidates.nth(element.index),
         revision: this.referenceRevision,
         url,
+        kind: "element",
       });
       output.push({
         ref,
@@ -429,13 +424,236 @@ export class BrowserController {
       });
     }
 
+    const regionLocator = page.locator(REGION_SELECTOR);
+    const pageOutline: BrowserPageRegion[] = outline.map(region => {
+      const ref = region.ref;
+      this.references.set(ref, {
+        locator: regionLocator.nth(region.candidateIndex),
+        revision,
+        url,
+        kind: "region",
+        regionKind: region.kind,
+        ...(region.heading ? { heading: region.heading } : {}),
+      });
+      return {
+        ref,
+        kind: region.kind,
+        ...(region.heading ? { heading: region.heading } : {}),
+        ...(region.preview ? { preview: region.preview } : {}),
+        ...(region.rowCount === undefined ? {} : { rowCount: region.rowCount }),
+        ...(region.columnCount === undefined ? {} : { columnCount: region.columnCount }),
+      };
+    });
+    const stableRevision = await this.refreshDomRevision(page);
+    if (stableRevision !== revision) {
+      if (attempt < 2) return this.snapshotInternal(input, attempt + 1);
+      throw new GuestRpcError("BROWSER_DOM_UNSTABLE", "The page changed repeatedly while its outline was being read.");
+    }
+
     return {
       url,
       title,
       pageCount: this.context?.pages().length ?? 1,
-      main,
+      revision,
+      regionCount: regionIndex.regionCount,
+      outlineTruncated: regionIndex.truncated || regionIndex.regionCount > pageOutline.length,
+      outline: pageOutline,
       elements: output,
     };
+  }
+
+  async searchPage(input: {
+    query: string;
+    kinds?: BrowserRegionKind[];
+    maxResults?: number;
+  }): Promise<BrowserSearchPageResult> {
+    return this.withWatchdog(() => this.searchPageInternal(input), "browser.searchPage");
+  }
+
+  private async searchPageInternal(input: {
+    query: string;
+    kinds?: BrowserRegionKind[];
+    maxResults?: number;
+  }, attempt = 0): Promise<BrowserSearchPageResult> {
+    const page = await this.ensurePage();
+    await this.refreshDomRevision(page);
+    const revision = this.referenceRevision;
+    const url = page.url();
+    const title = await this.readTitle(page);
+    const indexed = await this.getRegionRecords(page, true);
+    const ranked = rankPageRegions({
+      query: input.query,
+      regions: indexed.records,
+      ...(input.kinds ? { kinds: input.kinds } : {}),
+      ...(input.maxResults === undefined ? {} : { maxResults: input.maxResults }),
+    });
+    const regionLocator = page.locator(REGION_SELECTOR);
+    for (const result of ranked.results) {
+      const record = indexed.records.find(region => region.ref === result.ref);
+      if (!record) continue;
+      this.references.set(result.ref, {
+        locator: regionLocator.nth(record.candidateIndex),
+        revision,
+        url,
+        kind: "region",
+        regionKind: record.kind,
+        ...(record.heading ? { heading: record.heading } : {}),
+      });
+    }
+    const stableRevision = await this.refreshDomRevision(page);
+    if (stableRevision !== revision) {
+      if (attempt < 2) return this.searchPageInternal(input, attempt + 1);
+      throw new GuestRpcError("BROWSER_DOM_UNSTABLE", "The page changed repeatedly while regions were being searched.");
+    }
+    return {
+      url,
+      title,
+      revision,
+      query: input.query,
+      indexedRegionCount: ranked.indexedRegionCount,
+      results: ranked.results,
+    };
+  }
+
+  async inspectRegion(input: {
+    ref: string;
+    format?: "auto" | "text" | "table" | "links";
+    maxChars?: number;
+  }): Promise<BrowserRegionInspection> {
+    return this.withWatchdog(() => this.inspectRegionInternal(input), "browser.inspectRegion");
+  }
+
+  private async inspectRegionInternal(input: {
+    ref: string;
+    format?: "auto" | "text" | "table" | "links";
+    maxChars?: number;
+  }): Promise<BrowserRegionInspection> {
+    const page = await this.ensurePage();
+    const reference = await this.resolveReference(input.ref);
+    if (reference.kind !== "region" || reference.regionKind === undefined) {
+      throw new GuestRpcError("INVALID_REGION_REF", `${input.ref} is not a semantic region ref.`, { httpStatus: 400 });
+    }
+    const maxChars = Math.max(1_000, Math.min(20_000, Math.trunc(input.maxChars ?? DEFAULT_REGION_CHARS)));
+    const format = input.format ?? "auto";
+    const requestedFormat = format === "auto"
+      ? reference.regionKind === "table" ? "table" : "text"
+      : format === "table" && reference.regionKind !== "table" ? "text" : format;
+    const sourceRevision = reference.revision;
+    const regionInfo = await reference.locator.evaluateAll((nodes, options) => {
+      const node = nodes[0];
+      if (!(node instanceof HTMLElement)) return { missing: true as const };
+      const maxChars = typeof options === "object" && options !== null && "maxChars" in options
+        ? Number((options as { maxChars: number }).maxChars)
+        : 12_000;
+      const clean = (value: string | null | undefined, max = 1_000) => {
+        const normalized = (value ?? "").replace(/\s+/g, " ").trim();
+        return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
+      };
+      const selectedHeading = node.matches("h1,h2,h3,h4,h5,h6,[role='heading']")
+        ? node
+        : Array.from(node.querySelectorAll("h1,h2,h3,h4,h5,h6,[role='heading']"))
+          .find((candidate): candidate is HTMLElement => candidate instanceof HTMLElement);
+      const heading = clean(selectedHeading?.innerText, 240);
+      if (options && typeof options === "object" && "format" in options && options.format === "links") {
+        const anchors = Array.from(node.querySelectorAll("a[href]"));
+        const links: Array<{ text: string; href: string }> = [];
+        let chars = 0;
+        for (const anchor of anchors) {
+          if (!(anchor instanceof HTMLAnchorElement)) continue;
+          const link = { text: clean(anchor.innerText || anchor.getAttribute("aria-label"), 240), href: anchor.href.slice(0, 1_000) };
+          const size = JSON.stringify(link).length;
+          if (!link.text && !link.href) continue;
+          if (chars + size > maxChars) break;
+          links.push(link);
+          chars += size;
+        }
+        return { heading, links, linkCount: anchors.length, truncated: links.length < anchors.length };
+      }
+      if (options && typeof options === "object" && "format" in options && options.format === "table") {
+        const table = node.matches("table") ? node : node.querySelector("table");
+        if (table instanceof HTMLTableElement) {
+        const allRows = Array.from(table.querySelectorAll("tr"));
+        const headerRow = allRows.find(row => row.querySelector("th")) ?? allRows[0];
+          const allHeaderCells = headerRow ? Array.from(headerRow.querySelectorAll("th,td")) : [];
+          const columnCount = Math.max(0, ...allRows.map(row => row.querySelectorAll("th,td").length));
+          const maxColumns = Math.max(1, Math.min(80, Math.floor(maxChars / 100)));
+          const maxHeaderChars = Math.max(16, Math.min(128, Math.floor(maxChars / (maxColumns * 2))));
+          const columns: string[] = [];
+          let chars = 2;
+          for (const cell of allHeaderCells.slice(0, maxColumns)) {
+            const value = clean(cell.textContent, maxHeaderChars);
+            const size = JSON.stringify(value).length + (columns.length === 0 ? 0 : 1);
+            if (chars + size > maxChars * 0.45) break;
+            columns.push(value);
+            chars += size;
+          }
+          let truncated = columns.length < columnCount;
+          const rows: string[][] = [];
+          const maxCellChars = Math.max(16, Math.min(256, Math.floor(maxChars * 0.4 / Math.max(1, columns.length))));
+          for (const row of allRows) {
+            if (row === headerRow) continue;
+            const cells = Array.from(row.querySelectorAll("th,td")).slice(0, columns.length).map(cell => clean(cell.textContent, maxCellChars));
+            if (cells.length === 0) continue;
+            const size = JSON.stringify(cells).length + 1;
+            if (chars + size > maxChars) {
+              truncated = true;
+              break;
+            }
+            rows.push(cells);
+            chars += size;
+          }
+          const dataRowCount = allRows.filter(row => row !== headerRow && row.querySelector("th,td")).length;
+          return {
+            heading,
+            columns,
+            rows,
+            rowCount: dataRowCount,
+            columnCount,
+            truncated: truncated || rows.length < dataRowCount,
+          };
+        }
+      }
+      const text = node.innerText.replace(/\r\n?/g, "\n").trim();
+      return { heading, text: text.slice(0, maxChars), truncated: text.length > maxChars };
+    }, { format: requestedFormat, maxChars });
+    if (regionInfo.missing) {
+      throw new GuestRpcError("STALE_REGION_REF", `Browser region ${input.ref} is no longer available.`, { httpStatus: 409 });
+    }
+    const stableRevision = await this.refreshDomRevision(page);
+    if (stableRevision !== sourceRevision || page.url() !== reference.url) {
+      throw new GuestRpcError("STALE_REGION_REF", `Browser region ${input.ref} changed while it was being inspected.`, { httpStatus: 409 });
+    }
+    const common = {
+      url: page.url(),
+      title: await this.readTitle(page),
+      revision: this.referenceRevision,
+      ref: input.ref,
+      kind: reference.regionKind,
+      ...(reference.heading || regionInfo.heading ? { heading: reference.heading ?? regionInfo.heading } : {}),
+    };
+    if (requestedFormat === "links") {
+      return { ...common, format: "links", links: regionInfo.links ?? [], linkCount: regionInfo.linkCount ?? 0, truncated: regionInfo.truncated ?? false };
+    }
+    if (requestedFormat === "table" && reference.regionKind === "table" && "columns" in regionInfo) {
+      const tableInfo = regionInfo as {
+        columns: string[];
+        rows: string[][];
+        rowCount: number;
+        columnCount: number;
+        truncated: boolean;
+      };
+      return {
+        ...common,
+        kind: "table",
+        format: "table",
+        columns: tableInfo.columns,
+        rows: tableInfo.rows,
+        rowCount: tableInfo.rowCount,
+        columnCount: tableInfo.columnCount,
+        truncated: tableInfo.truncated,
+      };
+    }
+    return { ...common, format: "text", text: regionInfo.text ?? "", truncated: regionInfo.truncated ?? false };
   }
 
   async download(input: { ref?: string; url?: string }): Promise<{
@@ -449,8 +667,12 @@ export class BrowserController {
   }> {
     const page = await this.ensurePage();
     const startedAt = new Date().toISOString();
+    const reference = input.ref === undefined ? undefined : await this.resolveReference(input.ref);
+    if (reference && reference.kind !== "element") {
+      throw new GuestRpcError("INVALID_ELEMENT_REF", "browser.download requires an interactive element ref.", { httpStatus: 400 });
+    }
     const rawSourceUrl = input.url
-      ?? (input.ref === undefined ? page.url() : await this.resolveReference(input.ref).getAttribute("href"))
+      ?? (reference === undefined ? page.url() : await reference.locator.getAttribute("href"))
       ?? page.url();
     let sourceUrl = rawSourceUrl;
     try {
@@ -462,7 +684,8 @@ export class BrowserController {
     const downloadPromise = page.waitForEvent("download", { timeout: 30_000 });
     try {
       if (input.ref !== undefined) {
-        await this.resolveReference(input.ref).click({ timeout: 15_000 });
+        if (!reference) throw new GuestRpcError("STALE_ELEMENT_REF", `Browser ref ${input.ref} is no longer valid.`);
+        await reference.locator.click({ timeout: 15_000 });
       } else if (input.url !== undefined) {
         try {
           await page.goto(safeUrl(input.url), { waitUntil: "commit", timeout: 30_000 });
@@ -498,29 +721,55 @@ export class BrowserController {
     }
   }
 
-  async extractText(maxChars = 100_000): Promise<{
+  async extractText(input: { query?: string; maxChars?: number; mode?: "relevant" | "full" } = {}): Promise<{
     text: string;
     truncated: boolean;
     url: string;
     title: string;
+    mode: "relevant" | "full";
+    query?: string;
+    matches?: number;
   }> {
-    return this.withWatchdog(() => this.extractTextInternal(maxChars), "browser.extractText");
+    return this.withWatchdog(() => this.extractTextInternal(input), "browser.extractText");
   }
 
-  private async extractTextInternal(maxChars: number): Promise<{
+  private async extractTextInternal(input: { query?: string; maxChars?: number; mode?: "relevant" | "full" }): Promise<{
     text: string;
     truncated: boolean;
     url: string;
     title: string;
+    mode: "relevant" | "full";
+    query?: string;
+    matches?: number;
   }> {
     const page = await this.ensurePage();
-    const body = page.locator("body");
-    let text: string;
+    const mode = input.mode ?? "relevant";
+    const maxChars = Math.max(1, Math.min(MAX_FULL_EXTRACT_CHARS, Math.trunc(input.maxChars ?? DEFAULT_EXTRACT_CHARS)));
+    let text = "";
     try {
-      text = await body.evaluateAll((nodes) => {
-        const bodyNode = nodes[0];
-        return bodyNode instanceof HTMLElement ? bodyNode.innerText : "";
-      });
+      if (mode === "full") {
+        text = await page.locator("body").evaluateAll((nodes) => {
+          const bodyNode = nodes[0];
+          return bodyNode instanceof HTMLElement ? bodyNode.innerText : "";
+        });
+      } else if (input.query) {
+        text = await page.locator("body").evaluateAll((nodes) => {
+          const bodyNode = nodes[0];
+          return bodyNode instanceof HTMLElement ? bodyNode.innerText : "";
+        });
+      } else {
+        text = await page.locator("main, article").evaluateAll((nodes) => {
+          const candidates = nodes.filter((node): node is HTMLElement => node instanceof HTMLElement);
+          const main = candidates.find(node => node.matches("main,[role='main']")) ?? candidates[0];
+          return main?.innerText ?? "";
+        });
+        if (!text) {
+          text = await page.locator("body").evaluateAll((nodes) => {
+            const bodyNode = nodes[0];
+            return bodyNode instanceof HTMLElement ? bodyNode.innerText : "";
+          });
+        }
+      }
     } catch (error) {
       throw new GuestRpcError(
         "BROWSER_TEXT_EXTRACTION_FAILED",
@@ -528,19 +777,30 @@ export class BrowserController {
       );
     }
 
-    const normalized = text.replace(/\r\n/g, "\n").trim();
+    const normalized = text.replace(/\r\n?/g, "\n").trim();
+    const extracted = input.query && mode === "relevant"
+      ? extractRelevantPassages({ text: normalized, query: input.query, maxChars })
+      : mode === "full"
+        ? { text: normalized.slice(0, maxChars), matches: undefined, truncated: normalized.length > maxChars }
+        : { ...sampleReadableText(normalized, maxChars), matches: undefined };
     return {
-      text: normalized.slice(0, maxChars),
-      truncated: normalized.length > maxChars,
+      text: extracted.text,
+      truncated: extracted.truncated,
       url: page.url(),
       title: await this.readTitle(page),
+      mode,
+      ...(input.query ? { query: input.query } : {}),
+      ...(extracted.matches === undefined ? {} : { matches: extracted.matches }),
     };
   }
 
   async click(ref: string): Promise<BrowserState> {
-    const locator = this.resolveReference(ref);
+    const reference = await this.resolveReference(ref);
+    if (reference.kind !== "element") {
+      throw new GuestRpcError("INVALID_ELEMENT_REF", "browser.click requires an interactive element ref.", { httpStatus: 400 });
+    }
     try {
-      await locator.click({ timeout: 15_000 });
+      await reference.locator.click({ timeout: 15_000 });
     } catch (error) {
       throw new GuestRpcError(
         "BROWSER_CLICK_FAILED",
@@ -568,12 +828,15 @@ export class BrowserController {
   }
 
   async type(ref: string, text: string, clear: boolean): Promise<BrowserState> {
-    const locator = this.resolveReference(ref);
+    const reference = await this.resolveReference(ref);
+    if (reference.kind !== "element") {
+      throw new GuestRpcError("INVALID_ELEMENT_REF", "browser.type requires an interactive element ref.", { httpStatus: 400 });
+    }
     try {
       if (clear) {
-        await locator.fill(text, { timeout: 15_000 });
+        await reference.locator.fill(text, { timeout: 15_000 });
       } else {
-        await locator.pressSequentially(text, { timeout: 15_000 });
+        await reference.locator.pressSequentially(text, { timeout: 15_000 });
       }
     } catch (error) {
       throw new GuestRpcError(
@@ -622,12 +885,12 @@ export class BrowserController {
       this.options.profilePath ?? ".config/helm-chromium",
     );
     const contextOptions: {
-      headless: false;
+      headless: boolean;
       viewport: null;
       executablePath?: string;
       args?: readonly string[];
     } = {
-      headless: false,
+      headless: this.options.headless ?? false,
       viewport: null,
     };
     const executablePath = this.options.executablePath ?? process.env.HELM_CHROMIUM_PATH;
@@ -654,26 +917,215 @@ export class BrowserController {
     }
   }
 
-  private resolveReference(ref: string): PlaywrightLocator {
+  private async resolveReference(ref: string): Promise<BrowserReference> {
+    const page = await this.ensurePage();
+    await this.refreshDomRevision(page);
     const entry = this.references.get(ref);
+    const code = ref.startsWith("r") ? "STALE_REGION_REF" : "STALE_ELEMENT_REF";
     if (entry === undefined) {
-      throw new GuestRpcError("STALE_ELEMENT_REF", `Unknown or expired browser ref: ${ref}.`, {
-        httpStatus: 400,
-      });
+      throw new GuestRpcError(code, `Unknown or expired browser ref: ${ref}.`, { httpStatus: 409 });
     }
-    const currentUrl = this.page?.url() ?? "";
+    const currentUrl = page.url();
     if (entry.revision !== this.referenceRevision || entry.url !== currentUrl) {
       this.references.delete(ref);
-      throw new GuestRpcError("STALE_ELEMENT_REF", `Browser ref ${ref} is no longer valid.`, {
-        httpStatus: 409,
-      });
+      throw new GuestRpcError(code, `Browser ref ${ref} is no longer valid.`, { httpStatus: 409 });
     }
-    return entry.locator;
+    return entry;
   }
 
   private invalidateReferences(): void {
     this.referenceRevision += 1;
     this.references.clear();
+    this.referenceUrl = "";
+    this.lastDomMutationCount = undefined;
+    this.outlineCache = undefined;
+    this.searchCache = undefined;
+  }
+
+  private async refreshDomRevision(page: PlaywrightPage): Promise<number> {
+    let mutationCount = 0;
+    try {
+      mutationCount = await page.locator("body").evaluateAll((nodes) => {
+        const body = nodes[0];
+        if (!(body instanceof HTMLElement)) return 0;
+        const state = window as Window & {
+          __helmDomRevision?: number;
+          __helmDomObserver?: MutationObserver;
+        };
+        if (!state.__helmDomObserver) {
+          state.__helmDomRevision = 0;
+          const observer = new MutationObserver(() => {
+            state.__helmDomRevision = (state.__helmDomRevision ?? 0) + 1;
+          });
+          observer.observe(document.documentElement ?? body, {
+            subtree: true,
+            childList: true,
+            characterData: true,
+            attributes: true,
+            attributeFilter: ["aria-label", "aria-labelledby", "aria-disabled", "class", "disabled", "hidden", "href", "role", "style", "value"],
+          });
+          state.__helmDomObserver = observer;
+        }
+        return state.__helmDomRevision ?? 0;
+      });
+    } catch {
+      // A page without a readable body still has navigation and action revisions.
+    }
+    const url = page.url();
+    if (this.referenceUrl.length > 0 && this.referenceUrl !== url) this.invalidateReferences();
+    if (this.lastDomMutationCount !== undefined && this.lastDomMutationCount !== mutationCount) {
+      this.invalidateReferences();
+    }
+    this.referenceUrl = url;
+    this.lastDomMutationCount = mutationCount;
+    return this.referenceRevision;
+  }
+
+  private async getRegionRecords(page: PlaywrightPage, includeText: boolean): Promise<{
+    records: PageRegionRecord[];
+    regionCount: number;
+    truncated: boolean;
+  }> {
+    const revision = this.referenceRevision;
+    const cache = includeText ? this.searchCache : this.outlineCache;
+    if (cache?.revision === revision) return cache;
+    if (includeText && this.outlineCache?.revision === revision) {
+      // The outline index is deliberately text-light; search builds its own
+      // local searchable region data only when requested.
+    }
+    const candidates = page.locator(REGION_SELECTOR);
+    const result = await candidates.evaluateAll((nodes, options) => {
+      const includeText = typeof options === "object" && options !== null && "includeText" in options
+        ? Boolean((options as { includeText: boolean }).includeText)
+        : false;
+      const regionLimit = typeof options === "object" && options !== null && "limit" in options
+        ? Number((options as { limit: number }).limit)
+        : 1_200;
+      const clean = (value: string | null | undefined, max = 220) => {
+        const normalized = (value ?? "").replace(/\s+/g, " ").trim();
+        return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
+      };
+      const headings = nodes.filter((node): node is HTMLElement => node instanceof HTMLElement
+        && /^(H[1-6])$/u.test(node.tagName) || node instanceof HTMLElement && node.getAttribute("role") === "heading");
+      const structuralSelector = "main,article,section,table,ul,ol,form,nav,aside,footer,h1,h2,h3,h4,h5,h6,[role='main'],[role='article'],[role='region'],[role='navigation'],[role='contentinfo'],[role='complementary'],[role='list'],[role='form'],p,blockquote,pre,dl";
+      const kindOf = (node: HTMLElement): BrowserRegionKind => {
+        const tag = node.tagName.toLowerCase();
+        const role = node.getAttribute("role");
+        if (/^h[1-6]$/u.test(tag) || role === "heading") return "heading";
+        if (tag === "article" || role === "article") return "article";
+        if (tag === "table" || role === "table") return "table";
+        if (tag === "ul" || tag === "ol" || role === "list") return "list";
+        if (tag === "form" || role === "form") return "form";
+        if (tag === "nav" || role === "navigation") return "navigation";
+        if (tag === "footer" || role === "contentinfo") return "footer";
+        if (tag === "aside" || role === "complementary") return "aside";
+        if (tag === "main" || tag === "section" || role === "main" || role === "region") return "section";
+        return "text";
+      };
+      const visible = (node: HTMLElement) => {
+        const style = window.getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+      };
+      const records: Array<{
+        candidateIndex: number;
+        kind: BrowserRegionKind;
+        heading?: string;
+        preview?: string;
+        searchText: string;
+        tableHeaders?: string[];
+        rowCount?: number;
+        columnCount?: number;
+        domOrder: number;
+      }> = [];
+      let visibleCount = 0;
+      const priority = (node: unknown) => {
+        if (!(node instanceof HTMLElement)) return 99;
+        const tag = node.tagName.toLowerCase();
+        const role = node.getAttribute("role");
+        if (tag === "table" || role === "table") return 0;
+        if (tag === "main" || tag === "article" || tag === "section" || role === "main" || role === "article" || role === "region") return 1;
+        if (/^h[1-6]$/u.test(tag) || role === "heading") return 2;
+        if (tag === "ul" || tag === "ol" || role === "list" || tag === "form" || role === "form") return 3;
+        if (tag === "nav" || role === "navigation" || tag === "footer" || role === "contentinfo" || tag === "aside" || role === "complementary") return 5;
+        if (tag === "div") return 6;
+        return 4;
+      };
+      const candidateIndexes = Array.from({ length: nodes.length }, (_, index) => index)
+        .sort((left, right) => priority(nodes[left]) - priority(nodes[right]) || left - right);
+      let truncated = false;
+      for (const index of candidateIndexes) {
+        if (records.length >= regionLimit) {
+          truncated = true;
+          break;
+        }
+        const node = nodes[index];
+        if (!(node instanceof HTMLElement) || !visible(node)) continue;
+        const tag = node.tagName.toLowerCase();
+        const text = node.innerText.replace(/\s+/g, " ").trim();
+        if (tag === "div") {
+          if (text.length < 120 || node.querySelector(structuralSelector)) continue;
+          const childDivHasText = Array.from(node.querySelectorAll("div")).some(child => child.innerText.trim().length >= 120);
+          if (childDivHasText) continue;
+        }
+        if (text.length === 0) continue;
+        const kind = kindOf(node);
+        let headingNode: HTMLElement | undefined;
+        if (kind === "heading") headingNode = node;
+        else headingNode = Array.from(node.querySelectorAll("h1,h2,h3,h4,h5,h6,[role='heading']"))
+          .find((candidate): candidate is HTMLElement => candidate instanceof HTMLElement);
+        if (!headingNode) {
+          const regionContainer = node.closest("section,article,main,[role='main'],[role='region']");
+          for (const candidate of headings) {
+            if (!(candidate instanceof HTMLElement)) continue;
+            const followsNode = Boolean(candidate.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING);
+            if (!followsNode) continue;
+            const headingContainer = candidate.closest("section,article,main,[role='main'],[role='region']");
+            if (headingContainer === regionContainer || headingContainer?.contains(node)) headingNode = candidate;
+          }
+        }
+        const heading = clean(headingNode?.innerText, 160);
+        const rows = kind === "table" ? Array.from(node.querySelectorAll("tr")) : [];
+        const headerRow = rows.find(row => row.querySelector("th")) ?? rows[0];
+        const tableHeaders = kind === "table" && headerRow
+          ? Array.from(headerRow.querySelectorAll("th,td")).map(cell => clean(cell.textContent, 120))
+          : undefined;
+        const dataRows = rows.filter(row => row !== headerRow && row.querySelector("th,td"));
+        const columnCount = Math.max(0, ...rows.map(row => row.querySelectorAll("th,td").length));
+        const previewSource = kind === "table" && tableHeaders
+          ? `${tableHeaders.join(" ")} ${dataRows[0]?.innerText ?? ""}`
+          : text;
+        const preview = clean(previewSource, 180);
+        visibleCount += 1;
+        records.push({
+          candidateIndex: index,
+          kind,
+          ...(heading ? { heading } : {}),
+          ...(preview ? { preview } : {}),
+          searchText: includeText ? text : "",
+          ...(tableHeaders ? { tableHeaders } : {}),
+          ...(kind === "table" ? { rowCount: dataRows.length, columnCount } : {}),
+          domOrder: index,
+        });
+      }
+      return { records, regionCount: visibleCount, truncated: truncated || nodes.length > regionLimit };
+    }, { includeText, limit: MAX_INDEXED_REGIONS });
+    const records: PageRegionRecord[] = result.records.map(record => ({
+      ref: `r${revision}-${record.candidateIndex + 1}`,
+      kind: record.kind,
+      ...(record.heading ? { heading: record.heading } : {}),
+      ...(record.preview ? { preview: record.preview } : {}),
+      ...(record.rowCount === undefined ? {} : { rowCount: record.rowCount }),
+      ...(record.columnCount === undefined ? {} : { columnCount: record.columnCount }),
+      searchText: record.searchText,
+      ...(record.tableHeaders ? { tableHeaders: record.tableHeaders } : {}),
+      domOrder: record.domOrder,
+      candidateIndex: record.candidateIndex,
+    }));
+    const normalized = { records, regionCount: result.regionCount, truncated: result.truncated };
+    if (includeText) this.searchCache = { revision, ...normalized };
+    else this.outlineCache = { revision, ...normalized };
+    return normalized;
   }
 
   private async navigatePage(
@@ -747,12 +1199,22 @@ export class BrowserController {
       title: await this.readTitle(page),
       loading: this.loading,
       pageCount: this.context?.pages().length ?? 1,
+      revision: this.referenceRevision,
     };
   }
 }
 
-function cleanTextForSnapshot(value: string | null | undefined, maxLength = 240): string | undefined {
-  const text = value?.replace(/\s+/g, " ").trim();
-  if (text === undefined || text.length === 0) return undefined;
-  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+function outlinePriority(kind: BrowserRegionKind): number {
+  switch (kind) {
+    case "table": return 0;
+    case "heading": return 1;
+    case "article":
+    case "section": return 2;
+    case "form":
+    case "list": return 3;
+    case "navigation":
+    case "aside":
+    case "footer": return 4;
+    case "text": return 5;
+  }
 }

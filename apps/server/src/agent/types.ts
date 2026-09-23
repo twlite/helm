@@ -27,6 +27,7 @@ import type { GuestTransport } from '../tools/guest-transport';
 import type { ToolRegistry } from '../tools/tool-registry';
 import type { CriterionVerifierRegistry } from '../tools/criterion-verifier';
 import type { ToolDefinition } from '../tools/registry';
+import type { ContextCompactionEvent, ContextUsage } from '../ai/context-manager';
 
 export type {
   AgentDecision,
@@ -132,6 +133,8 @@ export interface ActingAgentContext {
   drainSteering?: () => Message[];
   /** Emits a brief user-facing progress summary, never private model reasoning. */
   onProgress?: (summary: string) => Promise<void> | void;
+  onContextUsage?: (usage: ContextUsage) => Promise<void> | void;
+  onContextCompacted?: (event: ContextCompactionEvent) => Promise<void> | void;
   maxSteps: number;
   maxRepeatedAction: number;
   maxConsecutiveFailures: number;
@@ -189,6 +192,8 @@ export type RuntimePersistence = RuntimeRepository;
 export type RuntimeEventType =
   | 'run.started'
   | 'run.progress'
+  | 'run.context.usage'
+  | 'run.context.compacted'
   | 'run.step.started'
   | 'run.step.completed'
   | 'run.verification'

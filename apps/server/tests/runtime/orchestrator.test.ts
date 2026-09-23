@@ -596,9 +596,9 @@ describe('orchestrated agent loop', () => {
     expect(result.evidence).toMatchObject({ receipt: { effect: { existsBefore: true, existsAfter: true } } });
   });
 
-  it('allows repeated observation calls when the semantic page changes', () => {
-    const first = { timestamp: 1, browser: { url: DEMO_PAGE_URL, title: 'demo', main: { text: 'first' }, interactiveElements: [] }, task: { completedCriteria: [], remainingCriteria: ['page'] } };
-    const second = { ...first, timestamp: 2, browser: { ...first.browser, main: { text: 'second' } } };
+  it('allows repeated observation calls when the browser DOM revision changes', () => {
+    const first = { timestamp: 1, browser: { url: DEMO_PAGE_URL, title: 'demo', revision: 1 }, task: { completedCriteria: [], remainingCriteria: ['page'] } };
+    const second = { ...first, timestamp: 2, browser: { ...first.browser, revision: 2 } };
     const state = createTaskState(taskWithRequirements());
     expect(progressFingerprint(state, first as EnvironmentObservation, objective('page', 'browser', 'Inspect page.', 'page')))
       .not.toBe(progressFingerprint(state, second as EnvironmentObservation, objective('page', 'browser', 'Inspect page.', 'page')));

@@ -44,6 +44,13 @@ export function createLmStudioModels(config: HelmConfig): HelmAiModels {
     embeddingModel,
     actingAgent: new AiSdkActingAgent({
       ...sharedGenerationOptions,
+      contextBudget: {
+        contextWindowTokens: config.models.contextWindowTokens,
+        contextCompactAtRatio: config.models.contextCompactAtRatio,
+        contextCriticalAtRatio: config.models.contextCriticalAtRatio,
+        contextRecentExchanges: config.models.contextRecentExchanges,
+        contextCriticalRecentExchanges: config.models.contextCriticalRecentExchanges,
+      },
     }),
     titleGenerator: new AiSdkThreadTitleGenerator(sharedGenerationOptions),
     memoryExtractor: new AiSdkMemoryExtractor({

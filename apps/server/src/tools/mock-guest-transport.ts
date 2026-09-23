@@ -1,7 +1,12 @@
 import { posix } from 'node:path';
 import { createHash } from 'node:crypto';
 
-import type { GuestMethod, WindowInfo } from '@helm/shared';
+import type {
+  BrowserRegionKind,
+  GuestMethod,
+  WindowInfo,
+} from '@helm/shared';
+import { extractRelevantPassages, rankPageRegions, sampleReadableText, type IndexedBrowserRegion } from '@helm/shared';
 import { guestMethodSchemas } from '@helm/shared';
 import type {
   GuestMethodParams,
@@ -60,8 +65,9 @@ interface MockBrowserState {
   text: string;
   elements: MockBrowserElement[];
   pageCount: number;
-  main?: { heading?: string; text?: string };
-  domFingerprint?: string;
+  revision: number;
+  html?: string;
+  regions: Array<IndexedBrowserRegion & { tableRows?: string[][]; links?: Array<{ text: string; href: string }> }>;
 }
 
 function decodeHtml(value: string): string {
@@ -107,8 +113,94 @@ function parseElements(html: string): MockBrowserElement[] {
   return elements;
 }
 
-function browserFingerprint(browser: Pick<MockBrowserState, 'text' | 'elements'>): string {
-  return JSON.stringify({ text: browser.text, elements: browser.elements });
+function mockRegionKind(tag: string): BrowserRegionKind {
+  if (/^h[1-6]$/iu.test(tag)) return 'heading';
+  if (tag === 'article') return 'article';
+  if (tag === 'table') return 'table';
+  if (tag === 'ul' || tag === 'ol') return 'list';
+  if (tag === 'form') return 'form';
+  if (tag === 'nav') return 'navigation';
+  if (tag === 'footer') return 'footer';
+  if (tag === 'aside') return 'aside';
+  if (tag === 'main' || tag === 'section') return 'section';
+  return 'text';
+}
+
+function mockRegions(html: string, revision: number) {
+  const selector = /<(main|article|section|table|ul|ol|form|nav|aside|footer|h[1-6]|p|blockquote|pre|dl)\b[^>]*>([\s\S]*?)<\/\1>/giu;
+  const regions: Array<IndexedBrowserRegion & { tableRows?: string[][]; links?: Array<{ text: string; href: string }> }> = [];
+  let heading: string | undefined;
+  for (const match of html.matchAll(selector)) {
+    const tag = match[1]?.toLowerCase() ?? 'text';
+    const body = match[2] ?? '';
+    const kind = mockRegionKind(tag);
+    const text = readableText(body);
+    if (!text) continue;
+    if (kind === 'heading') heading = text.slice(0, 160);
+    const rowMatches = tag === 'table' ? [...body.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/giu)] : [];
+    const parsedRows = rowMatches.map(row => [...(row[1] ?? '').matchAll(/<(?:th|td)\b[^>]*>([\s\S]*?)<\/(?:th|td)>/giu)]
+      .map(cell => readableText(cell[1] ?? '')));
+    const headerIndex = parsedRows.findIndex((_, index) => /<th\b/iu.test(rowMatches[index]?.[1] ?? ''));
+    const actualHeaderIndex = headerIndex >= 0 ? headerIndex : parsedRows.length > 0 ? 0 : -1;
+    const tableHeaders = actualHeaderIndex >= 0 ? parsedRows[actualHeaderIndex] : undefined;
+    const tableRows = parsedRows.filter((_, index) => index !== actualHeaderIndex && parsedRows[index]!.length > 0);
+    const candidateIndex = regions.length;
+    const previewSource = kind === 'table'
+      ? `${tableHeaders?.join(' ') ?? ''} ${tableRows[0]?.join(' ') ?? ''}`
+      : text;
+    const region: IndexedBrowserRegion & { tableRows?: string[][]; links?: Array<{ text: string; href: string }> } = {
+      ref: `r${revision}-${candidateIndex + 1}`,
+      kind,
+      ...(kind === 'heading' ? { heading: text.slice(0, 160) } : heading ? { heading } : {}),
+      preview: previewSource.replace(/\s+/gu, ' ').trim().slice(0, 180),
+      searchText: text,
+      ...(tableHeaders ? { tableHeaders } : {}),
+      ...(kind === 'table' ? { rowCount: tableRows.length, columnCount: Math.max(0, ...parsedRows.map(row => row.length)), tableRows } : {}),
+      domOrder: candidateIndex,
+      ...(kind === 'navigation' || kind === 'article' || kind === 'section' || kind === 'text'
+        ? { links: [...body.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/giu)]
+          .map(link => ({ text: readableText(link[2] ?? ''), href: link[1] ?? '' })) }
+        : {}),
+    };
+    regions.push(region);
+  }
+  if (regions.length === 0) {
+    const text = readableText(html);
+    if (text) regions.push({ ref: `r${revision}-1`, kind: 'text', preview: text.slice(0, 180), searchText: text, domOrder: 0 });
+  }
+  return regions;
+}
+
+function mockOutlinePriority(kind: BrowserRegionKind): number {
+  if (kind === 'table') return 0;
+  if (kind === 'heading') return 1;
+  if (kind === 'article' || kind === 'section') return 2;
+  if (kind === 'form' || kind === 'list') return 3;
+  if (kind === 'navigation' || kind === 'aside' || kind === 'footer') return 4;
+  return 5;
+}
+
+function boundedTable(region: MockBrowserState['regions'][number], maxChars: number) {
+  const sourceColumns = region.tableHeaders ?? [];
+  const sourceRows = region.tableRows ?? [];
+  const maxColumns = Math.max(1, Math.min(80, Math.floor(maxChars / 100)));
+  const maxHeaderChars = Math.max(16, Math.min(128, Math.floor(maxChars / (maxColumns * 2))));
+  const columns = sourceColumns.slice(0, maxColumns).map(value => value.slice(0, maxHeaderChars));
+  const maxCellChars = Math.max(16, Math.min(256, Math.floor(maxChars * 0.4 / Math.max(1, columns.length))));
+  let chars = JSON.stringify(columns).length;
+  const rows: string[][] = [];
+  for (const sourceRow of sourceRows) {
+    const row = sourceRow.slice(0, columns.length).map(value => value.slice(0, maxCellChars));
+    const size = JSON.stringify(row).length + 1;
+    if (chars + size > maxChars) break;
+    rows.push(row);
+    chars += size;
+  }
+  return {
+    columns,
+    rows,
+    truncated: columns.length < sourceColumns.length || rows.length < sourceRows.length,
+  };
 }
 
 function basename(path: string): string {
@@ -166,6 +258,8 @@ export class MockGuestTransport implements GuestTransport {
     text: '',
     elements: [],
     pageCount: 1,
+    revision: 0,
+    regions: [],
   };
   private screenshotCounter = 0;
   private screenshotId?: string;
@@ -214,7 +308,7 @@ export class MockGuestTransport implements GuestTransport {
     this.files.set(DEMO_PAGE_PATH, DEMO_PAGE_HTML);
     this.addDirectoryParents(DEMO_PAGE_PATH);
     this.windows.clear();
-    this.browser = { loaded: false, text: '', elements: [], pageCount: 1 };
+    this.browser = { loaded: false, text: '', elements: [], pageCount: 1, revision: 0, regions: [] };
     this.screenshotCounter = 0;
     this.screenshotId = undefined;
   }
@@ -354,6 +448,7 @@ export class MockGuestTransport implements GuestTransport {
         }
         const document = html ?? `<html><body>Mock page for ${url}</body></html>`;
         const title = pageTitle(document, 'Mock page');
+        const revision = this.browser.revision + 1;
         this.browser = {
           url,
           title,
@@ -361,50 +456,143 @@ export class MockGuestTransport implements GuestTransport {
           text: readableText(document),
           elements: parseElements(document),
           pageCount: 1,
-          main: {
-            heading: document.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/i)?.[1]
-              ? readableText(document.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/i)?.[0] ?? '')
-              : undefined,
-            text: readableText(document).slice(0, 2_000),
-          },
-          domFingerprint: browserFingerprint({ text: readableText(document), elements: parseElements(document) }),
+          revision,
+          html: document,
+          regions: mockRegions(document, revision),
         };
         this.upsertWindow('browser', 'Chromium', title, true);
-        return { url, title, loaded: true } as GuestMethodResult[M];
+        return {
+          url,
+          title,
+          loading: false,
+          pageCount: 1,
+          revision: this.browser.revision,
+        } as GuestMethodResult[M];
       }
       case 'browser.getState':
         return {
-          url: this.browser.url,
-          title: this.browser.title,
-          loaded: this.browser.loaded,
+          ready: this.browser.loaded,
+          visible: true,
+          url: this.browser.url ?? 'about:blank',
+          title: this.browser.title ?? '',
+          loading: !this.browser.loaded,
           pageCount: this.browser.pageCount,
-          domFingerprint: this.browser.domFingerprint,
+          revision: this.browser.revision,
         } as GuestMethodResult[M];
-      case 'browser.snapshot':
+      case 'browser.snapshot': {
+        const maxRegions = (params as GuestMethodParams['browser.snapshot']).maxRegions ?? 60;
+        const outline = [...this.browser.regions]
+          .sort((left, right) => mockOutlinePriority(left.kind) - mockOutlinePriority(right.kind) || left.domOrder - right.domOrder)
+          .slice(0, maxRegions)
+          .sort((left, right) => left.domOrder - right.domOrder)
+          .map(region => ({
+            ref: region.ref,
+            kind: region.kind,
+            ...(region.heading ? { heading: region.heading } : {}),
+            ...(region.preview ? { preview: region.preview } : {}),
+            ...(region.rowCount === undefined ? {} : { rowCount: region.rowCount }),
+            ...(region.columnCount === undefined ? {} : { columnCount: region.columnCount }),
+          }));
         return {
           url: this.browser.url,
           title: this.browser.title,
           pageCount: this.browser.pageCount,
-          main: this.browser.main,
-          elements: this.browser.elements.map(element => ({ ...element })),
+          revision: this.browser.revision,
+          regionCount: this.browser.regions.length,
+          outlineTruncated: this.browser.regions.length > outline.length,
+          outline,
+          elements: this.browser.elements.slice(0, 80).map((element, index) => ({
+            ...element,
+            ref: `e${this.browser.revision}-${index + 1}`,
+          })),
         } as GuestMethodResult[M];
+      }
+      case 'browser.searchPage': {
+        const input = params as GuestMethodParams['browser.searchPage'];
+        const ranked = rankPageRegions({
+          query: input.query,
+          regions: this.browser.regions,
+          ...(input.kinds ? { kinds: input.kinds } : {}),
+          maxResults: input.maxResults,
+        });
+        return {
+          url: this.browser.url ?? 'about:blank',
+          title: this.browser.title ?? '',
+          revision: this.browser.revision,
+          query: input.query,
+          ...ranked,
+        } as GuestMethodResult[M];
+      }
+      case 'browser.inspectRegion': {
+        const input = params as GuestMethodParams['browser.inspectRegion'];
+        const match = input.ref.match(/^r(\d+)-([1-9]\d*)$/u);
+        const region = match && Number(match[1]) === this.browser.revision
+          ? this.browser.regions.find(candidate => candidate.ref === input.ref)
+          : undefined;
+        if (!region) throw new GuestTransportError('STALE_REGION_REF', `Browser region no longer exists: ${input.ref}`);
+        const common = {
+          url: this.browser.url ?? 'about:blank',
+          title: this.browser.title ?? '',
+          revision: this.browser.revision,
+          ref: input.ref,
+          kind: region.kind,
+          ...(region.heading ? { heading: region.heading } : {}),
+        };
+        const format = input.format === 'auto' || input.format === undefined
+          ? region.kind === 'table' ? 'table' : 'text'
+          : input.format === 'table' && region.kind !== 'table' ? 'text' : input.format;
+        if (format === 'links') {
+          const links = (region.links ?? []).slice(0, 80);
+          return { ...common, format: 'links', links, linkCount: (region.links ?? []).length, truncated: links.length < (region.links ?? []).length } as GuestMethodResult[M];
+        }
+        if (format === 'table' && region.kind === 'table') {
+          const maxChars = Math.max(1_000, Math.min(20_000, input.maxChars ?? 12_000));
+          const table = boundedTable(region, maxChars);
+          return {
+            ...common,
+            format: 'table',
+            columns: table.columns,
+            rows: table.rows,
+            rowCount: region.rowCount ?? region.tableRows?.length ?? 0,
+            columnCount: region.columnCount ?? region.tableHeaders?.length ?? 0,
+            truncated: table.truncated,
+          } as GuestMethodResult[M];
+        }
+        const maxChars = Math.max(1_000, Math.min(20_000, input.maxChars ?? 12_000));
+        return { ...common, format: 'text', text: region.searchText.slice(0, maxChars), truncated: region.searchText.length > maxChars } as GuestMethodResult[M];
+      }
       case 'browser.extractText': {
         if (!this.browser.loaded || !this.browser.url) {
           throw new GuestTransportError('BROWSER_NOT_READY', 'Navigate the browser before extracting text');
         }
+        const input = params as GuestMethodParams['browser.extractText'];
+        const mode = input.mode ?? 'relevant';
+        const maxChars = Math.max(1, Math.min(100_000, input.maxChars ?? 8_000));
+        const extracted = input.query && mode === 'relevant'
+          ? extractRelevantPassages({ text: this.browser.text, query: input.query, maxChars })
+          : mode === 'full'
+            ? { text: this.browser.text.slice(0, maxChars), truncated: this.browser.text.length > maxChars }
+            : sampleReadableText(this.browser.text, maxChars);
         return {
           url: this.browser.url,
           title: this.browser.title ?? '',
-          text: this.browser.text,
+          text: extracted.text,
+          truncated: extracted.truncated,
+          mode,
+          ...(input.query ? { query: input.query } : {}),
+          ...('matches' in extracted && extracted.matches !== undefined ? { matches: extracted.matches } : {}),
         } as GuestMethodResult[M];
       }
       case 'browser.download': {
         const input = params as GuestMethodParams['browser.download'];
+        const elementRef = input.ref?.match(/^e(\d+)-([1-9]\d*)$/u);
         const element = input.ref === undefined
           ? undefined
-          : this.browser.elements.find(candidate => candidate.ref === input.ref);
+          : elementRef && Number(elementRef[1]) === this.browser.revision
+            ? this.browser.elements[Number(elementRef[2]) - 1]
+            : undefined;
         if (input.ref !== undefined && element === undefined) {
-          throw new GuestTransportError('ELEMENT_NOT_FOUND', `Browser element does not exist: ${input.ref}`);
+          throw new GuestTransportError('STALE_ELEMENT_REF', `Browser element ref is no longer valid: ${input.ref}`);
         }
         const rawSourceUrl = input.url ?? element?.href ?? this.browser.url ?? 'about:blank';
         let sourceUrl = rawSourceUrl;
@@ -432,19 +620,24 @@ export class MockGuestTransport implements GuestTransport {
       }
       case 'browser.click': {
         const input = params as GuestMethodParams['browser.click'];
-        if (input.ref && !this.browser.elements.some(element => element.ref === input.ref)) {
-          throw new GuestTransportError('ELEMENT_NOT_FOUND', `Browser element does not exist: ${input.ref}`);
+        const elementRef = input.ref?.match(/^e(\d+)-([1-9]\d*)$/u);
+        if (input.ref && (!elementRef || Number(elementRef[1]) !== this.browser.revision || !this.browser.elements[Number(elementRef[2]) - 1])) {
+          throw new GuestTransportError('STALE_ELEMENT_REF', `Browser element ref is no longer valid: ${input.ref}`);
         }
+        this.browser.revision += 1;
+        this.browser.regions = mockRegions(this.browser.html ?? '', this.browser.revision);
         return { ...input, clicked: true } as GuestMethodResult[M];
       }
       case 'browser.type': {
         const input = params as GuestMethodParams['browser.type'];
-        if (!this.browser.elements.some(element => element.ref === input.ref)) {
-          throw new GuestTransportError('ELEMENT_NOT_FOUND', `Browser element does not exist: ${input.ref}`);
+        const elementRef = input.ref.match(/^e(\d+)-([1-9]\d*)$/u);
+        if (!elementRef || Number(elementRef[1]) !== this.browser.revision || !this.browser.elements[Number(elementRef[2]) - 1]) {
+          throw new GuestTransportError('STALE_ELEMENT_REF', `Browser element ref is no longer valid: ${input.ref}`);
         }
-        const element = this.browser.elements.find(candidate => candidate.ref === input.ref);
+        const element = this.browser.elements[Number(elementRef[2]) - 1];
         if (element) element.value = input.text;
-        this.browser.domFingerprint = browserFingerprint({ text: this.browser.text, elements: this.browser.elements });
+        this.browser.revision += 1;
+        this.browser.regions = mockRegions(this.browser.html ?? '', this.browser.revision);
         return { ref: input.ref, text: input.text, typed: true } as GuestMethodResult[M];
       }
       case 'app.launch': {

@@ -54,10 +54,16 @@ export const GuestMethodContracts: Readonly<
   "browser.navigate": { description: "Navigate the visible Chromium page." },
   "browser.getState": { description: "Read the current browser state." },
   "browser.snapshot": {
-    description: "Return interactive browser elements with semantic refs.",
+    description: "Return a bounded page outline and visible interactive elements with semantic refs.",
+  },
+  "browser.searchPage": {
+    description: "Rank visible semantic page regions against a query without returning full page text.",
+  },
+  "browser.inspectRegion": {
+    description: "Inspect one current semantic page region, including structured table rows or local links.",
   },
   "browser.extractText": {
-    description: "Extract readable text from the current page.",
+    description: "Extract relevant passages, or explicitly requested bounded full text, from the current page.",
   },
   "browser.download": {
     description: "Start and record a browser download.",
