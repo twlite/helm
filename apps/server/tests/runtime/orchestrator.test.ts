@@ -10,7 +10,7 @@ import type {
 
 import { AgentRuntime } from '../../src/agent/runtime';
 import { deterministicObjectiveAction, objectiveForRequirement, ScriptedOrchestratorProvider } from '../../src/agent/orchestrator';
-import { createTaskState, progressFingerprint } from '../../src/agent/task-state';
+import { createTaskState, progressFingerprint, verifyTaskState } from '../../src/agent/task-state';
 import type { WorkerContext, WorkerProvider } from '../../src/agent/types';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
 import { createGuestToolRegistry } from '../../src/tools/guest-tools';
@@ -278,11 +278,49 @@ describe('orchestrated agent loop', () => {
     }, openObjective)).toBeUndefined();
   });
 
+  it('does not complete a page-summary file task when an error was saved instead of readable page output', async () => {
+    const task = taskWithRequirements({
+      id: 'summary-file-task',
+      threadId: 'summary-file-thread',
+      requirements: [
+        {
+          id: 'browserResearch',
+          description: 'Collect readable evidence from the requested page.',
+          type: 'fact',
+          mandatory: true,
+          target: { factId: 'pageContent' },
+        },
+        {
+          id: 'outputFile',
+          description: 'Create the requested summary file.',
+          type: 'filesystem',
+          mandatory: true,
+          target: { path: 'kd.txt', mode: 'non-empty' },
+        },
+      ],
+    });
+    const guest = new MockGuestTransport();
+    await guest.request('fs.write', { path: 'kd.txt', content: 'Error: Could not extract page content.' });
+
+    const verification = await verifyTaskState(
+      task,
+      createTaskState(task),
+      guest,
+      { timestamp: 1, task: { completedCriteria: [], remainingCriteria: ['browserResearch', 'outputFile'] } },
+    );
+
+    expect(verification.complete).toBe(false);
+    expect(verification.requirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requirement: expect.objectContaining({ id: 'browserResearch' }), passed: false }),
+      expect.objectContaining({ requirement: expect.objectContaining({ id: 'outputFile' }), passed: true }),
+    ]));
+  });
+
   it('recovers when the orchestrator mistakes an unmet browser requirement for a blocker', async () => {
     const guest = new MockGuestTransport();
     const worker = new FunctionalWorker([async context => {
       const navigate = await executeAction(context, 'browser.navigate', { url: 'https://github.com/oven-sh/bun' }, 'navigate');
-      const extract = await executeAction(context, 'browser.extractText', { query: 'repository information' }, 'extract');
+      const extract = await executeAction(context, 'browser.read', { mode: 'readable' }, 'read');
       return {
         status: 'completed', worker: 'browser', objectiveId: context.objective.id,
         actions: [navigate, extract], facts: [], evidence: [], artifacts: [], blockers: [], environmentChanged: true,
@@ -314,7 +352,7 @@ describe('orchestrated agent loop', () => {
     });
 
     expect(result.status).not.toBe('blocked');
-    expect(result.steps.some(step => step.workerResult?.actions.some(action => action.tool === 'browser.extractText'))).toBe(true);
+    expect(result.steps.some(step => step.workerResult?.actions.some(action => action.tool === 'browser.read'))).toBe(true);
     expect(result.run.state?.blockers.some(item => item.code === 'ORCHESTRATOR_BLOCKED_RECOVERED')).toBe(true);
   });
 
@@ -384,7 +422,7 @@ describe('orchestrated agent loop', () => {
     const worker = new FunctionalWorker([
       async context => {
         const navigate = await executeAction(context, 'browser.navigate', { url: releaseUrl }, 'navigate');
-        const extract = await executeAction(context, 'browser.extractText', { query: 'bun v1.2.3 released 2026-09-20' }, 'extract');
+        const extract = await executeAction(context, 'browser.read', { mode: 'readable' }, 'read');
         const evidence = extract.result.evidence as { receipt?: { id: string } };
         const evidenceId = evidence.receipt?.id ?? 'missing-receipt';
         return {
@@ -448,7 +486,7 @@ describe('orchestrated agent loop', () => {
     const worker = new FunctionalWorker([
       async context => {
         const navigate = await executeAction(context, 'browser.navigate', { url: releaseUrl }, 'navigate');
-        const extract = await executeAction(context, 'browser.extractText', { query: 'latest release version' }, 'extract');
+        const extract = await executeAction(context, 'browser.read', { mode: 'readable' }, 'read');
         const evidenceId = typeof extract.result.evidence === 'object' && extract.result.evidence !== null && 'receipt' in extract.result.evidence
           ? (extract.result.evidence.receipt as { id: string }).id
           : 'missing-receipt';
@@ -650,7 +688,7 @@ describe('orchestrated agent loop', () => {
         return { status: 'completed', worker: 'browser', objectiveId: context.objective.id, actions: [action], facts: [fact('latestReleaseVersion', 'v0.0.0', evidence.receipt?.id ?? 'missing')], evidence: [], artifacts: [], blockers: [], environmentChanged: true };
       },
       async context => {
-        const action = await executeAction(context, 'browser.extractText', { query: 'v9.9.9' }, 'read');
+        const action = await executeAction(context, 'browser.read', { mode: 'readable' }, 'read');
         const evidence = action.result.evidence as { receipt?: { id: string } };
         return { status: 'completed', worker: 'browser', objectiveId: context.objective.id, actions: [action], facts: [fact('latestReleaseVersion', 'v9.9.9', evidence.receipt?.id ?? 'missing')], evidence: [], artifacts: [], blockers: [], environmentChanged: true };
       },

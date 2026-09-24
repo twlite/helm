@@ -142,9 +142,21 @@ export class GuestRuntime {
           const maxRegions = optionalInteger(params, "maxRegions", { min: 1, max: 100 });
           return maxRegions === undefined ? {} : { maxRegions };
         })());
-      case "browser.searchPage": {
+      case "browser.read": {
+        const mode = enumValue(params, "mode", ["readable", "document"] as const, "readable");
+        const ref = optionalString(params, "ref", { maxLength: 64 });
+        const maxChars = optionalInteger(params, "maxChars", { min: 1, max: 12_000 });
+        const cursor = optionalString(params, "cursor", { maxLength: 2_048 });
+        return this.browser.read({
+          mode,
+          ...(ref === undefined ? {} : { ref }),
+          ...(maxChars === undefined ? {} : { maxChars }),
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+      }
+      case "browser.search": {
         const maxResults = optionalInteger(params, "maxResults", { min: 1, max: 20 });
-        return this.browser.searchPage({
+        return this.browser.search({
           query: requiredString(params, "query", { maxLength: 1_000 }),
           ...(Array.isArray(params.kinds) ? { kinds: params.kinds as import("../../../packages/shared/src/types").BrowserRegionKind[] } : {}),
           ...(maxResults === undefined ? {} : { maxResults }),
@@ -163,14 +175,6 @@ export class GuestRuntime {
             ...(limit === undefined ? {} : { limit }),
           };
         })());
-      case "browser.extractText": {
-        const query = requiredString(params, "query", { maxLength: 1_000 });
-        const maxChars = optionalInteger(params, "maxChars", { min: 1, max: 8_000 });
-        return this.browser.extractText({
-          query,
-          ...(maxChars === undefined ? {} : { maxChars }),
-        });
-      }
       case "browser.download":
         return this.browser.download((() => {
           const ref = optionalString(params, "ref", { maxLength: 64 });

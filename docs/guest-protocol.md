@@ -25,7 +25,7 @@ The guest rejects unknown methods, malformed parameters, traversal outside `/hom
 The initial method groups are:
 
 - `fs.read`, `fs.write`, `fs.mkdir`, `fs.exists`, `fs.list`, `fs.stat`
-- `browser.navigate`, `browser.getState`, `browser.snapshot`, `browser.searchPage`, `browser.inspectRegion`, `browser.extractText`, `browser.click`, `browser.type`, `browser.download`
+- `browser.navigate`, `browser.getState`, `browser.snapshot`, `browser.read`, `browser.search`, `browser.inspectRegion`, `browser.click`, `browser.type`, `browser.download`
 - `app.launch`, `app.openFile`
 - `desktop.getState`, `desktop.listWindows`, `desktop.focusWindow`, `desktop.hotkey`, `desktop.type`, `desktop.click`, `desktop.screenshot`
 
@@ -36,13 +36,21 @@ visible semantic regions plus a bounded list of interactive elements and their
 roles, accessible names, values, links, enabled state, checked state, and
 selected state. Region previews do not contain the full region content.
 
-`browser.searchPage` performs local lexical ranking over visible semantic
-regions in the current page. The guest builds bounded query-hit windows inside
-those regions, then scores body text with BM25-like IDF weighting and field
-boosts for headings, table headers, and form labels. Phrase, proximity, region
-kind, and DOM ancestry also affect ranking. Nested matches with substantially
+`browser.read` consumes bounded page content without a query. Readable mode
+uses deterministic content-root selection, removes hidden/script content and
+common navigation boilerplate, and returns structured heading sections.
+Document mode reads a broader visible representation. Reads accept a current
+snapshot region ref and return the complete sanitized region content. Responses
+default to 12,000 characters and large reads return a continuation cursor.
+
+`browser.search` performs local lexical ranking over visible semantic regions
+in the current page. The guest builds bounded query-hit windows inside those
+regions, then scores body text with BM25-like IDF weighting and field boosts
+for headings, table headers, and form labels. Phrase, proximity, region kind,
+and DOM ancestry also affect ranking. Nested matches with substantially
 overlapping query terms are deduplicated in favor of a more specific useful
-region. The default is five results.
+region. Results include query snippets and explicit `matchCount` and
+`pageReadable` fields. A zero match count describes only the query.
 
 `browser.inspectRegion` reads one selected region as bounded text, local links,
 or structured table columns and rows. Text responses default to 8,000
@@ -55,11 +63,10 @@ Region and interactive element refs include the DOM revision, for example
 the previous revision; using one returns a stale-ref error. The model should
 request a fresh snapshot or search result after that error.
 
-`browser.extractText` requires a non-empty query and is a bounded fallback for
-pages whose semantic regions are insufficient. It searches the same semantic
-region index, defaults to 6,000 characters, and accepts at most 8,000
-characters. There is no `mode: "full"` parameter and no acting-agent method
-that returns an entire page text dump.
+The read operation never accepts a natural-language query. Use `browser.search`
+only to locate specific information; a search with zero matches is not evidence
+that a page has no readable content. The acting agent reads page content with
+`browser.read` and uses its cursor when more bounded content is needed.
 
 `browser.download` accepts a semantic element ref or an explicit URL. The guest
 waits for Playwright's download event and returns the source URL, final URL,

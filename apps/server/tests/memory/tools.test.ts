@@ -44,7 +44,7 @@ describe('native memory tools', () => {
       const evidence = [{
         ok: true,
         data: { text: 'The Acme page publishes the current values.' },
-        evidence: { receipt: { id: 'receipt-acme-page', ok: true, tool: 'browser.extractText' } },
+        evidence: { receipt: { id: 'receipt-acme-page', ok: true, tool: 'browser.read' } },
       }];
 
       const saved = await tools.execute('memory.remember', {

@@ -275,7 +275,29 @@ function factIsSupported(fact: Fact, evidence: readonly Evidence[]): boolean {
   const linked = evidence.filter(item => fact.evidenceIds.includes(item.id));
   if (linked.length !== fact.evidenceIds.length) return false;
   const expected = json(fact.value);
-  return linked.some(item => json(item.data).includes(expected.replace(/^"|"$/gu, '')));
+  const expectedText = expected.replace(/^"|"$/gu, '');
+  return linked.some(item => (
+    json(item.data).includes(expectedText)
+    || structuredPageText(item.data) === expectedText
+  ));
+}
+
+/** Exact page-read text is grounded by the structured sections in its receipt. */
+function structuredPageText(value: unknown): string | undefined {
+  const outer = typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+  const data = typeof outer?.data === 'object' && outer.data !== null && !Array.isArray(outer.data)
+    ? outer.data as Record<string, unknown>
+    : undefined;
+  const sections = Array.isArray(data?.sections) ? data.sections : undefined;
+  if (!sections) return undefined;
+  const text = sections.flatMap(section => {
+    if (typeof section !== 'object' || section === null || Array.isArray(section)) return [];
+    const value = section as Record<string, unknown>;
+    return typeof value.text === 'string' && value.text.trim() ? [value.text.trim()] : [];
+  });
+  return text.length > 0 ? text.join('\n\n') : undefined;
 }
 
 function supportedFact(state: TaskState, id: string): Fact | undefined {
@@ -529,6 +551,14 @@ async function requirementCheck(
     try {
       const stat = await guest.request('fs.stat', { path: target.path });
       if (!stat.exists) return { passed: false, message: `Path does not exist: ${target.path}.`, evidence: stat };
+      if (target.mode === 'non-empty') {
+        const passed = stat.type === 'file' && stat.size > 0;
+        return {
+          passed,
+          message: passed ? `File contains output: ${target.path}.` : `File is empty or is not a regular file: ${target.path}.`,
+          evidence: stat,
+        };
+      }
       if (target.mode === 'contains-facts') {
         const file = await guest.request('fs.read', { path: target.path });
         const missing = (target.factIds ?? []).filter(id => {
@@ -759,8 +789,17 @@ export function observedFactsFromToolResult(result: ToolResult, now: () => numbe
   const source = evidenceId ? { type: 'action' as const, actionId: evidenceId } : { type: 'action' as const };
   const observedAt = iso(now);
   const facts: Fact[] = [];
-  if (typeof data.text === 'string' && data.text.trim().length > 0) {
-    facts.push({ id: 'pageContent', value: data.text.slice(0, 12_000), origin: 'observed', confidence: 'observed', evidenceIds: evidenceId ? [evidenceId] : [], source, observedAt });
+  const readSections = Array.isArray(data.sections)
+    ? data.sections.flatMap(section => {
+      if (typeof section !== 'object' || section === null || Array.isArray(section)) return [];
+      const value = section as Record<string, unknown>;
+      const text = typeof value.text === 'string' ? value.text.trim() : '';
+      return text ? [text] : [];
+    }).join('\n\n')
+    : '';
+  const pageText = typeof data.text === 'string' ? data.text : readSections;
+  if (pageText.trim().length > 0) {
+    facts.push({ id: 'pageContent', value: pageText.slice(0, 12_000), origin: 'observed', confidence: 'observed', evidenceIds: evidenceId ? [evidenceId] : [], source, observedAt });
   }
   if (typeof data.url === 'string' && data.url.length > 0) {
     facts.push({ id: 'currentPageUrl', value: data.url, origin: 'observed', confidence: 'observed', evidenceIds: evidenceId ? [evidenceId] : [], source, observedAt });

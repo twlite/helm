@@ -44,9 +44,9 @@ function displayValue(value: unknown, empty = 'No data recorded'): string {
 function toolTitle(toolName: string): string {
   const titles: Record<string, string> = {
     'browser.navigate': 'Opened webpage',
-    'browser.extractText': 'Read page contents',
+    'browser.read': 'Read page contents',
     'browser.snapshot': 'Inspected webpage',
-    'browser.searchPage': 'Searched current page',
+    'browser.search': 'Searched current page',
     'browser.inspectRegion': 'Inspected page region',
     'browser.download': 'Recorded browser download',
     'browser.click': 'Clicked webpage element',
@@ -208,7 +208,7 @@ function ActivityRowView({ row }: { row: ActivityRow }) {
   const reasoning = row.step.decision?.reasoningSummary;
   const objective = row.step.objective;
   const workerResult = row.step.workerResult;
-  const searchResult = row.toolName === 'browser.searchPage' ? resultData(row) : undefined;
+  const searchResult = row.toolName === 'browser.search' ? resultData(row) : undefined;
   const inspectedRegion = row.toolName === 'browser.inspectRegion' ? resultData(row) : undefined;
   const compaction = row.toolName === 'context.compaction' ? contextCompactionDisplay(row.step.observation) : undefined;
   const searchInput = row.step.toolInput;
@@ -229,7 +229,7 @@ function ActivityRowView({ row }: { row: ActivityRow }) {
           {objective?.rationale ? <Detail label="Why this objective" value={objective.rationale} /> : null}
           {row.toolName ? <Detail label="Tool" value={row.toolName} /> : null}
           {row.step.toolInput ? <Detail label="Input" value={displayValue(row.step.toolInput)} pre /> : null}
-          {row.toolName === 'browser.searchPage' ? (
+          {row.toolName === 'browser.search' ? (
             <>
               <Detail label="Query" value={searchDisplay?.query ?? 'Page search'} />
               <Detail label="Coverage" value={searchDisplay?.coverage ?? '0 regions indexed · 0 matches'} />

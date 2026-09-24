@@ -240,7 +240,13 @@ export class CriterionVerifierRegistry {
     this.register('custom', async (criterion, context) => {
       if (criterion.id === BROWSER_RESEARCH_CRITERION_ID) {
         const data = recordValue(context.lastToolResult?.data);
-        const text = typeof data?.text === 'string' ? data.text.trim() : '';
+        const sectionText = Array.isArray(data?.sections)
+          ? data.sections.flatMap(section => {
+            const value = recordValue(section);
+            return typeof value?.text === 'string' ? [value.text.trim()] : [];
+          }).join('\n')
+          : '';
+        const text = typeof data?.text === 'string' ? data.text.trim() : sectionText.trim();
         const passed = context.lastToolResult?.ok === true && text.length > 0;
         return {
           passed,

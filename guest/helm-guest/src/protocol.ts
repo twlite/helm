@@ -56,14 +56,14 @@ export const GuestMethodContracts: Readonly<
   "browser.snapshot": {
     description: "Return a bounded page outline and visible interactive elements with semantic refs.",
   },
-  "browser.searchPage": {
-    description: "Rank visible semantic page regions against a query without returning full page text.",
+  "browser.read": {
+    description: "Read bounded readable page content or the complete content of a current semantic region ref.",
+  },
+  "browser.search": {
+    description: "Search page content for a specific query and return bounded matching snippets and refs.",
   },
   "browser.inspectRegion": {
     description: "Inspect one current semantic page region, including structured table rows or local links.",
-  },
-  "browser.extractText": {
-    description: "Extract relevant passages, or explicitly requested bounded full text, from the current page.",
   },
   "browser.download": {
     description: "Start and record a browser download.",

@@ -27,7 +27,7 @@ describe('criterion verification and mock guest state', () => {
       lastToolResult: { ok: true, data: { url: DEMO_PAGE_URL, title: DEMO_PAGE_TITLE } },
     })).resolves.toMatchObject({ complete: false });
 
-    const extracted = await guest.request('browser.extractText', { query: 'Helm deterministic demo content' });
+    const extracted = await guest.request('browser.read', { mode: 'readable' });
     await expect(verifier.verifyTask({
       criteria: [criterion],
     }, {
@@ -38,10 +38,10 @@ describe('criterion verification and mock guest state', () => {
   it('verifies browser, filesystem, and focused-window criteria mechanically', async () => {
     const guest = new MockGuestTransport();
     await guest.request('browser.navigate', { url: DEMO_PAGE_URL });
-    const extracted = await guest.request('browser.extractText', { query: 'Helm deterministic demo content' });
+    const extracted = await guest.request('browser.read', { mode: 'readable' });
     await guest.request('fs.write', {
       path: '/home/helm/workspace/demo.txt',
-      content: extracted.text,
+      content: extracted.sections.map(section => section.text).join('\n'),
     });
     await guest.request('app.openFile', {
       path: '/home/helm/workspace/demo.txt',

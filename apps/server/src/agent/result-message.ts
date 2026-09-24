@@ -90,12 +90,22 @@ export function assistantMessageForResult(result: AgentRuntimeResult): string {
     return `Saved ${path}${size}.`;
   }
 
-  const extracted = successfulToolData(result, 'browser.extractText');
+  const extracted = successfulToolData(result, 'browser.read')
+    ?? successfulToolData(result, 'browser.extractText');
   if (extracted) {
     const title = typeof extracted.title === 'string' ? extracted.title.trim() : '';
     const url = typeof extracted.url === 'string' ? extracted.url.trim() : '';
     const source = title || url ? `I read ${title || url}${title && url ? ` (${url})` : ''}.` : 'I read the page.';
-    const text = typeof extracted.text === 'string' ? extracted.text.trim() : '';
+    const sections = Array.isArray(extracted.sections)
+      ? extracted.sections.flatMap(section => {
+        if (!isRecord(section)) return [];
+        const text = typeof section.text === 'string' ? section.text.trim() : '';
+        const heading = typeof section.heading === 'string' ? section.heading.trim() : '';
+        if (!text && !heading) return [];
+        return [heading ? `${heading}\n${text}` : text];
+      })
+      : [];
+    const text = typeof extracted.text === 'string' ? extracted.text.trim() : sections.join('\n\n');
     return `${source}\n\n${text ? boundedText(text) : 'The page did not contain readable text.'}`;
   }
 

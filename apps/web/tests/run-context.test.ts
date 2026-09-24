@@ -53,11 +53,13 @@ describe('run context activity display', () => {
   it('formats targeted page search and region inspection results for activity rows', () => {
     expect(browserSearchDisplay({
       indexedRegionCount: 124,
-      results: [{ ref: 'r7-18', kind: 'table', heading: 'Daily rates', score: 0.98, preview: 'Currency Unit Buying Selling' }],
+      matchCount: 1,
+      pageReadable: true,
+      results: [{ ref: 'r7-18', kind: 'table', heading: 'Daily rates', score: 0.98, preview: 'Currency Unit Buying Selling', snippet: 'USD buying 132.10 selling 132.70' }],
     }, 'currency buying selling')).toEqual({
       query: 'currency buying selling',
-      coverage: '124 regions indexed · 1 match',
-      matches: 'r7-18 · table · Daily rates · 0.98 · Currency Unit Buying Selling',
+      coverage: '124 regions indexed · 1 match · readable page content found',
+      matches: 'r7-18 · table · Daily rates · 0.98 · USD buying 132.10 selling 132.70',
     });
     expect(browserInspectionSummary({
       format: 'table',

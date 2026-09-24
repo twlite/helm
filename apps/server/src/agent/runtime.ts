@@ -156,28 +156,6 @@ function browserNavigationGuard(tool: string, input: Record<string, unknown>): T
   return undefined;
 }
 
-function browserExtractionGuard(tool: string, input: Record<string, unknown>): ToolResult | undefined {
-  if (tool !== 'browser.extractText') return undefined;
-  const query = input.query;
-  const maxChars = input.maxChars;
-  if (
-    Object.hasOwn(input, 'mode')
-    || typeof query !== 'string'
-    || query.trim().length === 0
-    || query.length > 1_000
-    || (maxChars !== undefined && (typeof maxChars !== 'number' || !Number.isInteger(maxChars) || maxChars < 1 || maxChars > 8_000))
-  ) {
-    return {
-      ok: false,
-      error: {
-        code: 'UNSUPPORTED_BROWSER_EXTRACTION',
-        message: 'Page extraction requires a focused query and is limited to 8,000 characters. Use browser.searchPage and browser.inspectRegion for structured page content, or browser.extractText with a targeted query.',
-      },
-    };
-  }
-  return undefined;
-}
-
 function successfulReceiptEffect(result: ToolResult): Record<string, unknown> | undefined {
   if (!result.evidence || typeof result.evidence !== 'object' || Array.isArray(result.evidence)) return undefined;
   const receipt = (result.evidence as Record<string, unknown>).receipt;
@@ -582,8 +560,7 @@ export class AgentRuntime {
           action: { tool: decision.tool, input: clone(decision.input) },
           observation,
         };
-        const result = browserExtractionGuard(decision.tool, decision.input)
-          ?? invalidBrowserNavigationResult(decision.tool, decision.input, !conversationalTask, task)
+        const result = invalidBrowserNavigationResult(decision.tool, decision.input, !conversationalTask, task)
           ?? await this.tools.execute(decision.tool, decision.input, {
             signal: cancellation.signal,
             runId: run.id,
@@ -748,6 +725,9 @@ export class AgentRuntime {
     const previousResults: ToolResult[] = [];
     const successfulCalls = new Map<string, number>();
     const noProgress = new Map<string, { result: string; count: number }>();
+    let readablePageEvidence = false;
+    let browserContentRead = false;
+    let browserReadAttemptedWithoutContent = false;
     const maxSteps = this.budgetOptions?.maxSteps ?? DEFAULT_RUNTIME_BUDGETS.maxSteps;
     const maxRepeatedAction = this.budgetOptions?.maxRepeatedAction ?? DEFAULT_RUNTIME_BUDGETS.maxRepeatedAction;
     const maxConsecutiveFailures = this.budgetOptions?.maxConsecutiveFailures ?? DEFAULT_RUNTIME_BUDGETS.maxConsecutiveFailures;
@@ -773,25 +753,65 @@ export class AgentRuntime {
         result = { ok: false, error: { code: 'REPEATED_ACTION', message: 'This exact action has already repeated without a concrete state change. Choose another action or report the blocker.' } };
       } else if (consecutiveFailures >= maxConsecutiveFailures) {
         result = { ok: false, error: { code: 'TOOL_FAILURE_BUDGET_EXCEEDED', message: `The run reached its ${maxConsecutiveFailures}-consecutive-failure bound.` } };
+      } else if (tool === 'fs.write' && !browserContentRead && (readablePageEvidence || browserReadAttemptedWithoutContent)) {
+        result = {
+          ok: false,
+          error: {
+            code: 'UNREAD_PAGE_CONTENT',
+            message: browserReadAttemptedWithoutContent
+              ? 'File write rejected because the page read returned no content. Recover with a readable region or broader document read before writing a page-derived artifact.'
+              : 'File write rejected because the snapshot or search showed readable page content that has not been read. Read the page or a relevant region before writing a page-derived artifact.',
+          },
+        };
       } else {
-        const invalidExtraction = browserExtractionGuard(tool, toolInput);
-        if (invalidExtraction) result = invalidExtraction;
+        const invalidNavigation = browserNavigationGuard(tool, toolInput);
+        if (invalidNavigation) result = invalidNavigation;
         else {
-          const invalidNavigation = browserNavigationGuard(tool, toolInput);
-          if (invalidNavigation) result = invalidNavigation;
-          else {
-            result = await this.tools.execute(tool, toolInput, {
-              signal: cancellation.signal,
-              runId,
-              stepIndex,
-              previousResults: clone(previousResults.slice(-12)),
-              timeoutMs: this.budgetOptions?.toolTimeoutMs,
-            });
-          }
+          result = await this.tools.execute(tool, toolInput, {
+            signal: cancellation.signal,
+            runId,
+            stepIndex,
+            previousResults: clone(previousResults.slice(-12)),
+            timeoutMs: this.budgetOptions?.toolTimeoutMs,
+          });
         }
       }
 
       const compactResult = compactAgentToolResult(result);
+      const resultData = result.data && typeof result.data === 'object' && !Array.isArray(result.data)
+        ? result.data as Record<string, unknown>
+        : undefined;
+      if (tool === 'browser.navigate') {
+        readablePageEvidence = false;
+        browserContentRead = false;
+        browserReadAttemptedWithoutContent = false;
+      }
+      if (tool === 'browser.snapshot') {
+        const outline = Array.isArray(resultData?.outline) ? resultData.outline : [];
+        readablePageEvidence ||= outline.some(region => (
+          typeof region === 'object' && region !== null && typeof (region as Record<string, unknown>).preview === 'string'
+          && ((region as Record<string, unknown>).preview as string).trim().length > 0
+        ));
+      }
+      if (tool === 'browser.search' && resultData?.pageReadable === true) readablePageEvidence = true;
+      if (tool === 'browser.read') {
+        const sections = Array.isArray(resultData?.sections) ? resultData.sections : [];
+        const hasText = sections.some(section => (
+          typeof section === 'object' && section !== null && typeof (section as Record<string, unknown>).text === 'string'
+          && ((section as Record<string, unknown>).text as string).trim().length > 0
+        ));
+        browserContentRead = result.ok && resultData?.readable === true && hasText;
+        browserReadAttemptedWithoutContent = !browserContentRead;
+        readablePageEvidence ||= resultData?.readable === true || browserReadAttemptedWithoutContent;
+      }
+      if (tool === 'browser.inspectRegion' && result.ok) {
+        const text = typeof resultData?.text === 'string' ? resultData.text.trim() : '';
+        const rows = Array.isArray(resultData?.rows) ? resultData.rows : [];
+        if (text.length > 0 || rows.length > 0) {
+          browserContentRead = true;
+          browserReadAttemptedWithoutContent = false;
+        }
+      }
       if (result.ok) {
         consecutiveFailures = 0;
         successfulCalls.set(tool, (successfulCalls.get(tool) ?? 0) + 1);
@@ -865,6 +885,18 @@ export class AgentRuntime {
             code: 'UNVERIFIED_SIDE_EFFECT',
             message: 'Completion rejected because one or more requested tool effects have no successful receipt. Continue the work or report the concrete blocker.',
             details: missing,
+          },
+        };
+      }
+      const writesFile = candidate.requiredEffects.some(effect => effect.tool === 'fs.write');
+      if (writesFile && readablePageEvidence && !browserContentRead) {
+        return {
+          ok: false,
+          error: {
+            code: 'UNREAD_PAGE_CONTENT',
+            message: browserReadAttemptedWithoutContent
+              ? 'Completion rejected because page reading returned no content. Recover with a readable region or broader document read before writing a page-derived artifact.'
+              : 'Completion rejected because the page showed readable content but no content read succeeded. Read the page or a relevant region before writing a page-derived artifact.',
           },
         };
       }

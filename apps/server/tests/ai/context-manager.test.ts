@@ -80,7 +80,7 @@ describe('model context management', () => {
         receiptId: 'ev-snapshot-current-b',
       }),
       toolExchange({
-        tool: 'browser.searchPage',
+        tool: 'browser.search',
         args: { query: 'exchange rates' },
         data: { url: 'https://example.test/rates', title: 'Rates', revision: 1, query: 'exchange rates', results: [{ ref: 'r1-2', kind: 'table' }] },
         receiptId: 'ev-search-old',

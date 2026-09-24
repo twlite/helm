@@ -47,7 +47,13 @@ export const guestMethodSchemas = {
   'browser.navigate': z.object({ url: z.string().min(1) }),
   'browser.getState': z.object({}),
   'browser.snapshot': z.object({ maxRegions: z.number().int().min(1).max(100).optional() }),
-  'browser.searchPage': z.object({
+  'browser.read': z.object({
+    mode: z.enum(['readable', 'document']).optional(),
+    ref: z.string().regex(/^r\d+-[1-9]\d*$/u).optional(),
+    maxChars: z.number().int().min(1).max(12_000).optional(),
+    cursor: z.string().min(1).max(2_048).optional(),
+  }).strict(),
+  'browser.search': z.object({
     query: z.string().trim().min(1).max(1_000),
     kinds: z.array(browserRegionKindSchema).max(10).optional(),
     maxResults: z.number().int().min(1).max(20).optional(),
@@ -59,10 +65,6 @@ export const guestMethodSchemas = {
     offset: z.number().int().min(0).max(1_000_000).optional(),
     limit: z.number().int().min(1).max(100).optional(),
   }),
-  'browser.extractText': z.object({
-    query: z.string().trim().min(1).max(1_000),
-    maxChars: z.number().int().min(1).max(8_000).optional(),
-  }).strict(),
   'browser.download': z.object({
     ref: z.string().min(1).optional(),
     url: z.string().min(1).optional(),

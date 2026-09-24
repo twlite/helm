@@ -93,13 +93,18 @@ export function browserSearchDisplay(value: unknown, queryValue: unknown): Brows
       typeof match.kind === 'string' ? match.kind : 'unknown',
       typeof match.heading === 'string' ? match.heading : '',
       typeof match.score === 'number' ? match.score.toFixed(2) : '',
-      typeof match.preview === 'string' ? match.preview : '',
+      typeof match.snippet === 'string' ? match.snippet : typeof match.preview === 'string' ? match.preview : '',
     ].filter(Boolean).join(' · ')];
   }) : [];
-  const count = results.length;
+  const count = typeof data?.matchCount === 'number' ? data.matchCount : results.length;
+  const readability = data?.pageReadable === true
+    ? 'readable page content found'
+    : data?.pageReadable === false
+      ? 'no readable page content found'
+      : undefined;
   return {
     query: typeof queryValue === 'string' ? queryValue : 'Page search',
-    coverage: `${typeof data?.indexedRegionCount === 'number' ? data.indexedRegionCount : 0} regions indexed · ${count} match${count === 1 ? '' : 'es'}`,
+    coverage: `${typeof data?.indexedRegionCount === 'number' ? data.indexedRegionCount : 0} regions indexed · ${count} match${count === 1 ? '' : 'es'}${readability ? ` · ${readability}` : ''}`,
     matches: results.join('\n'),
   };
 }

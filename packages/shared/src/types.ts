@@ -46,7 +46,7 @@ export interface RequirementTarget {
   url?: string;
   factIds?: string[];
   content?: string;
-  mode?: 'exists' | 'contains-facts' | 'contains-text' | 'downloaded' | 'matches-fact';
+  mode?: 'exists' | 'non-empty' | 'contains-facts' | 'contains-text' | 'downloaded' | 'matches-fact';
   factId?: string;
 }
 
@@ -463,9 +463,9 @@ export type GuestMethod =
   | 'browser.navigate'
   | 'browser.getState'
   | 'browser.snapshot'
-  | 'browser.searchPage'
+  | 'browser.read'
+  | 'browser.search'
   | 'browser.inspectRegion'
-  | 'browser.extractText'
   | 'browser.download'
   | 'browser.click'
   | 'browser.type'
@@ -549,15 +549,44 @@ export interface BrowserSnapshot {
 
 export interface BrowserSearchResult extends BrowserPageRegion {
   score: number;
+  snippet?: string;
 }
 
 export interface BrowserSearchPageResult {
+  operation: 'search';
+  searchCompleted: true;
   url: string;
   title: string;
   revision: number;
   query: string;
   indexedRegionCount: number;
+  matchCount: number;
+  pageReadable: boolean;
+  message: string;
   results: BrowserSearchResult[];
+}
+
+export type BrowserReadMode = 'readable' | 'document';
+
+export interface BrowserReadSection {
+  heading?: string;
+  text: string;
+  ref?: string;
+}
+
+export interface BrowserReadResult {
+  operation: 'read';
+  url: string;
+  title: string;
+  revision: number;
+  mode: BrowserReadMode;
+  source: 'readability' | 'main' | 'article' | 'role-main' | 'body' | 'region' | 'snapshot-regions';
+  readable: boolean;
+  sections: BrowserReadSection[];
+  totalChars: number;
+  returnedChars: number;
+  truncated: boolean;
+  nextCursor?: string;
 }
 
 export type BrowserRegionInspection =

@@ -34,16 +34,16 @@ export function createScriptedDemoDecisions(): ScriptedDecision[] {
     },
     {
       type: 'action',
-      tool: 'browser.extractText',
-      input: { query: 'Helm deterministic demo content' },
-      reasoningSummary: 'Extract readable page text from the loaded browser.',
+      tool: 'browser.read',
+      input: { mode: 'readable', maxChars: 12_000 },
+      reasoningSummary: 'Read bounded content from the loaded browser page.',
     },
     {
       type: 'action',
       tool: 'fs.write',
       input: {
         path: DEMO_OUTPUT_PATH,
-        content: { fromStep: 2, path: 'data.text' },
+        content: { fromStep: 2, path: 'data.sections.0.text' },
       },
       reasoningSummary: 'Persist the extracted result in the requested workspace file.',
     },

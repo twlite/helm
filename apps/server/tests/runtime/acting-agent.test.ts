@@ -115,7 +115,7 @@ function requestTools(request: CapturedRequest): string[] {
 }
 
 describe('native acting agent', () => {
-  it('exposes only query-targeted, bounded text extraction to the acting model', async () => {
+  it('exposes separate bounded page reading and query search operations', async () => {
     const guest = new MockGuestTransport();
     const requests: CapturedRequest[] = [];
     const { runtime, tools } = createRuntime(guest, [
@@ -126,16 +126,21 @@ describe('native acting agent', () => {
 
     expect(result.status).toBe('completed');
     const definitions = requests[0]!.body.tools as Array<{ function?: { name?: string; parameters?: Record<string, unknown> } }>;
-    const extractDefinition = definitions.find(definition => definition.function?.name === 'browser.extractText');
-    expect(extractDefinition).toBeDefined();
-    const parameters = extractDefinition!.function!.parameters!;
-    const properties = parameters.properties as Record<string, Record<string, unknown>>;
-    expect(properties).toHaveProperty('query');
-    expect(properties).not.toHaveProperty('mode');
-    expect(properties.maxChars?.maximum).toBe(8_000);
-    expect(parameters.required).toContain('query');
+    const readDefinition = definitions.find(definition => definition.function?.name === 'browser.read');
+    const searchDefinition = definitions.find(definition => definition.function?.name === 'browser.search');
+    expect(readDefinition).toBeDefined();
+    expect(searchDefinition).toBeDefined();
+    const readParameters = readDefinition!.function!.parameters!;
+    const readProperties = readParameters.properties as Record<string, Record<string, unknown>>;
+    expect(readProperties).toHaveProperty('mode');
+    expect(readProperties).toHaveProperty('cursor');
+    expect(readProperties).not.toHaveProperty('query');
+    expect(readProperties.maxChars?.maximum).toBe(12_000);
+    expect(readParameters.required ?? []).not.toContain('query');
+    const searchParameters = searchDefinition!.function!.parameters!;
+    expect(searchParameters.required).toContain('query');
 
-    const rejected = await tools.execute('browser.extractText', { query: 'exchange rates', mode: 'full' });
+    const rejected = await tools.execute('browser.read', { query: 'exchange rates', mode: 'readable' });
     expect(rejected).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
     expect(guest.browser.url).toBeUndefined();
   });
@@ -267,10 +272,10 @@ describe('native acting agent', () => {
     const response = `The profile currently shows ${followerCount} followers.`;
     const { runtime, tools } = createRuntime(guest, [
       toolReply('followers-nav', 'browser.navigate', { url: profileUrl }),
-      toolReply('followers-text', 'browser.extractText', { query: 'followers count' }),
+      toolReply('followers-text', 'browser.search', { query: 'followers count' }),
       toolReply('followers-complete', 'helm.complete', {
         response,
-        requiredEffects: [{ tool: 'browser.navigate' }, { tool: 'browser.extractText' }],
+        requiredEffects: [{ tool: 'browser.navigate' }, { tool: 'browser.search' }],
       }),
     ], requests);
 
@@ -283,7 +288,7 @@ describe('native acting agent', () => {
     expect(result.assistantResponse).toBe(response);
     expect(result.assistantResponse).toContain(followerCount);
     expect(tools.invocations.map(invocation => invocation.tool)).toEqual([
-      'browser.navigate', 'browser.extractText',
+      'browser.navigate', 'browser.search',
     ]);
     expect(JSON.stringify(requests[2]!.body.messages)).toContain(followerCount);
   });
@@ -350,13 +355,13 @@ describe('native acting agent', () => {
     const requests: CapturedRequest[] = [];
     const { runtime, tools } = createRuntime(guest, [
       toolReply('profile-nav', 'browser.navigate', { url: profileUrl }),
-      toolReply('profile-text', 'browser.extractText', { query: 'followers pinned repository detail' }),
+      toolReply('profile-text', 'browser.read', { mode: 'readable', maxChars: 12_000 }),
       toolReply('portfolio-write', 'fs.write', { path: 'twlite.html', content: portfolio }),
       toolReply('portfolio-complete', 'helm.complete', {
         response: 'Created twlite.html using the observed profile information.',
         requiredEffects: [
           { tool: 'browser.navigate' },
-          { tool: 'browser.extractText' },
+          { tool: 'browser.read' },
           { tool: 'fs.write' },
         ],
       }),
@@ -375,7 +380,7 @@ describe('native acting agent', () => {
     expect(html).toContain(followerCount);
     expect(html).toContain(repositoryName);
     expect(tools.invocations.map(invocation => invocation.tool)).toEqual([
-      'browser.navigate', 'browser.extractText', 'fs.write',
+      'browser.navigate', 'browser.read', 'fs.write',
     ]);
     expect(requests[2]!.body.tools).toBeDefined();
     expect(JSON.stringify(requests[2]!.body.messages)).toContain(followerCount);
@@ -384,6 +389,109 @@ describe('native acting agent', () => {
       .toHaveLength(1);
     expect((tools.invocations.find(invocation => invocation.tool === 'browser.navigate')?.input as { url: string }).url)
       .toBe(profileUrl);
+  });
+
+  it('reads, summarizes, saves, and opens the portfolio page using separate browser operations', async () => {
+    const url = 'https://dhunganakunjan.com.np/';
+    const guest = new MockGuestTransport({
+      pages: {
+        [url]: `<!doctype html><html><head><title>Kunjan Dhungana</title></head><body><nav>Home Blog Contact</nav>
+          <main><h1>Kunjan Dhungana</h1><p>Self-taught software engineer from Nepal and co-founder of Neplex.</p>
+            <h2>Work</h2><p>Interested in runtimes and developer experience.</p>
+            <h2>Outside software</h2><p>Slowly learning piano.</p>
+            <h2>Work with me</h2><p>Book a call to discuss developer tooling.</p></main></body></html>`,
+      },
+    });
+    const requests: CapturedRequest[] = [];
+    const summary = 'Kunjan Dhungana is a self-taught software engineer from Nepal and Neplex co-founder. He is interested in runtimes and developer experience, is learning piano, and invites calls about developer tooling.';
+    const { runtime, tools } = createRuntime(guest, [
+      toolReply('portfolio-nav', 'browser.navigate', { url }),
+      toolReply('portfolio-snapshot', 'browser.snapshot', {}),
+      toolReply('portfolio-read', 'browser.read', { mode: 'readable', maxChars: 12_000 }),
+      toolReply('portfolio-write', 'fs.write', { path: 'kd.txt', content: summary }),
+      toolReply('portfolio-open', 'app.openFile', { path: 'kd.txt', application: 'text-editor' }),
+      toolReply('portfolio-complete', 'helm.complete', {
+        response: 'Saved the page summary to kd.txt and opened it in the text viewer.',
+        requiredEffects: [
+          { tool: 'browser.navigate' },
+          { tool: 'browser.read' },
+          { tool: 'fs.write' },
+          { tool: 'app.openFile' },
+        ],
+      }),
+    ], requests);
+
+    const result = await runtime.run({
+      threadId: 'portfolio-summary',
+      userMessage: 'go to dhunganakunjan.com.np and summarize the page content and save it to kd.txt file and open it with text viewer app',
+    });
+
+    expect(result.status).toBe('completed');
+    expect(guest.getFile('/home/helm/workspace/kd.txt')).toBe(summary);
+    expect(guest.desktopWindows.find(window => window.focused)?.title).toContain('kd.txt');
+    expect(tools.invocations.map(invocation => invocation.tool)).toEqual([
+      'browser.navigate', 'browser.snapshot', 'browser.read', 'fs.write', 'app.openFile',
+    ]);
+    const read = tools.invocations.find(invocation => invocation.tool === 'browser.read');
+    expect(read?.input).toEqual({ mode: 'readable', maxChars: 12_000 });
+    expect(read?.input).not.toHaveProperty('query');
+    expect(JSON.stringify(requests[3]!.body.messages)).toContain('Self-taught software engineer from Nepal');
+  });
+
+  it('does not let a zero-match search or error-file write complete a page-summary task', async () => {
+    const url = 'https://dhunganakunjan.com.np/';
+    const guest = new MockGuestTransport({
+      pages: {
+        [url]: '<html><body><main><h1>Kunjan Dhungana</h1><p>Readable portfolio content is present.</p></main></body></html>',
+      },
+    });
+    const requests: CapturedRequest[] = [];
+    const errorText = 'Error: Could not extract meaningful content from the page.';
+    const completion = {
+      response: 'I could not summarize the page.',
+      requiredEffects: [
+        { tool: 'browser.navigate' },
+        { tool: 'fs.write' },
+        { tool: 'app.openFile' },
+      ],
+    };
+    const blockedResponse = 'The page has readable content, so I need to read it before saving a summary.';
+    const { runtime, tools } = createRuntime(guest, [
+      toolReply('failed-nav', 'browser.navigate', { url }),
+      toolReply('failed-snapshot', 'browser.snapshot', {}),
+      toolReply('zero-search', 'browser.search', { query: 'qzxwvv-9347182-uniquetoken' }),
+      toolReply('failed-read', 'browser.read', { ref: 'r1-9999', maxChars: 5_000 }),
+      toolReply('blocked-write', 'fs.write', { path: 'kd.txt', content: errorText }),
+      toolReply('blocked-open', 'app.openFile', { path: 'kd.txt', application: 'text-editor' }),
+      toolReply('blocked-complete', 'helm.complete', completion),
+      textReply('report-blocker-1', blockedResponse),
+      toolReply('finalize-blocker-1', 'helm.complete', completion),
+      textReply('report-blocker-2', blockedResponse),
+      toolReply('finalize-blocker-2', 'helm.complete', completion),
+      textReply('report-blocker-3', blockedResponse),
+      toolReply('finalize-blocker-3', 'helm.complete', completion),
+      textReply('report-blocker-4', blockedResponse),
+      toolReply('finalize-blocker-4', 'helm.complete', completion),
+      textReply('report-blocker-final', blockedResponse),
+    ], requests);
+
+    const result = await runtime.run({
+      threadId: 'unreadable-summary',
+      userMessage: 'Go to dhunganakunjan.com.np, summarize the page, save it to kd.txt, and open it in a text viewer.',
+    });
+
+    expect(result.status).toBe('failed');
+    expect(guest.hasFile('/home/helm/workspace/kd.txt')).toBe(false);
+    expect(tools.invocations.find(invocation => invocation.tool === 'browser.search')?.result)
+      .toMatchObject({ ok: true, data: { matchCount: 0, pageReadable: true } });
+    expect(result.steps.find(step => step.toolName === 'browser.read')?.toolResult)
+      .toMatchObject({ ok: false, error: { code: 'STALE_REGION_REF' } });
+    expect(result.steps.find(step => step.toolName === 'fs.write')?.toolResult)
+      .toMatchObject({ ok: false, error: { code: 'UNREAD_PAGE_CONTENT' } });
+    expect(result.steps.find(step => step.toolName === 'app.openFile')?.toolResult?.ok).toBe(false);
+    const searches = tools.invocations.filter(invocation => invocation.tool === 'browser.search');
+    const queries = searches.map(invocation => (invocation.input as { query: string }).query.toLowerCase());
+    expect(queries.every(query => !['main content', 'full content', 'page content', 'summary'].includes(query))).toBe(true);
   });
 
   it('remembers discovered information only after browser receipts reach the acting model', async () => {
@@ -401,7 +509,7 @@ describe('native acting agent', () => {
       let tools: ReturnType<typeof createGuestToolRegistry> | undefined;
       const { runtime, tools: runtimeTools } = createRuntime(guest, [
         toolReply('acme-nav', 'browser.navigate', { url: sourceUrl }),
-        toolReply('acme-text', 'browser.extractText', { query: 'published benchmark value' }),
+        toolReply('acme-text', 'browser.search', { query: 'published benchmark value' }),
         () => {
           const evidenceIds = tools?.invocations.flatMap(invocation => {
             const result = invocation.result;
@@ -426,7 +534,7 @@ describe('native acting agent', () => {
           response: `The current published Acme benchmark is ${benchmark}.`,
           requiredEffects: [
             { tool: 'browser.navigate' },
-            { tool: 'browser.extractText' },
+            { tool: 'browser.search' },
             { tool: 'memory.remember' },
           ],
         }),
@@ -462,7 +570,7 @@ describe('native acting agent', () => {
       expect(receiptIds.every(id => id.startsWith('receipt-'))).toBe(true);
       expect(saved?.lastVerifiedAt).toBeString();
       expect(tools?.invocations.map(invocation => invocation.tool)).toEqual([
-        'browser.navigate', 'browser.extractText', 'memory.remember',
+        'browser.navigate', 'browser.search', 'memory.remember',
       ]);
       expect(requestTools(requests[0]!)).toContain('memory.remember');
       expect(JSON.stringify(requests[2]!.body.messages)).toContain(benchmark);

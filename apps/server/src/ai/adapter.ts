@@ -109,7 +109,8 @@ export class AiSdkDecisionProvider implements DecisionProviderBoundary {
         'Do not claim success. Helm executes the action and verifies the result separately.',
         'If the task has no completion criteria, this is a conversational request: return complete immediately and do not call a tool.',
         'Request completion only when every explicit task criterion is already satisfied.',
-        'Use browser.snapshot for a bounded page overview, browser.searchPage to locate matching regions, and browser.inspectRegion to read the selected content. Use browser.extractText only as a bounded fallback with a focused query.',
+        'Use browser.snapshot to inspect page structure, browser.read({ mode: "readable", maxChars: 12000 }) to consume page content, browser.read({ ref }) for a snapshot region, and browser.search({ query }) only to find specific information. Search with zero matches does not mean the page is unreadable; use pageReadable and snapshot previews as evidence, then read the page or region. Use read cursors for large pages, and never use vague searches to read the whole page.',
+        'If page content is needed for a file summary, read non-empty page content before writing the file. Do not save a read error or placeholder as the requested artifact. If a page read fails, recover by reading a snapshot region or using document mode; otherwise report the blocker.',
         'Helm can use its browser to answer current and publicly available web questions. Never refuse solely because information is current, live, or unavailable from a direct data feed.',
         'For current web information, navigate to a relevant source, search its semantic regions, and inspect the best matching section or table before answering.',
         'If a source or organization is named, prefer its official website. If no URL is provided, use a complete https:// URL, including a web-search URL when needed; never pass a bare hostname.',
@@ -677,14 +678,15 @@ function compiledRequirements(
   const factIds = requirements
     .filter(requirement => requirement.type === 'fact' && requirement.id !== 'browserResearch')
     .map(requirement => requirement.target?.factId ?? requirement.id);
-  const outputFactIds = pageContentSave
-    ? [...new Set(['pageContent', ...factIds])]
-    : factIds;
+  // The page read is a prerequisite, but its full text is not the expected
+  // file content: the model may be asked to summarize or transform it.
+  const outputFactIds = factIds;
   if (directoryPath && (!filePath || /\b(?:mkdir|folder|directory)\b/iu.test(request))) {
     add({ id: 'outputDirectory', description: 'Create the requested output directory.', type: 'filesystem', mandatory: true, status: 'pending', target: { path: directoryPath, mode: 'exists' } });
   }
   if (filePath && writesFile(request)) {
-    add({ id: 'outputFile', description: 'Create the requested output file with the facts collected during the task.', type: 'filesystem', mandatory: true, status: 'pending', target: { path: filePath, mode: outputFactIds.length > 0 ? 'contains-facts' : 'exists', ...(outputFactIds.length > 0 ? { factIds: outputFactIds } : {}) } });
+    const mode = outputFactIds.length > 0 ? 'contains-facts' : pageContentSave ? 'non-empty' : 'exists';
+    add({ id: 'outputFile', description: 'Create the requested output file with the requested result.', type: 'filesystem', mandatory: true, status: 'pending', target: { path: filePath, mode, ...(outputFactIds.length > 0 ? { factIds: outputFactIds } : {}) } });
   }
   if (filePath && opensFileInViewer(request)) {
     add({
@@ -789,7 +791,8 @@ export class AiSdkTaskPlanner implements TaskCompiler {
           'Use mode conversation with an empty criteria array for normal questions, identity questions, explanations, greetings, and other requests that do not require changing or inspecting the computer.',
           'Use mode task for browser, desktop, filesystem, or application work.',
           'Questions that require current or publicly available web information are tasks, not conversation. This includes today/latest/live facts, exchange rates, prices, weather, news, schedules, and facts attributed to a named organization.',
-          'For web research, create a task that uses browser navigation and progressive semantic inspection. Use browser.snapshot for an overview, browser.searchPage to locate matching regions, and browser.inspectRegion for the selected section or table. Use browser.extractText only with a focused query when semantic regions are insufficient.',
+          'For web research, use browser.navigate, browser.snapshot, then browser.read({ mode: "readable" }) to consume the page. Use browser.read({ ref }) for a selected region and browser.read({ mode: "document" }) as a broader fallback. Use browser.search({ query }) only to locate specific information; zero matches apply only to that query and never prove that the page has no readable content. Continue large reads with nextCursor.',
+          'When a requested page summary is saved to a file, successful non-empty browser.read content is a prerequisite to fs.write. A read failure must leave the task recovering or blocked; do not write the error or a placeholder as the requested summary.',
           'A URL supplied as an image, profile picture, avatar, logo, icon, thumbnail, background, src, href, or other asset/reference value is not a research destination. Preserve it as a user-provided value and embed it directly where requested; do not navigate to it unless the user explicitly asks to open it.',
           'For mode task, convert the request into one concrete goal and the smallest set of explicit, deterministic completion criteria.',
           'Do not choose or return a maxSteps value. The runtime owns the configured safety budget.',
@@ -1042,7 +1045,8 @@ export class AiSdkWorker implements WorkerProvider {
               'browser.navigate requires an absolute http(s), file, or about URL. Output filenames belong to filesystem or desktop tools; never turn a filename into a URL.',
               'Do not navigate to a user-provided asset/reference URL merely because it contains http. Use that URL directly in the requested output.',
               'After an action, use its actual result and the next observation. A model hypothesis is not an observed fact.',
-              'If the objective needs browser information, use bounded semantic search and inspect the matching region; use targeted browser.extractText only when those regions are insufficient.',
+              'If the objective needs page structure, use browser.snapshot. Read page content with browser.read({ mode: "readable" }), use browser.read({ ref }) for a relevant region, and continue large reads using nextCursor. Use browser.search({ query }) only for a specific lookup; zero matches do not imply unreadable content. Never use vague searches to read an entire page.',
+              'For page summaries written to files, non-empty browser.read content must precede fs.write. If extraction fails, recover with a region or document read, or report the blocker without saving the error as the requested artifact.',
               'If you report a discovered fact, set evidenceId to the action receipt id whose actual result contains the value.',
               'When recoveryActive is true, do not repeat a failed strategy; choose a materially different action or report the concrete blocker.',
               'Keep reasoningSummary short and operational.',
@@ -1290,7 +1294,7 @@ function responseEvidence(result: AgentRuntimeResult): unknown[] {
     .filter(step => step.phase === 'act' && step.toolName)
     .sort((left, right) => {
       const priority = (toolName: string | undefined): number => {
-        if (toolName === 'browser.extractText' || toolName === 'fs.read') return 0;
+        if (toolName === 'browser.read' || toolName === 'fs.read') return 0;
         if (toolName === 'browser.navigate' || toolName === 'fs.write') return 1;
         return 2;
       };

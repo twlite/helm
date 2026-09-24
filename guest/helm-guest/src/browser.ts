@@ -3,6 +3,9 @@ import type { GuestSandbox } from "./sandbox";
 import { normalizeBrowserUrl } from "../../../packages/shared/src/browser-url";
 import type {
   BrowserPageRegion,
+  BrowserReadMode,
+  BrowserReadResult,
+  BrowserReadSection,
   BrowserRegionInspection,
   BrowserRegionKind,
   BrowserSearchPageResult,
@@ -121,12 +124,324 @@ const DEFAULT_OUTLINE_REGIONS = 60;
 const MAX_INTERACTIVE_ELEMENTS = 80;
 const MAX_SEARCH_INDEX_CHARS = 1_024_000;
 const MAX_SEARCH_REGION_CHARS = 800;
-const DEFAULT_EXTRACT_CHARS = 6_000;
-const MAX_EXTRACT_CHARS = 8_000;
+const DEFAULT_READ_CHARS = 12_000;
 const DEFAULT_REGION_CHARS = 8_000;
 const DEFAULT_TABLE_ROWS = 50;
 const BROWSER_OPERATION_TIMEOUT_MS = 10_000;
 const BROWSER_CONTEXT_RESET_TIMEOUT_MS = 1_000;
+
+type ReadSource = BrowserReadResult['source'];
+
+interface ExtractedBrowserContent {
+  source: ReadSource;
+  sections: BrowserReadSection[];
+  totalChars: number;
+  sourceTruncated: boolean;
+}
+
+interface ReadCursorPosition {
+  sectionIndex: number;
+  charOffset: number;
+}
+
+function readScope(url: string, ref: string | undefined, mode: BrowserReadMode): string {
+  const value = `${url}\u0000${ref ?? ''}\u0000${mode}`;
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function makeReadCursor(input: {
+  revision: number;
+  url: string;
+  ref?: string;
+  mode: BrowserReadMode;
+  sectionIndex: number;
+  charOffset: number;
+}): string {
+  return `br1.${input.revision}.${readScope(input.url, input.ref, input.mode)}.${input.sectionIndex}.${input.charOffset}`;
+}
+
+function parseReadCursor(value: string | undefined, input: {
+  revision: number;
+  url: string;
+  ref?: string;
+  mode: BrowserReadMode;
+}): ReadCursorPosition {
+  if (!value) return { sectionIndex: 0, charOffset: 0 };
+  const match = /^br1\.(\d+)\.([a-z0-9]+)\.(\d+)\.(\d+)$/u.exec(value);
+  if (!match
+    || Number(match[1]) !== input.revision
+    || match[2] !== readScope(input.url, input.ref, input.mode)) {
+    throw new GuestRpcError('STALE_BROWSER_CURSOR', 'The browser read cursor is invalid or belongs to a different page revision.', { httpStatus: 409 });
+  }
+  return { sectionIndex: Number(match[3]), charOffset: Number(match[4]) };
+}
+
+/**
+ * Read visible text inside Chromium and convert it into bounded semantic
+ * sections. This function is serialized by Playwright, so it intentionally
+ * depends only on the DOM and the options passed to evaluateAll.
+ */
+function extractBrowserContent(nodes: readonly unknown[], rawOptions?: unknown): ExtractedBrowserContent {
+  const maxSourceChars = 2_000_000;
+  const maxSections = 5_000;
+  const options = typeof rawOptions === 'object' && rawOptions !== null
+    ? rawOptions as { mode?: BrowserReadMode; region?: boolean }
+    : {};
+  const mode = options.mode === 'document' ? 'document' : 'readable';
+  const region = options.region === true;
+  const base = nodes[0];
+  if (!(base instanceof HTMLElement)) {
+    return { source: region ? 'region' : 'body', sections: [], totalChars: 0, sourceTruncated: false };
+  }
+
+  const normalizedText = (value: string): string => value
+    .replace(/\u00a0/gu, ' ')
+    .split(/\r?\n/u)
+    .map(line => line.replace(/[\t ]+/gu, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
+  const isHeading = (element: HTMLElement): boolean => /^H[1-6]$/u.test(element.tagName)
+    || element.getAttribute('role') === 'heading';
+  const alwaysIgnored = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'TEMPLATE', 'IFRAME', 'CANVAS', 'HEAD']);
+  const boilerplate = new Set(['NAV', 'FOOTER', 'ASIDE']);
+
+  const isHidden = (element: HTMLElement): boolean => {
+    if (element.hidden || element.getAttribute('aria-hidden')?.toLowerCase() === 'true') return true;
+    const style = window.getComputedStyle(element);
+    return style.display === 'none'
+      || style.visibility === 'hidden'
+      || style.visibility === 'collapse'
+      || style.contentVisibility === 'hidden';
+  };
+
+  const isIgnored = (element: HTMLElement, root: HTMLElement): boolean => {
+    if (alwaysIgnored.has(element.tagName)) return true;
+    if (element !== root && mode === 'readable') {
+      return boilerplate.has(element.tagName)
+        || ['navigation', 'contentinfo', 'complementary'].includes(element.getAttribute('role') ?? '');
+    }
+    return false;
+  };
+
+  const textInside = (element: HTMLElement, root: HTMLElement): string => {
+    const pieces: string[] = [];
+    const visit = (node: Node, hiddenParent: boolean): void => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (!hiddenParent) pieces.push(node.textContent ?? '');
+        return;
+      }
+      if (!(node instanceof HTMLElement)) return;
+      const hidden = hiddenParent || isHidden(node) || isIgnored(node, root);
+      if (hidden) return;
+      const before = pieces.length;
+      for (const child of Array.from(node.childNodes)) visit(child, hidden);
+      if (node !== element && /^(?:P|LI|BLOCKQUOTE|PRE|DT|DD|TR|BR|H[1-6])$/u.test(node.tagName)) {
+        pieces.splice(before, 0, '\n');
+        pieces.push('\n');
+      }
+    };
+    visit(element, false);
+    return normalizedText(pieces.join(''));
+  };
+
+  const collectSections = (root: HTMLElement): { sections: BrowserReadSection[]; totalChars: number; sourceTruncated: boolean } => {
+    const sections: BrowserReadSection[] = [];
+    let heading: string | undefined;
+    let parts: string[] = [];
+    let totalChars = 0;
+    let sourceTruncated = false;
+    const finish = (): void => {
+      const text = normalizedText(parts.join('\n'));
+      if (heading || text) {
+        if (sections.length >= maxSections) sourceTruncated = true;
+        else sections.push({ ...(heading ? { heading } : {}), text });
+      }
+      parts = [];
+    };
+    const append = (text: string): void => {
+      const clean = normalizedText(text);
+      if (!clean) return;
+      const remaining = maxSourceChars - totalChars;
+      if (remaining <= 0 || sections.length >= maxSections) {
+        sourceTruncated = true;
+        return;
+      }
+      const bounded = clean.slice(0, remaining);
+      parts.push(bounded);
+      totalChars += bounded.length;
+      if (bounded.length < clean.length) sourceTruncated = true;
+    };
+    const blockTags = new Set(['P', 'LI', 'BLOCKQUOTE', 'PRE', 'DT', 'DD', 'TD', 'TH']);
+    const visit = (node: Node, hiddenParent: boolean): void => {
+      if (sourceTruncated) return;
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (!hiddenParent) append(node.textContent ?? '');
+        return;
+      }
+      if (!(node instanceof HTMLElement)) return;
+      const hidden = hiddenParent || isHidden(node) || isIgnored(node, root);
+      if (hidden) return;
+      if (isHeading(node)) {
+        finish();
+        heading = normalizedText(textInside(node, root)).slice(0, 240);
+        return;
+      }
+      if (blockTags.has(node.tagName)) {
+        append(textInside(node, root));
+        return;
+      }
+      if (node.tagName === 'DIV' && !node.querySelector('p,li,blockquote,pre,dt,dd,td,th,h1,h2,h3,h4,h5,h6,[role="heading"]')) {
+        append(textInside(node, root));
+        return;
+      }
+      for (const child of Array.from(node.childNodes)) visit(child, hidden);
+    };
+    visit(root, false);
+    finish();
+    return { sections, totalChars, sourceTruncated };
+  };
+
+  const sanitizedInnerText = (root: HTMLElement): string => {
+    const clone = root.cloneNode(true) as HTMLElement;
+    const sourceElements = [root, ...Array.from(root.querySelectorAll<HTMLElement>('*'))];
+    const clonedElements = [clone, ...Array.from(clone.querySelectorAll<HTMLElement>('*'))];
+    for (let index = 0; index < sourceElements.length; index += 1) {
+      const source = sourceElements[index];
+      const copy = clonedElements[index];
+      if (source && copy && (isHidden(source) || isIgnored(source, root))) copy.remove();
+    }
+    return normalizedText(clone.innerText);
+  };
+
+  if (region) {
+    const result = collectSections(base);
+    return { source: 'region', ...result };
+  }
+
+  const body = document.body;
+  if (!body) return { source: 'body', sections: [], totalChars: 0, sourceTruncated: false };
+  let selected: HTMLElement | undefined;
+  let source: ReadSource = 'body';
+  if (mode === 'readable') {
+    const candidates = Array.from(document.querySelectorAll<HTMLElement>(
+      'article,[itemprop="articleBody"],[class*="article-body" i],[id*="article-body" i],[class*="post-content" i],[id*="post-content" i]'
+    )).filter(candidate => !isHidden(candidate) && normalizedText(textInside(candidate, candidate)).length >= 80);
+    const scored = candidates.map(candidate => {
+      const text = normalizedText(textInside(candidate, candidate));
+      const links = Array.from(candidate.querySelectorAll('a')).reduce((sum, anchor) => sum + normalizedText(textInside(anchor, candidate)).length, 0);
+      const paragraphCount = candidate.querySelectorAll('p').length;
+      return { candidate, score: text.length * (1 - Math.min(0.85, links / Math.max(1, text.length))) + paragraphCount * 40 };
+    }).sort((left, right) => right.score - left.score);
+    if (scored[0]) {
+      selected = scored[0].candidate;
+      source = 'readability';
+    }
+    if (!selected) {
+      const main = document.querySelector<HTMLElement>('main');
+      if (main && !isHidden(main) && normalizedText(textInside(main, main))) {
+        selected = main;
+        source = 'main';
+      }
+    }
+    if (!selected) {
+      const article = document.querySelector<HTMLElement>('article');
+      if (article && !isHidden(article) && normalizedText(textInside(article, article))) {
+        selected = article;
+        source = 'article';
+      }
+    }
+    if (!selected) {
+      const roleMain = document.querySelector<HTMLElement>('[role="main"]');
+      if (roleMain && !isHidden(roleMain) && normalizedText(textInside(roleMain, roleMain))) {
+        selected = roleMain;
+        source = 'role-main';
+      }
+    }
+  }
+  selected ??= body;
+  if (selected === body && source === 'body' && mode === 'readable') {
+    const text = sanitizedInnerText(body);
+    const bounded = text.slice(0, maxSourceChars);
+    return {
+      source,
+      sections: bounded ? [{ text: bounded }] : [],
+      totalChars: bounded.length,
+      sourceTruncated: bounded.length < text.length,
+    };
+  }
+  const result = collectSections(selected);
+  return { source, ...result };
+}
+
+function pageReadChunk(input: {
+  sections: BrowserReadSection[];
+  maxChars: number;
+  position: ReadCursorPosition;
+  revision: number;
+  url: string;
+  ref?: string;
+  mode: BrowserReadMode;
+}): { sections: BrowserReadSection[]; returnedChars: number; nextCursor?: string } {
+  let sectionIndex = input.position.sectionIndex;
+  let charOffset = input.position.charOffset;
+  if (sectionIndex > input.sections.length
+    || (sectionIndex === input.sections.length && charOffset > 0)
+    || (sectionIndex < input.sections.length && charOffset > input.sections[sectionIndex]!.text.length)) {
+    throw new GuestRpcError('STALE_BROWSER_CURSOR', 'The browser read cursor points outside the current content.', { httpStatus: 409 });
+  }
+
+  const output: BrowserReadSection[] = [];
+  let used = 0;
+  let returnedChars = 0;
+  while (sectionIndex < input.sections.length && used < input.maxChars) {
+    const section = input.sections[sectionIndex]!;
+    const remainder = section.text.slice(charOffset);
+    if (!remainder) {
+      sectionIndex += 1;
+      charOffset = 0;
+      continue;
+    }
+    const headingCost = section.heading ? section.heading.length + 1 : 0;
+    let room = input.maxChars - used;
+    const includeHeading = headingCost > 0 && headingCost < room;
+    if (includeHeading) room -= headingCost;
+    const pieceLength = Math.min(remainder.length, room);
+    if (pieceLength <= 0) break;
+    output.push({
+      ...(includeHeading ? { heading: section.heading } : {}),
+      text: remainder.slice(0, pieceLength),
+      ...(section.ref ? { ref: section.ref } : {}),
+    });
+    used += pieceLength + (includeHeading ? headingCost : 0);
+    returnedChars += pieceLength;
+    if (pieceLength < remainder.length) {
+      charOffset += pieceLength;
+      break;
+    }
+    sectionIndex += 1;
+    charOffset = 0;
+  }
+  const hasMore = sectionIndex < input.sections.length;
+  return {
+    sections: output,
+    returnedChars,
+    ...(hasMore ? {
+      nextCursor: makeReadCursor({
+        revision: input.revision,
+        url: input.url,
+        ...(input.ref === undefined ? {} : { ref: input.ref }),
+        mode: input.mode,
+        sectionIndex,
+        charOffset,
+      }),
+    } : {}),
+  };
+}
 
 class BrowserOperationTimeout extends Error {
   constructor(public readonly operation: string) {
@@ -463,15 +778,130 @@ export class BrowserController {
     };
   }
 
-  async searchPage(input: {
+  async read(input: {
+    mode?: BrowserReadMode;
+    ref?: string;
+    maxChars?: number;
+    cursor?: string;
+  } = {}): Promise<BrowserReadResult> {
+    return this.withWatchdog(() => this.readInternal(input), "browser.read");
+  }
+
+  private async readInternal(input: {
+    mode?: BrowserReadMode;
+    ref?: string;
+    maxChars?: number;
+    cursor?: string;
+  }, attempt = 0): Promise<BrowserReadResult> {
+    const page = await this.ensurePage();
+    const mode = input.mode ?? 'readable';
+    const maxChars = Math.max(1, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
+    if (!input.ref) {
+      try {
+        await page.waitForLoadState('domcontentloaded', { timeout: 2_000 });
+      } catch {
+        // Some pages do not reach DOMContentLoaded after navigation. The
+        // bounded content polling below still permits reading their current state.
+      }
+      for (let wait = 0; wait < 5; wait += 1) {
+        const body = await page.locator('body').evaluateAll(nodes => {
+          const candidate = nodes[0];
+          return candidate instanceof HTMLElement ? candidate.innerText.trim().length : 0;
+        }).catch(() => 0);
+        if (body > 0) break;
+        await new Promise(resolve => setTimeout(resolve, 150));
+      }
+    }
+    await this.refreshDomRevision(page);
+    const revision = this.referenceRevision;
+    const url = page.url();
+    const title = await this.readTitle(page);
+    const reference = input.ref === undefined ? undefined : await this.resolveReference(input.ref);
+    const position = parseReadCursor(input.cursor, {
+      revision,
+      url,
+      ...(input.ref === undefined ? {} : { ref: input.ref }),
+      mode,
+    });
+    let extracted = reference
+      ? await reference.locator.evaluateAll(extractBrowserContent, { mode, region: true })
+      : await page.locator('body').evaluateAll(extractBrowserContent, { mode, region: false });
+
+    if (extracted.sections.every(section => !section.text.trim())) {
+      const indexed = await this.getRegionRecords(page, true, '');
+      const useful = indexed.records.filter(record => (
+        !['navigation', 'footer', 'aside'].includes(record.kind)
+        && Boolean(record.searchText.trim())
+      ));
+      if (useful.length > 0) {
+        const locator = page.locator(REGION_SELECTOR);
+        for (const record of useful) {
+          this.references.set(record.ref, {
+            locator: locator.nth(record.candidateIndex),
+            revision,
+            url,
+            kind: 'region',
+            regionKind: record.kind,
+            ...(record.heading ? { heading: record.heading } : {}),
+          });
+        }
+        const sections = useful.map(record => ({
+          ...(record.heading ? { heading: record.heading } : {}),
+          text: record.searchText,
+          ref: record.ref,
+        }));
+        extracted = {
+          source: 'snapshot-regions',
+          sections,
+          totalChars: sections.reduce((sum, section) => sum + section.text.length, 0),
+          sourceTruncated: indexed.truncated,
+        };
+      }
+    }
+
+    const stableRevision = await this.refreshDomRevision(page);
+    if (stableRevision !== revision || page.url() !== url) {
+      if (attempt < 2 && input.cursor === undefined) return this.readInternal(input, attempt + 1);
+      throw new GuestRpcError('STALE_BROWSER_CURSOR', 'The page changed while its content was being read.', { httpStatus: 409 });
+    }
+    if (reference && reference.revision !== revision) {
+      throw new GuestRpcError('STALE_REGION_REF', `Browser ref ${input.ref} is no longer available.`, { httpStatus: 409 });
+    }
+
+    const paged = pageReadChunk({
+      sections: extracted.sections,
+      maxChars,
+      position,
+      revision,
+      url,
+      ...(input.ref === undefined ? {} : { ref: input.ref }),
+      mode,
+    });
+    return {
+      operation: 'read',
+      url,
+      title,
+      revision,
+      mode,
+      source: reference ? 'region' : extracted.source,
+      readable: extracted.sections.some(section => Boolean(section.text.trim())),
+      sections: paged.sections,
+      totalChars: extracted.totalChars,
+      returnedChars: paged.returnedChars,
+      truncated: paged.nextCursor !== undefined || extracted.sourceTruncated,
+      ...(paged.nextCursor ? { nextCursor: paged.nextCursor } : {}),
+    };
+  }
+
+  async search(input: {
     query: string;
     kinds?: BrowserRegionKind[];
     maxResults?: number;
   }): Promise<BrowserSearchPageResult> {
-    return this.withWatchdog(() => this.searchPageInternal(input), "browser.searchPage");
+    return this.withWatchdog(() => this.searchInternal(input), "browser.search");
   }
 
-  private async searchPageInternal(input: {
+  private async searchInternal(input: {
     query: string;
     kinds?: BrowserRegionKind[];
     maxResults?: number;
@@ -481,6 +911,13 @@ export class BrowserController {
     const revision = this.referenceRevision;
     const url = page.url();
     const title = await this.readTitle(page);
+    const outline = await this.getRegionRecords(page, false);
+    const indexedReadable = outline.records.some(record => (
+      !['navigation', 'footer', 'aside'].includes(record.kind)
+      && Boolean(record.preview?.trim())
+    ));
+    const contentProbe = await page.locator('body').evaluateAll(extractBrowserContent, { mode: 'readable', region: false });
+    const pageReadable = indexedReadable || contentProbe.sections.some(section => Boolean(section.text.trim()));
     const indexed = await this.getRegionRecords(page, true, input.query);
     const ranked = rankPageRegions({
       query: input.query,
@@ -503,16 +940,26 @@ export class BrowserController {
     }
     const stableRevision = await this.refreshDomRevision(page);
     if (stableRevision !== revision) {
-      if (attempt < 2) return this.searchPageInternal(input, attempt + 1);
+      if (attempt < 2) return this.searchInternal(input, attempt + 1);
       throw new GuestRpcError("BROWSER_DOM_UNSTABLE", "The page changed repeatedly while regions were being searched.");
     }
     return {
+      operation: 'search',
+      searchCompleted: true,
       url,
       title,
       revision,
       query: input.query,
       indexedRegionCount: ranked.indexedRegionCount,
-      results: ranked.results,
+      matchCount: ranked.results.length,
+      pageReadable,
+      message: ranked.results.length > 0
+        ? `Search completed successfully. Found ${ranked.results.length} matching page region${ranked.results.length === 1 ? '' : 's'}.`
+        : 'Search completed successfully. No page text matched the query.',
+      results: ranked.results.map(result => {
+        const record = indexed.records.find(candidate => candidate.ref === result.ref);
+        return { ...result, snippet: record?.searchText ?? result.preview ?? result.heading ?? '' };
+      }),
     };
   }
 
@@ -746,82 +1193,6 @@ export class BrowserController {
         error instanceof Error ? error.message.slice(0, 500) : "The browser download could not be completed.",
       );
     }
-  }
-
-  async extractText(input: { query: string; maxChars?: number }): Promise<{
-    text: string;
-    truncated: boolean;
-    url: string;
-    title: string;
-    query: string;
-    matches: number;
-  }> {
-    return this.withWatchdog(() => this.extractTextInternal(input), "browser.extractText");
-  }
-
-  private async extractTextInternal(input: { query: string; maxChars?: number }): Promise<{
-    text: string;
-    truncated: boolean;
-    url: string;
-    title: string;
-    query: string;
-    matches: number;
-  }> {
-    const page = await this.ensurePage();
-    const maxChars = Math.max(1, Math.min(MAX_EXTRACT_CHARS, Math.trunc(input.maxChars ?? DEFAULT_EXTRACT_CHARS)));
-    const search = await this.searchPageInternal({ query: input.query, maxResults: 5 });
-    const records = this.searchCache?.revision === search.revision && this.searchCache.query === input.query
-      ? this.searchCache.records
-      : [];
-    const sections: string[] = [];
-    let chars = 0;
-    let truncated = false;
-    for (const result of search.results) {
-      const record = records.find(candidate => candidate.ref === result.ref);
-      if (!record) continue;
-      const remaining = maxChars - chars - (sections.length > 0 ? 2 : 0);
-      if (remaining <= 0) {
-        truncated = true;
-        break;
-      }
-
-      let content: string;
-      if (record.kind === "table") {
-        const inspected = await this.inspectRegionInternal({
-          ref: record.ref,
-          format: "table",
-          maxChars: Math.max(1_000, Math.min(12_000, remaining)),
-          limit: 30,
-        });
-        content = JSON.stringify(inspected);
-        truncated ||= inspected.format === "table" && inspected.truncated;
-      } else {
-        content = record.searchText;
-        if (record.heading && !content.toLocaleLowerCase().includes(record.heading.toLocaleLowerCase())) {
-          content = `${record.heading}\n${content}`;
-        }
-      }
-
-      const section = record.kind === "table" && result.heading
-        ? `${result.heading}\n${content}`
-        : content;
-      const bounded = section.slice(0, remaining);
-      sections.push(bounded);
-      chars += bounded.length + (sections.length > 1 ? 2 : 0);
-      if (bounded.length < section.length) {
-        truncated = true;
-        break;
-      }
-    }
-    if (search.results.length > sections.length) truncated = true;
-    return {
-      text: sections.join("\n\n"),
-      truncated,
-      url: search.url,
-      title: await this.readTitle(page),
-      query: input.query,
-      matches: search.results.length,
-    };
   }
 
   async click(ref: string): Promise<BrowserState> {

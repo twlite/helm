@@ -61,6 +61,13 @@ becomes a tool error in the same conversation, giving the acting model a chance
 to finish the work or report a blocker. This check does not decide what fields
 belong in an artifact or whether the response is semantically complete.
 
+When a run has observed readable page content, page-derived file writes require
+a successful content read or region inspection first. A zero-match search is
+query-local: it proves neither that the page is unreadable nor that its content
+was read. Legacy compiled tasks keep page reading as a prerequisite and verify
+transformed output as a non-empty file, without requiring a summary to
+reproduce the entire source page.
+
 ## Persistence and limits
 
 `runs.task_json` stores the request envelope. `run_steps` stores each validated
@@ -79,7 +86,7 @@ page count, and DOM revision. They do not request or attach a semantic page
 snapshot. The acting model can request progressive detail when it needs it:
 
 ```text
-browser.getState -> browser.snapshot -> browser.searchPage -> browser.inspectRegion
+browser.getState -> browser.snapshot -> browser.read / browser.search -> browser.inspectRegion
 ```
 
 `browser.snapshot` returns a bounded outline and visible controls. The guest
@@ -94,6 +101,15 @@ Nested results with substantially overlapping query matches are deduplicated
 in favor of the more specific useful region. Search returns five matches by
 default.
 
+`browser.read` reads structured, sanitized page content without a query. It
+defaults to 12,000 characters, supports snapshot region refs and continuation
+cursors, and returns bounded sections instead of raw HTML or a complete DOM.
+Readable mode prefers article content and excludes common navigation
+boilerplate; document mode includes broader visible text. `browser.search` is a
+separate query-only operation. Its result reports both match count and whether
+readable page content exists, so zero matches cannot be confused with an
+unreadable page.
+
 `browser.inspectRegion` reads one selected region as bounded text, local links,
 or structured table columns and rows. Text inspection defaults to 8,000
 characters. Table inspection defaults to 50 rows and supports `offset` and
@@ -103,12 +119,9 @@ in the run activity feed.
 
 Region and interactive refs encode the current DOM revision. Navigation and
 observed DOM changes invalidate earlier refs; the guest rejects expired refs
-instead of acting on a control from an older page state. `browser.extractText`
-is a targeted fallback that requires a query, retrieves matching semantic
-regions, defaults to 6,000 characters, and has an 8,000-character maximum. The
-guest reads candidate region text locally to build bounded query-hit windows; it
-does not send or return a full-page `body.innerText` dump. No whole-page
-extraction mode is present in the acting-agent catalog.
+instead of acting on a control from an older page state. Page reads wait for
+useful content, use deterministic extraction fallbacks, and never send raw
+HTML or the complete DOM into model context.
 
 ## Model context management
 

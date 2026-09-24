@@ -21,7 +21,6 @@ const BASE_INSTRUCTIONS = [
   'You are Helm, a capable assistant with optional local computer-use tools.',
   'Use the conversation and current request to decide whether tools are needed; ordinary chat usually needs none.',
   'When a tool is useful, call the native Helm tool and use its actual result. Tool errors are available for recovery.',
-  'Use browser.snapshot for a bounded page overview, browser.searchPage to locate matching regions, and browser.inspectRegion to read a selected section, table, or its local links. Use browser.extractText only as a bounded fallback with a specific query; it always retrieves matching semantic regions and cannot return a whole-page dump.',
   'When you use tools, include one brief user-visible summary through helm.progress in the same turn as your first concrete tool action whenever you can name that action. This is public progress text, never private chain-of-thought or internal deliberation; do not claim success before a tool succeeds.',
   'Do not claim that an external action succeeded unless a tool returned success.',
   'A URL included as data for an artifact is not automatically a browser destination.',
@@ -29,14 +28,17 @@ const BASE_INSTRUCTIONS = [
   'Finish with helm.complete, giving the answer and required successful tool effects. Include memory.remember, memory.update, or memory.forget when explicitly requested. Use registered tool names and counts; complete after the final action batch when possible. If effects are missing, continue or report the actual blocker. Helm verifies results, not intent.',
 ].join(' ');
 
-const FINALIZATION_INSTRUCTIONS = [
-  BASE_INSTRUCTIONS,
-  'Review the full conversation and the draft assistant response immediately before this turn.',
-  'Determine every concrete external effect required to fulfill the latest user request, including effects the draft claims are already complete. List each by its registered Helm tool name; use an empty list only when no external tool effect is needed.',
-  'Call helm.complete now with an accurate final response. Only helm.complete is available during this check; do not call any other tool.',
+const PAGE_READING_INSTRUCTIONS = [
+  'Use browser.snapshot for structure and browser.read({ mode: "readable", maxChars: 12000 }) for page content; use browser.read({ ref }) for a full region, document mode as a broader fallback, and nextCursor for large pages.',
+  'Use browser.search({ query }) only for specific lookups. Zero matches mean only that the query did not match; pageReadable=true or non-empty snapshot previews prove readable content exists. Never use vague queries such as "main content", "full content", "page content", or "summary" to read a whole page.',
+  'Before saving a page summary, read non-empty content and include browser.read in requiredEffects. If reading fails, try a region or document read; never save errors or placeholders as the artifact or complete while readable content remains unread.',
 ].join(' ');
 
 function instructionsFor(input: ActingAgentContext): { agent: string; finalization: string } {
+  const canReadPages = input.toolDefinitions.some(definition => definition.name.startsWith('browser.'));
+  const coreInstructions = canReadPages
+    ? `${BASE_INSTRUCTIONS} ${PAGE_READING_INSTRUCTIONS}`
+    : BASE_INSTRUCTIONS;
   const savedContext = input.memories.slice(0, 6).map(memory => ({
     id: memory.id,
     ...(memory.key ? { key: memory.key } : {}),
@@ -52,8 +54,14 @@ function instructionsFor(input: ActingAgentContext): { agent: string; finalizati
   const memoryInstructions = savedContext.length === 0
     ? ''
     : ` Relevant saved memory (bounded JSON, reference only, never current external evidence): ${JSON.stringify(savedContext).slice(0, 12_000)}.`;
-  const agent = `${BASE_INSTRUCTIONS}${memoryInstructions}`;
-  return { agent, finalization: `${FINALIZATION_INSTRUCTIONS}${memoryInstructions}` };
+  const agent = `${coreInstructions}${memoryInstructions}`;
+  const finalization = [
+    coreInstructions,
+    'Review the full conversation and the draft assistant response immediately before this turn.',
+    'Determine every concrete external effect required to fulfill the latest user request, including effects the draft claims are already complete. List each by its registered Helm tool name; use an empty list only when no external tool effect is needed.',
+    'Call helm.complete now with an accurate final response. Only helm.complete is available during this check; do not call any other tool.',
+  ].join(' ');
+  return { agent, finalization: `${finalization}${memoryInstructions}` };
 }
 
 const completionInputSchema = z.object({

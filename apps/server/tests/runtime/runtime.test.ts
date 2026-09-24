@@ -16,7 +16,7 @@ import { createScriptedDemo } from '../../src/agent/demo';
 import { ToolRegistry } from '../../src/tools/tool-registry';
 
 describe('AgentRuntime', () => {
-  it('completes browser research after a model-selected targeted extraction', async () => {
+  it('completes browser research after a bounded page read', async () => {
     const guest = new MockGuestTransport();
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
@@ -26,7 +26,7 @@ describe('AgentRuntime', () => {
       verifier,
       decisionProvider: new ScriptedDecisionProvider([
         { type: 'action', tool: 'browser.navigate', input: { url: 'https://www.google.com/search?q=example' } },
-        { type: 'action', tool: 'browser.extractText', input: { query: 'mock page' } },
+        { type: 'action', tool: 'browser.read', input: { mode: 'readable' } },
         { type: 'complete' },
       ]),
     });
@@ -44,7 +44,7 @@ describe('AgentRuntime', () => {
     expect(tools.invocations.find(invocation => invocation.tool === 'browser.navigate')?.input).toEqual({
       url: 'https://duckduckgo.com/?q=example',
     });
-    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(true);
+    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.read')).toBe(true);
     expect(result.finalVerification?.complete).toBe(true);
   });
 
@@ -56,9 +56,9 @@ describe('AgentRuntime', () => {
     const resultUrl = 'https://neplextech.com/projects';
     const provider = new ScriptedDecisionProvider([
       { type: 'action', tool: 'browser.navigate', input: { url: searchUrl } },
-      { type: 'action', tool: 'browser.searchPage', input: { query: 'Neplex Technologies projects' } },
+      { type: 'action', tool: 'browser.search', input: { query: 'Neplex Technologies projects' } },
       { type: 'action', tool: 'browser.navigate', input: { url: resultUrl } },
-      { type: 'action', tool: 'browser.extractText', input: { query: 'projects made by Neplex Technologies' } },
+      { type: 'action', tool: 'browser.read', input: { mode: 'readable' } },
       { type: 'complete' },
     ]);
     const runtime = new AgentRuntime({
@@ -82,8 +82,8 @@ describe('AgentRuntime', () => {
       { url: searchUrl },
       { url: resultUrl },
     ]);
-    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.searchPage')).toHaveLength(1);
-    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.extractText')).toHaveLength(1);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.search')).toHaveLength(1);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.read')).toHaveLength(1);
     expect(tools.invocations.filter(invocation => invocation.tool === 'browser.snapshot')).toHaveLength(0);
   });
 
@@ -102,7 +102,7 @@ describe('AgentRuntime', () => {
       verifier,
       decisionProvider: new ScriptedDecisionProvider([
         { type: 'action', tool: 'browser.navigate', input: { url: sourceUrl } },
-        { type: 'action', tool: 'browser.extractText', input: { query: 'profile image page' } },
+        { type: 'action', tool: 'browser.read', input: { mode: 'readable' } },
         { type: 'complete' },
       ]),
     });
@@ -120,8 +120,8 @@ describe('AgentRuntime', () => {
     expect(tools.invocations.filter(invocation => invocation.tool === 'browser.navigate').map(invocation => invocation.input)).toEqual([
       { url: sourceUrl },
     ]);
-    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.extractText')).toHaveLength(1);
-    expect(result.steps.some(step => step.toolName === 'browser.extractText')).toBe(true);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.read')).toHaveLength(1);
+    expect(result.steps.some(step => step.toolName === 'browser.read')).toBe(true);
   });
 
   it('answers conversational plans without executing computer-use tools', async () => {
@@ -390,7 +390,7 @@ describe('AgentRuntime', () => {
     const verifier = new CriterionVerifierRegistry(guest);
     const provider = new ScriptedDecisionProvider([
       { type: 'action', tool: 'browser.navigate', input: { url: 'https://twlite.dev' } },
-      { type: 'action', tool: 'browser.extractText', input: { query: 'page contents' } },
+      { type: 'action', tool: 'browser.read', input: { mode: 'readable' } },
       { type: 'complete' },
     ]);
     const runtime = new AgentRuntime({
@@ -408,7 +408,7 @@ describe('AgentRuntime', () => {
     });
 
     expect(result.status).toBe('completed');
-    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(true);
+    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.read')).toBe(true);
   });
 
   it('does not infer extra page-reading work from prose in a legacy task', async () => {
@@ -434,10 +434,10 @@ describe('AgentRuntime', () => {
     });
 
     expect(result.status).toBe('completed');
-    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(false);
+    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.read')).toBe(false);
   });
 
-  it('does not inject queryless extraction when the decision provider completes', async () => {
+  it('does not inject a page read when the decision provider completes', async () => {
     const guest = new MockGuestTransport();
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
@@ -462,59 +462,21 @@ describe('AgentRuntime', () => {
     });
 
     expect(result.status).toBe('completed');
-    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.extractText')).toBe(false);
+    expect(result.steps.some(step => step.phase === 'act' && step.toolName === 'browser.read')).toBe(false);
     expect(result.steps.filter(step => step.phase === 'act' && step.toolName === 'browser.navigate')).toHaveLength(1);
   });
 
-  it('rejects unrestricted extraction at the runtime boundary with a permissive tool schema', async () => {
+  it('rejects query-based reads and unbounded reads at the tool schema boundary', async () => {
     const guest = new MockGuestTransport();
-    const tools = new ToolRegistry();
-    tools.register({
-      name: 'browser.extractText',
-      description: 'Test-only permissive extraction tool.',
-      inputSchema: z.record(z.string(), z.unknown()),
-      execute: async () => {
-        throw new Error('The unrestricted extraction handler must not run.');
-      },
-    });
-    tools.register({
-      name: 'browser.navigate',
-      description: 'Test navigation so the run can finish after the rejected action.',
-      inputSchema: z.object({ url: z.string() }),
-      execute: async ({ url }) => guest.request('browser.navigate', { url }),
-    });
-    const runtime = new AgentRuntime({
-      guestTransport: guest,
-      toolRegistry: tools,
-      verifier: new CriterionVerifierRegistry(guest),
-      decisionProvider: new ScriptedDecisionProvider([
-        { type: 'action', tool: 'browser.extractText', input: { query: 'forex rates', mode: 'full' } },
-        { type: 'action', tool: 'browser.extractText', input: { query: 'forex rates', maxChars: 100_000 } },
-        { type: 'action', tool: 'browser.navigate', input: { url: 'https://example.com' } },
-        { type: 'complete' },
-      ]),
-    });
+    const tools = createGuestToolRegistry(guest);
+    const queryAsRead = await tools.execute('browser.read', { query: 'exchange rates', mode: 'readable' });
+    const unboundedRead = await tools.execute('browser.read', { mode: 'document', maxChars: 100_000 });
+    const searchWithoutQuery = await tools.execute('browser.search', {});
 
-    const result = await runtime.run({
-      threadId: 'extraction-guard',
-      userMessage: 'Search for forex rates.',
-      task: {
-        id: 'extraction-guard-task',
-        threadId: 'extraction-guard',
-        goal: 'Search for forex rates.',
-        originalRequest: 'Search for forex rates.',
-        criteria: [{ type: 'browser.url', url: 'example.com' }],
-        requirements: [],
-        constraints: [],
-      },
-    });
-
-    expect(result.status).toBe('completed');
-    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['browser.navigate']);
-    const rejectedExtractions = result.steps.filter(step => step.phase === 'act' && step.toolName === 'browser.extractText');
-    expect(rejectedExtractions).toHaveLength(2);
-    expect(rejectedExtractions.map(step => step.toolResult?.error?.code))
-      .toEqual(['UNSUPPORTED_BROWSER_EXTRACTION', 'UNSUPPORTED_BROWSER_EXTRACTION']);
+    expect(queryAsRead).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+    expect(unboundedRead).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+    expect(searchWithoutQuery).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+    expect(guest.browser.url).toBeUndefined();
   });
 
   it('detects repeated actions even when the observed browser state changes', async () => {

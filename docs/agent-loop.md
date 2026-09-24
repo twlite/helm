@@ -78,10 +78,11 @@ bounded. Cancellation is passed through to both model and guest calls.
 
 Ordinary environment reads do not fetch page text or a snapshot. They carry
 only URL, title, loading state, page count, and DOM revision. The model chooses
-when to request the bounded page outline, search visible regions with local
-lexical ranking, and inspect a matching region. The guest indexes semantic DOM
-regions and sends bounded query-hit windows to its local ranker instead of
-sending the complete `body.innerText`. Ranking combines IDF/BM25-like body
+when to request the bounded page outline, read page content, or search for
+specific information. The guest indexes semantic DOM regions and sends bounded
+search-hit windows to its local ranker instead of sending the complete
+`body.innerText` for search. `browser.read` extracts bounded content sections
+inside the guest. Ranking combines IDF/BM25-like body
 relevance with heading, table-header, and form-label field boosts, phrase and
 proximity signals, and semantic region kinds. Nested matches with substantially
 overlapping query terms are deduplicated in favor of the more specific useful
@@ -90,9 +91,11 @@ region.
 Tables are returned as structured columns and rows. Inspection defaults to an
 8,000-character response and 50 rows; `offset` and `limit` paginate larger
 tables, which report total row count, returned row count, offset, and
-truncation. `browser.extractText` is a bounded fallback that requires a focused
-query, searches the semantic region index, and returns at most 8,000 characters.
-There is no acting-agent path for a whole-page text dump.
+truncation. `browser.read` returns bounded structured page sections without a
+query, supports current snapshot refs, and returns a cursor when more content
+remains. `browser.search` requires a specific query and reports `pageReadable`
+separately from query matches. Zero search matches never mean that the page is
+unreadable.
 
 Semantic region and element refs are tied to the observed DOM revision. A
 navigation or meaningful DOM mutation expires them, and the guest returns a

@@ -20,9 +20,9 @@ const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'browser.navigate': 'Navigate the visible guest browser to a URL.',
   'browser.getState': 'Read the visible browser URL, title, loading state, page count, and current DOM revision without reading page text.',
   'browser.snapshot': 'Return a bounded semantic outline of the current page and its visible interactive elements.',
-  'browser.searchPage': 'Search visible semantic regions on the current page with local IDF weighted ranking and return up to five bounded matches by default.',
+  'browser.read': 'Read bounded, structured readable page content or the complete content of a current semantic region ref. Use cursors to continue large pages. This operation does not accept a query.',
+  'browser.search': 'Search page content for a specific query and return bounded matching snippets and refs. Zero matches describe only this query; pageReadable reports whether the page has readable content.',
   'browser.inspectRegion': 'Inspect one current page region as bounded text, structured table rows, or local links. Large tables support offset and limit pagination.',
-  'browser.extractText': 'Retrieve bounded content matching a required query from semantic page regions. Use searchPage and inspectRegion first when structure is useful.',
   'browser.download': 'Start and record a browser download from a semantic element or URL.',
   'browser.click': 'Click a semantic browser element or desktop coordinate fallback.',
   'browser.type': 'Type into a semantic browser element.',
@@ -72,7 +72,7 @@ async function boundarySnapshot(
 ): Promise<BoundarySnapshot> {
   const snapshot: BoundarySnapshot = {};
   if (method.startsWith('browser.') && ![
-    'browser.extractText', 'browser.snapshot', 'browser.searchPage', 'browser.inspectRegion', 'browser.getState',
+    'browser.read', 'browser.snapshot', 'browser.search', 'browser.inspectRegion', 'browser.getState',
   ].includes(method)) {
     try {
       const state = await guest.request('browser.getState', {}, { signal });

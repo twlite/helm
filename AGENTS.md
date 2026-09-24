@@ -149,7 +149,7 @@ Good verification:
 Did fs.write succeed?
 Does the file exist?
 Did browser.navigate reach a page?
-Did browser.extractText return usable text?
+Did browser.read return usable page content?
 Did the download produce an artifact?
 Is the requested window open?
 Did the environment change?

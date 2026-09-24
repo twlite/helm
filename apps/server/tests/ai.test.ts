@@ -418,7 +418,7 @@ describe('LM Studio AI adapters', () => {
       }],
     });
     expect(JSON.stringify(requestBody)).toContain('current or publicly available web information are tasks, not conversation');
-    expect(JSON.stringify(requestBody)).toContain('browser.extractText');
+    expect(JSON.stringify(requestBody)).toContain('browser.read');
   });
 
   it('allows DuckDuckGo as the only search engine and rewrites Google or Bing searches', () => {
@@ -490,8 +490,8 @@ describe('LM Studio AI adapters', () => {
       id: BROWSER_RESEARCH_CRITERION_ID,
       description: 'Read current public web information with the browser before answering.',
     });
-    expect(JSON.stringify(requestBody)).toContain('browser.searchPage');
-    expect(JSON.stringify(requestBody)).toContain('browser.inspectRegion');
+    expect(JSON.stringify(requestBody)).toContain('browser.search');
+    expect(JSON.stringify(requestBody)).toContain('browser.read');
   });
 
   it('compiles the GitHub release workflow into executable research and Desktop requirements', async () => {
@@ -856,13 +856,13 @@ describe('LM Studio AI adapters', () => {
       requestTimeoutMs: 1000,
       structuredOutputCompatibility: 'lmstudio-mlx',
     });
-    const firstRequest = 'go to https://twlite.dev and save the contents in a twlite.txt file';
+    const firstRequest = 'go to https://twlite.dev, summarize the page content, and save it in a twlite.txt file';
     const firstTask = await planner.createTask({ threadId: 'page-to-file-thread', userMessage: firstRequest });
     expect(firstTask.requirements).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'browserResearch', target: { factId: 'pageContent' } }),
       expect.objectContaining({
         id: 'outputFile',
-        target: { path: 'twlite.txt', mode: 'contains-facts', factIds: ['pageContent'] },
+        target: { path: 'twlite.txt', mode: 'non-empty' },
       }),
     ]));
 
@@ -873,7 +873,7 @@ describe('LM Studio AI adapters', () => {
     expect(combinedTask.requirements).toEqual(expect.arrayContaining([
       expect.objectContaining({
         id: 'outputFile',
-        target: { path: 'twlite.md', mode: 'contains-facts', factIds: ['pageContent'] },
+        target: { path: 'twlite.md', mode: 'non-empty' },
       }),
       expect.objectContaining({
         id: 'openFile',
@@ -955,8 +955,8 @@ describe('LM Studio AI adapters', () => {
     const worker = new AiSdkWorker({
       model: provider.chatModel('google/gemma-4-e2b'),
       toolDefinitions: [{
-        name: 'browser.extractText',
-        description: 'Extract page text.',
+        name: 'browser.read',
+        description: 'Read page text.',
         inputSchema: z.object({}),
         execute: async () => ({ ok: true }),
       }],
@@ -987,7 +987,7 @@ describe('LM Studio AI adapters', () => {
           executed.push(tool);
           return {
             ok: true,
-            data: { url: 'https://twlite.dev', title: 'Twilight', text: 'Helm makes local computer use useful.' },
+            data: { url: 'https://twlite.dev', title: 'Twilight', readable: true, sections: [{ heading: 'Twilight', text: 'Helm makes local computer use useful.' }] },
             evidence: { receipt: { id: 'receipt-browser-extract' } },
           };
         },
@@ -1039,7 +1039,7 @@ describe('LM Studio AI adapters', () => {
       model: provider.chatModel('google/gemma-4-e2b'),
       toolDefinitions: [
         { name: 'browser.navigate', description: 'Navigate the browser.', inputSchema: z.object({}) },
-        { name: 'browser.extractText', description: 'Extract page text.', inputSchema: z.object({}) },
+        { name: 'browser.read', description: 'Read page text.', inputSchema: z.object({}) },
       ],
       maxOutputTokens: 256,
       temperature: 0,
@@ -1074,8 +1074,8 @@ describe('LM Studio AI adapters', () => {
           if (tool === 'browser.navigate') currentUrl = finalUrl;
           return {
             ok: true,
-            data: tool === 'browser.extractText'
-              ? { url: finalUrl, title: 'Profile', text: 'Redirected profile page content.' }
+            data: tool === 'browser.read'
+              ? { url: finalUrl, title: 'Profile', readable: true, sections: [{ text: 'Redirected profile page content.' }] }
               : { url: finalUrl, title: 'Profile', loaded: true },
             evidence: { receipt: { id: `receipt-${executed.length}` } },
           };

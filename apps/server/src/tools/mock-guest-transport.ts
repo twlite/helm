@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 
 import type {
   BrowserRegionKind,
+  BrowserReadMode,
   GuestMethod,
   WindowInfo,
 } from '@helm/shared';
@@ -89,6 +90,18 @@ function readableText(html: string): string {
       .replace(/\s+/g, ' ')
       .trim(),
   );
+}
+
+function mockReadablePageText(html: string, mode: 'readable' | 'document'): string {
+  let source = html;
+  if (mode === 'readable') {
+    source = html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/iu)?.[1]
+      ?? html.match(/<article\b[^>]*>([\s\S]*?)<\/article>/iu)?.[1]
+      ?? html.match(/<body\b[^>]*>([\s\S]*?)<\/body>/iu)?.[1]
+      ?? html;
+    source = source.replace(/<(nav|footer|aside)\b[^>]*>[\s\S]*?<\/\1>/giu, ' ');
+  }
+  return readableText(source);
 }
 
 function pageTitle(html: string, fallback: string): string {
@@ -515,8 +528,68 @@ export class MockGuestTransport implements GuestTransport {
           })),
         } as GuestMethodResult[M];
       }
-      case 'browser.searchPage': {
-        const input = params as GuestMethodParams['browser.searchPage'];
+      case 'browser.read': {
+        if (!this.browser.loaded || !this.browser.url) {
+          throw new GuestTransportError('BROWSER_NOT_READY', 'Navigate the browser before reading page content');
+        }
+        const input = params as GuestMethodParams['browser.read'];
+        const mode: BrowserReadMode = input.mode ?? 'readable';
+        const match = input.ref?.match(/^r(\d+)-([1-9]\d*)$/u);
+        const region = input.ref === undefined
+          ? undefined
+          : match && Number(match[1]) === this.browser.revision
+            ? this.browser.regions.find(candidate => candidate.ref === input.ref)
+            : undefined;
+        if (input.ref !== undefined && !region) {
+          throw new GuestTransportError('STALE_REGION_REF', `Browser region no longer exists: ${input.ref}`);
+        }
+        const html = this.browser.html ?? this.browser.text;
+        const text = region?.searchText ?? mockReadablePageText(html, mode);
+        const source: GuestMethodResult['browser.read']['source'] = region
+          ? 'region'
+          : mode === 'document'
+            ? 'body'
+            : /<main\b/iu.test(html)
+              ? 'main'
+              : /<article\b/iu.test(html)
+                ? 'readability'
+              : /role\s*=\s*["']main["']/iu.test(html)
+                  ? 'role-main'
+                  : 'body';
+        const heading = region?.heading ?? (region ? undefined : this.browser.title);
+        const maxChars = Math.max(1, Math.min(12_000, input.maxChars ?? 12_000));
+        const scope = `${this.browser.url}|${input.ref ?? ''}|${mode}`;
+        const scopeHash = [...scope].reduce((hash, char) => Math.imul(hash ^ char.charCodeAt(0), 16777619) >>> 0, 2166136261).toString(36);
+        let offset = 0;
+        if (input.cursor) {
+          const cursor = /^mock1\.(\d+)\.([a-z0-9]+)\.(\d+)$/u.exec(input.cursor);
+          if (!cursor || Number(cursor[1]) !== this.browser.revision || cursor[2] !== scopeHash) {
+            throw new GuestTransportError('STALE_BROWSER_CURSOR', 'The browser read cursor belongs to a different page revision.');
+          }
+          offset = Number(cursor[3]);
+        }
+        const chunk = text.slice(offset, offset + maxChars);
+        const nextOffset = offset + chunk.length;
+        const nextCursor = nextOffset < text.length
+          ? `mock1.${this.browser.revision}.${scopeHash}.${nextOffset}`
+          : undefined;
+        return {
+          operation: 'read',
+          url: this.browser.url,
+          title: this.browser.title ?? '',
+          revision: this.browser.revision,
+          mode,
+          source,
+          readable: text.trim().length > 0,
+          sections: chunk ? [{ ...(heading ? { heading } : {}), text: chunk, ...(region ? { ref: region.ref } : {}) }] : [],
+          totalChars: text.length,
+          returnedChars: chunk.length,
+          truncated: nextCursor !== undefined,
+          ...(nextCursor ? { nextCursor } : {}),
+        } as GuestMethodResult[M];
+      }
+      case 'browser.search': {
+        const input = params as GuestMethodParams['browser.search'];
         const ranked = rankPageRegions({
           query: input.query,
           regions: this.browser.regions,
@@ -524,11 +597,27 @@ export class MockGuestTransport implements GuestTransport {
           maxResults: input.maxResults,
         });
         return {
+          operation: 'search',
+          searchCompleted: true,
           url: this.browser.url ?? 'about:blank',
           title: this.browser.title ?? '',
           revision: this.browser.revision,
           query: input.query,
           ...ranked,
+          matchCount: ranked.results.length,
+          pageReadable: this.browser.regions.some(region => (
+            !['navigation', 'footer', 'aside'].includes(region.kind) && region.searchText.trim().length > 0
+          )) || mockReadablePageText(this.browser.html ?? this.browser.text, 'readable').trim().length > 0,
+          message: ranked.results.length > 0
+            ? `Search completed successfully. Found ${ranked.results.length} matching page region${ranked.results.length === 1 ? '' : 's'}.`
+            : 'Search completed successfully. No page text matched the query.',
+          results: ranked.results.map(result => {
+            const region = this.browser.regions.find(candidate => candidate.ref === result.ref);
+            const snippet = region
+              ? extractRelevantPassages({ text: region.searchText, query: input.query, maxChars: 500 }).text
+              : '';
+            return { ...result, snippet: snippet || result.preview || result.heading || '' };
+          }),
         } as GuestMethodResult[M];
       }
       case 'browser.inspectRegion': {
@@ -572,62 +661,6 @@ export class MockGuestTransport implements GuestTransport {
         }
         const maxChars = Math.max(1_000, Math.min(12_000, input.maxChars ?? 8_000));
         return { ...common, format: 'text', text: region.searchText.slice(0, maxChars), truncated: region.searchText.length > maxChars } as GuestMethodResult[M];
-      }
-      case 'browser.extractText': {
-        if (!this.browser.loaded || !this.browser.url) {
-          throw new GuestTransportError('BROWSER_NOT_READY', 'Navigate the browser before extracting text');
-        }
-        const input = params as GuestMethodParams['browser.extractText'];
-        const maxChars = Math.max(1, Math.min(8_000, input.maxChars ?? 6_000));
-        const ranked = rankPageRegions({ query: input.query, regions: this.browser.regions, maxResults: 5 });
-        const sections: string[] = [];
-        let truncated = false;
-        for (const result of ranked.results) {
-          const region = this.browser.regions.find(candidate => candidate.ref === result.ref);
-          if (!region) continue;
-          const remaining = maxChars - sections.join('\n\n').length - (sections.length > 0 ? 2 : 0);
-          if (remaining <= 0) {
-            truncated = true;
-            break;
-          }
-          let text: string;
-          let sectionTruncated = false;
-          if (region.kind === 'table') {
-            const table = boundedTable(region, Math.max(1_000, Math.min(8_000, remaining)), 0, 30);
-            text = JSON.stringify({
-              heading: region.heading,
-              columns: table.columns,
-              rows: table.rows,
-              rowCount: table.rowCount,
-              returnedRowCount: table.returnedRowCount,
-              offset: table.offset,
-              truncated: table.truncated,
-            });
-            sectionTruncated = table.truncated;
-          } else {
-            const extracted = extractRelevantPassages({ text: region.searchText, query: input.query, maxChars: remaining });
-            const selectedRegionText = extracted.text || region.searchText.slice(0, remaining);
-            text = region.heading && !selectedRegionText.toLocaleLowerCase().includes(region.heading.toLocaleLowerCase())
-              ? `${region.heading}\n${selectedRegionText}`
-              : selectedRegionText;
-            sectionTruncated = extracted.truncated || selectedRegionText.length < region.searchText.length;
-          }
-          const rawSection = region.kind === 'table' && region.heading
-            ? `${region.heading}\n${text}`
-            : text;
-          const section = rawSection.slice(0, remaining);
-          sections.push(section);
-          truncated ||= sectionTruncated || section.length < rawSection.length;
-        }
-        truncated ||= ranked.results.length > sections.length;
-        return {
-          url: this.browser.url,
-          title: this.browser.title ?? '',
-          text: sections.join('\n\n'),
-          truncated,
-          query: input.query,
-          matches: ranked.results.length,
-        } as GuestMethodResult[M];
       }
       case 'browser.download': {
         const input = params as GuestMethodParams['browser.download'];

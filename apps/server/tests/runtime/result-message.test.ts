@@ -53,14 +53,14 @@ describe('assistant result messages', () => {
       runId: 'run-1',
       stepIndex: 0,
       phase: 'act',
-      toolName: 'browser.extractText',
+      toolName: 'browser.read',
       toolInput: {},
       toolResult: {
         ok: true,
         data: {
           url: 'https://twlite.dev/',
           title: 'Twilight',
-          text: 'Helm makes local computer use useful.',
+          sections: [{ heading: 'Twilight', text: 'Helm makes local computer use useful.' }],
         },
       },
       createdAt: '2026-01-01T00:00:00.000Z',

@@ -225,12 +225,12 @@ function browserObservationKey(tool: string, data: Record<string, unknown> | und
       return `${tool}|${url}|${data.title ?? ''}|${data.loading ?? ''}|${data.pageCount ?? ''}|${revision}`;
     case 'browser.snapshot':
       return `${tool}|${url}|${revision}`;
-    case 'browser.searchPage':
+    case 'browser.read':
+      return `${tool}|${url}|${revision}|${data.mode ?? ''}|${data.ref ?? ''}|${stringify(data.sections ?? [])}|${data.nextCursor ?? ''}`;
+    case 'browser.search':
       return `${tool}|${url}|${revision}|${data.query ?? ''}|${stringify(data.results ?? [])}`;
     case 'browser.inspectRegion':
       return `${tool}|${url}|${revision}|${data.ref ?? ''}|${stringify(data)}`;
-    case 'browser.extractText':
-      return `${tool}|${url}|${revision}|${data.query ?? ''}|${data.text ?? ''}`;
     default:
       return undefined;
   }
@@ -486,13 +486,13 @@ function pruneBrowserObservations(exchanges: ContextExchange[]): ContextPruningC
 
   const seen = new Set<string>();
   for (const item of [...items].reverse()) {
-    if (!['browser.getState', 'browser.snapshot', 'browser.searchPage', 'browser.inspectRegion', 'browser.extractText'].includes(item.tool)) continue;
+    if (!['browser.getState', 'browser.snapshot', 'browser.read', 'browser.search', 'browser.inspectRegion'].includes(item.tool)) continue;
     const data = resultData(item.result);
     if (!data) continue;
     const url = pageUrl(item.tool, item.result);
     const revision = typeof data.revision === 'number' ? data.revision : undefined;
     const currentRevision = url ? latestRevision.get(url) : undefined;
-    const obsoleteOutline = (item.tool === 'browser.snapshot' || item.tool === 'browser.searchPage')
+    const obsoleteOutline = (item.tool === 'browser.snapshot' || item.tool === 'browser.search')
       && revision !== undefined && currentRevision !== undefined && revision < currentRevision;
     const key = browserObservationKey(item.tool, data);
     if (data.superseded === true || data.duplicate === true) continue;
@@ -505,7 +505,7 @@ function pruneBrowserObservations(exchanges: ContextExchange[]): ContextPruningC
       url,
       ...(typeof data.title === 'string' ? { title: data.title } : {}),
       ...(revision === undefined ? {} : { revision }),
-      ...(item.tool === 'browser.searchPage' && typeof data.query === 'string' ? { query: data.query } : {}),
+      ...(item.tool === 'browser.search' && typeof data.query === 'string' ? { query: data.query } : {}),
       ...(obsoleteOutline ? { superseded: true, note: 'This page revision has newer refs; use the current page state.' } : { duplicate: true, note: 'An equivalent browser observation is already present in newer context.' }),
     };
     replaceToolResult(item.part, {
