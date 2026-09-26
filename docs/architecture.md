@@ -101,14 +101,21 @@ Nested results with substantially overlapping query matches are deduplicated
 in favor of the more specific useful region. Search returns five matches by
 default.
 
-`browser.read` reads structured, sanitized page content without a query. It
-defaults to 12,000 characters, supports snapshot region refs and continuation
-cursors, and returns bounded sections instead of raw HTML or a complete DOM.
-Readable mode prefers article content and excludes common navigation
-boilerplate; document mode includes broader visible text. `browser.search` is a
-separate query-only operation. Its result reports both match count and whether
-readable page content exists, so zero matches cannot be confused with an
-unreadable page.
+`browser.read` extracts typed content blocks for tables, headings, prose,
+lists, code, forms, navigation, search results, and other useful regions. It
+accepts an optional query or focus, ranks blocks locally, and returns compact
+previews rather than the full page. With no query it returns a compact semantic
+overview. `browser.search` remains a separate query-only operation over the
+existing semantic-region index; its result reports both match count and
+whether readable page content exists.
+
+Full extracted blocks live in a guest content registry. A `c<revision>-<n>`
+ref retrieves a block or more table rows using `browser.read`; navigation or
+page mutations expire refs. `fs.write` accepts either normal string content or
+a content `sourceRef` and serializes the selected block locally as text,
+Markdown, JSON, or CSV. Tables preserve heading ancestry, columns, rows, and
+row/column spans where available. The source-ref write result reports the
+source revision and type along with normal filesystem evidence.
 
 `browser.inspectRegion` reads one selected region as bounded text, local links,
 or structured table columns and rows. Text inspection defaults to 8,000
@@ -119,9 +126,16 @@ in the run activity feed.
 
 Region and interactive refs encode the current DOM revision. Navigation and
 observed DOM changes invalidate earlier refs; the guest rejects expired refs
-instead of acting on a control from an older page state. Page reads wait for
-useful content, use deterministic extraction fallbacks, and never send raw
-HTML or the complete DOM into model context.
+instead of acting on a control from an older page state. Reads settle on
+bounded DOM readiness and content stability, inspect accessible frames and
+open shadow roots, and combine semantic DOM, table/grid, optional local
+Readability, and ARIA fallback signals. Raw HTML and the complete DOM stay out
+of model context.
+
+Navigation policy records whether a destination came from the user, verified
+memory, a DuckDuckGo result, or an observed page link. A model-proposed URL
+without that provenance starts a DuckDuckGo search using the current request;
+the runtime does not turn site or organization names into guessed routes.
 
 ## Model context management
 

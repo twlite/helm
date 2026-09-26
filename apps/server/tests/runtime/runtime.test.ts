@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 import { z } from 'zod';
+import type { AgentDecision, Memory } from '@helm/shared';
 
 import { AgentRuntime } from '../../src/agent/runtime';
-import { browserResearchTask } from '../../src/agent/browser-research';
+import { browserResearchSearchUrl, browserResearchTask } from '../../src/agent/browser-research';
+import { deriveBrowserReadQuery } from '@helm/shared';
 import { LoopDetector } from '../../src/agent/fingerprint';
 import { ScriptedDecisionProvider } from '../../src/agent/planner';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
@@ -16,8 +18,234 @@ import { createScriptedDemo } from '../../src/agent/demo';
 import { ToolRegistry } from '../../src/tools/tool-registry';
 
 describe('AgentRuntime', () => {
-  it('completes browser research after a bounded page read', async () => {
+  it('rejects browser downloads that use model-invented URLs', async () => {
     const guest = new MockGuestTransport();
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
+    const userMessage = 'Find the current foreign exchange rates.';
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: new ScriptedDecisionProvider([
+        { type: 'action', tool: 'browser.download', input: { url: 'https://guessed.example.test/latest.csv' } },
+        { type: 'blocked', reason: 'The runtime rejected an unobserved download URL.' },
+      ]),
+    });
+
+    const result = await runtime.run({
+      threadId: 'unobserved-download',
+      userMessage,
+      task: browserResearchTask({ threadId: 'unobserved-download', userMessage }),
+    });
+
+    expect(result.status).toBe('blocked');
+    expect(result.steps.find(step => step.toolName === 'browser.download')?.toolResult?.error)
+      .toMatchObject({ code: 'UNOBSERVED_DOWNLOAD_URL' });
+    expect(tools.invocations.some(invocation => invocation.tool === 'browser.download')).toBe(false);
+  });
+
+  it('accepts only user, verified-memory, or observed-link destinations and searches DuckDuckGo otherwise', async () => {
+    const runScenario = async (input: {
+      userMessage: string;
+      proposedUrl: string;
+      memories?: Memory[];
+      pages?: Record<string, string>;
+      followLink?: string;
+      retryNavigation?: string;
+      redirects?: Record<string, string>;
+      navigationFailures?: Record<string, string>;
+    }) => {
+      const genericContentPage = '<html><body><main><h1>Rates</h1><p>Exchange rate data content.</p></main></body></html>';
+      const pages = {
+        [input.proposedUrl]: genericContentPage,
+        [browserResearchSearchUrl(deriveBrowserReadQuery(input.userMessage))]: genericContentPage,
+        ...input.pages,
+      };
+      const guest = new MockGuestTransport({
+        pages,
+        ...(input.redirects ? { redirects: input.redirects } : {}),
+        ...(input.navigationFailures ? { navigationFailures: input.navigationFailures } : {}),
+      });
+      const tools = createGuestToolRegistry(guest);
+      const verifier = new CriterionVerifierRegistry(guest);
+      const decisions: AgentDecision[] = [
+        { type: 'action', tool: 'browser.navigate', input: { url: input.proposedUrl } },
+        ...(input.retryNavigation ? [{ type: 'action' as const, tool: 'browser.navigate', input: { url: input.retryNavigation } }] : []),
+        { type: 'action', tool: 'browser.read', input: { query: 'content' } },
+        ...(input.followLink ? [
+          { type: 'action' as const, tool: 'browser.navigate', input: { url: input.followLink } },
+          { type: 'action' as const, tool: 'browser.read', input: { query: 'content' } },
+        ] : []),
+        { type: 'complete' },
+      ];
+      const seenProvenance = new Set<string>();
+      let decisionIndex = 0;
+      const runtime = new AgentRuntime({
+        guestTransport: guest,
+        toolRegistry: tools,
+        verifier,
+        memories: input.memories,
+        decisionProvider: {
+          next: async context => {
+            for (const previous of context.previousResults) {
+              const data = previous.data;
+              if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+                const provenance = (data as Record<string, unknown>).urlProvenance;
+                if (typeof provenance === 'string') seenProvenance.add(provenance);
+              }
+            }
+            return decisions[decisionIndex++] ?? { type: 'complete' };
+          },
+        },
+      });
+      const result = await runtime.run({
+        threadId: 'url-provenance',
+        userMessage: input.userMessage,
+        task: browserResearchTask({ threadId: 'url-provenance', userMessage: input.userMessage }),
+      });
+      return {
+        result,
+        navigations: tools.invocations.filter(invocation => invocation.tool === 'browser.navigate'),
+        seenProvenance,
+      };
+    };
+
+    const explicitUrl = 'https://bank.example.test/rates';
+    const explicit = await runScenario({
+      userMessage: `Open ${explicitUrl} and read the rates.`,
+      proposedUrl: explicitUrl,
+    });
+    expect(explicit.result.status).toBe('completed');
+    expect(explicit.navigations[0]?.input).toEqual({ url: explicitUrl });
+    expect(explicit.seenProvenance).toContain('user');
+
+    const savedUrl = 'https://bank.example.test/forex';
+    const verifiedMemory: Memory = {
+      id: 'saved-forex-source',
+      content: 'Example Bank forex source.',
+      kind: 'note',
+      importance: 0.8,
+      metadata: {},
+      source: 'observed',
+      sourceUrl: savedUrl,
+      evidenceIds: ['receipt-forex-source'],
+      lastVerifiedAt: '2026-09-25T12:00:00.000Z',
+      createdAt: '2026-09-25T12:00:00.000Z',
+      updatedAt: '2026-09-25T12:00:00.000Z',
+    };
+    const saved = await runScenario({
+      userMessage: 'Find current forex rates using my saved source.',
+      proposedUrl: savedUrl,
+      memories: [verifiedMemory],
+    });
+    expect(saved.result.status).toBe('completed');
+    expect(saved.navigations[0]?.input).toEqual({ url: savedUrl });
+    expect(saved.seenProvenance).toContain('verified-memory');
+
+    const unverifiedMemoryUrl = 'https://unverified.example.test/forex';
+    const unverifiedMemory: Memory = {
+      id: 'unverified-forex-source',
+      content: 'Example Bank forex source.',
+      kind: 'note',
+      importance: 0.8,
+      metadata: {},
+      source: 'manual',
+      sourceUrl: unverifiedMemoryUrl,
+      evidenceIds: [],
+      createdAt: '2026-09-25T12:00:00.000Z',
+      updatedAt: '2026-09-25T12:00:00.000Z',
+    };
+    const unverified = await runScenario({
+      userMessage: 'Find forex rates using my saved source.',
+      proposedUrl: unverifiedMemoryUrl,
+      memories: [unverifiedMemory],
+    });
+    expect(unverified.navigations[0]?.input).toEqual({
+      url: browserResearchSearchUrl(deriveBrowserReadQuery('Find forex rates using my saved source.')),
+    });
+    expect(unverified.seenProvenance).toContain('duckduckgo-search');
+
+    const request = 'Find Example Bank current forex rates.';
+    const guessed = await runScenario({
+      userMessage: request,
+      proposedUrl: 'https://examplebank.test/forex',
+    });
+    const expectedSearchUrl = browserResearchSearchUrl(deriveBrowserReadQuery(request));
+    expect(guessed.result.status).toBe('completed');
+    expect(guessed.navigations[0]?.input).toEqual({ url: expectedSearchUrl });
+    expect(guessed.seenProvenance).toContain('duckduckgo-search');
+
+    const vagueMemory: Memory = {
+      id: 'vague-forex-source',
+      content: 'For forex rates, use Example Bank.',
+      kind: 'preference',
+      importance: 0.8,
+      metadata: {},
+      source: 'manual',
+      createdAt: '2026-09-25T12:00:00.000Z',
+      updatedAt: '2026-09-25T12:00:00.000Z',
+    };
+    const recalledName = await runScenario({
+      userMessage: 'Find forex rates using the bank I mentioned earlier.',
+      proposedUrl: 'https://examplebank.test/forex',
+      memories: [vagueMemory],
+    });
+    expect(recalledName.result.status).toBe('completed');
+    expect(recalledName.navigations[0]?.input).toEqual({
+      url: browserResearchSearchUrl(deriveBrowserReadQuery('Find forex rates using the bank I mentioned earlier.')),
+    });
+    expect(recalledName.seenProvenance).toContain('duckduckgo-search');
+
+    const failedMemory = await runScenario({
+      userMessage: 'Find current forex rates using my saved source.',
+      proposedUrl: savedUrl,
+      retryNavigation: 'https://guessed.example.test/alternative',
+      memories: [verifiedMemory],
+      navigationFailures: { [savedUrl]: 'The saved page is unavailable.' },
+    });
+    expect(failedMemory.result.status).toBe('completed');
+    expect(failedMemory.navigations.map(invocation => invocation.input)).toEqual([
+      { url: savedUrl },
+      { url: browserResearchSearchUrl(deriveBrowserReadQuery('Find current forex rates using my saved source.')) },
+    ]);
+
+    const redirectedUrl = 'https://bank.example.test/archive';
+    const redirectedMemory = await runScenario({
+      userMessage: 'Find current forex rates using my saved source.',
+      proposedUrl: savedUrl,
+      retryNavigation: 'https://guessed.example.test/alternative',
+      memories: [verifiedMemory],
+      redirects: { [savedUrl]: redirectedUrl },
+      pages: { [redirectedUrl]: '<html><body><main><h1>Archived source</h1><p>Archived content.</p></main></body></html>' },
+    });
+    expect(redirectedMemory.result.status).toBe('completed');
+    expect(redirectedMemory.navigations.map(invocation => invocation.input)).toEqual([
+      { url: savedUrl },
+      { url: browserResearchSearchUrl(deriveBrowserReadQuery('Find current forex rates using my saved source.')) },
+    ]);
+
+    const startUrl = 'https://source.example.test/start';
+    const observedHref = 'https://docs.example.test/rates-guide';
+    const followed = await runScenario({
+      userMessage: `Open ${startUrl} and follow the rates guide link.`,
+      proposedUrl: startUrl,
+      followLink: observedHref,
+      pages: {
+        [startUrl]: `<html><body><main><h1>Rates</h1><p>The rates guide explains the source data content.</p><a href="${observedHref}">Rates guide</a></main></body></html>`,
+        [observedHref]: '<html><body><main><h1>Rates guide</h1><p>Guide content.</p></main></body></html>',
+      },
+    });
+    expect(followed.result.status).toBe('completed');
+    expect(followed.navigations.map(invocation => invocation.input)).toEqual([
+      { url: startUrl },
+      { url: observedHref },
+    ]);
+    expect(followed.seenProvenance).toContain('page-link');
+  });
+
+  it('completes browser research after a bounded page read', async () => {
+    const guest = new MockGuestTransport({ pages: { 'https://duckduckgo.com/?q=example': '<html><body><main><h1>Demo</h1><p>Helm deterministic demo content.</p></main></body></html>' } });
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
     const runtime = new AgentRuntime({
@@ -26,19 +254,20 @@ describe('AgentRuntime', () => {
       verifier,
       decisionProvider: new ScriptedDecisionProvider([
         { type: 'action', tool: 'browser.navigate', input: { url: 'https://www.google.com/search?q=example' } },
-        { type: 'action', tool: 'browser.read', input: { mode: 'readable' } },
+        { type: 'action', tool: 'browser.read', input: { query: 'demo content' } },
         { type: 'complete' },
       ]),
     });
 
     const result = await runtime.run({
-      userMessage: 'Find the current information from the official site.',
+      userMessage: 'Find the demo content from the official site.',
       task: browserResearchTask({
         threadId: 'browser-research',
-        userMessage: 'Find the current information from the official site.',
+        userMessage: 'Find the demo content from the official site.',
       }),
       threadId: 'browser-research',
     });
+
 
     expect(result.status).toBe('completed');
     expect(tools.invocations.find(invocation => invocation.tool === 'browser.navigate')?.input).toEqual({
@@ -48,17 +277,113 @@ describe('AgentRuntime', () => {
     expect(result.finalVerification?.complete).toBe(true);
   });
 
-  it('uses explicit semantic search and targeted reads without runtime-injected extraction', async () => {
-    const guest = new MockGuestTransport();
+  it('searches first, ranks a forex table, writes its full content ref, and opens the file', async () => {
+    const userMessage = 'Fetch exchange rate data, save it in forex.txt, and open the file in the text viewer.';
+    const searchUrl = browserResearchSearchUrl(deriveBrowserReadQuery(userMessage));
+    const guessedUrl = 'https://rates.example.test/assumed-route';
+    const resultUrl = 'https://rates.example.test/daily';
+    const ratePage = `<html><body>
+      <nav>Home Deposit Current Account Saving Account</nav>
+      <h1>Foreign Exchange Rate</h1>
+      <h2>Exchange Rate of 24-September-2026 10:00 AM</h2>
+      <table><thead><tr><th>Currency</th><th>Code</th><th>Unit</th><th>Buying: Cash below Deno 50</th><th>Buying: Cash 50 and above Deno</th><th>Selling</th></tr></thead>
+        <tbody>
+          <tr><td>USD</td><td>USD</td><td>1</td><td>152.28</td><td>153.05</td><td>153.65</td></tr>
+          <tr><td>Euro</td><td>EUR</td><td>1</td><td>173.65</td><td>173.65</td><td>175.36</td></tr>
+          <tr><td>Japanese Yen</td><td>JPY</td><td>10</td><td>9.69</td><td>9.69</td><td>9.78</td></tr>
+          <tr><td>Indian Currency</td><td>INR</td><td>100</td><td>160.00</td><td>160.00</td><td>160.15</td></tr>
+        </tbody>
+      </table>
+      <footer>Footer links and unrelated banking information.</footer>
+    </body></html>`;
+    const guest = new MockGuestTransport({
+      pages: {
+        [searchUrl]: `<html><body><main><h1>Search results</h1><p>Foreign exchange rate data from the official bank.</p><a href="${resultUrl}">Daily exchange rate table</a></main></body></html>`,
+        [resultUrl]: ratePage,
+      },
+    });
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
+    let decisionIndex = 0;
+    const latestRead = (context: { previousResults: Array<{ ok: boolean; data?: unknown }> }) => {
+      const result = [...context.previousResults].reverse().find(item => (
+        item.ok && typeof item.data === 'object' && item.data !== null
+        && (item.data as { operation?: string }).operation === 'read'
+      ));
+      if (!result || typeof result.data !== 'object' || result.data === null) throw new Error('Expected an observed browser read.');
+      return result.data as { blocks?: Array<{ type: string; ref: string; links?: Array<{ href: string }> }> };
+    };
+    const runtime = new AgentRuntime({
+      guestTransport: guest,
+      toolRegistry: tools,
+      verifier,
+      decisionProvider: {
+        next: async context => {
+          const step = decisionIndex++;
+          if (step === 0) return { type: 'action', tool: 'browser.navigate', input: { url: guessedUrl } };
+          if (step === 1) return { type: 'action', tool: 'browser.read', input: {} };
+          if (step === 2) {
+            const link = latestRead(context).blocks?.flatMap(block => block.links ?? []).find(item => item.href === resultUrl);
+            if (!link) throw new Error('The search result did not expose its observed href.');
+            return { type: 'action', tool: 'browser.navigate', input: { url: link.href } };
+          }
+          if (step === 3) return { type: 'action', tool: 'browser.read', input: {} };
+          if (step === 4) {
+            const table = latestRead(context).blocks?.find(block => block.type === 'table');
+            if (!table) throw new Error('The ranked browser read did not return a table ref.');
+            return { type: 'action', tool: 'fs.write', input: { path: 'forex.txt', sourceRef: table.ref, format: 'text' } };
+          }
+          if (step === 5) return { type: 'action', tool: 'app.openFile', input: { path: 'forex.txt', application: 'text-editor' } };
+          return { type: 'complete' };
+        },
+      },
+    });
+
+    const result = await runtime.run({
+      threadId: 'forex-source-ref',
+      userMessage,
+      task: browserResearchTask({ threadId: 'forex-source-ref', userMessage }),
+    });
+
+    expect(result.status).toBe('completed');
+    const navigations = tools.invocations.filter(invocation => invocation.tool === 'browser.navigate');
+    expect(navigations.map(invocation => invocation.input)).toEqual([
+      { url: searchUrl },
+      { url: resultUrl },
+    ]);
+    const navigationResults = result.steps.filter(step => step.phase === 'act' && step.toolName === 'browser.navigate').map(step => step.toolResult?.data as { urlProvenance?: string });
+    expect(navigationResults.map(data => data.urlProvenance)).toEqual(['duckduckgo-search', 'page-link']);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.read').map(invocation => invocation.input))
+      .toEqual([{ query: 'exchange rate data' }, { query: 'exchange rate data' }]);
+    const selectedRead = tools.invocations.filter(invocation => invocation.tool === 'browser.read')[1];
+    expect((selectedRead?.result.data as { blocks: Array<{ type: string }> }).blocks[0]?.type).toBe('table');
+    const saved = guest.getFile('forex.txt') ?? '';
+    expect(saved).toContain('Exchange Rate of 24-September-2026 10:00 AM');
+    expect(saved).toContain('USD | USD | 1 | 152.28 | 153.05 | 153.65');
+    expect(saved).toContain('Euro | EUR | 1 | 173.65 | 173.65 | 175.36');
+    expect(saved).toContain('Japanese Yen | JPY | 10 | 9.69 | 9.69 | 9.78');
+    expect(saved).toContain('Indian Currency | INR | 100 | 160.00 | 160.00 | 160.15');
+    expect(saved).not.toContain('Current Account');
+    expect(saved).not.toContain('Footer links');
+    expect(guest.desktopWindows.find(window => window.focused)?.title).toContain('forex.txt');
+  });
+
+  it('uses explicit semantic search and targeted reads without runtime-injected extraction', async () => {
     const searchUrl = 'https://duckduckgo.com/?q=Neplex+Technologies';
     const resultUrl = 'https://neplextech.com/projects';
+    const guest = new MockGuestTransport({
+      pages: {
+        [searchUrl]: `<html><body><main><h1>Search results</h1><p>Neplex Technologies projects listing content.</p><a href="${resultUrl}">Neplex Technologies projects</a></main></body></html>`,
+        [resultUrl]: '<html><body><main><h1>Neplex projects</h1><p>Project details content.</p></main></body></html>',
+      },
+    });
+    const tools = createGuestToolRegistry(guest);
+    const verifier = new CriterionVerifierRegistry(guest);
     const provider = new ScriptedDecisionProvider([
       { type: 'action', tool: 'browser.navigate', input: { url: searchUrl } },
-      { type: 'action', tool: 'browser.search', input: { query: 'Neplex Technologies projects' } },
+      { type: 'action', tool: 'browser.read', input: { query: 'Neplex projects' } },
       { type: 'action', tool: 'browser.navigate', input: { url: resultUrl } },
-      { type: 'action', tool: 'browser.read', input: { mode: 'readable' } },
+      { type: 'action', tool: 'browser.read', input: { query: 'Neplex projects' } },
       { type: 'complete' },
     ]);
     const runtime = new AgentRuntime({
@@ -82,8 +407,7 @@ describe('AgentRuntime', () => {
       { url: searchUrl },
       { url: resultUrl },
     ]);
-    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.search')).toHaveLength(1);
-    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.read')).toHaveLength(1);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.read')).toHaveLength(2);
     expect(tools.invocations.filter(invocation => invocation.tool === 'browser.snapshot')).toHaveLength(0);
   });
 
@@ -92,7 +416,7 @@ describe('AgentRuntime', () => {
     const finalUrl = 'https://avatars.githubusercontent.com/u/123456?v=4';
     const guest = new MockGuestTransport({
       redirects: { [sourceUrl]: finalUrl },
-      pages: { [finalUrl]: '<html><body><p>profile image page</p></body></html>' },
+      pages: { [finalUrl]: '<html><body><main><h1>twlite GitHub profile</h1><p>Profile image page content.</p></main></body></html>' },
     });
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
@@ -403,7 +727,7 @@ describe('AgentRuntime', () => {
     const result = await runtime.run({
       id: 'follow-up',
       threadId: 'thread',
-      goal: 'Read the page after navigating to it.',
+      goal: 'Read the page after navigating to https://twlite.dev.',
       criteria: [{ type: 'browser.url', url: 'twlite.dev' }],
     });
 
@@ -429,7 +753,7 @@ describe('AgentRuntime', () => {
     const result = await runtime.run({
       id: 'page-information',
       threadId: 'thread',
-      goal: 'Visit the page and extract information from it.',
+      goal: 'Visit https://twlite.dev and extract information from the page.',
       criteria: [{ type: 'browser.url', url: 'twlite.dev' }],
     });
 
@@ -466,17 +790,21 @@ describe('AgentRuntime', () => {
     expect(result.steps.filter(step => step.phase === 'act' && step.toolName === 'browser.navigate')).toHaveLength(1);
   });
 
-  it('rejects query-based reads and unbounded reads at the tool schema boundary', async () => {
-    const guest = new MockGuestTransport();
+  it('accepts ranked reads and rejects unbounded reads at the tool schema boundary', async () => {
+    const guest = new MockGuestTransport({ pages: {
+      'https://rates.example.test/': '<html><body><nav>Home Deposit Accounts</nav><h2>Exchange Rate Data</h2><table><tr><th>Currency</th><th>Buying</th><th>Selling</th></tr><tr><td>USD</td><td>152.28</td><td>153.65</td></tr></table></body></html>',
+    } });
     const tools = createGuestToolRegistry(guest);
+    await guest.request('browser.navigate', { url: 'https://rates.example.test/' });
     const queryAsRead = await tools.execute('browser.read', { query: 'exchange rates', mode: 'readable' });
     const unboundedRead = await tools.execute('browser.read', { mode: 'document', maxChars: 100_000 });
     const searchWithoutQuery = await tools.execute('browser.search', {});
 
-    expect(queryAsRead).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+    expect(queryAsRead).toMatchObject({ ok: true, data: { pageType: 'data_table', query: 'exchange rates' } });
+    expect((queryAsRead.data as { blocks: Array<{ type: string }> }).blocks[0]?.type).toBe('table');
     expect(unboundedRead).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
     expect(searchWithoutQuery).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
-    expect(guest.browser.url).toBeUndefined();
+    expect(guest.browser.url).toBe('https://rates.example.test/');
   });
 
   it('detects repeated actions even when the observed browser state changes', async () => {

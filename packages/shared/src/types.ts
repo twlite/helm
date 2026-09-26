@@ -568,6 +568,83 @@ export interface BrowserSearchPageResult {
 
 export type BrowserReadMode = 'readable' | 'document';
 
+export type BrowserPageType =
+  | 'article'
+  | 'data_table'
+  | 'search_results'
+  | 'documentation'
+  | 'form'
+  | 'application'
+  | 'generic';
+
+export type BrowserContentType =
+  | 'text'
+  | 'heading'
+  | 'table'
+  | 'list'
+  | 'code'
+  | 'form'
+  | 'definition'
+  | 'navigation'
+  | 'search_result'
+  | 'other';
+
+export type BrowserContentFormat = 'text' | 'markdown' | 'json' | 'csv';
+
+export interface BrowserContentSource {
+  frameUrl?: string;
+  frameName?: string;
+  extractor?: 'dom' | 'aria' | 'readability';
+}
+
+export interface BrowserContentLink {
+  text: string;
+  href: string;
+}
+
+/** Complete local browser artifact retained outside the model context. */
+export interface BrowserContentBlock {
+  ref: string;
+  type: BrowserContentType;
+  text?: string;
+  heading?: string;
+  headingPath?: string[];
+  source?: BrowserContentSource;
+  role?: string;
+  importance?: number;
+  relevance?: number;
+  boilerplate?: boolean;
+  caption?: string;
+  columns?: string[];
+  rows?: string[][];
+  /** Per source cell, retain the original HTML/ARIA span information. */
+  cellSpans?: Array<Array<{ rowspan: number; colspan: number }>>;
+  rowCount?: number;
+  columnCount?: number;
+  ordered?: boolean;
+  items?: string[];
+  fields?: Array<{ label: string; type?: string; value?: string; required?: boolean }>;
+  definitions?: Array<{ term: string; definition: string }>;
+  links?: BrowserContentLink[];
+  title?: string;
+  href?: string;
+  snippet?: string;
+  language?: string;
+  truncated?: boolean;
+}
+
+/** Compact summary returned by browser.read; full blocks stay in the guest registry. */
+export interface BrowserContentSummary extends Omit<BrowserContentBlock, 'text' | 'rows' | 'items' | 'definitions' | 'fields' | 'links'> {
+  preview?: string;
+  offset?: number;
+  returnedRowCount?: number;
+  rows?: string[][];
+  items?: string[];
+  definitions?: Array<{ term: string; definition: string }>;
+  fields?: Array<{ label: string; type?: string; value?: string; required?: boolean }>;
+  links?: BrowserContentLink[];
+}
+
 export interface BrowserReadSection {
   heading?: string;
   text: string;
@@ -581,6 +658,16 @@ export interface BrowserReadResult {
   revision: number;
   mode: BrowserReadMode;
   source: 'readability' | 'main' | 'article' | 'role-main' | 'body' | 'region' | 'snapshot-regions';
+  pageType?: BrowserPageType;
+  query?: string;
+  blocks?: BrowserContentSummary[];
+  diagnostics?: {
+    blockCount: number;
+    tableCount: number;
+    selectedRefs: Array<{ ref: string; relevance?: number }>;
+    extractors: string[];
+    inaccessibleFrames?: number;
+  };
   readable: boolean;
   sections: BrowserReadSection[];
   totalChars: number;

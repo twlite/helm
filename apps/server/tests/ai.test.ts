@@ -8,7 +8,9 @@ import { createTaskState } from '../src/agent/task-state';
 import type { AgentRuntimeResult } from '../src/agent/types';
 import {
   BROWSER_RESEARCH_CRITERION_ID,
+  browserResearchSearchUrl,
   browserResearchStartUrl,
+  explicitBrowserNavigationUrls,
   isBrowserResearchRequest,
   isSearchEngineUrl,
   isSearchResultsUrl,
@@ -313,7 +315,7 @@ describe('LM Studio AI adapters', () => {
     expect(JSON.stringify(requestBody)).toContain('Who are you?');
   });
 
-  it('keeps model guesses out of compiled acceptance criteria', async () => {
+  it('keeps model guesses out of compiled acceptance criteria and preserves a user-supplied source URL', async () => {
     const provider = createOpenAICompatible({
       name: 'lmstudio',
       baseURL: 'http://localhost:1234/v1',
@@ -357,7 +359,7 @@ describe('LM Studio AI adapters', () => {
     expect(task.isConversation).toBe(false);
     expect(task.criteria).toEqual([]);
     expect(task.requirements).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'browser', target: { url: 'https://example.com' } }),
+      expect.objectContaining({ type: 'browser', target: { url: 'https://example.com/' } }),
       expect.objectContaining({ type: 'filesystem', target: expect.objectContaining({ path: '~/Desktop/result.txt' }) }),
     ]));
     expect(JSON.stringify(task)).not.toContain('invented.example');
@@ -406,7 +408,7 @@ describe('LM Studio AI adapters', () => {
     expect(isBrowserResearchRequest(userMessage)).toBe(true);
     expect(isBrowserResearchRequest("What's today's exchange rate?")).toBe(true);
     expect(isBrowserResearchRequest('Who are you?')).toBe(false);
-    expect(browserResearchStartUrl('nrb.org.np')).toBe('https://nrb.org.np');
+    expect(browserResearchStartUrl('nrb.org.np')).toBe('https://nrb.org.np/');
     await expect(planner.createTask({
       threadId: 'thread-research',
       userMessage,
@@ -435,6 +437,14 @@ describe('LM Studio AI adapters', () => {
     expect(browserResearchStartUrl('twlite.html')).toBe('https://duckduckgo.com/?q=twlite.html');
     expect(browserResearchStartUrl('file:///home/helm/release.html')).toBe('file:///home/helm/release.html');
     expect(browserResearchStartUrl('about:blank')).toBe('about:blank');
+    expect(browserResearchStartUrl('Open GitHub and inspect the oven-sh/bun repository.')).toBe(
+      browserResearchSearchUrl('Open GitHub and inspect the oven-sh/bun repository.'),
+    );
+    expect(explicitBrowserNavigationUrls('Open https://example.test/rates and use https://cdn.example.test/avatar.png as the profile picture.'))
+      .toEqual(['https://example.test/rates']);
+    expect(explicitBrowserNavigationUrls('Use https://cdn.example.test/avatar.png as the profile picture.')).toEqual([]);
+    expect(explicitBrowserNavigationUrls('Download https://example.test/exports/daily.csv'))
+      .toEqual(['https://example.test/exports/daily.csv']);
     expect(isSearchEngineUrl(duckDuckGoUrl)).toBe(true);
     expect(isSearchResultsUrl(duckDuckGoUrl)).toBe(true);
     expect(isSearchEngineUrl(googleUrl)).toBe(false);
@@ -490,8 +500,8 @@ describe('LM Studio AI adapters', () => {
       id: BROWSER_RESEARCH_CRITERION_ID,
       description: 'Read current public web information with the browser before answering.',
     });
-    expect(JSON.stringify(requestBody)).toContain('browser.search');
-    expect(JSON.stringify(requestBody)).toContain('browser.read');
+    expect(JSON.stringify(requestBody)).toContain('DuckDuckGo');
+    expect(JSON.stringify(requestBody)).toContain('browser.read({ query })');
   });
 
   it('compiles the GitHub release workflow into executable research and Desktop requirements', async () => {
@@ -542,7 +552,7 @@ describe('LM Studio AI adapters', () => {
       'repositoryName', 'latestReleaseVersion', 'releaseDate', 'releaseUrl', 'currentDate',
     ]));
     expect(requirements.find(requirement => requirement.id === 'outputFile')?.target?.factIds).not.toContain('pageContent');
-    expect(browserResearchStartUrl(userMessage)).toBe('https://github.com/oven-sh/bun');
+    expect(browserResearchStartUrl(userMessage)).toBe(browserResearchSearchUrl(userMessage));
     expect(requirements.findIndex(requirement => requirement.id === 'browserResearch')).toBeLessThan(
       requirements.findIndex(requirement => requirement.id === 'latestReleaseVersion'),
     );

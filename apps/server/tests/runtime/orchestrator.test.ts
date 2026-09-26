@@ -9,12 +9,14 @@ import type {
 } from '@helm/shared';
 
 import { AgentRuntime } from '../../src/agent/runtime';
+import { browserResearchSearchUrl } from '../../src/agent/browser-research';
 import { deterministicObjectiveAction, objectiveForRequirement, ScriptedOrchestratorProvider } from '../../src/agent/orchestrator';
 import { createTaskState, progressFingerprint, verifyTaskState } from '../../src/agent/task-state';
 import type { WorkerContext, WorkerProvider } from '../../src/agent/types';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
 import { createGuestToolRegistry } from '../../src/tools/guest-tools';
 import { DEMO_PAGE_URL, MockGuestTransport } from '../../src/tools/mock-guest-transport';
+import { deriveBrowserReadQuery } from '@helm/shared';
 
 function objective(id: string, kind: 'browser' | 'filesystem', description: string, requirementId: string) {
   return { id, kind, description, requirementIds: [requirementId], rationale: 'test objective' } as const;
@@ -410,9 +412,14 @@ describe('orchestrated agent loop', () => {
   });
 
   it('completes the GitHub release to Desktop folder and file workflow', async () => {
+    const userMessage = 'Open GitHub and go to the oven-sh/bun repository.';
+    const searchUrl = browserResearchSearchUrl(deriveBrowserReadQuery(userMessage));
+    const repositoryUrl = 'https://github.com/oven-sh/bun';
     const releaseUrl = 'https://github.com/oven-sh/bun/releases/tag/bun-v1.2.3';
     const guest = new MockGuestTransport({
       pages: {
+        [searchUrl]: `<html><body><main><h1>Search results</h1></main><article><a href="${repositoryUrl}">oven-sh/bun repository</a><p>Official repository and latest releases.</p></article></body></html>`,
+        [repositoryUrl]: `<html><body><main><h1>oven-sh/bun</h1><p>Latest release bun-v1.2.3</p><a href="${releaseUrl}">Latest release: bun-v1.2.3</a></main></body></html>`,
         [releaseUrl]: '<html><body><h1>oven-sh/bun bun-v1.2.3</h1><p>Released 2026-09-20</p></body></html>',
       },
     });
@@ -421,13 +428,17 @@ describe('orchestrated agent loop', () => {
     const fileObjective = objective('file', 'filesystem', 'Write the requested output file.', 'outputFile');
     const worker = new FunctionalWorker([
       async context => {
-        const navigate = await executeAction(context, 'browser.navigate', { url: releaseUrl }, 'navigate');
-        const extract = await executeAction(context, 'browser.read', { mode: 'readable' }, 'read');
+        const search = await executeAction(context, 'browser.navigate', { url: repositoryUrl }, 'search');
+        const results = await executeAction(context, 'browser.read', { query: 'oven-sh bun repository' }, 'search-results');
+        const repository = await executeAction(context, 'browser.navigate', { url: repositoryUrl }, 'repository');
+        const repositoryRead = await executeAction(context, 'browser.read', { query: 'oven bun latest release' }, 'repository-read');
+        const release = await executeAction(context, 'browser.navigate', { url: releaseUrl }, 'release');
+        const extract = await executeAction(context, 'browser.read', { query: 'bun release date 2026-09-20' }, 'read');
         const evidence = extract.result.evidence as { receipt?: { id: string } };
         const evidenceId = evidence.receipt?.id ?? 'missing-receipt';
         return {
           status: 'completed', worker: 'browser', objectiveId: context.objective.id,
-          actions: [navigate, extract], facts: [
+          actions: [search, results, repository, repositoryRead, release, extract], facts: [
             fact('latestReleaseVersion', 'bun-v1.2.3', evidenceId),
             fact('releaseDate', '2026-09-20', evidenceId),
             fact('releaseUrl', releaseUrl, evidenceId),
@@ -458,11 +469,17 @@ describe('orchestrated agent loop', () => {
       { type: 'objective', objective: fileObjective },
     ], worker, { maxSteps: 3 }).run({
       threadId: 'desktop-release-thread',
-      userMessage: 'Open GitHub and go to the oven-sh/bun repository.',
+      userMessage,
       task: desktopReleaseTask(),
     });
 
     expect(result.status).toBe('completed');
+    expect(guest.browserState.url).toBe(releaseUrl);
+    const navigations = result.steps.flatMap(step => step.workerResult?.actions ?? []).filter(action => action.tool === 'browser.navigate');
+    expect(navigations.slice(0, 3).map(action => action.result.data && 'url' in action.result.data ? action.result.data.url : undefined))
+      .toEqual([searchUrl, repositoryUrl, releaseUrl]);
+    expect((navigations[0]?.result.data as { urlProvenance?: string }).urlProvenance).toBe('duckduckgo-search');
+    expect((navigations[1]?.result.data as { urlProvenance?: string }).urlProvenance).toBe('search-result');
     expect(guest.getFile('~/Desktop/helm-demo/bun-release.md')).toContain('Release date: 2026-09-20');
     expect((await guest.request('fs.stat', { path: '~/Desktop/helm-demo' })).type).toBe('directory');
     expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining([
@@ -679,7 +696,7 @@ describe('orchestrated agent loop', () => {
 
   it('lets a worker correct an assumption after reading the actual page', async () => {
     const releaseUrl = 'file:///home/helm/release.html';
-    const guest = new MockGuestTransport({ initialFiles: { '/home/helm/release.html': '<html><body><h1>v9.9.9</h1></body></html>' } });
+    const guest = new MockGuestTransport({ initialFiles: { '/home/helm/release.html': '<html><body><h1>Latest release v9.9.9</h1></body></html>' } });
     const target = objective('release', 'browser', 'Determine the release version.', 'latestReleaseVersion');
     const worker = new FunctionalWorker([
       async context => {
@@ -694,7 +711,7 @@ describe('orchestrated agent loop', () => {
       },
     ]);
     const result = await runtimeFor(guest, [{ type: 'objective', objective: target }], worker, { maxSteps: 3, noProgressThreshold: 2, maxRecoveryAttempts: 2 }).run({
-      threadId: 'assumption-thread', userMessage: 'Read the release.', task: taskWithRequirements({ id: 'assumption-task', requirements: [{ id: 'latestReleaseVersion', description: 'Observe version.', type: 'fact', mandatory: true, target: { factId: 'latestReleaseVersion' } }] }),
+      threadId: 'assumption-thread', userMessage: `Read the release at ${releaseUrl}.`, task: taskWithRequirements({ id: 'assumption-task', requirements: [{ id: 'latestReleaseVersion', description: 'Observe version.', type: 'fact', mandatory: true, target: { factId: 'latestReleaseVersion' } }] }),
     });
     expect(result.status).toBe('completed');
     expect(result.run.state?.facts.find(item => item.id === 'latestReleaseVersion')).toMatchObject({ value: 'v9.9.9', origin: 'observed' });

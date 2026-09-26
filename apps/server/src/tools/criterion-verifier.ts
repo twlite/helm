@@ -17,6 +17,8 @@ export interface CriterionVerificationContext {
   guest: GuestTransport;
   observation?: EnvironmentObservation;
   lastToolResult?: ToolResult;
+  /** Most recent successful page-content read, even when a later file/viewer action is last. */
+  browserContentResult?: ToolResult;
 }
 
 export interface CriterionCheck {
@@ -239,7 +241,8 @@ export class CriterionVerifierRegistry {
 
     this.register('custom', async (criterion, context) => {
       if (criterion.id === BROWSER_RESEARCH_CRITERION_ID) {
-        const data = recordValue(context.lastToolResult?.data);
+        const browserResult = context.browserContentResult ?? context.lastToolResult;
+        const data = recordValue(browserResult?.data);
         const sectionText = Array.isArray(data?.sections)
           ? data.sections.flatMap(section => {
             const value = recordValue(section);
@@ -247,7 +250,7 @@ export class CriterionVerifierRegistry {
           }).join('\n')
           : '';
         const text = typeof data?.text === 'string' ? data.text.trim() : sectionText.trim();
-        const passed = context.lastToolResult?.ok === true && text.length > 0;
+        const passed = browserResult?.ok === true && text.length > 0;
         return {
           passed,
           message: passed

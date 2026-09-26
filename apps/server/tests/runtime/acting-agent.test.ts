@@ -134,13 +134,13 @@ describe('native acting agent', () => {
     const readProperties = readParameters.properties as Record<string, Record<string, unknown>>;
     expect(readProperties).toHaveProperty('mode');
     expect(readProperties).toHaveProperty('cursor');
-    expect(readProperties).not.toHaveProperty('query');
+    expect(readProperties).toHaveProperty('query');
     expect(readProperties.maxChars?.maximum).toBe(12_000);
     expect(readParameters.required ?? []).not.toContain('query');
     const searchParameters = searchDefinition!.function!.parameters!;
     expect(searchParameters.required).toContain('query');
 
-    const rejected = await tools.execute('browser.read', { query: 'exchange rates', mode: 'readable' });
+    const rejected = await tools.execute('browser.read', { query: 'exchange rates', mode: 'readable', unexpected: true });
     expect(rejected).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
     expect(guest.browser.url).toBeUndefined();
   });

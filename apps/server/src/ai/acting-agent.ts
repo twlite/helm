@@ -29,9 +29,10 @@ const BASE_INSTRUCTIONS = [
 ].join(' ');
 
 const PAGE_READING_INSTRUCTIONS = [
-  'Use browser.snapshot for structure and browser.read({ mode: "readable", maxChars: 12000 }) for page content; use browser.read({ ref }) for a full region, document mode as a broader fallback, and nextCursor for large pages.',
-  'Use browser.search({ query }) only for specific lookups. Zero matches mean only that the query did not match; pageReadable=true or non-empty snapshot previews prove readable content exists. Never use vague queries such as "main content", "full content", "page content", or "summary" to read a whole page.',
-  'Before saving a page summary, read non-empty content and include browser.read in requiredEffects. If reading fails, try a region or document read; never save errors or placeholders as the artifact or complete while readable content remains unread.',
+  'Use browser.read({ query }) with concise terms from the current task to retrieve locally ranked semantic blocks; without a query it returns a compact overview. Use a returned block ref with offset and limit to inspect more table rows or list items.',
+  'When saving extracted page content, choose the relevant block ref and call fs.write with sourceRef and a suitable text, markdown, json, or csv format. The guest transfers the full stored block; do not copy a preview or reconstruct the extracted data in the content argument. Use content for model-authored summaries or other new text.',
+  'For web discovery, never invent a hostname or route. Use an exact URL supplied by the user or an exact verified URL in memory; otherwise search DuckDuckGo and navigate only to a result href observed in the browser. A remembered site or organization name can guide the search query but is not a URL.',
+  'Before saving page-derived content, obtain a successful non-empty browser.read result and include browser.read in requiredEffects. If reading fails, recover with another query or a relevant ref; never save errors or placeholders as the artifact or complete while readable content remains unread.',
 ].join(' ');
 
 function instructionsFor(input: ActingAgentContext): { agent: string; finalization: string } {

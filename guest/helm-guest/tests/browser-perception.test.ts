@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { GuestRpcError } from '../src/errors';
 import { BrowserController } from '../src/browser';
+import { GuestRuntime } from '../src/runtime';
 import { GuestSandbox } from '../src/sandbox';
+import { extractAccessibleCandidate } from '../src/semantic-extraction';
 
 describe('progressive browser perception', () => {
   it('keeps snapshots bounded, finds late tables, extracts relevant passages, and rejects stale refs', async () => {
@@ -193,5 +195,170 @@ describe('progressive browser perception', () => {
       await controller.close();
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
+
+  it('ranks semantic browser blocks, exports complete content refs, and expires refs with page revisions', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-browser-content-'));
+    const workspace = join(root, 'workspace');
+    const sandbox = new GuestSandbox({ root, workspace });
+    const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
+    const runtime = new GuestRuntime({ sandbox, browser: controller });
+    const fixture = async (name: string): Promise<string> => {
+      const html = await readFile(new URL(`./fixtures/${name}`, import.meta.url), 'utf8');
+      return (await sandbox.write(`workspace/${name}`, html)).path;
+    };
+
+    try {
+      const forexPath = await fixture('forex.html');
+      await controller.navigate({ url: pathToFileURL(forexPath).href });
+      const forex = await controller.read({ query: 'exchange rate data' });
+      const table = forex.blocks?.find(block => block.type === 'table');
+      expect(forex).toMatchObject({ pageType: 'data_table', query: 'exchange rate data' });
+      expect(table).toMatchObject({
+        type: 'table',
+        headingPath: ['Foreign Exchange Rate', 'Exchange Rate of 24-September-2026 10:00 AM'],
+        columns: [
+          'Currency',
+          'Code',
+          'Unit',
+          'Buying: Cash below Deno 50',
+          'Buying: Cash 50 and above Deno',
+          'Selling',
+        ],
+        rows: [
+          ['USD', 'USD', '1', '152.28', '153.05', '153.65'],
+          ['Euro', 'EUR', '1', '173.65', '173.65', '175.36'],
+        ],
+        rowCount: 4,
+        columnCount: 6,
+      });
+      expect(forex.diagnostics?.tableCount).toBe(1);
+      expect(forex.diagnostics?.selectedRefs[0]?.ref).toBe(table?.ref);
+
+      const overview = await controller.read();
+      expect(overview.blocks?.find(block => block.type === 'navigation')).toMatchObject({
+        type: 'navigation',
+        boilerplate: true,
+        importance: 0.1,
+      });
+      const repeated = await controller.read({ query: 'currency buying selling' });
+      expect(repeated.blocks?.[0]?.ref).toBe(table?.ref);
+      const fullTable = await controller.read({ ref: table!.ref, limit: 20 });
+      expect(fullTable.blocks?.[0]?.rows).toEqual([
+        ['USD', 'USD', '1', '152.28', '153.05', '153.65'],
+        ['Euro', 'EUR', '1', '173.65', '173.65', '175.36'],
+        ['Japanese Yen', 'JPY', '10', '9.69', '9.69', '9.78'],
+        ['Indian Currency', 'INR', '100', '160.00', '160.00', '160.15'],
+      ]);
+      expect(fullTable.blocks?.[0]?.cellSpans?.[0]).toEqual([
+        { rowspan: 2, colspan: 1 },
+        { rowspan: 2, colspan: 1 },
+        { rowspan: 2, colspan: 1 },
+        { rowspan: 1, colspan: 2 },
+        { rowspan: 2, colspan: 1 },
+      ]);
+
+      const write = await runtime.dispatch({
+        id: 'forex-source-ref-write',
+        method: 'fs.write',
+        params: { path: 'workspace/forex.txt', sourceRef: table!.ref, format: 'text' },
+      });
+      expect(write).toMatchObject({
+        ok: true,
+        result: { sourceRef: table!.ref, sourceType: 'table', format: 'text', size: expect.any(Number) },
+      });
+      const saved = await sandbox.read('workspace/forex.txt');
+      expect(saved.content).toContain('Exchange Rate of 24-September-2026 10:00 AM');
+      expect(saved.content).toContain('Japanese Yen | JPY | 10 | 9.69 | 9.69 | 9.78');
+      expect(saved.content).toContain('Indian Currency | INR | 100 | 160.00 | 160.00 | 160.15');
+      expect(saved.content).not.toContain('Current Account');
+      expect(saved.content).not.toContain('Saving Account');
+
+      const csvWrite = await runtime.dispatch({
+        id: 'forex-csv-source-ref-write',
+        method: 'fs.write',
+        params: { path: 'workspace/forex.csv', sourceRef: table!.ref, format: 'csv' },
+      });
+      expect(csvWrite).toMatchObject({ ok: true, result: { sourceType: 'table', format: 'csv' } });
+      const csv = await sandbox.read('workspace/forex.csv');
+      expect(csv.content.split('\n')[0]).toBe('Currency,Code,Unit,Buying: Cash below Deno 50,Buying: Cash 50 and above Deno,Selling');
+      expect(csv.content.split('\n')).toContain('Indian Currency,INR,100,160.00,160.00,160.15');
+      expect(csv.content).not.toContain('# Foreign Exchange Rate');
+
+      const semanticPath = await fixture('semantic-pages.html');
+      await controller.navigate({ url: pathToFileURL(semanticPath).href });
+      const spanTable = await controller.read({ query: 'currency region buy sell' });
+      const extractedTables = spanTable.blocks?.filter(block => block.type === 'table') ?? [];
+      expect(spanTable.diagnostics?.tableCount).toBeGreaterThanOrEqual(2);
+      expect(extractedTables[0]).toMatchObject({
+        columns: ['Currency', 'Rate: Buy', 'Rate: Sell'],
+        rows: [['USD', '152.28', '153.65'], ['USD', 'Weekly average', 'Weekly average']],
+      });
+      expect(extractedTables[0]?.cellSpans?.[0]).toEqual([
+        { rowspan: 2, colspan: 1 },
+        { rowspan: 1, colspan: 2 },
+      ]);
+      const grid = await controller.read({ query: 'symbol price change' });
+      expect(grid.blocks?.find(block => block.type === 'table')).toMatchObject({
+        columns: ['Symbol', 'Price', 'Change'],
+        rows: [['KST', '48.20', '+1.20']],
+      });
+      const code = await controller.read({ query: 'createClient retry local options' });
+      expect(code.blocks?.some(block => block.type === 'code' && block.preview?.includes('createClient'))).toBe(true);
+      const frame = await controller.read({ query: 'Saffron-204 accessible embedded panel' });
+      expect(frame.blocks?.some(block => block.source?.frameUrl && block.preview?.includes('Saffron-204'))).toBe(true);
+
+      const articlePath = await fixture('article.html');
+      await controller.navigate({ url: pathToFileURL(articlePath).href });
+      const article = await controller.read({ query: 'Cedar-731 preservation method' });
+      expect(article.pageType).toBe('article');
+      expect(article.blocks?.some(block => block.source?.extractor === 'readability')).toBe(true);
+      expect(article.blocks?.[0]?.preview).toContain('Cedar-731');
+      expect(article.blocks?.filter(block => block.preview?.includes('Cedar-731'))).toHaveLength(1);
+      expect(article.blocks?.some(block => block.boilerplate && block.preview?.includes('Large footer'))).toBe(false);
+
+      expect(extractAccessibleCandidate([
+        { role: 'heading', name: 'Duplicate accessible heading' },
+        { role: 'heading', name: 'Duplicate accessible heading' },
+      ])).toBe('Duplicate accessible heading');
+
+      const ariaPath = await fixture('aria-only.html');
+      await controller.navigate({ url: pathToFileURL(ariaPath).href });
+      const ariaOnly = await controller.read({ query: 'Violet-588 accessible system status' });
+      expect(ariaOnly.diagnostics?.extractors).toContain('aria');
+      expect(ariaOnly.blocks?.some(block => block.source?.extractor === 'aria' && block.preview?.includes('Violet-588'))).toBe(true);
+
+      const resultsPath = await fixture('search-results.html');
+      await controller.navigate({ url: pathToFileURL(resultsPath).href });
+      const searchResults = await controller.read({ query: 'historical currency rate tables' });
+      expect(searchResults.pageType).toBe('search_results');
+      expect(searchResults.blocks?.[0]).toMatchObject({
+        type: 'search_result',
+        title: 'Exchange archive',
+        href: 'https://archive.example.test/rates',
+        snippet: expect.stringContaining('Historical currency rate tables'),
+      });
+      expect(searchResults.blocks?.find(block => block.title === 'Resolved search result')?.href)
+        .toBe('https://results.example.test/resolved');
+      const actualHrefResult = await controller.read({ query: 'observed redirect parameter' });
+      expect(actualHrefResult.blocks?.find(block => block.title === 'Observed redirect parameter')?.href)
+        .toBe('https://redirect.example.test/out?uddg=https%3A%2F%2Fwrong.example.test%2Fdestination');
+
+      const dynamicPath = await fixture('dynamic-table.html');
+      await controller.navigate({ url: pathToFileURL(dynamicPath).href });
+      const dynamic = await controller.read({ query: 'dynamic exchange rates buying selling' });
+      expect(dynamic.blocks?.[0]).toMatchObject({ type: 'table', columns: ['Currency', 'Buying', 'Selling'] });
+      expect(dynamic.blocks?.[0]?.rows).toEqual([['CHF', '170.10', '171.00']]);
+
+      const staleWrite = await runtime.dispatch({
+        id: 'stale-source-ref-write',
+        method: 'fs.write',
+        params: { path: 'workspace/stale.txt', sourceRef: table!.ref, format: 'text' },
+      });
+      expect(staleWrite).toMatchObject({ ok: false, error: { code: 'STALE_CONTENT_REF' } });
+    } finally {
+      await controller.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });

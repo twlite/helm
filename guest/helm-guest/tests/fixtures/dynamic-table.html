@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Dynamic rate panel</title></head>
+  <body>
+    <nav>Home Deposit Transfer</nav>
+    <main><p id="status">Loading current rates…</p></main>
+    <script>
+      setTimeout(() => {
+        document.querySelector('#status')?.remove();
+        const main = document.querySelector('main');
+        if (main) main.innerHTML = '<h1>Dynamic exchange rates</h1><table><thead><tr><th>Currency</th><th>Buying</th><th>Selling</th></tr></thead><tbody><tr><td>CHF</td><td>170.10</td><td>171.00</td></tr></tbody></table>';
+      }, 220);
+    </script>
+  </body>
+</html>

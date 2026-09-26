@@ -1,7 +1,10 @@
 import { posix } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import type {
+  BrowserContentBlock,
+  BrowserContentFormat,
+  BrowserContentSummary,
   BrowserRegionKind,
   BrowserReadMode,
   GuestMethod,
@@ -43,6 +46,8 @@ export interface MockGuestOptions {
   pages?: Record<string, string>;
   /** Deterministic HTTP redirect map used by browser navigation tests. */
   redirects?: Record<string, string>;
+  /** Deterministic failures for selected browser navigation URLs. */
+  navigationFailures?: Record<string, string>;
   delayMs?: number;
   downloads?: Record<string, { finalUrl?: string; filename: string; content?: string; context?: string }>;
 }
@@ -68,7 +73,13 @@ interface MockBrowserState {
   pageCount: number;
   revision: number;
   html?: string;
-  regions: Array<IndexedBrowserRegion & { tableRows?: string[][]; links?: Array<{ text: string; href: string }> }>;
+  regions: Array<IndexedBrowserRegion & { tableRows?: string[][]; links?: Array<{ text: string; href: string }>; listItem?: boolean }>;
+}
+
+interface MockContentReference {
+  block: BrowserContentBlock;
+  revision: number;
+  url: string;
 }
 
 function decodeHtml(value: string): string {
@@ -130,7 +141,7 @@ function mockRegionKind(tag: string): BrowserRegionKind {
   if (/^h[1-6]$/iu.test(tag)) return 'heading';
   if (tag === 'article') return 'article';
   if (tag === 'table') return 'table';
-  if (tag === 'ul' || tag === 'ol') return 'list';
+  if (tag === 'ul' || tag === 'ol' || tag === 'li') return 'list';
   if (tag === 'form') return 'form';
   if (tag === 'nav') return 'navigation';
   if (tag === 'footer') return 'footer';
@@ -140,8 +151,8 @@ function mockRegionKind(tag: string): BrowserRegionKind {
 }
 
 function mockRegions(html: string, revision: number) {
-  const selector = /<(main|article|section|table|ul|ol|form|nav|aside|footer|h[1-6]|p|blockquote|pre|dl)\b[^>]*>([\s\S]*?)<\/\1>/giu;
-  const regions: Array<IndexedBrowserRegion & { tableRows?: string[][]; links?: Array<{ text: string; href: string }> }> = [];
+  const selector = /<(main|article|section|table|ul|ol|li|form|nav|aside|footer|h[1-6]|p|blockquote|pre|dl)\b[^>]*>([\s\S]*?)<\/\1>/giu;
+  const regions: Array<IndexedBrowserRegion & { tableRows?: string[][]; links?: Array<{ text: string; href: string }>; listItem?: boolean }> = [];
   let heading: string | undefined;
   for (const match of html.matchAll(selector)) {
     const tag = match[1]?.toLowerCase() ?? 'text';
@@ -161,7 +172,7 @@ function mockRegions(html: string, revision: number) {
     const previewSource = kind === 'table'
       ? `${tableHeaders?.join(' ') ?? ''} ${tableRows[0]?.join(' ') ?? ''}`
       : text;
-    const region: IndexedBrowserRegion & { tableRows?: string[][]; links?: Array<{ text: string; href: string }> } = {
+    const region: IndexedBrowserRegion & { tableRows?: string[][]; links?: Array<{ text: string; href: string }>; listItem?: boolean } = {
       ref: `r${revision}-${candidateIndex + 1}`,
       kind,
       ...(kind === 'heading' ? { heading: text.slice(0, 160) } : heading ? { heading } : {}),
@@ -169,8 +180,9 @@ function mockRegions(html: string, revision: number) {
       searchText: text,
       ...(tableHeaders ? { tableHeaders } : {}),
       ...(kind === 'table' ? { rowCount: tableRows.length, columnCount: Math.max(0, ...parsedRows.map(row => row.length)), tableRows } : {}),
+      ...(tag === 'li' ? { listItem: true } : {}),
       domOrder: candidateIndex,
-      ...(kind === 'navigation' || kind === 'article' || kind === 'section' || kind === 'text'
+      ...(kind === 'navigation' || kind === 'article' || kind === 'section' || kind === 'list' || kind === 'text'
         ? { links: [...body.matchAll(/<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/giu)]
           .map(link => ({ text: readableText(link[2] ?? ''), href: link[1] ?? '' })) }
         : {}),
@@ -224,6 +236,121 @@ function boundedTable(
   };
 }
 
+function mockContentBlocks(
+  browser: MockBrowserState,
+  contentReferences: Map<string, MockContentReference>,
+  contentSessionId: string,
+): BrowserContentBlock[] {
+  const isDuckDuckGoResults = (() => {
+    try {
+      const url = new URL(browser.url ?? '');
+      return url.hostname === 'duckduckgo.com' && (url.searchParams.has('q') || url.searchParams.has('query'));
+    } catch {
+      return false;
+    }
+  })();
+  const blocks = browser.regions.map((region, index): BrowserContentBlock => {
+    const ref = `c${browser.revision}-${contentSessionId}-${index + 1}`;
+    const searchResultLink = isDuckDuckGoResults
+      && (region.kind === 'article' || (region.kind === 'list' && region.listItem))
+      && region.links?.length === 1
+      ? region.links[0]
+      : undefined;
+    if (searchResultLink) {
+      const snippet = region.searchText.replace(searchResultLink.text, ' ').replace(/\s+/gu, ' ').trim();
+      return {
+        ref,
+        type: 'search_result',
+        title: searchResultLink.text,
+        href: searchResultLink.href,
+        ...(snippet ? { snippet } : {}),
+        text: [searchResultLink.text, snippet].filter(Boolean).join('\n'),
+        source: { extractor: 'dom' },
+        role: 'search-result',
+        importance: 0.96,
+        boilerplate: false,
+      };
+    }
+    if (region.kind === 'table') {
+      return {
+        ref,
+        type: 'table',
+        ...(region.heading ? { heading: region.heading, headingPath: [region.heading] } : {}),
+        source: { extractor: 'dom' },
+        role: 'table',
+        importance: 0.98,
+        boilerplate: false,
+        columns: region.tableHeaders ?? [],
+        rows: region.tableRows ?? [],
+        rowCount: region.rowCount ?? region.tableRows?.length ?? 0,
+        columnCount: region.columnCount ?? region.tableHeaders?.length ?? 0,
+      };
+    }
+    if (region.kind === 'navigation' || region.kind === 'footer' || region.kind === 'aside') {
+      return {
+        ref,
+        type: 'navigation',
+        heading: region.heading,
+        source: { extractor: 'dom' },
+        role: region.kind,
+        importance: 0.1,
+        boilerplate: true,
+        text: region.searchText,
+        links: region.links ?? [],
+      };
+    }
+    if (region.kind === 'heading') {
+      return {
+        ref,
+        type: 'heading',
+        heading: region.heading ?? region.searchText,
+        headingPath: region.heading ? [region.heading] : [region.searchText],
+        source: { extractor: 'dom' },
+        importance: 0.7,
+        boilerplate: false,
+        text: region.searchText,
+      };
+    }
+    return {
+      ref,
+      type: region.kind === 'list' ? 'list' : region.kind === 'form' ? 'form' : 'text',
+      ...(region.heading ? { heading: region.heading, headingPath: [region.heading] } : {}),
+      source: { extractor: 'dom' },
+      importance: region.kind === 'article' ? 0.84 : region.kind === 'form' ? 0.92 : 0.68,
+      boilerplate: false,
+      text: region.searchText,
+      ...(region.links ? { links: region.links } : {}),
+      ...(region.tableRows ? { rows: region.tableRows } : {}),
+    };
+  });
+  for (const block of blocks) {
+    contentReferences.set(block.ref, { block, revision: browser.revision, url: browser.url ?? '' });
+  }
+  return blocks;
+}
+
+function mockSerializeContent(block: BrowserContentBlock, format: BrowserContentFormat): string {
+  if (format === 'json') return `${JSON.stringify(block, null, 2)}\n`;
+  if (block.type === 'table' && block.columns && block.rows) {
+    if (format === 'csv') {
+      const cell = (value: string): string => /[",\r\n]/u.test(value) ? `"${value.replace(/"/gu, '""')}"` : value;
+      return [
+        block.columns.map(cell).join(','),
+        ...block.rows.map(row => block.columns!.map((_, index) => cell(row[index] ?? '')).join(',')),
+      ].join('\n') + '\n';
+    }
+    const heading = block.headingPath?.join(' / ') || block.heading || block.caption;
+    const rows = [
+      ...(heading ? [format === 'markdown' ? `## ${heading}` : heading, ''] : []),
+      ...(format === 'markdown'
+        ? [`| ${block.columns.join(' | ')} |`, `| ${block.columns.map(() => '---').join(' | ')} |`, ...block.rows.map(row => `| ${block.columns!.map((_, index) => row[index] ?? '').join(' | ')} |`)]
+        : [block.columns.join(' | '), ...block.rows.map(row => block.columns!.map((_, index) => row[index] ?? '').join(' | '))]),
+    ];
+    return rows.join('\n') + '\n';
+  }
+  return `${block.headingPath?.join(' / ') || block.heading ? `${block.headingPath?.join(' / ') || block.heading}\n\n` : ''}${block.text ?? ''}\n`;
+}
+
 function basename(path: string): string {
   return path.slice(path.lastIndexOf('/') + 1) || path;
 }
@@ -271,9 +398,12 @@ export class MockGuestTransport implements GuestTransport {
   private readonly directories = new Set<string>([MOCK_GUEST_ROOT]);
   private readonly pages: Record<string, string>;
   private readonly redirects: Record<string, string>;
+  private readonly navigationFailures: Record<string, string>;
   private readonly delayMs: number;
   private readonly downloads: Record<string, { finalUrl?: string; filename: string; content?: string; context?: string }>;
   private readonly windows = new Map<string, WindowInfo>();
+  private readonly contentReferences = new Map<string, MockContentReference>();
+  private contentSessionId = randomUUID().replace(/-/gu, '').slice(0, 8);
   private browser: MockBrowserState = {
     loaded: false,
     text: '',
@@ -289,6 +419,7 @@ export class MockGuestTransport implements GuestTransport {
     this.delayMs = Math.max(0, options.delayMs ?? 0);
     this.pages = { ...(options.pages ?? {}) };
     this.redirects = { ...(options.redirects ?? {}) };
+    this.navigationFailures = { ...(options.navigationFailures ?? {}) };
     this.downloads = options.downloads ?? {};
     this.files.set(DEMO_PAGE_PATH, DEMO_PAGE_HTML);
     this.addDirectoryParents(DEMO_PAGE_PATH);
@@ -329,6 +460,8 @@ export class MockGuestTransport implements GuestTransport {
     this.files.set(DEMO_PAGE_PATH, DEMO_PAGE_HTML);
     this.addDirectoryParents(DEMO_PAGE_PATH);
     this.windows.clear();
+    this.contentReferences.clear();
+    this.contentSessionId = randomUUID().replace(/-/gu, '').slice(0, 8);
     this.browser = { loaded: false, text: '', elements: [], pageCount: 1, revision: 0, regions: [] };
     this.screenshotCounter = 0;
     this.screenshotId = undefined;
@@ -384,14 +517,30 @@ export class MockGuestTransport implements GuestTransport {
       case 'fs.write': {
         const input = params as GuestMethodParams['fs.write'];
         const path = normalizeGuestPath(input.path);
+        let content = input.content;
+        let sourceReference: MockContentReference | undefined;
+        if (input.sourceRef) {
+          sourceReference = this.contentReferences.get(input.sourceRef);
+          if (!sourceReference || sourceReference.revision !== this.browser.revision || sourceReference.url !== this.browser.url) {
+            throw new GuestTransportError('STALE_CONTENT_REF', `Browser content ref ${input.sourceRef} is unknown or stale. Read the current page again to obtain a fresh ref.`);
+          }
+          content = mockSerializeContent(sourceReference.block, input.format ?? 'text');
+        }
+        if (content === undefined) throw new GuestTransportError('INVALID_INPUT', 'Provide content or sourceRef.');
         const existedBefore = this.files.has(path);
         this.addDirectoryParents(path);
-        this.files.set(path, input.content);
+        this.files.set(path, content);
         return {
           path,
-          size: Buffer.byteLength(input.content, 'utf8'),
-          sha256: createHash('sha256').update(input.content, 'utf8').digest('hex'),
+          size: Buffer.byteLength(content, 'utf8'),
+          sha256: createHash('sha256').update(content, 'utf8').digest('hex'),
           existedBefore,
+          ...(input.sourceRef && sourceReference ? {
+            sourceRef: input.sourceRef,
+            sourceType: sourceReference.block.type,
+            sourceRevision: sourceReference.revision,
+            format: input.format ?? 'text',
+          } : {}),
         } as GuestMethodResult[M];
       }
       case 'fs.mkdir': {
@@ -456,6 +605,8 @@ export class MockGuestTransport implements GuestTransport {
       }
       case 'browser.navigate': {
         const requestedUrl = (params as GuestMethodParams['browser.navigate']).url;
+        const navigationFailure = this.navigationFailures[requestedUrl];
+        if (navigationFailure) throw new GuestTransportError('BROWSER_NAVIGATION_FAILED', navigationFailure);
         let url = requestedUrl;
         const visited = new Set<string>();
         while (this.redirects[url] && !visited.has(url)) {
@@ -470,6 +621,7 @@ export class MockGuestTransport implements GuestTransport {
         const document = html ?? `<html><body>Mock page for ${url}</body></html>`;
         const title = pageTitle(document, 'Mock page');
         const revision = this.browser.revision + 1;
+        this.contentReferences.clear();
         this.browser = {
           url,
           title,
@@ -534,6 +686,106 @@ export class MockGuestTransport implements GuestTransport {
         }
         const input = params as GuestMethodParams['browser.read'];
         const mode: BrowserReadMode = input.mode ?? 'readable';
+        if (input.ref?.startsWith('c')) {
+          const reference = this.contentReferences.get(input.ref);
+          if (!reference || reference.revision !== this.browser.revision || reference.url !== this.browser.url) {
+            throw new GuestTransportError('STALE_CONTENT_REF', `Browser content ref ${input.ref} is unknown or stale.`);
+          }
+          const block = reference.block.type === 'table'
+            ? { ...reference.block, rows: (reference.block.rows ?? []).slice(input.offset ?? 0, (input.offset ?? 0) + (input.limit ?? 20)) }
+            : reference.block;
+          const preview = mockSerializeContent(block, 'text').slice(0, input.maxChars ?? 4_000);
+          const summary: BrowserContentSummary = {
+            ...block,
+            preview,
+            ...(block.type === 'table' ? { rows: (block.rows ?? []).slice(0, 2) } : {}),
+          };
+          return {
+            operation: 'read',
+            url: this.browser.url,
+            title: this.browser.title ?? '',
+            revision: this.browser.revision,
+            mode,
+            source: 'region',
+            pageType: block.type === 'table' ? 'data_table' : 'generic',
+            blocks: [summary],
+            diagnostics: { blockCount: 1, tableCount: block.type === 'table' ? 1 : 0, selectedRefs: [{ ref: input.ref }], extractors: ['dom'] },
+            readable: true,
+            sections: [{ ...(block.heading ? { heading: block.heading } : {}), text: preview, ref: input.ref }],
+            totalChars: JSON.stringify(reference.block).length,
+            returnedChars: preview.length,
+            truncated: block.type === 'table' && (input.offset ?? 0) + (block.rows?.length ?? 0) < (block.rowCount ?? 0),
+          } as GuestMethodResult[M];
+        }
+        if (input.query) {
+          const blocks = mockContentBlocks(this.browser, this.contentReferences, this.contentSessionId);
+          const indexed = blocks.map((block, domOrder): IndexedBrowserRegion => ({
+            ref: block.ref,
+            kind: block.type === 'table' ? 'table' : block.type === 'navigation' ? 'navigation' : block.type === 'heading' ? 'heading' : 'text',
+            ...(block.heading ? { heading: block.heading } : {}),
+            ...(block.headingPath ? { headingPath: block.headingPath } : {}),
+            ...(block.type === 'table' ? { tableHeaders: block.columns ?? [] } : {}),
+            ...(block.boilerplate ? { boilerplate: true } : {}),
+            ...(block.importance === undefined ? {} : { importance: block.importance }),
+            searchText: [block.text, ...(block.columns ?? []), ...(block.rows ?? []).flat()].filter(Boolean).join(' '),
+            ...(block.rowCount === undefined ? {} : { rowCount: block.rowCount }),
+            ...(block.columnCount === undefined ? {} : { columnCount: block.columnCount }),
+            preview: (block.text ?? block.rows?.[0]?.join(' ') ?? '').slice(0, 180),
+            domOrder,
+          }));
+          const ranked = rankPageRegions({ query: input.query, regions: indexed, maxResults: 8 });
+          const blocksByRef = new Map(blocks.map(block => [block.ref, block]));
+          const summaries: BrowserContentSummary[] = ranked.results.flatMap(result => {
+            const block = blocksByRef.get(result.ref);
+            if (!block) return [];
+            const preview = block.type === 'table'
+              ? [block.headingPath?.join(' / ') || block.heading, block.columns?.join(' | '), ...(block.rows ?? []).slice(0, 2).map(row => row.join(' | '))].filter(Boolean).join('\n')
+              : block.text ?? '';
+            return [{
+              ref: block.ref,
+              type: block.type,
+              ...(block.heading ? { heading: block.heading } : {}),
+              ...(block.headingPath ? { headingPath: block.headingPath } : {}),
+              ...(block.source ? { source: block.source } : {}),
+              ...(block.importance === undefined ? {} : { importance: block.importance }),
+              ...(block.boilerplate === undefined ? {} : { boilerplate: block.boilerplate }),
+              ...(block.columns ? { columns: block.columns } : {}),
+              ...(block.type === 'table' ? { rows: (block.rows ?? []).slice(0, 2), rowCount: block.rowCount, columnCount: block.columnCount } : {}),
+              ...(block.links ? { links: block.links.slice(0, 8) } : {}),
+              ...(block.title ? { title: block.title } : {}),
+              ...(block.href ? { href: block.href } : {}),
+              ...(block.snippet ? { snippet: block.snippet } : {}),
+              relevance: result.score,
+              preview,
+            }];
+          });
+          const pageType = blocks.some(block => block.type === 'search_result') ? 'search_results'
+            : blocks.some(block => block.type === 'table') ? 'data_table'
+              : blocks.some(block => block.type === 'form') ? 'form' : 'generic';
+          const sections = summaries.map(block => ({ ...(block.heading ? { heading: block.heading } : {}), text: block.preview ?? '', ref: block.ref }));
+          return {
+            operation: 'read',
+            url: this.browser.url,
+            title: this.browser.title ?? '',
+            revision: this.browser.revision,
+            mode,
+            source: 'body',
+            pageType,
+            query: input.query,
+            blocks: summaries,
+            diagnostics: {
+              blockCount: blocks.length,
+              tableCount: blocks.filter(block => block.type === 'table').length,
+              selectedRefs: summaries.map(block => ({ ref: block.ref, relevance: block.relevance })),
+              extractors: ['dom'],
+            },
+            readable: blocks.length > 0,
+            sections,
+            totalChars: blocks.reduce((sum, block) => sum + JSON.stringify(block).length, 0),
+            returnedChars: JSON.stringify(summaries).length,
+            truncated: summaries.length < blocks.length,
+          } as GuestMethodResult[M];
+        }
         const match = input.ref?.match(/^r(\d+)-([1-9]\d*)$/u);
         const region = input.ref === undefined
           ? undefined
@@ -704,6 +956,7 @@ export class MockGuestTransport implements GuestTransport {
           throw new GuestTransportError('STALE_ELEMENT_REF', `Browser element ref is no longer valid: ${input.ref}`);
         }
         this.browser.revision += 1;
+        this.contentReferences.clear();
         this.browser.regions = mockRegions(this.browser.html ?? '', this.browser.revision);
         return { ...input, clicked: true } as GuestMethodResult[M];
       }
@@ -716,6 +969,7 @@ export class MockGuestTransport implements GuestTransport {
         const element = this.browser.elements[Number(elementRef[2]) - 1];
         if (element) element.value = input.text;
         this.browser.revision += 1;
+        this.contentReferences.clear();
         this.browser.regions = mockRegions(this.browser.html ?? '', this.browser.revision);
         return { ref: input.ref, text: input.text, typed: true } as GuestMethodResult[M];
       }

@@ -103,11 +103,25 @@ export class GuestRuntime {
         };
       case "fs.read":
         return this.sandbox.read(requiredString(params, "path", { maxLength: 16_384 }));
-      case "fs.write":
+      case "fs.write": {
+        const path = requiredString(params, "path", { maxLength: 16_384 });
+        const sourceRef = optionalString(params, "sourceRef", { maxLength: 64 });
+        if (sourceRef !== undefined) {
+          const format = enumValue(params, "format", ["text", "markdown", "json", "csv"] as const, "text");
+          const serialized = await this.browser.serializeContentRef(sourceRef, format);
+          return {
+            ...await this.sandbox.write(path, serialized.content),
+            sourceRef: serialized.sourceRef,
+            sourceType: serialized.sourceType,
+            sourceRevision: serialized.sourceRevision,
+            format: serialized.format,
+          };
+        }
         return this.sandbox.write(
-          requiredString(params, "path", { maxLength: 16_384 }),
+          path,
           requiredString(params, "content", { maxLength: 50 * 1024 * 1024 }),
         );
+      }
       case "fs.mkdir":
         return this.sandbox.mkdir(requiredString(params, "path", { maxLength: 16_384 }));
       case "fs.exists":
@@ -144,13 +158,19 @@ export class GuestRuntime {
         })());
       case "browser.read": {
         const mode = enumValue(params, "mode", ["readable", "document"] as const, "readable");
+        const query = optionalString(params, "query", { maxLength: 1_000 });
         const ref = optionalString(params, "ref", { maxLength: 64 });
         const maxChars = optionalInteger(params, "maxChars", { min: 1, max: 12_000 });
+        const offset = optionalInteger(params, "offset", { min: 0, max: 1_000_000 });
+        const limit = optionalInteger(params, "limit", { min: 1, max: 100 });
         const cursor = optionalString(params, "cursor", { maxLength: 2_048 });
         return this.browser.read({
           mode,
+          ...(query === undefined ? {} : { query }),
           ...(ref === undefined ? {} : { ref }),
           ...(maxChars === undefined ? {} : { maxChars }),
+          ...(offset === undefined ? {} : { offset }),
+          ...(limit === undefined ? {} : { limit }),
           ...(cursor === undefined ? {} : { cursor }),
         });
       }

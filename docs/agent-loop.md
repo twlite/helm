@@ -42,10 +42,9 @@ There is no unrestricted host shell tool.
 The prompt is intentionally short. It establishes Helm's role, says to use
 actual results and not claim unverified effects, and tells the model how to
 finish. It does not prescribe browser sequences, artifact formats, or domain
-facts. For browser tasks, it recommends a bounded outline, local semantic
-region search, and region inspection. Targeted text extraction requires a
-query and has a fixed 8,000-character maximum; the model has no full-page
-extraction mode.
+facts. Browser reads accept a task-derived or model-supplied query and return
+ranked semantic block summaries with compact previews. Full blocks remain in a
+revision-bound guest registry and can be fetched through their content refs.
 
 ## Completion and concrete evidence
 
@@ -88,18 +87,28 @@ proximity signals, and semantic region kinds. Nested matches with substantially
 overlapping query terms are deduplicated in favor of the more specific useful
 region.
 
-Tables are returned as structured columns and rows. Inspection defaults to an
-8,000-character response and 50 rows; `offset` and `limit` paginate larger
-tables, which report total row count, returned row count, offset, and
-truncation. `browser.read` returns bounded structured page sections without a
-query, supports current snapshot refs, and returns a cursor when more content
-remains. `browser.search` requires a specific query and reports `pageReadable`
-separately from query matches. Zero search matches never mean that the page is
-unreadable.
+Tables are first-class blocks with caption, heading ancestry, columns, rows,
+and span metadata where available. Query results contain a small row preview;
+`browser.read({ref, offset, limit})` retrieves more rows. `fs.write` can accept
+`sourceRef` and a deterministic text, Markdown, JSON, or CSV format, so the
+guest transfers the selected full block without routing all its contents
+through the model. Ordinary `content` writes remain available. `browser.search`
+continues to search the existing semantic-region index and reports
+`pageReadable` separately from query matches.
 
-Semantic region and element refs are tied to the observed DOM revision. A
-navigation or meaningful DOM mutation expires them, and the guest returns a
-stale-ref error so the model can inspect the current page again.
+Semantic region, element, and content refs are tied to the observed page
+revision. Navigation or meaningful DOM changes expire them, and the guest
+returns a stale-ref error so the model can inspect the current page again.
+Extraction combines semantic DOM, HTML/ARIA tables, accessible frames, and an
+ARIA snapshot fallback. Readability is used locally as an additional candidate
+for prose-heavy pages. Page settling uses bounded DOM readiness and a short
+content-stability check rather than waiting indefinitely for network idle.
+
+Browser navigation accepts a user-supplied destination, an exact verified
+memory URL, or a URL observed in browser results or page links. If the model
+proposes an unobserved destination, the runtime starts a DuckDuckGo search
+using the current task's terms. The model must select a destination from the
+visible result links; URLs are not inferred from organization names.
 
 ## Context budgeting and compaction
 

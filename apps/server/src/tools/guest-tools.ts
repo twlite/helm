@@ -12,7 +12,7 @@ import { ToolRegistry, type ToolRegistryOptions } from './tool-registry';
 const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'guest.handshake': 'Check the guest protocol and capabilities.',
   'fs.read': 'Read a UTF-8 file inside the allowed guest filesystem root.',
-  'fs.write': 'Write a UTF-8 file inside the allowed guest filesystem root.',
+  'fs.write': 'Write a UTF-8 file inside the allowed guest filesystem root. Use content for model-generated text or sourceRef plus an optional format to copy a full browser artifact deterministically.',
   'fs.mkdir': 'Create a directory inside the allowed guest filesystem root.',
   'fs.exists': 'Check whether a guest filesystem path exists.',
   'fs.list': 'List immediate entries inside an allowed guest directory.',
@@ -20,7 +20,7 @@ const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'browser.navigate': 'Navigate the visible guest browser to a URL.',
   'browser.getState': 'Read the visible browser URL, title, loading state, page count, and current DOM revision without reading page text.',
   'browser.snapshot': 'Return a bounded semantic outline of the current page and its visible interactive elements.',
-  'browser.read': 'Read bounded, structured readable page content or the complete content of a current semantic region ref. Use cursors to continue large pages. This operation does not accept a query.',
+  'browser.read': 'Read a compact semantic overview or retrieve locally ranked page blocks for a query. Results include typed blocks and current-page content refs; use a block ref with fs.write sourceRef to transfer complete extracted content without copying it into tool arguments. Use a content ref with offset and limit to inspect more rows or items.',
   'browser.search': 'Search page content for a specific query and return bounded matching snippets and refs. Zero matches describe only this query; pageReadable reports whether the page has readable content.',
   'browser.inspectRegion': 'Inspect one current page region as bounded text, structured table rows, or local links. Large tables support offset and limit pagination.',
   'browser.download': 'Start and record a browser download from a semantic element or URL.',

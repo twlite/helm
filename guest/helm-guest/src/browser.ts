@@ -1,7 +1,12 @@
 import { GuestRpcError } from "./errors";
 import type { GuestSandbox } from "./sandbox";
 import { normalizeBrowserUrl } from "../../../packages/shared/src/browser-url";
+import { deriveBrowserReadQuery, rankPageRegions, type IndexedBrowserRegion } from "../../../packages/shared/src/browser-perception";
 import type {
+  BrowserContentBlock,
+  BrowserContentFormat,
+  BrowserContentSummary,
+  BrowserPageType,
   BrowserPageRegion,
   BrowserReadMode,
   BrowserReadResult,
@@ -11,10 +16,8 @@ import type {
   BrowserSearchPageResult,
   BrowserSnapshot as SharedBrowserSnapshot,
 } from "../../../packages/shared/src/types";
-import {
-  rankPageRegions,
-  type IndexedBrowserRegion,
-} from "../../../packages/shared/src/browser-perception";
+import { Readability } from "@mozilla/readability";
+import { extractAccessibleCandidate, extractSemanticBrowserBlocks } from "./semantic-extraction";
 
 type WaitUntil = "commit" | "domcontentloaded" | "load" | "networkidle";
 
@@ -27,7 +30,12 @@ interface PlaywrightLocator {
     pageFunction: (elements: readonly unknown[], arg?: unknown) => T,
     arg?: unknown,
   ): Promise<T>;
+  ariaSnapshotJSON?(options?: { mode?: "ai" | "default"; depth?: number }): Promise<unknown>;
   getAttribute(name: string): Promise<string | null>;
+}
+
+interface PlaywrightElementHandle {
+  evaluate<T>(pageFunction: (element: unknown) => T): Promise<T>;
 }
 
 interface PlaywrightDownload {
@@ -44,12 +52,21 @@ interface PlaywrightPage {
   title(): Promise<string>;
   url(): string;
   locator(selector: string): PlaywrightLocator;
+  frames(): PlaywrightFrame[];
+  addScriptTag(options: { content: string }): Promise<PlaywrightElementHandle>;
   mouse: { click(x: number, y: number): Promise<void> };
   waitForEvent(event: "download", options?: { timeout?: number }): Promise<PlaywrightDownload>;
   on(event: string, listener: (...args: unknown[]) => void): void;
   waitForLoadState(state?: WaitUntil, options?: { timeout?: number }): Promise<void>;
   close(): Promise<void>;
   isClosed?(): boolean;
+}
+
+interface PlaywrightFrame {
+  url(): string;
+  name(): string;
+  locator(selector: string): PlaywrightLocator;
+  addScriptTag(options: { content: string }): Promise<PlaywrightElementHandle>;
 }
 
 interface PlaywrightContext {
@@ -124,7 +141,8 @@ const DEFAULT_OUTLINE_REGIONS = 60;
 const MAX_INTERACTIVE_ELEMENTS = 80;
 const MAX_SEARCH_INDEX_CHARS = 1_024_000;
 const MAX_SEARCH_REGION_CHARS = 800;
-const DEFAULT_READ_CHARS = 12_000;
+const DEFAULT_READ_CHARS = 4_000;
+const DEFAULT_BLOCK_PREVIEW_CHARS = 520;
 const DEFAULT_REGION_CHARS = 8_000;
 const DEFAULT_TABLE_ROWS = 50;
 const BROWSER_OPERATION_TIMEOUT_MS = 10_000;
@@ -137,6 +155,20 @@ interface ExtractedBrowserContent {
   sections: BrowserReadSection[];
   totalChars: number;
   sourceTruncated: boolean;
+}
+
+interface IndexedSemanticContent {
+  blocks: BrowserContentBlock[];
+  pageType: BrowserPageType;
+  sourceTruncated: boolean;
+  extractors: string[];
+  inaccessibleFrames: number;
+}
+
+interface SerializableContentReference {
+  block: BrowserContentBlock;
+  revision: number;
+  url: string;
 }
 
 interface ReadCursorPosition {
@@ -152,6 +184,10 @@ function readScope(url: string, ref: string | undefined, mode: BrowserReadMode):
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(36);
+}
+
+function createContentSessionId(): string {
+  return crypto.randomUUID().replace(/-/gu, '').slice(0, 8);
 }
 
 function makeReadCursor(input: {
@@ -511,14 +547,115 @@ function isClosedBrowserError(error: unknown): boolean {
   );
 }
 
+function readabilityInjectionSource(): string {
+  const valueSource = (value: unknown): string => {
+    if (typeof value === "function") return value.toString();
+    if (value instanceof RegExp) return `new RegExp(${JSON.stringify(value.source)}, ${JSON.stringify(value.flags)})`;
+    if (Array.isArray(value)) return `[${value.map(valueSource).join(", ")}]`;
+    if (typeof value === "object" && value !== null) {
+      return `{${Object.entries(value).map(([key, nested]) => `${JSON.stringify(key)}: ${valueSource(nested)}`).join(", ")}}`;
+    }
+    if (value === undefined) return "undefined";
+    return JSON.stringify(value) ?? "null";
+  };
+  const members = Object.entries(Object.getOwnPropertyDescriptors(Readability.prototype))
+    .filter(([name, descriptor]) => name !== "constructor" && "value" in descriptor)
+    .map(([name, descriptor]) => typeof descriptor.value === "function"
+      ? descriptor.value.toString()
+      : `${JSON.stringify(name)}: ${valueSource(descriptor.value)}`)
+    .join(",\n");
+  return `(() => {\nconst Readability = ${Readability.toString()};\nReadability.prototype = {\n${members}\n};\nwindow.__helmReadability = Readability;\n})();`;
+}
+
+function tableCsvCell(value: string): string {
+  return /[",\r\n]/u.test(value) ? `"${value.replace(/"/gu, '""')}"` : value;
+}
+
+function blockText(block: BrowserContentBlock): string {
+  if (block.type === "table") {
+    const heading = block.headingPath?.join(" / ") || block.heading || block.caption;
+    return [
+      heading,
+      block.columns?.join(" | "),
+      ...(block.rows ?? []).map(row => row.join(" | ")),
+    ].filter(Boolean).join("\n");
+  }
+  if (block.type === "list") return (block.items ?? []).map((item, index) => (
+    block.ordered ? `${index + 1}. ${item}` : `- ${item}`
+  )).join("\n");
+  if (block.type === "definition") return (block.definitions ?? [])
+    .map(item => `${item.term}: ${item.definition}`).join("\n");
+  if (block.type === "form") return (block.fields ?? [])
+    .map(field => `${field.label || field.type || "Field"}${field.required ? " (required)" : ""}${field.value ? `: ${field.value}` : ""}`).join("\n");
+  if (block.type === "search_result") {
+    return [block.title, block.href, block.snippet].filter(Boolean).join("\n");
+  }
+  if (block.type === "navigation") {
+    const links = (block.links ?? []).map(link => `${link.text || link.href}${link.text ? ` (${link.href})` : ""}`);
+    return [block.text, ...links].filter(Boolean).join("\n");
+  }
+  return block.text ?? "";
+}
+
+function serializeBrowserContentBlock(block: BrowserContentBlock, format: BrowserContentFormat): string {
+  if (format === "json") return `${JSON.stringify({
+    type: block.type,
+    heading: block.heading,
+    headingPath: block.headingPath,
+    ...(block.caption ? { caption: block.caption } : {}),
+    ...(block.columns ? { columns: block.columns } : {}),
+    ...(block.rows ? { rows: block.rows } : {}),
+    ...(block.items ? { items: block.items } : {}),
+    ...(block.fields ? { fields: block.fields } : {}),
+    ...(block.definitions ? { definitions: block.definitions } : {}),
+    ...(block.links ? { links: block.links } : {}),
+    ...(block.title ? { title: block.title } : {}),
+    ...(block.href ? { href: block.href } : {}),
+    ...(block.snippet ? { snippet: block.snippet } : {}),
+    ...(block.language ? { language: block.language } : {}),
+    ...(block.text ? { text: block.text } : {}),
+    ...(block.cellSpans ? { cellSpans: block.cellSpans } : {}),
+  }, null, 2)}\n`;
+  if (format === "csv") {
+    if (block.type !== "table" || !block.columns || !block.rows) {
+      throw new GuestRpcError("UNSUPPORTED_CONTENT_FORMAT", "CSV export requires a table content ref.", { httpStatus: 400 });
+    }
+    return [
+      block.columns.map(tableCsvCell).join(","),
+      ...block.rows.map(row => block.columns!.map((_, index) => tableCsvCell(row[index] ?? "")).join(",")),
+    ].join("\n") + "\n";
+  }
+  if (format === "markdown" && block.type === "table" && block.columns && block.rows) {
+    const heading = block.headingPath?.join(" / ") || block.heading || block.caption;
+    const escape = (value: string): string => value.replace(/\\/gu, "\\\\").replace(/\|/gu, "\\|").replace(/\r?\n/gu, " ");
+    return [
+      ...(heading ? [`## ${heading}`, ""] : []),
+      `| ${block.columns.map(escape).join(" | ")} |`,
+      `| ${block.columns.map(() => "---").join(" | ")} |`,
+      ...block.rows.map(row => `| ${block.columns!.map((_, index) => escape(row[index] ?? "")).join(" | ")} |`),
+    ].join("\n") + "\n";
+  }
+  if (format === "markdown") {
+    const heading = block.headingPath?.join(" / ") || block.heading;
+    const text = blockText(block);
+    return `${heading ? `## ${heading}\n\n` : ""}${text}\n`;
+  }
+  const heading = block.type === "heading" ? undefined : block.headingPath?.join(" / ") || block.heading;
+  return `${heading ? `${heading}\n\n` : ""}${blockText(block)}\n`;
+}
+
 export class BrowserController {
+  private readonly contentSessionId = createContentSessionId();
   private context: PlaywrightContext | undefined;
   private page: PlaywrightPage | undefined;
   private loading = false;
   private referenceRevision = 0;
   private referenceUrl = "";
   private lastDomMutationCount: number | undefined;
+  private lastFrameMutationSignature: string | undefined;
   private references = new Map<string, BrowserReference>();
+  private contentReferences = new Map<string, SerializableContentReference>();
+  private readabilitySource = readabilityInjectionSource();
   private outlineCache: { revision: number; records: PageRegionRecord[]; regionCount: number; truncated: boolean } | undefined;
   private searchCache: { revision: number; query: string; records: PageRegionRecord[]; regionCount: number; truncated: boolean } | undefined;
 
@@ -780,8 +917,11 @@ export class BrowserController {
 
   async read(input: {
     mode?: BrowserReadMode;
+    query?: string;
     ref?: string;
     maxChars?: number;
+    offset?: number;
+    limit?: number;
     cursor?: string;
   } = {}): Promise<BrowserReadResult> {
     return this.withWatchdog(() => this.readInternal(input), "browser.read");
@@ -789,8 +929,36 @@ export class BrowserController {
 
   private async readInternal(input: {
     mode?: BrowserReadMode;
+    query?: string;
     ref?: string;
     maxChars?: number;
+    offset?: number;
+    limit?: number;
+    cursor?: string;
+  }, attempt = 0): Promise<BrowserReadResult> {
+    if (input.ref?.startsWith("c")) return this.readContentReference({
+      ref: input.ref,
+      ...(input.mode === undefined ? {} : { mode: input.mode }),
+      ...(input.maxChars === undefined ? {} : { maxChars: input.maxChars }),
+      ...(input.offset === undefined ? {} : { offset: input.offset }),
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+    });
+    // Explicitly bounded/cursor reads retain the original text-section API.
+    // A normal browser.read() call now returns a compact typed overview.
+    if (input.ref?.startsWith("r") || input.cursor !== undefined
+      || (input.query === undefined && input.maxChars !== undefined)) {
+      return this.readLegacyInternal(input, attempt);
+    }
+    return this.readSemanticContent(input, attempt);
+  }
+
+  private async readLegacyInternal(input: {
+    mode?: BrowserReadMode;
+    query?: string;
+    ref?: string;
+    maxChars?: number;
+    offset?: number;
+    limit?: number;
     cursor?: string;
   }, attempt = 0): Promise<BrowserReadResult> {
     const page = await this.ensurePage();
@@ -861,7 +1029,7 @@ export class BrowserController {
 
     const stableRevision = await this.refreshDomRevision(page);
     if (stableRevision !== revision || page.url() !== url) {
-      if (attempt < 2 && input.cursor === undefined) return this.readInternal(input, attempt + 1);
+      if (attempt < 2 && input.cursor === undefined) return this.readLegacyInternal(input, attempt + 1);
       throw new GuestRpcError('STALE_BROWSER_CURSOR', 'The page changed while its content was being read.', { httpStatus: 409 });
     }
     if (reference && reference.revision !== revision) {
@@ -891,6 +1059,398 @@ export class BrowserController {
       truncated: paged.nextCursor !== undefined || extracted.sourceTruncated,
       ...(paged.nextCursor ? { nextCursor: paged.nextCursor } : {}),
     };
+  }
+
+  private async readSemanticContent(input: {
+    mode?: BrowserReadMode;
+    query?: string;
+    ref?: string;
+    maxChars?: number;
+    offset?: number;
+    limit?: number;
+    cursor?: string;
+  }, attempt = 0): Promise<BrowserReadResult> {
+    const page = await this.ensurePage();
+    await this.waitForReadableStability(page);
+    await this.installReadabilityScript(page);
+    await this.refreshDomRevision(page);
+    const revision = this.referenceRevision;
+    const url = page.url();
+    const title = await this.readTitle(page);
+    const maxChars = Math.max(800, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
+    const query = input.query?.trim() || undefined;
+    const extracted = await this.extractSemanticContent(page, url);
+    const indexed = extracted.blocks.map((block, domOrder): IndexedBrowserRegion => ({
+      ref: block.ref,
+      kind: this.contentRegionKind(block.type),
+      ...(block.heading ? { heading: block.heading } : {}),
+      ...(block.headingPath ? { headingPath: block.headingPath } : {}),
+      ...(block.type === "table" ? { tableHeaders: block.columns ?? [] } : {}),
+      ...(block.type === "form" ? { formLabels: (block.fields ?? []).map(field => field.label) } : {}),
+      ...(block.importance === undefined ? {} : { importance: block.importance }),
+      ...(block.boilerplate === undefined ? {} : { boilerplate: block.boilerplate }),
+      searchText: [block.text, block.caption, block.title, block.snippet, ...(block.columns ?? []), ...(block.rows ?? []).flat()]
+        .filter(Boolean).join(" "),
+      ...(block.type === "table" && block.rowCount !== undefined ? { rowCount: block.rowCount } : {}),
+      ...(block.type === "table" && block.columnCount !== undefined ? { columnCount: block.columnCount } : {}),
+      ...(block.text ? { preview: block.text.slice(0, 240) } : block.snippet ? { preview: block.snippet.slice(0, 240) } : {}),
+      domOrder,
+    }));
+    let selected: BrowserContentBlock[];
+    if (query) {
+      const ranked = rankPageRegions({ query, regions: indexed, maxResults: 10 });
+      selected = ranked.results.flatMap(result => {
+        const block = this.contentReferences.get(result.ref)?.block;
+        if (!block) return [];
+        return [{ ...block, relevance: result.score }];
+      });
+    } else {
+      const substantive = extracted.blocks.filter(block => !block.boilerplate);
+      const boilerplate = extracted.blocks.filter(block => block.boilerplate);
+      selected = [...substantive].sort((left, right) => (
+        (right.importance ?? 0) - (left.importance ?? 0)
+        || this.contentTypePriority(left.type) - this.contentTypePriority(right.type)
+        || left.ref.localeCompare(right.ref)
+      )).slice(0, 7);
+      const chrome = boilerplate[0];
+      if (chrome) selected.push(chrome);
+    }
+
+    const summaries: BrowserContentSummary[] = [];
+    let returnedChars = 0;
+    const previewChars = Math.max(160, Math.min(DEFAULT_BLOCK_PREVIEW_CHARS, Math.floor(maxChars / Math.max(1, Math.min(6, selected.length)))));
+    for (const block of selected) {
+      const summary = this.summarizeContentBlock(block, previewChars);
+      const cost = JSON.stringify(summary).length;
+      if (summaries.length > 0 && returnedChars + cost > maxChars) break;
+      summaries.push(summary);
+      returnedChars += cost;
+    }
+    const sections = summaries.map(summary => ({
+      ...(summary.heading ? { heading: summary.heading } : {}),
+      text: summary.preview ?? "",
+      ref: summary.ref,
+    }));
+    const stableRevision = await this.refreshDomRevision(page);
+    if (stableRevision !== revision || page.url() !== url) {
+      if (attempt < 2) return this.readSemanticContent(input, attempt + 1);
+      throw new GuestRpcError("BROWSER_DOM_UNSTABLE", "The page changed repeatedly while semantic content was being read.", { httpStatus: 409 });
+    }
+    return {
+      operation: "read",
+      url,
+      title,
+      revision,
+      mode: input.mode ?? "readable",
+      source: "body",
+      pageType: extracted.pageType,
+      ...(query ? { query } : {}),
+      blocks: summaries,
+      diagnostics: {
+        blockCount: extracted.blocks.length,
+        tableCount: extracted.blocks.filter(block => block.type === "table").length,
+        selectedRefs: summaries.map(summary => ({ ref: summary.ref, ...(summary.relevance === undefined ? {} : { relevance: summary.relevance }) })),
+        extractors: extracted.extractors,
+        inaccessibleFrames: extracted.inaccessibleFrames,
+      },
+      readable: extracted.blocks.some(block => Boolean(block.text?.trim() || block.rows?.length || block.items?.length)),
+      sections,
+      totalChars: extracted.blocks.reduce((sum, block) => sum + this.contentBlockSize(block), 0),
+      returnedChars,
+      truncated: extracted.sourceTruncated || summaries.length < selected.length || extracted.blocks.length > summaries.length,
+    };
+  }
+
+  private async readContentReference(input: {
+    ref: string;
+    mode?: BrowserReadMode;
+    maxChars?: number;
+    offset?: number;
+    limit?: number;
+  }): Promise<BrowserReadResult> {
+    const page = await this.ensurePage();
+    const reference = await this.resolveContentReference(input.ref);
+    const maxChars = Math.max(800, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
+    const offset = Math.max(0, Math.trunc(input.offset ?? 0));
+    const limit = Math.max(1, Math.min(100, Math.trunc(input.limit ?? 20)));
+    const full = reference.block;
+    let block: BrowserContentBlock = full;
+    if (full.type === "table") {
+      const rows = full.rows ?? [];
+      block = {
+        ...full,
+        rows: rows.slice(offset, offset + limit),
+        ...(full.cellSpans ? { cellSpans: full.cellSpans.slice(offset, offset + limit) } : {}),
+      };
+    } else if (full.type === "list") {
+      const items = full.items ?? [];
+      block = { ...full, items: items.slice(offset, offset + limit) };
+    }
+    const summary = this.summarizeContentBlock(block, maxChars);
+    if (block.type === "table") {
+      const rows: string[][] = [];
+      let rowChars = 0;
+      for (const row of block.rows ?? []) {
+        const nextChars = JSON.stringify(row).length;
+        if (rows.length > 0 && rowChars + nextChars > maxChars) break;
+        rows.push(row);
+        rowChars += nextChars;
+      }
+      summary.rows = rows;
+      summary.offset = offset;
+      summary.returnedRowCount = rows.length;
+    }
+    const preview = summary.preview ?? "";
+    const stableRevision = await this.refreshDomRevision(page);
+    if (stableRevision !== reference.revision || page.url() !== reference.url) {
+      throw new GuestRpcError("STALE_CONTENT_REF", `Browser content ref ${input.ref} is no longer available.`, { httpStatus: 409 });
+    }
+    return {
+      operation: "read",
+      url: reference.url,
+      title: await this.readTitle(page),
+      revision: reference.revision,
+      mode: input.mode ?? "readable",
+      source: "region",
+      pageType: full.type === "table" ? "data_table" : "generic",
+      blocks: [summary],
+      diagnostics: {
+        blockCount: 1,
+        tableCount: full.type === "table" ? 1 : 0,
+        selectedRefs: [{ ref: input.ref }],
+        extractors: full.source?.extractor ? [full.source.extractor] : ["dom"],
+      },
+      readable: Boolean(preview),
+      sections: [{ ...(summary.heading ? { heading: summary.heading } : {}), text: preview, ref: input.ref }],
+      totalChars: this.contentBlockSize(full),
+      returnedChars: preview.length,
+      truncated: Boolean(full.truncated)
+        || (full.type === "table" && offset + (block.rows?.length ?? 0) < (full.rowCount ?? 0))
+        || (full.type === "list" && offset + (block.items?.length ?? 0) < (full.items?.length ?? 0)),
+    };
+  }
+
+  async serializeContentRef(ref: string, format: BrowserContentFormat = "text"): Promise<{
+    content: string;
+    sourceRef: string;
+    sourceType: BrowserContentBlock["type"];
+    sourceRevision: number;
+    format: BrowserContentFormat;
+  }> {
+    return this.withWatchdog(async () => {
+      const reference = await this.resolveContentReference(ref);
+      return {
+        content: serializeBrowserContentBlock(reference.block, format),
+        sourceRef: ref,
+        sourceType: reference.block.type,
+        sourceRevision: reference.revision,
+        format,
+      };
+    }, "browser.serializeContentRef");
+  }
+
+  private async extractSemanticContent(page: PlaywrightPage, pageUrl: string): Promise<IndexedSemanticContent> {
+    const frames = page.frames();
+    const extracted: IndexedSemanticContent = {
+      blocks: [],
+      pageType: "generic",
+      sourceTruncated: false,
+      extractors: ["dom"],
+      inaccessibleFrames: 0,
+    };
+    for (const frame of frames) {
+      const frameUrl = frame.url();
+      const frameName = frame.name();
+      try {
+        const result = await frame.locator("body").evaluateAll(extractSemanticBrowserBlocks, {
+          frameUrl,
+          frameName,
+          pageUrl: frameUrl || pageUrl,
+          readability: true,
+        });
+        if (frameUrl === pageUrl || extracted.blocks.length === 0) extracted.pageType = result.pageType;
+        extracted.sourceTruncated ||= result.sourceTruncated;
+        for (const block of result.blocks) extracted.blocks.push(block as BrowserContentBlock);
+        if (result.blocks.some(block => block.source?.extractor === "readability")) {
+          if (!extracted.extractors.includes("readability")) extracted.extractors.push("readability");
+        }
+      } catch {
+        // A detached or cross-origin frame must not make the top-level read fail.
+        extracted.inaccessibleFrames += 1;
+      }
+    }
+
+    const mainFrame = frames[0];
+    const hasUsefulDomBlocks = extracted.blocks.some(block => !block.boilerplate && Boolean(
+      block.text?.trim() || block.rows?.length || block.items?.length || block.fields?.length || block.definitions?.length,
+    ));
+    if (mainFrame && !hasUsefulDomBlocks) {
+      try {
+        const aria = await mainFrame.locator("body").ariaSnapshotJSON?.({ mode: "ai", depth: 7 });
+        if (aria !== undefined) {
+          const candidate = extractAccessibleCandidate(aria);
+          const represented = extracted.blocks.map(block => [block.text, block.title, block.snippet, ...(block.columns ?? []), ...(block.rows ?? []).flat()]
+            .filter(Boolean).join(" ")).join(" ").replace(/\s+/gu, " ").toLocaleLowerCase();
+          const uniqueLines = candidate.split("\n").filter(line => {
+            const normalized = line.replace(/\s+/gu, " ").trim().toLocaleLowerCase();
+            return normalized.length > 4 && !represented.includes(normalized);
+          });
+          const uniqueText = uniqueLines.join("\n").slice(0, 20_000);
+          if (uniqueText.length >= 80) {
+            extracted.blocks.push({
+              ref: "",
+              type: "other",
+              text: uniqueText,
+              source: { frameUrl: mainFrame.url(), frameName: mainFrame.name(), extractor: "aria" },
+              role: "accessibility-tree",
+              importance: 0.42,
+              boilerplate: false,
+            });
+            extracted.extractors.push("aria");
+            await new Promise(resolve => setTimeout(resolve, 40));
+          }
+        }
+      } catch {
+        // Older Playwright builds and inaccessible documents fall back to DOM.
+      }
+    }
+
+    const seen = new Set<string>();
+    const unique = extracted.blocks.filter(block => {
+      const key = `${block.type}\u0000${block.headingPath?.join("/") ?? ""}\u0000${(block.text ?? block.title ?? "").replace(/\s+/gu, " ").trim().toLocaleLowerCase()}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    extracted.blocks = unique;
+    extracted.extractors = [...new Set(extracted.extractors)];
+    extracted.blocks.forEach((block, index) => {
+      const ref = `c${this.referenceRevision}-${this.contentSessionId}-${index + 1}`;
+      block.ref = ref;
+      this.contentReferences.set(ref, { block, revision: this.referenceRevision, url: pageUrl });
+    });
+    return extracted;
+  }
+
+  private contentRegionKind(type: BrowserContentBlock["type"]): BrowserRegionKind {
+    switch (type) {
+      case "table": return "table";
+      case "list": return "list";
+      case "form": return "form";
+      case "heading": return "heading";
+      case "navigation": return "navigation";
+      case "search_result": return "article";
+      case "text": return "text";
+      default: return "section";
+    }
+  }
+
+  private contentTypePriority(type: BrowserContentBlock["type"]): number {
+    return ({ table: 0, search_result: 1, text: 2, list: 3, definition: 4, form: 5, code: 6, heading: 7, other: 8, navigation: 9 })[type];
+  }
+
+  private contentBlockSize(block: BrowserContentBlock): number {
+    return JSON.stringify(block).length;
+  }
+
+  private summarizeContentBlock(block: BrowserContentBlock, previewLimit: number): BrowserContentSummary {
+    const previewText = block.type === "table"
+      ? [block.caption || block.headingPath?.join(" / ") || block.heading, (block.columns ?? []).join(" | "), ...(block.rows ?? []).slice(0, 2).map(row => row.join(" | "))].filter(Boolean).join("\n")
+      : block.type === "search_result"
+        ? [block.title, block.href, block.snippet].filter(Boolean).join("\n")
+        : blockText(block);
+    const preview = previewText.length > previewLimit ? `${previewText.slice(0, Math.max(1, previewLimit - 1))}…` : previewText;
+    return {
+      ref: block.ref,
+      type: block.type,
+      ...(block.heading ? { heading: block.heading } : {}),
+      ...(block.headingPath ? { headingPath: block.headingPath } : {}),
+      ...(block.source ? { source: block.source } : {}),
+      ...(block.role ? { role: block.role } : {}),
+      ...(block.importance === undefined ? {} : { importance: block.importance }),
+      ...(block.relevance === undefined ? {} : { relevance: block.relevance }),
+      ...(block.boilerplate === undefined ? {} : { boilerplate: block.boilerplate }),
+      ...(block.caption ? { caption: block.caption } : {}),
+      ...(block.columns ? { columns: block.columns } : {}),
+      ...(block.type === "table" ? { rows: (block.rows ?? []).slice(0, 2), rowCount: block.rowCount, columnCount: block.columnCount } : {}),
+      ...(block.cellSpans ? { cellSpans: block.cellSpans.slice(0, 2) } : {}),
+      ...(block.type === "list" ? { items: (block.items ?? []).slice(0, 5), rowCount: block.rowCount } : {}),
+      ...(block.type === "definition" ? { definitions: (block.definitions ?? []).slice(0, 5) } : {}),
+      ...(block.type === "form" ? { fields: (block.fields ?? []).slice(0, 8) } : {}),
+      ...(block.links ? { links: block.links.slice(0, 8) } : {}),
+      ...(block.title ? { title: block.title } : {}),
+      ...(block.href ? { href: block.href } : {}),
+      ...(block.snippet ? { snippet: block.snippet.slice(0, 400) } : {}),
+      ...(block.language ? { language: block.language } : {}),
+      ...(block.truncated === undefined ? {} : { truncated: block.truncated }),
+      ...(preview ? { preview } : {}),
+    };
+  }
+
+  private async resolveContentReference(ref: string): Promise<SerializableContentReference> {
+    const page = await this.ensurePage();
+    await this.refreshDomRevision(page);
+    const reference = this.contentReferences.get(ref);
+    if (!reference || reference.revision !== this.referenceRevision || reference.url !== page.url()) {
+      this.contentReferences.delete(ref);
+      throw new GuestRpcError("STALE_CONTENT_REF", `Browser content ref ${ref} is unknown or stale. Read the current page again to obtain a fresh ref.`, { httpStatus: 409 });
+    }
+    return reference;
+  }
+
+  private async waitForReadableStability(page: PlaywrightPage): Promise<void> {
+    try {
+      await page.waitForLoadState("domcontentloaded", { timeout: 1_200 });
+    } catch {
+      // DOM observation below handles pages that never signal this state.
+    }
+    const deadline = Date.now() + 1_800;
+    let previous = "";
+    let stableSamples = 0;
+    while (Date.now() < deadline) {
+      const signature = await page.locator("body").evaluateAll(nodes => {
+        const body = nodes[0];
+        if (!(body instanceof HTMLElement)) return "empty";
+        const tables = Array.from(body.querySelectorAll("table,[role='table'],[role='grid'],[role='treegrid']"))
+          .reduce((sum, table) => sum + table.querySelectorAll("tr,[role='row']").length, 0);
+        const state = window as Window & { __helmDomRevision?: number };
+        return `${body.innerText.length}:${tables}:${state.__helmDomRevision ?? 0}`;
+      }).catch(() => "empty");
+      if (signature === previous && signature !== "empty:0:0") stableSamples += 1;
+      else stableSamples = 0;
+      if (stableSamples >= 3) return;
+      previous = signature;
+      await new Promise(resolve => setTimeout(resolve, 120));
+    }
+  }
+
+  private async installReadabilityScript(page: PlaywrightPage): Promise<void> {
+    for (const frame of page.frames()) {
+      try {
+        const shouldInject = await frame.locator("body").evaluateAll(nodes => {
+          if (!(nodes[0] instanceof HTMLElement)) return false;
+          const body = nodes[0];
+          const proseLength = Array.from(body.querySelectorAll("article p, main p, [role='main'] p, p"))
+            .reduce((sum, paragraph) => sum + ((paragraph as HTMLElement).innerText?.length ?? 0), 0);
+          const tableCount = body.querySelectorAll("table,[role='table'],[role='grid'],[role='treegrid']").length;
+          const formCount = body.querySelectorAll("form,[role='form']").length;
+          const article = body.querySelector("article,[itemprop='articleBody']");
+          const installed = typeof (window as Window & { __helmReadability?: unknown }).__helmReadability === "function";
+          return { shouldInject: !installed && tableCount === 0 && formCount === 0 && (Boolean(article) || proseLength >= 700), installed };
+        });
+        if (!shouldInject || typeof shouldInject !== "object" || !shouldInject.shouldInject) continue;
+        const script = await frame.addScriptTag({ content: this.readabilitySource });
+        await script.evaluate(element => {
+          if (element instanceof HTMLScriptElement) element.remove();
+          return true;
+        });
+        // Let the page-local MutationObserver observe the injected and
+        // removed script before refs are bound to this page revision.
+        await new Promise(resolve => setTimeout(resolve, 40));
+      } catch {
+        // Some frames enforce a policy that disallows local script injection.
+      }
+    }
   }
 
   async search(input: {
@@ -1337,8 +1897,10 @@ export class BrowserController {
   private invalidateReferences(): void {
     this.referenceRevision += 1;
     this.references.clear();
+    this.contentReferences.clear();
     this.referenceUrl = "";
     this.lastDomMutationCount = undefined;
+    this.lastFrameMutationSignature = undefined;
     this.outlineCache = undefined;
     this.searchCache = undefined;
   }
@@ -1372,13 +1934,49 @@ export class BrowserController {
     } catch {
       // A page without a readable body still has navigation and action revisions.
     }
+    const frameMutations: string[] = [];
+    for (const frame of page.frames()) {
+      try {
+        const count = await frame.locator("body").evaluateAll(nodes => {
+          const body = nodes[0];
+          if (!(body instanceof HTMLElement)) return 0;
+          const state = window as Window & {
+            __helmDomRevision?: number;
+            __helmDomObserver?: MutationObserver;
+          };
+          if (!state.__helmDomObserver) {
+            state.__helmDomRevision = 0;
+            const observer = new MutationObserver(() => {
+              state.__helmDomRevision = (state.__helmDomRevision ?? 0) + 1;
+            });
+            observer.observe(document.documentElement ?? body, {
+              subtree: true,
+              childList: true,
+              characterData: true,
+              attributes: true,
+              attributeFilter: ["aria-label", "aria-labelledby", "aria-disabled", "class", "disabled", "hidden", "href", "role", "style", "value"],
+            });
+            state.__helmDomObserver = observer;
+          }
+          return state.__helmDomRevision ?? 0;
+        });
+        frameMutations.push(`${frame.url()}#${count}`);
+      } catch {
+        frameMutations.push(`${frame.url()}#inaccessible`);
+      }
+    }
+    const frameMutationSignature = frameMutations.join("|");
     const url = page.url();
     if (this.referenceUrl.length > 0 && this.referenceUrl !== url) this.invalidateReferences();
     if (this.lastDomMutationCount !== undefined && this.lastDomMutationCount !== mutationCount) {
       this.invalidateReferences();
     }
+    if (this.lastFrameMutationSignature !== undefined && this.lastFrameMutationSignature !== frameMutationSignature) {
+      this.invalidateReferences();
+    }
     this.referenceUrl = url;
     this.lastDomMutationCount = mutationCount;
+    this.lastFrameMutationSignature = frameMutationSignature;
     return this.referenceRevision;
   }
 

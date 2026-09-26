@@ -39,7 +39,18 @@ const browserRegionKindSchema = z.enum([
 export const guestMethodSchemas = {
   'guest.handshake': z.object({}),
   'fs.read': z.object({ path: pathSchema }),
-  'fs.write': z.object({ path: pathSchema, content: z.string() }),
+  'fs.write': z.object({
+    path: pathSchema,
+    content: z.string().max(50 * 1024 * 1024).optional(),
+    sourceRef: z.string().regex(/^c\d+-[a-f0-9]{8}-[1-9]\d*$/u).optional(),
+    format: z.enum(['text', 'markdown', 'json', 'csv']).optional(),
+  }).refine(
+    value => (value.content !== undefined) !== (value.sourceRef !== undefined),
+    'Provide exactly one of content or sourceRef',
+  ).refine(
+    value => value.format === undefined || value.sourceRef !== undefined,
+    'format is only supported when writing from sourceRef',
+  ),
   'fs.mkdir': z.object({ path: pathSchema }),
   'fs.exists': z.object({ path: pathSchema }),
   'fs.list': z.object({ path: pathSchema }),
@@ -49,8 +60,11 @@ export const guestMethodSchemas = {
   'browser.snapshot': z.object({ maxRegions: z.number().int().min(1).max(100).optional() }),
   'browser.read': z.object({
     mode: z.enum(['readable', 'document']).optional(),
-    ref: z.string().regex(/^r\d+-[1-9]\d*$/u).optional(),
+    query: z.string().trim().min(1).max(1_000).optional(),
+    ref: z.string().regex(/^(?:r\d+-[1-9]\d*|c\d+-[a-f0-9]{8}-[1-9]\d*)$/u).optional(),
     maxChars: z.number().int().min(1).max(12_000).optional(),
+    offset: z.number().int().min(0).max(1_000_000).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
     cursor: z.string().min(1).max(2_048).optional(),
   }).strict(),
   'browser.search': z.object({

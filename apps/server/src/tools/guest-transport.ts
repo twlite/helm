@@ -1,4 +1,6 @@
 import type {
+  BrowserContentFormat,
+  BrowserContentType,
   BrowserRegionInspection,
   BrowserReadResult,
   BrowserSearchPageResult,
@@ -10,7 +12,7 @@ import type {
 export type GuestMethodParams = {
   'guest.handshake': Record<string, never>;
   'fs.read': { path: string };
-  'fs.write': { path: string; content: string };
+  'fs.write': { path: string; content?: string; sourceRef?: string; format?: BrowserContentFormat };
   'fs.mkdir': { path: string };
   'fs.exists': { path: string };
   'fs.list': { path: string };
@@ -18,7 +20,7 @@ export type GuestMethodParams = {
   'browser.navigate': { url: string };
   'browser.getState': Record<string, never>;
   'browser.snapshot': { maxRegions?: number };
-  'browser.read': { mode?: 'readable' | 'document'; ref?: string; maxChars?: number; cursor?: string };
+  'browser.read': { mode?: 'readable' | 'document'; query?: string; ref?: string; maxChars?: number; offset?: number; limit?: number; cursor?: string };
   'browser.search': { query: string; kinds?: import('@helm/shared').BrowserRegionKind[]; maxResults?: number };
   'browser.inspectRegion': { ref: string; format?: 'auto' | 'text' | 'table' | 'links'; maxChars?: number; offset?: number; limit?: number };
   'browser.download': { ref?: string; url?: string };
@@ -44,7 +46,16 @@ export type GuestMethodResult = {
     capabilities: GuestMethod[];
   };
   'fs.read': { path: string; content: string; size: number };
-  'fs.write': { path: string; size: number; sha256?: string; existedBefore?: boolean };
+  'fs.write': {
+    path: string;
+    size: number;
+    sha256?: string;
+    existedBefore?: boolean;
+    sourceRef?: string;
+    sourceType?: BrowserContentType;
+    sourceRevision?: number;
+    format?: BrowserContentFormat;
+  };
   'fs.mkdir': { path: string; existedBefore: boolean };
   'fs.exists': { path: string; exists: boolean };
   'fs.list': { path: string; entries: string[] };

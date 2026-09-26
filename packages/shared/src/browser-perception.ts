@@ -8,6 +8,9 @@ export interface IndexedBrowserRegion extends BrowserPageRegion {
   searchText: string;
   tableHeaders?: string[];
   formLabels?: string[];
+  headingPath?: string[];
+  boilerplate?: boolean;
+  importance?: number;
   domOrder: number;
   /** Internal DOM ancestry used to suppress overlapping search results. */
   ancestorRefs?: string[];
@@ -16,6 +19,17 @@ export interface IndexedBrowserRegion extends BrowserPageRegion {
 const STOP_WORDS = new Set([
   "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is", "it",
   "of", "on", "or", "that", "the", "this", "to", "was", "were", "with",
+  "fetch", "save", "saved", "open", "opened", "write", "written", "read", "get", "gets", "find", "finds",
+  "please", "want", "need", "using", "use", "into", "me", "my", "file", "txt", "document",
+  "tell", "show", "give", "make", "retrieve", "download", "website", "site",
+  "go", "what", "whats", "how", "where", "when", "why", "who", "page", "application", "app", "viewer",
+  "out", "many", "he", "she", "his", "her", "they", "them", "their", "has", "have", "had",
+  "about", "then",
+]);
+
+const TASK_QUERY_STOP_WORDS = new Set([
+  "summarize", "summarise", "summary", "content", "create", "created", "creating",
+  "good", "looking", "information", "based", "text",
 ]);
 
 function tokens(value: string): string[] {
@@ -26,6 +40,26 @@ function usefulTokens(value: string): string[] {
   const all = tokens(value);
   const useful = all.filter(token => token.length > 1 && !STOP_WORDS.has(token));
   return useful.length > 0 ? useful : all;
+}
+
+function queryTerms(value: string): string[] {
+  return tokens(value).filter(token => token.length > 1 && !STOP_WORDS.has(token));
+}
+
+/** Reduce a task request to generic page-search terms without encoding task domains. */
+export function deriveBrowserReadQuery(value: string, maxTerms = 8): string {
+  // A URL is a destination value, not usually a useful description of the
+  // content to retrieve. Drop complete URLs and bare hostnames while keeping
+  // adjacent natural-language terms (including repository names such as
+  // "oven-sh/bun", which are not hostnames).
+  const contentRequest = value
+    .replace(/\b(?:https?|file):\/\/[^\s"'<>]+/giu, " ")
+    .replace(/\b(?:www\.)?(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,}(?:\/[^\s"'<>]*)?/giu, " ")
+    .replace(/\b[\p{L}\p{N}_-]+\.(?:txt|md|markdown|json|csv|tsv|log|html?|css|js|jsx|mjs|cjs|ts|tsx|xml|ya?ml|toml|ini|conf|env|pdf|docx?|xlsx?|pptx?)\b/giu, " ");
+  const terms = [...new Set(tokens(contentRequest).filter(token => (
+    token.length > 1 && !STOP_WORDS.has(token) && !TASK_QUERY_STOP_WORDS.has(token)
+  )))];
+  return terms.slice(0, clamp(Math.trunc(maxTerms), 1, 16)).join(" ");
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -55,6 +89,7 @@ function makeIdf(
     const fields = new Set([
       ...tokens(region.searchText),
       ...usefulTokens(region.heading ?? ""),
+      ...usefulTokens((region.headingPath ?? []).join(" ")),
       ...usefulTokens((region.tableHeaders ?? []).join(" ")),
       ...usefulTokens((region.formLabels ?? []).join(" ")),
     ]);
@@ -80,13 +115,17 @@ function scoreWithIdf(
   const bodyTokens = tokens(region.searchText);
   const bodySet = new Set(bodyTokens);
   const headingTokens = usefulTokens(region.heading ?? "");
+  const headingPathTokens = usefulTokens((region.headingPath ?? []).join(" "));
   const headingSet = new Set(headingTokens);
   const headerText = (region.tableHeaders ?? []).join(" ");
   const headerSet = new Set(usefulTokens(headerText));
   const formLabelText = (region.formLabels ?? []).join(" ");
   const formLabelSet = new Set(usefulTokens(formLabelText));
   const bodyCoverage = weightedCoverage(queryTokens, bodySet, inverseDocumentFrequency);
-  const headingMatch = weightedCoverage(queryTokens, headingSet, inverseDocumentFrequency);
+  const headingMatch = Math.max(
+    weightedCoverage(queryTokens, headingSet, inverseDocumentFrequency),
+    weightedCoverage(queryTokens, new Set(headingPathTokens), inverseDocumentFrequency),
+  );
   const headerMatch = weightedCoverage(queryTokens, headerSet, inverseDocumentFrequency);
   const formLabelMatch = weightedCoverage(queryTokens, formLabelSet, inverseDocumentFrequency);
   if (bodyCoverage === 0 && headingMatch === 0 && headerMatch === 0 && formLabelMatch === 0) return 0;
@@ -126,7 +165,11 @@ function scoreWithIdf(
   // through IDF, while headings and especially table headers carry stronger
   // information-density signals than incidental prose.
   const semanticBoost = region.kind === "table"
-    ? headerMatch > 0 ? 0.18 + headerMatch * 0.1 : 0
+    ? headerMatch > 0
+      ? 0.18 + headerMatch * 0.1
+      : headingMatch > 0
+        ? 0.16 + headingMatch * 0.08
+        : bodyCoverage > 0 ? 0.12 + bodyCoverage * 0.04 : 0
     : region.kind === "form"
       ? formLabelMatch > 0 ? 0.18 + formLabelMatch * 0.08 : 0
       : region.kind === "article"
@@ -134,7 +177,7 @@ function scoreWithIdf(
         : region.kind === "section"
           ? headingMatch > 0 ? 0.06 : 0
           : region.kind === "list" && bodyCoverage > 0 ? 0.04 : 0;
-  const score = (
+  const rawScore = (
     bodyCoverage * 0.3
     + bm25Coverage * 0.12
     + headingMatch * 0.24
@@ -146,20 +189,24 @@ function scoreWithIdf(
     + Number(formLabelPhrase) * 0.08
     + semanticBoost
   );
+  const importance = clamp(region.importance ?? 0.7, 0, 1);
+  const boilerplatePenalty = region.boilerplate ? 0.06 : 1;
+  const score = rawScore * (0.55 + importance * 0.45) * boilerplatePenalty;
   return Number(clamp(score, 0, 1).toFixed(3));
 }
 
 export function scorePageRegion(query: string, region: IndexedBrowserRegion): number {
-  const queryTokens = [...new Set(usefulTokens(query))];
-  const idf = makeIdf([region], queryTokens);
+  const terms = [...new Set(queryTerms(query))];
+  const idf = makeIdf([region], terms);
   const averageLength = tokens(region.searchText).length;
-  return scoreWithIdf(queryTokens, region, idf, averageLength);
+  return scoreWithIdf(terms, region, idf, averageLength);
 }
 
 function matchedQueryTerms(region: IndexedBrowserRegion, queryTokens: readonly string[]): Set<string> {
   const terms = new Set([
     ...tokens(region.searchText),
     ...usefulTokens(region.heading ?? ""),
+    ...usefulTokens((region.headingPath ?? []).join(" ")),
     ...usefulTokens((region.tableHeaders ?? []).join(" ")),
     ...usefulTokens((region.formLabels ?? []).join(" ")),
   ]);
@@ -203,7 +250,7 @@ export function rankPageRegions(input: {
 }): { indexedRegionCount: number; results: BrowserSearchResult[] } {
   const kinds = input.kinds ? new Set(input.kinds) : undefined;
   const maxResults = clamp(Math.trunc(input.maxResults ?? 5), 1, 20);
-  const queryTokens = [...new Set(usefulTokens(input.query))];
+  const queryTokens = [...new Set(queryTerms(input.query))];
   const inverseDocumentFrequency = makeIdf(input.regions, queryTokens);
   const averageDocumentLength = input.regions.length === 0 ? 0 : input.regions.reduce(
     (total, region) => total + tokens(region.searchText).length,
@@ -217,7 +264,9 @@ export function rankPageRegions(input: {
       terms: matchedQueryTerms(region, queryTokens),
     }))
     .filter(item => item.score > 0)
-    .sort((left, right) => right.score - left.score || left.region.domOrder - right.region.domOrder);
+    .sort((left, right) => right.score - left.score
+      || (right.region.importance ?? 0) - (left.region.importance ?? 0)
+      || left.region.domOrder - right.region.domOrder);
   const selected: typeof ranked = [];
   for (const candidate of ranked) {
     const duplicateIndex = selected.findIndex(current => nestedDuplicate(
@@ -239,7 +288,9 @@ export function rankPageRegions(input: {
       selected.splice(duplicateIndex, 1, candidate);
     }
   }
-  selected.sort((left, right) => right.score - left.score || left.region.domOrder - right.region.domOrder);
+  selected.sort((left, right) => right.score - left.score
+    || (right.region.importance ?? 0) - (left.region.importance ?? 0)
+    || left.region.domOrder - right.region.domOrder);
   const results = selected.slice(0, maxResults).map(({ region, score }) => ({
       ref: region.ref,
       kind: region.kind,

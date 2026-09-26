@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { extractRelevantPassages, rankPageRegions, sampleReadableText, type IndexedBrowserRegion } from '../src/browser-perception';
+import { deriveBrowserReadQuery, extractRelevantPassages, rankPageRegions, sampleReadableText, type IndexedBrowserRegion } from '../src/browser-perception';
 
 describe('shared browser perception helpers', () => {
   it('keeps queryless samples within even very small requested character limits', () => {
@@ -9,6 +9,19 @@ describe('shared browser perception helpers', () => {
       expect(sample.text.length).toBeLessThanOrEqual(limit);
       expect(sample.truncated).toBe(true);
     }
+  });
+
+  it('derives concise task queries and does not turn generic questions into broad matches', () => {
+    expect(deriveBrowserReadQuery('Fetch the exchange rate data and save it to forex.txt.')).toBe('exchange rate data');
+    expect(deriveBrowserReadQuery('What is on the page?')).toBe('');
+    expect(deriveBrowserReadQuery('Open https://github.com/twlite and find out how many followers he has and his pinned repos with their details.'))
+      .toBe('followers pinned repos details');
+    expect(deriveBrowserReadQuery('Go to dhunganakunjan.com.np and summarize the page content and save it to kd.txt.'))
+      .toBe('');
+    expect(rankPageRegions({
+      query: 'what is on the page',
+      regions: [{ ref: 'r1-1', kind: 'text', searchText: 'A page with useful information.', domOrder: 0 }],
+    }).results).toEqual([]);
   });
 
   it('ranks matching table headers ahead of unrelated page regions', () => {

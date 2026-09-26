@@ -19,9 +19,14 @@ import { CriterionVerifierRegistry } from '../tools/criterion-verifier';
 import type { GuestTransport } from '../tools/guest-transport';
 import { ToolRegistry } from '../tools/tool-registry';
 import {
+  browserResearchSearchUrl,
   browserResearchStartUrl,
+  explicitBrowserNavigationUrls,
   isAbsoluteBrowserNavigationUrl,
+  isSearchEngineUrl,
+  isUnsupportedSearchEngineUrl,
 } from './browser-research';
+import { deriveBrowserReadQuery } from '@helm/shared';
 import { fingerprintAction, LoopDetector } from './fingerprint';
 import { DEFAULT_RUNTIME_BUDGETS, RunBudget, RunCancellation } from './limits';
 import { GuestObservationProvider } from './observation';
@@ -81,19 +86,248 @@ function criterionKey(criterion: CompletionCriterion): string {
   return JSON.stringify(criterion);
 }
 
-/** Enforce the browser research search-engine policy at the execution boundary. */
-function normalizeBrowserNavigationInput(
+type NavigationProvenance = 'user' | 'search-result' | 'page-link' | 'verified-memory' | 'duckduckgo-search' | 'navigation-result';
+
+interface BrowserNavigationPolicy {
+  request: string;
+  allowedUrls: Map<string, NavigationProvenance>;
+  attempted: boolean;
+  forceDuckDuckGo: boolean;
+}
+
+interface PreparedNavigation {
+  input: Record<string, unknown>;
+  provenance?: NavigationProvenance;
+  requestedUrl?: string;
+  error?: ToolResult;
+}
+
+function navigationKey(value: string): string | undefined {
+  try {
+    const parsed = new URL(value);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return undefined;
+    return parsed.href;
+  } catch {
+    return undefined;
+  }
+}
+
+function createBrowserNavigationPolicy(input: {
+  userMessage: string;
+  conversation?: readonly Message[];
+}, memories: readonly Memory[]): BrowserNavigationPolicy {
+  const allowedUrls = new Map<string, NavigationProvenance>();
+  for (const message of input.conversation ?? []) {
+    if (message.role !== 'user') continue;
+    for (const url of explicitBrowserNavigationUrls(message.content)) {
+      const key = navigationKey(url);
+      if (key) allowedUrls.set(key, 'user');
+    }
+  }
+  for (const url of explicitBrowserNavigationUrls(input.userMessage)) {
+    const key = navigationKey(url);
+    if (key) allowedUrls.set(key, 'user');
+  }
+  for (const memory of memories) {
+    const hasVerifiedProvenance = Boolean(
+      memory.lastVerifiedAt || (memory.source === 'observed' && (memory.evidenceIds?.length ?? 0) > 0),
+    );
+    const verifiedMemoryUrls = hasVerifiedProvenance
+      ? [...(memory.sourceUrl ? [memory.sourceUrl] : []), ...explicitBrowserNavigationUrls(memory.content)]
+      : [];
+    for (const url of verifiedMemoryUrls) {
+      if (!url) continue;
+      const key = navigationKey(url);
+      if (key && !allowedUrls.has(key)) allowedUrls.set(key, 'verified-memory');
+    }
+  }
+  return { request: input.userMessage, allowedUrls, attempted: false, forceDuckDuckGo: false };
+}
+
+function prepareBrowserNavigation(
+  tool: string,
+  toolInput: Record<string, unknown>,
+  policy: BrowserNavigationPolicy,
+): PreparedNavigation {
+  if (policy.forceDuckDuckGo && tool.startsWith('browser.') && tool !== 'browser.navigate') {
+    return {
+      input: toolInput,
+      error: {
+        ok: false,
+        error: {
+          code: 'VERIFIED_URL_RECOVERY_REQUIRED',
+          message: 'The exact URL saved in memory failed or redirected. Search DuckDuckGo for the current task before reading or inspecting this destination.',
+        },
+      },
+    };
+  }
+  if (tool === 'browser.download' && typeof toolInput.url === 'string') {
+    const key = navigationKey(toolInput.url);
+    const provenance = key ? policy.allowedUrls.get(key) : undefined;
+    if (!provenance) {
+      return {
+        input: toolInput,
+        error: {
+          ok: false,
+          error: {
+            code: 'UNOBSERVED_DOWNLOAD_URL',
+            message: 'Download URLs must come from the user, verified memory, or an observed page link. Open a DuckDuckGo result or inspect the page link first.',
+          },
+        },
+      };
+    }
+    return { input: toolInput, provenance, requestedUrl: toolInput.url };
+  }
+  if (tool !== 'browser.navigate' || typeof toolInput.url !== 'string') return { input: toolInput };
+  const requestedUrl = toolInput.url.trim();
+  let parsed: URL | undefined;
+  try { parsed = new URL(requestedUrl); } catch {
+    const explicit = policy.allowedUrls.get(navigationKey(`https://${requestedUrl}`) ?? '');
+    if (explicit) {
+      policy.attempted = true;
+      return { input: { ...toolInput, url: `https://${requestedUrl}` }, provenance: explicit, requestedUrl };
+    }
+  }
+  if (!parsed || !['http:', 'https:'].includes(parsed.protocol)) return { input: toolInput };
+
+  const normalizedSearchUrl = browserResearchStartUrl(parsed.href);
+  if (isUnsupportedSearchEngineUrl(parsed.href) || normalizedSearchUrl !== parsed.href) {
+    policy.attempted = true;
+    policy.forceDuckDuckGo = false;
+    return { input: { ...toolInput, url: normalizedSearchUrl }, provenance: 'duckduckgo-search', requestedUrl };
+  }
+  if (isSearchEngineUrl(parsed.href)) {
+    policy.attempted = true;
+    policy.forceDuckDuckGo = false;
+    return { input: toolInput, provenance: 'duckduckgo-search', requestedUrl };
+  }
+  if (policy.forceDuckDuckGo) {
+    policy.attempted = true;
+    policy.forceDuckDuckGo = false;
+    const query = deriveBrowserReadQuery(policy.request) || policy.request;
+    return { input: { ...toolInput, url: browserResearchSearchUrl(query) }, provenance: 'duckduckgo-search', requestedUrl };
+  }
+  const provenance = policy.allowedUrls.get(parsed.href);
+  if (provenance) {
+    policy.attempted = true;
+    return { input: toolInput, provenance, requestedUrl };
+  }
+  if (!policy.attempted) {
+    policy.attempted = true;
+    const query = deriveBrowserReadQuery(policy.request) || policy.request;
+    return {
+      input: { ...toolInput, url: browserResearchSearchUrl(query) },
+      provenance: 'duckduckgo-search',
+      requestedUrl,
+    };
+  }
+  return {
+    input: toolInput,
+    requestedUrl,
+    error: {
+      ok: false,
+      error: {
+        code: 'UNOBSERVED_NAVIGATION_URL',
+        message: 'This URL was not supplied by the user or observed in page links, DuckDuckGo results, or exact memory. Search DuckDuckGo first and navigate using an observed result href.',
+      },
+    },
+  };
+}
+
+function rememberObservedBrowserUrls(
+  tool: string,
+  data: unknown,
+  policy: BrowserNavigationPolicy,
+): void {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) return;
+  const record = data as Record<string, unknown>;
+  const add = (value: unknown, provenance: NavigationProvenance): void => {
+    if (typeof value !== 'string') return;
+    const key = navigationKey(value);
+    if (!key) return;
+    const current = policy.allowedUrls.get(key);
+    if (!current || (current === 'page-link' && provenance === 'search-result')) {
+      policy.allowedUrls.set(key, provenance);
+    }
+  };
+  if (tool === 'browser.navigate') add(record.url, 'navigation-result');
+  if (tool === 'browser.snapshot' && Array.isArray(record.elements)) {
+    for (const item of record.elements) {
+      if (typeof item === 'object' && item !== null) add((item as Record<string, unknown>).href, 'page-link');
+    }
+  }
+  if (tool === 'browser.inspectRegion' && Array.isArray(record.links)) {
+    for (const item of record.links) {
+      if (typeof item === 'object' && item !== null) add((item as Record<string, unknown>).href, 'page-link');
+    }
+  }
+  if (tool === 'browser.read' && Array.isArray(record.blocks)) {
+    for (const item of record.blocks) {
+      if (typeof item !== 'object' || item === null) continue;
+      const block = item as Record<string, unknown>;
+      const provenance: NavigationProvenance = block.type === 'search_result' ? 'search-result' : 'page-link';
+      add(block.href, provenance);
+      if (Array.isArray(block.links)) {
+        for (const link of block.links) {
+          if (typeof link === 'object' && link !== null) add((link as Record<string, unknown>).href, provenance);
+        }
+      }
+    }
+  }
+}
+
+function attachNavigationProvenance(result: ToolResult, navigation: PreparedNavigation): ToolResult {
+  if (!result.ok || !navigation.provenance || typeof result.data !== 'object' || result.data === null || Array.isArray(result.data)) return result;
+  return {
+    ...result,
+    data: {
+      ...(result.data as Record<string, unknown>),
+      urlProvenance: navigation.provenance,
+      ...(navigation.requestedUrl && navigation.requestedUrl !== navigation.input.url ? { proposedUrl: navigation.requestedUrl } : {}),
+    },
+  };
+}
+
+function recordNavigationOutcome(
+  result: ToolResult,
+  navigation: PreparedNavigation,
+  policy: BrowserNavigationPolicy,
+): ToolResult {
+  if (navigation.provenance === 'verified-memory') {
+    const requested = typeof navigation.input.url === 'string' ? navigation.input.url : undefined;
+    if (!result.ok) {
+      if (requested) policy.allowedUrls.delete(navigationKey(requested) ?? '');
+      policy.forceDuckDuckGo = true;
+      return result;
+    }
+    const data = typeof result.data === 'object' && result.data !== null && !Array.isArray(result.data)
+      ? result.data as Record<string, unknown>
+      : undefined;
+    const reached = typeof data?.url === 'string' ? data.url : requested;
+    if (requested && reached && navigationKey(requested) !== navigationKey(reached)) {
+      policy.allowedUrls.delete(navigationKey(requested) ?? '');
+      policy.forceDuckDuckGo = true;
+      return attachNavigationProvenance({
+        ...result,
+        data: { ...data, expectedUrl: requested, unexpectedRedirect: reached },
+      }, navigation);
+    }
+  }
+  return attachNavigationProvenance(result, navigation);
+}
+
+function withDerivedBrowserReadQuery(
   tool: string,
   input: Record<string, unknown>,
-  enabled: boolean,
+  task: TaskDefinition,
+  request: string,
 ): Record<string, unknown> {
-  if (
-    !enabled
-    || tool !== 'browser.navigate'
-    || typeof input.url !== 'string'
-    || !isAbsoluteBrowserNavigationUrl(input.url)
-  ) return input;
-  return { ...input, url: browserResearchStartUrl(input.url) };
+  if (tool !== 'browser.read' || input.ref !== undefined || typeof input.query === 'string') return input;
+  // The original user wording is the best source for extraction terms. A
+  // planner's normalized task title or criterion text may contain only output
+  // details and lose the subject the browser needs to retrieve.
+  const query = deriveBrowserReadQuery(request || task.originalRequest || task.goal);
+  return query ? { ...input, query } : input;
 }
 
 function invalidBrowserNavigationResult(
@@ -120,17 +354,6 @@ function invalidBrowserNavigationResult(
       code: 'INVALID_BROWSER_NAVIGATION',
       message: 'Browser navigation requires an absolute http(s), file, or about URL. Output filenames must be handled by filesystem or desktop tools.',
     },
-  };
-}
-
-function normalizeBrowserNavigationDecision(
-  decision: AgentDecision,
-  enabled: boolean,
-): AgentDecision {
-  if (decision.type !== 'action') return decision;
-  return {
-    ...decision,
-    input: normalizeBrowserNavigationInput(decision.tool, decision.input, enabled),
   };
 }
 
@@ -162,6 +385,19 @@ function successfulReceiptEffect(result: ToolResult): Record<string, unknown> | 
   if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return undefined;
   const effect = (receipt as Record<string, unknown>).effect;
   return effect && typeof effect === 'object' && !Array.isArray(effect) ? effect as Record<string, unknown> : undefined;
+}
+
+function hasReadableBrowserContent(result: ToolResult): boolean {
+  if (!result.ok || typeof result.data !== 'object' || result.data === null || Array.isArray(result.data)) return false;
+  const data = result.data as Record<string, unknown>;
+  if (data.operation !== 'read') return false;
+  const sections = Array.isArray(data.sections) ? data.sections : [];
+  const hasSectionText = sections.some(section => (
+    typeof section === 'object' && section !== null
+    && typeof (section as Record<string, unknown>).text === 'string'
+    && ((section as Record<string, unknown>).text as string).trim().length > 0
+  ));
+  return hasSectionText || (Array.isArray(data.blocks) && data.blocks.length > 0);
 }
 
 function actionEffectChanged(result: ToolResult): boolean {
@@ -320,9 +556,10 @@ export class AgentRuntime {
         criteria: [],
       }
       : await this.createTask(input, memories));
-    if (this.actingAgent) return this.runWithActingAgent(input, task, memories, conversation);
+    const navigationPolicy = createBrowserNavigationPolicy(input, memories);
+    if (this.actingAgent) return this.runWithActingAgent(input, task, memories, conversation, navigationPolicy);
     if (this.orchestrator && this.worker) {
-      return this.runOrchestrated(input, task, memories, conversation);
+      return this.runOrchestrated(input, task, memories, conversation, navigationPolicy);
     }
     if (!this.decisionProvider) throw new Error('A decision provider is required for the legacy runtime path.');
     const cancellation = new RunCancellation();
@@ -348,6 +585,7 @@ export class AgentRuntime {
     let completedCriteria: string[] = [];
     let remainingCriteria = task.criteria.map(criterionKey);
     let lastToolResult: ToolResult | undefined;
+    let browserContentResult: ToolResult | undefined;
     let completionCandidate: {
       actionFingerprint: string;
       verification: VerificationResult;
@@ -421,7 +659,12 @@ export class AgentRuntime {
         let decision: AgentDecision = conversationalTask
           ? { type: 'complete', reasoningSummary: 'Responding to the conversation.' }
           : await this.decisionProvider!.next(context);
-        decision = normalizeBrowserNavigationDecision(decision, !conversationalTask);
+        if (decision.type === 'action') {
+          decision = {
+            ...decision,
+            input: withDerivedBrowserReadQuery(decision.tool, decision.input, task, input.userMessage),
+          };
+        }
 
         // Give the model one final turn after a successful action, but do not
         // execute the same already-verified action again if it repeats it.
@@ -506,7 +749,7 @@ export class AgentRuntime {
         if (decision.type === 'complete') {
           let verification = conversationalTask
             ? { complete: true, criteria: [], summary: 'Response ready.' }
-            : await this.verify(task, observation, lastToolResult);
+            : await this.verify(task, observation, lastToolResult, browserContentResult);
           finalVerification = verification;
           const entry: AgentStep = {
             reasoningSummary: decision.reasoningSummary,
@@ -560,14 +803,25 @@ export class AgentRuntime {
           action: { tool: decision.tool, input: clone(decision.input) },
           observation,
         };
-        const result = invalidBrowserNavigationResult(decision.tool, decision.input, !conversationalTask, task)
-          ?? await this.tools.execute(decision.tool, decision.input, {
+        const navigation = prepareBrowserNavigation(decision.tool, decision.input, navigationPolicy);
+        let result = navigation.error
+          ?? invalidBrowserNavigationResult(decision.tool, navigation.input, !conversationalTask, task)
+          ?? await this.tools.execute(decision.tool, navigation.input, {
             signal: cancellation.signal,
             runId: run.id,
             stepIndex,
             previousResults,
             timeoutMs: this.budgetOptions?.toolTimeoutMs,
           });
+        if (decision.tool === 'browser.navigate') {
+          result = recordNavigationOutcome(result, navigation, navigationPolicy);
+        } else if (decision.tool === 'browser.download') result = attachNavigationProvenance(result, navigation);
+        rememberObservedBrowserUrls(decision.tool, result.data, navigationPolicy);
+        if (decision.tool.startsWith('browser.') && decision.tool !== 'browser.read' && actionEffectChanged(result)) {
+          browserContentResult = undefined;
+        } else if (decision.tool === 'browser.read' && hasReadableBrowserContent(result)) {
+          browserContentResult = result;
+        }
         rejectedCompletionAttempts = 0;
         previousResults.push(clone(result));
         lastToolResult = result;
@@ -578,7 +832,7 @@ export class AgentRuntime {
           lastToolResult: result,
           signal: cancellation.signal,
         });
-        const verification = await this.verify(task, postActionObservation, result);
+        const verification = await this.verify(task, postActionObservation, result, browserContentResult);
         finalVerification = verification;
         entry.observation = postActionObservation;
         entry.verification = verification;
@@ -702,6 +956,7 @@ export class AgentRuntime {
     task: TaskDefinition,
     memories: Memory[],
     conversation: Message[],
+    navigationPolicy: BrowserNavigationPolicy,
   ): Promise<AgentRuntimeResult> {
     const cancellation = new RunCancellation();
     const removeExternalAbort = this.attachExternalCancellation(cancellation, input.signal);
@@ -738,6 +993,7 @@ export class AgentRuntime {
     let actionQueue: Promise<void> = Promise.resolve();
 
     const executeToolNow = async (tool: string, toolInput: Record<string, unknown>): Promise<ToolResult> => {
+      toolInput = withDerivedBrowserReadQuery(tool, toolInput, task, input.userMessage);
       cancellation.throwIfCancelled();
       const stepIndex = actionCount;
       actionCount += 1;
@@ -764,10 +1020,11 @@ export class AgentRuntime {
           },
         };
       } else {
-        const invalidNavigation = browserNavigationGuard(tool, toolInput);
+        const navigation = prepareBrowserNavigation(tool, toolInput, navigationPolicy);
+        const invalidNavigation = navigation.error ?? browserNavigationGuard(tool, navigation.input);
         if (invalidNavigation) result = invalidNavigation;
         else {
-          result = await this.tools.execute(tool, toolInput, {
+          result = await this.tools.execute(tool, navigation.input, {
             signal: cancellation.signal,
             runId,
             stepIndex,
@@ -775,8 +1032,12 @@ export class AgentRuntime {
             timeoutMs: this.budgetOptions?.toolTimeoutMs,
           });
         }
+        if (tool === 'browser.navigate') {
+          result = recordNavigationOutcome(result, navigation, navigationPolicy);
+        } else if (tool === 'browser.download') result = attachNavigationProvenance(result, navigation);
       }
 
+      rememberObservedBrowserUrls(tool, result.data, navigationPolicy);
       const compactResult = compactAgentToolResult(result);
       const resultData = result.data && typeof result.data === 'object' && !Array.isArray(result.data)
         ? result.data as Record<string, unknown>
@@ -800,7 +1061,8 @@ export class AgentRuntime {
           typeof section === 'object' && section !== null && typeof (section as Record<string, unknown>).text === 'string'
           && ((section as Record<string, unknown>).text as string).trim().length > 0
         ));
-        browserContentRead = result.ok && resultData?.readable === true && hasText;
+        const hasBlocks = Array.isArray(resultData?.blocks) && resultData.blocks.length > 0;
+        browserContentRead = result.ok && resultData?.readable === true && (hasText || hasBlocks);
         browserReadAttemptedWithoutContent = !browserContentRead;
         readablePageEvidence ||= resultData?.readable === true || browserReadAttemptedWithoutContent;
       }
@@ -1048,6 +1310,7 @@ export class AgentRuntime {
     task: TaskDefinition,
     memories: Memory[],
     conversation: Message[],
+    navigationPolicy: BrowserNavigationPolicy,
   ): Promise<AgentRuntimeResult> {
     const cancellation = new RunCancellation();
     const removeExternalAbort = this.attachExternalCancellation(cancellation, input.signal);
@@ -1277,6 +1540,7 @@ export class AgentRuntime {
           signal: cancellation.signal,
           execute: {
             execute: async (tool: string, toolInput: Record<string, unknown>): Promise<ToolResult> => {
+              toolInput = withDerivedBrowserReadQuery(tool, toolInput, task, input.userMessage);
               if (!allowedWorkerTool(objective.kind, tool)) {
                 return { ok: false, error: { code: 'WORKER_TOOL_NOT_ALLOWED', message: `${objective.kind} worker cannot use ${tool}.` } };
               }
@@ -1284,18 +1548,22 @@ export class AgentRuntime {
                 return { ok: false, error: { code: 'WORKER_ACTION_BUDGET_EXCEEDED', message: `Worker exceeded its ${maxWorkerActions}-action budget.` } };
               }
               workerExecutionCount += 1;
-              const invalidNavigation = invalidBrowserNavigationResult(tool, toolInput, true, task);
+              const navigation = prepareBrowserNavigation(tool, toolInput, navigationPolicy);
+              const invalidNavigation = navigation.error ?? invalidBrowserNavigationResult(tool, navigation.input, true, task);
               if (invalidNavigation) {
                 lastToolResult = invalidNavigation;
                 return invalidNavigation;
               }
-              const executableInput = normalizeBrowserNavigationInput(tool, toolInput, true);
-              const result = await this.tools.execute(tool, executableInput, {
+              let result = await this.tools.execute(tool, navigation.input, {
                 signal: cancellation.signal,
                 runId,
                 stepIndex,
                 timeoutMs: this.budgetOptions?.toolTimeoutMs,
               });
+              if (tool === 'browser.navigate') {
+                result = recordNavigationOutcome(result, navigation, navigationPolicy);
+              } else if (tool === 'browser.download') result = attachNavigationProvenance(result, navigation);
+              rememberObservedBrowserUrls(tool, result.data, navigationPolicy);
               lastToolResult = result;
               return result;
             },
@@ -1450,11 +1718,13 @@ export class AgentRuntime {
     task: TaskDefinition,
     observation: EnvironmentObservation,
     lastToolResult?: ToolResult,
+    browserContentResult?: ToolResult,
   ): Promise<VerificationResult> {
     return this.verifier.verifyTask(task, {
       guest: this.guest,
       observation,
       lastToolResult,
+      browserContentResult,
     });
   }
 

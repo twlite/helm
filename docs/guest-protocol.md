@@ -36,12 +36,19 @@ visible semantic regions plus a bounded list of interactive elements and their
 roles, accessible names, values, links, enabled state, checked state, and
 selected state. Region previews do not contain the full region content.
 
-`browser.read` consumes bounded page content without a query. Readable mode
-uses deterministic content-root selection, removes hidden/script content and
-common navigation boilerplate, and returns structured heading sections.
-Document mode reads a broader visible representation. Reads accept a current
-snapshot region ref and return the complete sanitized region content. Responses
-default to 12,000 characters and large reads return a continuation cursor.
+`browser.read` extracts typed semantic blocks and accepts an optional local
+retrieval query. Results are ranked and compact: tables include their headers,
+row count, heading ancestry, and a short row preview; prose, lists, code,
+forms, navigation, and search results retain their block type. With no query,
+the read returns a compact page overview. The complete block remains inside
+the guest and is addressable through its revision-bound `c<revision>-<n>` ref.
+Pass that ref back to `browser.read` to retrieve the full block or paginate a
+large table with `offset` and `limit`.
+
+`fs.write` accepts either `content` or `sourceRef`, never both. A source ref
+can be serialized locally as `text`, `markdown`, `json`, or `csv`; normal
+arbitrary-content writes continue to use `content`. A stale or unknown ref
+returns a clear error instead of resolving to newer page data.
 
 `browser.search` performs local lexical ranking over visible semantic regions
 in the current page. The guest builds bounded query-hit windows inside those
@@ -63,10 +70,12 @@ Region and interactive element refs include the DOM revision, for example
 the previous revision; using one returns a stale-ref error. The model should
 request a fresh snapshot or search result after that error.
 
-The read operation never accepts a natural-language query. Use `browser.search`
-only to locate specific information; a search with zero matches is not evidence
-that a page has no readable content. The acting agent reads page content with
-`browser.read` and uses its cursor when more bounded content is needed.
+`browser.search` remains available for finding semantic regions and reports
+`pageReadable` separately from matches. A zero-match search is not evidence
+that a page has no readable content. Navigation uses exact user URLs, exact
+verified-memory URLs, DuckDuckGo result links, or links observed on the page.
+Unobserved model proposals are redirected to a DuckDuckGo search before they
+can become a destination.
 
 `browser.download` accepts a semantic element ref or an explicit URL. The guest
 waits for Playwright's download event and returns the source URL, final URL,

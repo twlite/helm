@@ -57,7 +57,7 @@ export const GuestMethodContracts: Readonly<
     description: "Return a bounded page outline and visible interactive elements with semantic refs.",
   },
   "browser.read": {
-    description: "Read bounded readable page content or the complete content of a current semantic region ref.",
+    description: "Read a compact semantic overview or locally ranked page content. Content refs remain internal to the current page revision and can be exported through fs.write.",
   },
   "browser.search": {
     description: "Search page content for a specific query and return bounded matching snippets and refs.",
