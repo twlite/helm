@@ -78,23 +78,22 @@ bounded. Cancellation is passed through to both model and guest calls.
 Ordinary environment reads do not fetch page text or a snapshot. They carry
 only URL, title, loading state, page count, and DOM revision. The model chooses
 when to request the bounded page outline, read page content, or search for
-specific information. The guest indexes semantic DOM regions and sends bounded
-search-hit windows to its local ranker instead of sending the complete
-`body.innerText` for search. `browser.read` extracts bounded content sections
-inside the guest. Ranking combines IDF/BM25-like body
-relevance with heading, table-header, and form-label field boosts, phrase and
-proximity signals, and semantic region kinds. Nested matches with substantially
-overlapping query terms are deduplicated in favor of the more specific useful
-region.
+specific information. `browser.read` and `browser.search` use the same local
+semantic extraction and ranker. Search returns typed blocks, current-page
+content refs, and hrefs observed in the DOM. The runtime remembers those hrefs
+as navigation provenance, while `browser.open({ ref })` lets the guest resolve
+and open one without asking the model to retype its URL.
 
 Tables are first-class blocks with caption, heading ancestry, columns, rows,
 and span metadata where available. Query results contain a small row preview;
-`browser.read({ref, offset, limit})` retrieves more rows. `fs.write` can accept
+`browser.read({ref, offset, limit})` retrieves more rows, list items, or
+`browser.read({ref, offset, maxChars})` retrieves a prose chunk. `fs.write` can accept
 `sourceRef` and a deterministic text, Markdown, JSON, or CSV format, so the
 guest transfers the selected full block without routing all its contents
-through the model. Ordinary `content` writes remain available. `browser.search`
-continues to search the existing semantic-region index and reports
-`pageReadable` separately from query matches.
+through the model. Ordinary `content` writes remain available. A successful
+current-run `fs.write` receipt is required for explicit write requests even if
+the file existed before the task; an explicit open request requires a
+current-run `app.openFile` receipt and the resulting desktop state.
 
 Semantic region, element, and content refs are tied to the observed page
 revision. Navigation or meaningful DOM changes expire them, and the guest

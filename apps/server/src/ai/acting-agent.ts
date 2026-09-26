@@ -29,10 +29,11 @@ const BASE_INSTRUCTIONS = [
 ].join(' ');
 
 const PAGE_READING_INSTRUCTIONS = [
-  'Use browser.read({ query }) with concise terms from the current task to retrieve locally ranked semantic blocks; without a query it returns a compact overview. Use a returned block ref with offset and limit to inspect more table rows or list items.',
+  'Use browser.read({ query }) to locate relevant semantic blocks; browser.search ranks the same blocks and exposes observed hrefs. Without a read query, browser.read returns a compact overview. Use browser.read({ ref }) only to inspect more of an already selected block, including table pagination with offset and limit.',
   'When saving extracted page content, choose the relevant block ref and call fs.write with sourceRef and a suitable text, markdown, json, or csv format. The guest transfers the full stored block; do not copy a preview or reconstruct the extracted data in the content argument. Use content for model-authored summaries or other new text.',
-  'For web discovery, never invent a hostname or route. Use an exact URL supplied by the user or an exact verified URL in memory; otherwise search DuckDuckGo and navigate only to a result href observed in the browser. A remembered site or organization name can guide the search query but is not a URL.',
+  'For an unnamed destination, search DuckDuckGo first and prefer the named organization\'s official result. Never invent a hostname or route. Use browser.open({ ref }) to open a selected result or page link; do not retype or reconstruct its URL. An exact user URL or exact verified-memory URL may be navigated to directly. If a verified-memory URL fails or unexpectedly redirects, return to DuckDuckGo discovery.',
   'Before saving page-derived content, obtain a successful non-empty browser.read result and include browser.read in requiredEffects. If reading fails, recover with another query or a relevant ref; never save errors or placeholders as the artifact or complete while readable content remains unread.',
+  'An existing output file or already-open window does not satisfy a request to write or open it during this run. Verify the current-run fs.write result before calling app.openFile, and verify the current-run app.openFile result for an explicit open request.',
 ].join(' ');
 
 function instructionsFor(input: ActingAgentContext): { agent: string; finalization: string } {

@@ -275,7 +275,7 @@ function factIsSupported(fact: Fact, evidence: readonly Evidence[]): boolean {
   const linked = evidence.filter(item => fact.evidenceIds.includes(item.id));
   if (linked.length !== fact.evidenceIds.length) return false;
   const expected = json(fact.value);
-  const expectedText = expected.replace(/^"|"$/gu, '');
+  const expectedText = typeof fact.value === 'string' ? fact.value : expected.replace(/^"|"$/gu, '');
   return linked.some(item => (
     json(item.data).includes(expectedText)
     || structuredPageText(item.data) === expectedText
@@ -338,6 +338,82 @@ function actualEvidenceFromResult(action: WorkerAction, now: () => number): Evid
   };
 }
 
+function normalizedRequirementPath(value: string): string {
+  return value.replace(/\\/gu, '/').replace(/^(?:\.\/)+/u, '').replace(/\/$/u, '');
+}
+
+function actionReceipt(action: WorkerAction): WorkerAction['receipt'] | undefined {
+  if (action.receipt) return action.receipt;
+  const evidence = recordValue(action.result.evidence);
+  const receipt = recordValue(evidence?.receipt);
+  return receipt as WorkerAction['receipt'] | undefined;
+}
+
+function requiredAction(target: TaskRequirement['target']): string | undefined {
+  if (target?.action) return target.action;
+  switch (target?.mode) {
+    case 'written':
+    case 'written-from-artifact': return 'fs.write';
+    case 'created': return 'fs.mkdir';
+    case 'opened': return 'app.openFile';
+    default: return undefined;
+  }
+}
+
+function observedSemanticContentRef(
+  state: TaskState,
+  writeAction: WorkerAction,
+  sourceRef: string,
+  sourceRevision: number,
+  sourceUrl: string,
+): boolean {
+  const writeIndex = state.recentActions.lastIndexOf(writeAction);
+  if (writeIndex < 0) return false;
+  return state.recentActions.slice(0, writeIndex).some(action => {
+    if ((action.tool !== 'browser.read' && action.tool !== 'browser.search') || !action.result.ok) return false;
+    const receipt = actionReceipt(action);
+    if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
+    const data = recordValue(action.result.data);
+    if (data?.url !== sourceUrl || data.revision !== sourceRevision) return false;
+    const collection = action.tool === 'browser.read' ? data.blocks : data.results;
+    return Array.isArray(collection) && collection.some(item => recordValue(item)?.ref === sourceRef);
+  });
+}
+
+function successfulCurrentRunAction(
+  requirement: TaskRequirement,
+  state: TaskState,
+): { action: WorkerAction; receipt: NonNullable<WorkerAction['receipt']>; data?: Record<string, unknown> } | undefined {
+  const target = requirement.target;
+  const expectedTool = requiredAction(target);
+  if (!expectedTool || target?.freshness !== 'current-run') return undefined;
+  for (const action of [...state.recentActions].reverse()) {
+    if (action.tool !== expectedTool || !action.result.ok) continue;
+    const receipt = actionReceipt(action);
+    if (!receipt || receipt.ok !== true || receipt.tool !== expectedTool) continue;
+    const data = recordValue(action.result.data);
+    const path = target.path;
+    if (path) {
+      const observedPaths = [data?.path, receipt.effect?.path, action.input.path]
+        .filter((value): value is string => typeof value === 'string');
+      if (!observedPaths.some(observedPath => normalizedRequirementPath(observedPath) === normalizedRequirementPath(path))) continue;
+    }
+    if (expectedTool === 'fs.write' && (
+      receipt.effect?.writePerformed !== true
+      || typeof data?.sha256 !== 'string'
+    )) continue;
+    if (typeof data?.sourceRef === 'string' && (
+      typeof data.sourceType !== 'string'
+      || typeof data.sourceRevision !== 'number'
+      || typeof data.sourceUrl !== 'string'
+      || !observedSemanticContentRef(state, action, data.sourceRef, data.sourceRevision, data.sourceUrl)
+    )) continue;
+    if (target.mode === 'written-from-artifact' && typeof data?.sourceRef !== 'string') continue;
+    return { action, receipt, ...(data ? { data } : {}) };
+  }
+  return undefined;
+}
+
 function retainEvidence(evidence: readonly Evidence[], facts: readonly Fact[]): Evidence[] {
   const requiredIds = new Set(facts.flatMap(fact => fact.evidenceIds));
   const recentIds = new Set(evidence.slice(-80).map(item => item.id));
@@ -381,9 +457,9 @@ export function mergeWorkerResult(
   }
   const artifacts = [...state.artifacts];
   for (const artifact of result.artifacts) {
-    if (!artifacts.some(existing => existing.id === artifact.id || existing.path === artifact.path)) {
-      artifacts.push(artifact);
-    }
+    if (artifacts.some(existing => existing.id === artifact.id)) continue;
+    const version = Math.max(0, ...artifacts.filter(existing => existing.path === artifact.path).map(existing => existing.version ?? 1)) + 1;
+    artifacts.push({ ...artifact, version });
   }
   const mergedFacts = [...factMap.values()];
   const actions = [...state.recentActions, ...compactActions].slice(-24);
@@ -534,6 +610,16 @@ async function requirementCheck(
     }
   }
   const target = requirement.target ?? {};
+  const expectedAction = requiredAction(target);
+  const currentAction = target.freshness === 'current-run' && expectedAction
+    ? successfulCurrentRunAction(requirement, state)
+    : undefined;
+  if (target.freshness === 'current-run' && expectedAction && !currentAction) {
+    return {
+      passed: false,
+      message: `A successful current-run ${expectedAction} action for ${target.path ?? requirement.id} has not been recorded.`,
+    };
+  }
   if (requirement.type === 'fact') {
     const fact = supportedFact(state, target.factId ?? requirement.id);
     return fact
@@ -551,6 +637,31 @@ async function requirementCheck(
     try {
       const stat = await guest.request('fs.stat', { path: target.path });
       if (!stat.exists) return { passed: false, message: `Path does not exist: ${target.path}.`, evidence: stat };
+      if (target.mode === 'written' || target.mode === 'written-from-artifact' || target.mode === 'created') {
+        const lineageArtifact = target.mode === 'written-from-artifact' && currentAction?.data
+          ? state.artifacts.find(artifact => artifact.type === 'file'
+            && artifact.writeReceiptId === currentAction.receipt.id
+            && artifact.sourceRef === currentAction.data?.sourceRef
+            && artifact.sourceRevision === currentAction.data?.sourceRevision)
+          : undefined;
+        if (target.mode === 'written-from-artifact' && !lineageArtifact) {
+          return {
+            passed: false,
+            message: `The current-run write to ${target.path} has no matching browser-content artifact lineage.`,
+            evidence: { action: currentAction, stat },
+          };
+        }
+        const passed = target.mode === 'created'
+          ? stat.type === 'directory'
+          : stat.type === 'file';
+        return {
+          passed,
+          message: passed
+            ? `${target.mode === 'created' ? 'Directory creation' : 'File write'} is verified for ${target.path}.`
+            : `The requested current-run action did not produce the expected path type at ${target.path}.`,
+          evidence: { action: currentAction, artifact: lineageArtifact, stat },
+        };
+      }
       if (target.mode === 'non-empty') {
         const passed = stat.type === 'file' && stat.size > 0;
         return {
@@ -613,8 +724,14 @@ async function requirementCheck(
   if (requirement.type === 'desktop') {
     const expected = target.content;
     const windows = observation.desktop?.windows ?? [];
-    const passed = expected === undefined || windows.some(window => window.title.includes(expected));
-    return { passed, message: passed ? 'Desktop requirement is satisfied.' : 'Desktop requirement is not satisfied.', evidence: observation.desktop };
+    const stateMatches = expected === undefined || windows.some(window => window.title.includes(expected));
+    return {
+      passed: stateMatches && (target.freshness !== 'current-run' || Boolean(currentAction)),
+      message: stateMatches
+        ? target.freshness === 'current-run' ? 'The requested current-run open action and desktop state are verified.' : 'Desktop requirement is satisfied.'
+        : 'Desktop requirement is not satisfied.',
+      evidence: { desktop: observation.desktop, action: currentAction },
+    };
   }
   return { passed: false, message: `Semantic requirement ${requirement.id} needs an explicit verifier.` };
 }
@@ -748,12 +865,18 @@ export function evidenceFromObservation(observation: EnvironmentObservation, seq
   };
 }
 
-export function artifactsFromResult(result: ToolResult, now: () => number = Date.now): Artifact[] {
+export function artifactsFromResult(
+  result: ToolResult,
+  now: () => number = Date.now,
+  action?: WorkerAction,
+): Artifact[] {
   const data = recordValue(result.data);
+  const evidence = recordValue(result.evidence);
+  const receipt = action?.receipt ?? recordValue(evidence?.receipt) as WorkerAction['receipt'] | undefined;
   const download = recordValue(data?.download) ?? (typeof data?.sourceUrl === 'string' ? data : undefined);
   if (download && typeof download.savedPath === 'string') {
     return [{
-      id: `artifact-${download.savedPath}`,
+      id: receipt?.id ? `artifact-${receipt.id}` : `artifact-download-${download.savedPath}-${now()}`,
       type: 'download',
       path: download.savedPath,
       ...(typeof download.size === 'number' ? { size: download.size } : {}),
@@ -764,11 +887,17 @@ export function artifactsFromResult(result: ToolResult, now: () => number = Date
   }
   if (result.ok && typeof data?.path === 'string' && (typeof data.existsAfter === 'boolean' || typeof data.sha256 === 'string')) {
     return [{
-      id: `artifact-${data.path}`,
+      id: receipt?.id ? `artifact-${receipt.id}` : `artifact-write-${data.path}-${now()}`,
       type: 'file',
       path: data.path,
-      ...(typeof data.bytesWritten === 'number' ? { size: data.bytesWritten } : {}),
+      ...(typeof data.size === 'number' ? { size: data.size } : typeof data.bytesWritten === 'number' ? { size: data.bytesWritten } : {}),
       ...(typeof data.sha256 === 'string' ? { sha256: data.sha256 } : {}),
+      ...(typeof data.sourceUrl === 'string' ? { sourceUrl: data.sourceUrl } : {}),
+      ...(typeof data.sourceRef === 'string' ? { sourceRef: data.sourceRef } : {}),
+      ...(typeof data.sourceType === 'string' ? { sourceType: data.sourceType as Artifact['sourceType'] } : {}),
+      ...(typeof data.sourceRevision === 'number' ? { sourceRevision: data.sourceRevision } : {}),
+      ...(typeof data.format === 'string' ? { format: data.format as Artifact['format'] } : {}),
+      ...(receipt?.id ? { writeReceiptId: receipt.id } : {}),
       observedAt: iso(now),
     }];
   }

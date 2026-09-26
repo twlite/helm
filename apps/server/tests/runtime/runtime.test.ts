@@ -278,30 +278,40 @@ describe('AgentRuntime', () => {
   });
 
   it('searches first, ranks a forex table, writes its full content ref, and opens the file', async () => {
-    const userMessage = 'Fetch exchange rate data, save it in forex.txt, and open the file in the text viewer.';
+    const userMessage = "Fetch the exchange rate data from Nepal Rastra Bank's official forex website, save that data to forex.txt, and open it with the text viewer application.";
     const searchUrl = browserResearchSearchUrl(deriveBrowserReadQuery(userMessage));
-    const guessedUrl = 'https://rates.example.test/assumed-route';
-    const resultUrl = 'https://rates.example.test/daily';
+    const inventedUrl = 'https://www.nrb.org.np';
+    const resultUrl = 'https://www.nrb.org.np/forex';
     const ratePage = `<html><body>
       <nav>Home Deposit Current Account Saving Account</nav>
       <h1>Foreign Exchange Rate</h1>
       <h2>Exchange Rate of 24-September-2026 10:00 AM</h2>
-      <table><thead><tr><th>Currency</th><th>Code</th><th>Unit</th><th>Buying: Cash below Deno 50</th><th>Buying: Cash 50 and above Deno</th><th>Selling</th></tr></thead>
+      <table><thead><tr><th>Currency</th><th>Code</th><th>Unit</th><th>Buying below Deno 50</th><th>Buying 50 and above Deno</th><th>Selling</th></tr></thead>
         <tbody>
           <tr><td>USD</td><td>USD</td><td>1</td><td>152.28</td><td>153.05</td><td>153.65</td></tr>
           <tr><td>Euro</td><td>EUR</td><td>1</td><td>173.65</td><td>173.65</td><td>175.36</td></tr>
           <tr><td>Japanese Yen</td><td>JPY</td><td>10</td><td>9.69</td><td>9.69</td><td>9.78</td></tr>
           <tr><td>Indian Currency</td><td>INR</td><td>100</td><td>160.00</td><td>160.00</td><td>160.15</td></tr>
+          <tr><td>British Pound</td><td>GBP</td><td>1</td><td>205.10</td><td>205.80</td><td>206.50</td></tr>
+          <tr><td>Swiss Franc</td><td>CHF</td><td>1</td><td>181.20</td><td>181.90</td><td>182.60</td></tr>
+          <tr><td>Australian Dollar</td><td>AUD</td><td>1</td><td>98.10</td><td>98.50</td><td>99.00</td></tr>
+          <tr><td>Canadian Dollar</td><td>CAD</td><td>1</td><td>110.10</td><td>110.55</td><td>111.00</td></tr>
+          <tr><td>Singapore Dollar</td><td>SGD</td><td>1</td><td>112.20</td><td>112.65</td><td>113.10</td></tr>
+          <tr><td>Chinese Yuan</td><td>CNY</td><td>1</td><td>20.90</td><td>21.00</td><td>21.10</td></tr>
+          <tr><td>Qatari Riyal</td><td>QAR</td><td>1</td><td>41.50</td><td>41.65</td><td>41.80</td></tr>
+          <tr><td>Saudi Riyal</td><td>SAR</td><td>1</td><td>40.40</td><td>40.55</td><td>40.70</td></tr>
         </tbody>
       </table>
       <footer>Footer links and unrelated banking information.</footer>
     </body></html>`;
     const guest = new MockGuestTransport({
+      initialFiles: { 'forex.txt': 'OLD DATA' },
       pages: {
-        [searchUrl]: `<html><body><main><h1>Search results</h1><p>Foreign exchange rate data from the official bank.</p><a href="${resultUrl}">Daily exchange rate table</a></main></body></html>`,
+        [searchUrl]: `<html><body><main><h1>Search results</h1></main><article><h2><a href="https://duckduckgo.com/l/?uddg=${encodeURIComponent(resultUrl)}">Foreign Exchange Rate - Nepal Rastra Bank</a></h2><p>Official exchange rate data with currency buying and selling tables.</p></article></body></html>`,
         [resultUrl]: ratePage,
       },
     });
+    await guest.request('app.openFile', { path: 'forex.txt', application: 'text-editor' });
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
     let decisionIndex = 0;
@@ -313,6 +323,14 @@ describe('AgentRuntime', () => {
       if (!result || typeof result.data !== 'object' || result.data === null) throw new Error('Expected an observed browser read.');
       return result.data as { blocks?: Array<{ type: string; ref: string; links?: Array<{ href: string }> }> };
     };
+    const latestSearch = (context: { previousResults: Array<{ ok: boolean; data?: unknown }> }) => {
+      const result = [...context.previousResults].reverse().find(item => (
+        item.ok && typeof item.data === 'object' && item.data !== null
+        && (item.data as { operation?: string }).operation === 'search'
+      ));
+      if (!result || typeof result.data !== 'object' || result.data === null) throw new Error('Expected an observed browser search.');
+      return result.data as { results?: Array<{ type: string; ref: string; href?: string }> };
+    };
     const runtime = new AgentRuntime({
       guestTransport: guest,
       toolRegistry: tools,
@@ -320,20 +338,23 @@ describe('AgentRuntime', () => {
       decisionProvider: {
         next: async context => {
           const step = decisionIndex++;
-          if (step === 0) return { type: 'action', tool: 'browser.navigate', input: { url: guessedUrl } };
-          if (step === 1) return { type: 'action', tool: 'browser.read', input: {} };
+          if (step === 0) return { type: 'action', tool: 'browser.navigate', input: { url: searchUrl } };
+          if (step === 1) return { type: 'action', tool: 'browser.search', input: { query: 'Nepal Rastra Bank official foreign exchange rate' } };
           if (step === 2) {
-            const link = latestRead(context).blocks?.flatMap(block => block.links ?? []).find(item => item.href === resultUrl);
-            if (!link) throw new Error('The search result did not expose its observed href.');
-            return { type: 'action', tool: 'browser.navigate', input: { url: link.href } };
+            return { type: 'action', tool: 'browser.navigate', input: { url: inventedUrl } };
           }
-          if (step === 3) return { type: 'action', tool: 'browser.read', input: {} };
-          if (step === 4) {
+          if (step === 3) {
+            const result = latestSearch(context).results?.find(item => item.type === 'search_result' && item.href === resultUrl);
+            if (!result) throw new Error('The search result did not expose its exact observed href.');
+            return { type: 'action', tool: 'browser.open', input: { ref: result.ref } };
+          }
+          if (step === 4) return { type: 'action', tool: 'browser.read', input: { query: 'foreign exchange currency buying selling' } };
+          if (step === 5) {
             const table = latestRead(context).blocks?.find(block => block.type === 'table');
             if (!table) throw new Error('The ranked browser read did not return a table ref.');
             return { type: 'action', tool: 'fs.write', input: { path: 'forex.txt', sourceRef: table.ref, format: 'text' } };
           }
-          if (step === 5) return { type: 'action', tool: 'app.openFile', input: { path: 'forex.txt', application: 'text-editor' } };
+          if (step === 6) return { type: 'action', tool: 'app.openFile', input: { path: 'forex.txt', application: 'text-editor' } };
           return { type: 'complete' };
         },
       },
@@ -347,22 +368,32 @@ describe('AgentRuntime', () => {
 
     expect(result.status).toBe('completed');
     const navigations = tools.invocations.filter(invocation => invocation.tool === 'browser.navigate');
-    expect(navigations.map(invocation => invocation.input)).toEqual([
-      { url: searchUrl },
-      { url: resultUrl },
-    ]);
-    const navigationResults = result.steps.filter(step => step.phase === 'act' && step.toolName === 'browser.navigate').map(step => step.toolResult?.data as { urlProvenance?: string });
-    expect(navigationResults.map(data => data.urlProvenance)).toEqual(['duckduckgo-search', 'page-link']);
+    expect(navigations.map(invocation => invocation.input)).toEqual([{ url: searchUrl }]);
+    const search = tools.invocations.find(invocation => invocation.tool === 'browser.search');
+    const searchResult = (search?.result.data as { results: Array<{ type: string; ref: string; href?: string }> })
+      .results.find(result => result.type === 'search_result');
+    expect(searchResult).toMatchObject({
+      type: 'search_result',
+      ref: expect.stringMatching(/^c\d+-/),
+      href: resultUrl,
+    });
+    expect(tools.invocations.find(invocation => invocation.tool === 'browser.open')?.input).toEqual({ ref: searchResult?.ref });
+    const opened = result.steps.find(step => step.phase === 'act' && step.toolName === 'browser.open')?.toolResult;
+    expect(opened).toMatchObject({ ok: true, data: { openedHref: resultUrl, url: resultUrl, urlProvenance: 'search-result' } });
+    const rejectedGuess = result.steps.find(step => step.phase === 'act' && step.toolName === 'browser.navigate' && step.toolResult?.error);
+    expect(rejectedGuess?.toolResult?.error).toMatchObject({ code: 'UNOBSERVED_NAVIGATION_URL' });
     expect(tools.invocations.filter(invocation => invocation.tool === 'browser.read').map(invocation => invocation.input))
-      .toEqual([{ query: 'exchange rate data' }, { query: 'exchange rate data' }]);
-    const selectedRead = tools.invocations.filter(invocation => invocation.tool === 'browser.read')[1];
-    expect((selectedRead?.result.data as { blocks: Array<{ type: string }> }).blocks[0]?.type).toBe('table');
+      .toEqual([{ query: 'foreign exchange currency buying selling' }]);
+    const selectedRead = tools.invocations.find(invocation => invocation.tool === 'browser.read');
+    expect((selectedRead?.result.data as { blocks: Array<{ type: string; rowCount?: number }> }).blocks[0]).toMatchObject({ type: 'table', rowCount: 12 });
     const saved = guest.getFile('forex.txt') ?? '';
     expect(saved).toContain('Exchange Rate of 24-September-2026 10:00 AM');
     expect(saved).toContain('USD | USD | 1 | 152.28 | 153.05 | 153.65');
     expect(saved).toContain('Euro | EUR | 1 | 173.65 | 173.65 | 175.36');
     expect(saved).toContain('Japanese Yen | JPY | 10 | 9.69 | 9.69 | 9.78');
     expect(saved).toContain('Indian Currency | INR | 100 | 160.00 | 160.00 | 160.15');
+    expect(saved).toContain('Saudi Riyal | SAR | 1 | 40.40 | 40.55 | 40.70');
+    expect(saved).not.toContain('OLD DATA');
     expect(saved).not.toContain('Current Account');
     expect(saved).not.toContain('Footer links');
     expect(guest.desktopWindows.find(window => window.focused)?.title).toContain('forex.txt');
@@ -645,8 +676,11 @@ describe('AgentRuntime', () => {
     expect(result.finalVerification?.complete).toBe(true);
     expect(demo.guest.getFile('/home/helm/workspace/demo.txt')).toContain(DEMO_PAGE_TEXT);
     const write = demo.tools.invocations.find(invocation => invocation.tool === 'fs.write');
-    expect(write?.input).toMatchObject({ path: '/home/helm/workspace/demo.txt' });
-    expect((write?.input as { content?: string } | undefined)?.content).toContain(DEMO_PAGE_TEXT);
+    expect(write?.input).toMatchObject({
+      path: '/home/helm/workspace/demo.txt',
+      sourceRef: expect.stringMatching(/^c\d+-/),
+      format: 'text',
+    });
   });
 
   it('cannot silently accept a premature completion request', async () => {

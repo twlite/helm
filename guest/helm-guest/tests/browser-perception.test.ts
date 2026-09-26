@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -37,8 +38,6 @@ describe('progressive browser perception', () => {
           <table id="rates"><thead><tr><th>Currency</th><th>Unit</th><th>Buying</th><th>Selling</th></tr></thead>
             <tbody><tr><td>USD</td><td>1</td><td>132.10</td><td>132.70</td></tr>
             <tr><td>EUR</td><td>1</td><td>143.20</td><td>144.00</td></tr></tbody></table>
-          <table id="large"><thead><tr><th>Item</th><th>Code</th><th>Description</th></tr></thead>
-            <tbody>${largeRows}</tbody></table>
         </div></div></section>
         <form><label for="email">Email address</label><input id="email" type="email">
           <label for="verification">Verification code</label><input id="verification"></form>
@@ -63,11 +62,15 @@ describe('progressive browser perception', () => {
     const largeReadHtml = `<!doctype html><html><head><title>Large read</title></head><body><main>
       <h1>Large readable document</h1>${Array.from({ length: 120 }, (_, index) => `<section><h2>Chapter ${index}</h2><p>${`Chapter ${index} paragraph with bounded continuation content. `.repeat(14)}</p></section>`).join('')}
     </main></body></html>`;
+    const largeTableHtml = `<!doctype html><html><head><title>Large table</title></head><body><main><h1>Catalog</h1>
+      <table id="large"><thead><tr><th>Item</th><th>Code</th><th>Description</th></tr></thead><tbody>${largeRows}</tbody></table>
+    </main></body></html>`;
     const pagePath = await sandbox.write('workspace/large.html', html);
     const nextPath = await sandbox.write('workspace/next.html', '<!doctype html><title>Next page</title><main><h1>Next</h1></main>');
     const portfolioPath = await sandbox.write('workspace/portfolio.html', portfolioHtml);
     const bodyFallbackPath = await sandbox.write('workspace/body-fallback.html', bodyFallbackHtml);
     const largeReadPath = await sandbox.write('workspace/large-read.html', largeReadHtml);
+    const largeTablePath = await sandbox.write('workspace/large-table.html', largeTableHtml);
 
     try {
       await controller.navigate({ url: pathToFileURL(pagePath.path).href });
@@ -81,7 +84,7 @@ describe('progressive browser perception', () => {
       expect(JSON.stringify(snapshot).length).toBeLessThan(30_000);
 
       const search = await controller.search({ query: 'foreign exchange currency buying selling rates', maxResults: 5 });
-      expect(search.results[0]).toMatchObject({ kind: 'table', rowCount: 2, columnCount: 4 });
+      expect(search.results[0]).toMatchObject({ type: 'table', rowCount: 2, columnCount: 4 });
       expect(search).toMatchObject({ operation: 'search', searchCompleted: true, pageReadable: true });
       expect(search.matchCount).toBe(search.results.length);
       expect(search.matchCount).toBeGreaterThan(0);
@@ -90,15 +93,14 @@ describe('progressive browser perception', () => {
       const noMatchSearch = await controller.search({ query: 'qzxwvv-9347182-uniquetoken' });
       expect(noMatchSearch).toMatchObject({
         operation: 'search', searchCompleted: true, matchCount: 0, pageReadable: true,
-        message: 'Search completed successfully. No page text matched the query.',
+        message: 'Search completed successfully. No semantic content matched the query.',
       });
       const nestedSearch = await controller.search({ query: 'currency buying selling rates', maxResults: 10 });
-      expect(nestedSearch.results.filter(result => ['section', 'table', 'text'].includes(result.kind))).toHaveLength(1);
+      expect(nestedSearch.results.filter(result => ['table', 'text', 'other'].includes(result.type))).toHaveLength(1);
       const tableRef = search.results[0]!.ref;
-      const inspected = await controller.inspectRegion({ ref: tableRef });
-      expect(inspected).toMatchObject({
-        kind: 'table',
-        format: 'table',
+      const inspected = await controller.read({ ref: tableRef, limit: 20 });
+      expect(inspected.blocks?.[0]).toMatchObject({
+        type: 'table',
         columns: ['Currency', 'Unit', 'Buying', 'Selling'],
         rows: [
           ['USD', '1', '132.10', '132.70'],
@@ -112,25 +114,11 @@ describe('progressive browser perception', () => {
       expect(JSON.stringify(inspected).length).toBeLessThan(12_000);
 
       const formSearch = await controller.search({ query: 'email address verification code' });
-      expect(formSearch.results[0]?.kind).toBe('form');
+      expect(formSearch.results[0]?.type).toBe('form');
       expect(JSON.stringify(formSearch).length).toBeLessThan(12_000);
 
-      const largeTableSearch = await controller.search({ query: 'catalog item code description' });
-      const largeTableRef = largeTableSearch.results.find(result => result.kind === 'table')?.ref;
-      expect(largeTableRef).toBeDefined();
-      const tablePage = await controller.inspectRegion({ ref: largeTableRef!, format: 'table', offset: 100, limit: 10 });
-      expect(tablePage).toMatchObject({
-        format: 'table',
-        rowCount: 240,
-        returnedRowCount: 10,
-        offset: 100,
-        truncated: true,
-      });
-      expect(JSON.stringify(tablePage).length).toBeLessThan(12_000);
-      if (tablePage.format === 'table') expect(tablePage.rows[0]?.[0]).toBe('Item-100');
-
       const relevantSearch = await controller.search({ query: 'Kestrel-482 exchange review marker' });
-      const relevant = relevantSearch.results.map(result => result.snippet ?? '').join('\n');
+      const relevant = relevantSearch.results.map(result => result.preview ?? '').join('\n');
       expect(relevant).toContain('Kestrel-482 exchange review marker');
       expect(relevant).not.toContain('Earlier body passage 0');
       expect(relevant.length).toBeLessThanOrEqual(5 * 800);
@@ -138,10 +126,25 @@ describe('progressive browser perception', () => {
       await controller.click(updateRef!);
       const changed = await controller.getState();
       expect(changed.revision).toBeGreaterThan(snapshot.revision);
-      await expect(controller.inspectRegion({ ref: tableRef })).rejects.toMatchObject({ code: 'STALE_REGION_REF' });
+      await expect(controller.read({ ref: tableRef })).rejects.toMatchObject({ code: 'STALE_CONTENT_REF' });
       if (elementRef) {
         await expect(controller.click(elementRef)).rejects.toMatchObject({ code: 'STALE_ELEMENT_REF' });
       }
+
+      await controller.navigate({ url: pathToFileURL(largeTablePath.path).href });
+      const largeTableSearch = await controller.search({ query: 'item code description' });
+      const largeTableRef = largeTableSearch.results.find(result => result.type === 'table')?.ref;
+      expect(largeTableRef).toBeDefined();
+      const tablePage = await controller.read({ ref: largeTableRef!, offset: 100, limit: 10 });
+      expect(tablePage.blocks?.[0]).toMatchObject({
+        type: 'table',
+        rowCount: 240,
+        returnedRowCount: 10,
+        offset: 100,
+      });
+      expect(tablePage.truncated).toBe(true);
+      expect(JSON.stringify(tablePage).length).toBeLessThan(12_000);
+      expect(tablePage.blocks?.[0]?.rows?.[0]?.[0]).toBe('Item-100');
 
       const beforeNavigation = await controller.snapshot();
       const staleRef = beforeNavigation.outline[0]?.ref;
@@ -151,9 +154,9 @@ describe('progressive browser perception', () => {
       }
 
       await controller.navigate({ url: pathToFileURL(portfolioPath.path).href });
-      const portfolio = await controller.read({ mode: 'readable', maxChars: 12_000 });
-      const portfolioText = portfolio.sections.map(section => `${section.heading ?? ''}\n${section.text}`).join('\n');
-      expect(portfolio).toMatchObject({ operation: 'read', readable: true, mode: 'readable', source: 'main', truncated: false });
+      const portfolio = await controller.read({ query: 'Self-taught software engineer Work Outside software Work with me' });
+      const portfolioText = portfolio.blocks?.map(block => block.preview ?? '').join('\n') ?? '';
+      expect(portfolio).toMatchObject({ operation: 'read', readable: true, mode: 'readable', source: 'semantic' });
       expect(portfolioText).toContain('Self-taught software engineer from Nepal');
       expect(portfolioText).toContain('Work');
       expect(portfolioText).toContain('Outside software');
@@ -164,15 +167,14 @@ describe('progressive browser perception', () => {
       const portfolioSnapshot = await controller.snapshot();
       const mainRef = portfolioSnapshot.outline.find(region => region.kind === 'section')?.ref;
       expect(mainRef).toBeDefined();
-      const fullRegion = await controller.read({ ref: mainRef!, maxChars: 5_000 });
-      expect(fullRegion.source).toBe('region');
-      expect(fullRegion.sections.map(section => section.text).join('\n')).toContain('PIANO-REGION-9284');
+      const fullRegion = await controller.inspectRegion({ ref: mainRef!, maxChars: 5_000 });
+      expect(fullRegion.format).toBe('text');
+      expect(fullRegion.text).toContain('PIANO-REGION-9284');
 
       await controller.navigate({ url: pathToFileURL(bodyFallbackPath.path).href });
-      const bodyFallback = await controller.read({ mode: 'readable', maxChars: 100 });
-      const bodyFallbackText = bodyFallback.sections.map(section => section.text).join('\n');
-      expect(bodyFallback).toMatchObject({ source: 'body', readable: true, truncated: true });
-      expect(bodyFallback.returnedChars).toBeLessThanOrEqual(100);
+      const bodyFallback = await controller.read({ query: 'Visible body content' });
+      const bodyFallbackText = JSON.stringify(bodyFallback.blocks ?? []);
+      expect(bodyFallback).toMatchObject({ source: 'semantic', readable: true });
       expect(bodyFallbackText).toContain('Visible body content');
       expect(bodyFallbackText).not.toContain('Navigation fallback noise');
       expect(bodyFallbackText).not.toContain('ARIA-HIDDEN-SECRET');
@@ -182,17 +184,67 @@ describe('progressive browser perception', () => {
       expect(bodyFallbackText).not.toContain('SVG-SECRET');
 
       await controller.navigate({ url: pathToFileURL(largeReadPath.path).href });
-      const firstChunk = await controller.read({ mode: 'readable', maxChars: 1_000 });
-      expect(firstChunk.returnedChars).toBeLessThanOrEqual(1_000);
+      const largeSearch = await controller.read({ query: 'Chapter 0 paragraph with bounded continuation content' });
+      const textRef = largeSearch.blocks?.find(block => block.type === 'text')?.ref;
+      expect(textRef).toBeDefined();
+      const firstChunk = await controller.read({ ref: textRef!, maxChars: 300 });
+      expect(firstChunk.blocks?.[0]?.returnedChars).toBe(300);
       expect(firstChunk.truncated).toBe(true);
-      expect(firstChunk.nextCursor).toBeDefined();
+      expect(firstChunk.blocks?.[0]?.nextOffset).toBe(300);
       expect(JSON.stringify(firstChunk).length).toBeLessThan(2_500);
-      const secondChunk = await controller.read({ mode: 'readable', maxChars: 1_000, cursor: firstChunk.nextCursor });
+      const secondChunk = await controller.read({ ref: textRef!, maxChars: 300, offset: 300 });
       expect(secondChunk.returnedChars).toBeGreaterThan(0);
       expect(secondChunk.sections.map(section => section.text).join('\n')).not.toBe(firstChunk.sections.map(section => section.text).join('\n'));
-      expect(secondChunk.totalChars).toBeGreaterThan(10_000);
+      expect(secondChunk.totalChars).toBeGreaterThan(500);
     } finally {
       await controller.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it('opens an observed page link by semantic ref and rejects refs after navigation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-browser-open-ref-'));
+    const sandbox = new GuestSandbox({ root, workspace: join(root, 'workspace') });
+    const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
+    let destinationUrl = '';
+    const server = createServer((request, response) => {
+      response.setHeader('content-type', 'text/html; charset=utf-8');
+      if (request.url === '/search') {
+        response.end(`<!doctype html><html><head><title>Search page</title></head><body><main>
+          <h1>Local results</h1>
+          <article><h2><a href="${destinationUrl}">Official foreign exchange rates</a></h2><p>Local observed result with currency buying and selling values.</p></article>
+          <article><h2><a href="http://127.0.0.1:${addressPort()}/archive">Currency archive</a></h2><p>Historical tables and prior rates.</p></article>
+          <article><h2><a href="http://127.0.0.1:${addressPort()}/news">Exchange rate news</a></h2><p>Recent market commentary and reports.</p></article>
+        </main></body></html>`);
+      } else {
+        response.end('<!doctype html><html><head><title>Rates page</title></head><body><main><h1>Rates</h1><p>Destination loaded.</p></main></body></html>');
+      }
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Expected a local HTTP server address.');
+    destinationUrl = `http://127.0.0.1:${address.port}/forex`;
+    const searchUrl = `http://127.0.0.1:${address.port}/search`;
+    function addressPort(): number { return address.port; }
+
+    try {
+      await controller.navigate({ url: searchUrl });
+      const search = await controller.search({ query: 'official foreign exchange rates currency buying selling' });
+      const result = search.results.find(block => block.href === destinationUrl);
+      expect(result?.type).toBe('search_result');
+      expect(typeof result?.ref).toBe('string');
+      expect(result?.ref.startsWith('c')).toBe(true);
+      expect(result?.href).toBe(destinationUrl);
+
+      const opened = await controller.open({ ref: result!.ref });
+      expect(opened).toMatchObject({ openedHref: destinationUrl, url: destinationUrl, sourceType: result!.type });
+      await expect(controller.open({ ref: result!.ref })).rejects.toMatchObject({ code: 'STALE_CONTENT_REF' });
+    } finally {
+      await controller.close();
+      await new Promise<void>(resolve => server.close(() => resolve()));
       await rm(root, { recursive: true, force: true });
     }
   }, 15_000);
@@ -229,7 +281,7 @@ describe('progressive browser perception', () => {
           ['USD', 'USD', '1', '152.28', '153.05', '153.65'],
           ['Euro', 'EUR', '1', '173.65', '173.65', '175.36'],
         ],
-        rowCount: 4,
+        rowCount: 12,
         columnCount: 6,
       });
       expect(forex.diagnostics?.tableCount).toBe(1);
@@ -249,6 +301,14 @@ describe('progressive browser perception', () => {
         ['Euro', 'EUR', '1', '173.65', '173.65', '175.36'],
         ['Japanese Yen', 'JPY', '10', '9.69', '9.69', '9.78'],
         ['Indian Currency', 'INR', '100', '160.00', '160.00', '160.15'],
+        ['British Pound', 'GBP', '1', '205.10', '205.80', '206.50'],
+        ['Swiss Franc', 'CHF', '1', '181.20', '181.90', '182.60'],
+        ['Australian Dollar', 'AUD', '1', '98.10', '98.50', '99.00'],
+        ['Canadian Dollar', 'CAD', '1', '110.10', '110.55', '111.00'],
+        ['Singapore Dollar', 'SGD', '1', '112.20', '112.65', '113.10'],
+        ['Chinese Yuan', 'CNY', '1', '20.90', '21.00', '21.10'],
+        ['Qatari Riyal', 'QAR', '1', '41.50', '41.65', '41.80'],
+        ['Saudi Riyal', 'SAR', '1', '40.40', '40.55', '40.70'],
       ]);
       expect(fullTable.blocks?.[0]?.cellSpans?.[0]).toEqual([
         { rowspan: 2, colspan: 1 },
@@ -258,6 +318,7 @@ describe('progressive browser perception', () => {
         { rowspan: 2, colspan: 1 },
       ]);
 
+      const previous = await sandbox.write('workspace/forex.txt', 'OLD DATA');
       const write = await runtime.dispatch({
         id: 'forex-source-ref-write',
         method: 'fs.write',
@@ -265,12 +326,24 @@ describe('progressive browser perception', () => {
       });
       expect(write).toMatchObject({
         ok: true,
-        result: { sourceRef: table!.ref, sourceType: 'table', format: 'text', size: expect.any(Number) },
+        result: {
+          sourceRef: table!.ref,
+          sourceType: 'table',
+          format: 'text',
+          sourceRevision: forex.revision,
+          sourceUrl: pathToFileURL(forexPath).href,
+          existedBefore: true,
+          beforeSha256: previous.sha256,
+          changed: true,
+          size: expect.any(Number),
+        },
       });
       const saved = await sandbox.read('workspace/forex.txt');
       expect(saved.content).toContain('Exchange Rate of 24-September-2026 10:00 AM');
       expect(saved.content).toContain('Japanese Yen | JPY | 10 | 9.69 | 9.69 | 9.78');
       expect(saved.content).toContain('Indian Currency | INR | 100 | 160.00 | 160.00 | 160.15');
+      expect(saved.content).toContain('Saudi Riyal | SAR | 1 | 40.40 | 40.55 | 40.70');
+      expect(saved.content).not.toContain('OLD DATA');
       expect(saved.content).not.toContain('Current Account');
       expect(saved.content).not.toContain('Saving Account');
 
@@ -283,6 +356,7 @@ describe('progressive browser perception', () => {
       const csv = await sandbox.read('workspace/forex.csv');
       expect(csv.content.split('\n')[0]).toBe('Currency,Code,Unit,Buying: Cash below Deno 50,Buying: Cash 50 and above Deno,Selling');
       expect(csv.content.split('\n')).toContain('Indian Currency,INR,100,160.00,160.00,160.15');
+      expect(csv.content.split('\n')).toContain('Saudi Riyal,SAR,1,40.40,40.55,40.70');
       expect(csv.content).not.toContain('# Foreign Exchange Rate');
 
       const semanticPath = await fixture('semantic-pages.html');
@@ -330,6 +404,20 @@ describe('progressive browser perception', () => {
 
       const resultsPath = await fixture('search-results.html');
       await controller.navigate({ url: pathToFileURL(resultsPath).href });
+      const ddgSearch = await controller.search({ query: 'Nepal Rastra Bank foreign exchange rate' });
+      const nrbResult = ddgSearch.results.find(block => block.title === 'Foreign Exchange Rate - Nepal Rastra Bank');
+      expect(nrbResult).toMatchObject({
+        type: 'search_result',
+        ref: expect.stringMatching(/^c\d+-/),
+        href: 'https://www.nrb.org.np/forex',
+        relevance: expect.any(Number),
+      });
+      const ddgRead = await controller.read({ query: 'Nepal Rastra Bank foreign exchange rate' });
+      expect(ddgRead.blocks?.find(block => block.title === nrbResult?.title)).toMatchObject({
+        ref: nrbResult?.ref,
+        type: 'search_result',
+        href: 'https://www.nrb.org.np/forex',
+      });
       const searchResults = await controller.read({ query: 'historical currency rate tables' });
       expect(searchResults.pageType).toBe('search_results');
       expect(searchResults.blocks?.[0]).toMatchObject({

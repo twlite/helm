@@ -1,4 +1,5 @@
 import type {
+  BrowserContentBlock,
   BrowserPageRegion,
   BrowserRegionKind,
   BrowserSearchResult,
@@ -301,6 +302,61 @@ export function rankPageRegions(input: {
       score,
     }));
   return { indexedRegionCount: input.regions.length, results };
+}
+
+export interface BrowserContentMatch {
+  ref: string;
+  relevance: number;
+}
+
+/** Rank the canonical semantic content blocks used by browser.read and browser.search. */
+export function rankBrowserContentBlocks(input: {
+  query: string;
+  blocks: readonly BrowserContentBlock[];
+  maxResults?: number;
+}): { indexedBlockCount: number; results: BrowserContentMatch[] } {
+  const regions = input.blocks.map((block, domOrder): IndexedBrowserRegion => ({
+    ref: block.ref,
+    kind: block.type === "table" ? "table"
+      : block.type === "list" ? "list"
+        : block.type === "form" ? "form"
+          : block.type === "heading" ? "heading"
+            : block.type === "navigation" ? "navigation"
+              : block.type === "search_result" ? "article"
+                : block.type === "text" ? "text" : "section",
+    ...(block.heading ? { heading: block.heading } : {}),
+    ...(block.headingPath ? { headingPath: block.headingPath } : {}),
+    ...(block.type === "table" ? { tableHeaders: block.columns ?? [] } : {}),
+    ...(block.type === "form" ? { formLabels: (block.fields ?? []).map(field => field.label) } : {}),
+    ...(block.importance === undefined ? {} : { importance: block.importance }),
+    ...(block.boilerplate === undefined ? {} : { boilerplate: block.boilerplate }),
+    searchText: [
+      block.text,
+      block.caption,
+      block.title,
+      block.href,
+      block.snippet,
+      ...(block.columns ?? []),
+      ...(block.rows ?? []).flat(),
+      ...(block.items ?? []),
+      ...(block.fields ?? []).flatMap(field => [field.label, field.value]),
+      ...(block.definitions ?? []).flatMap(item => [item.term, item.definition]),
+      ...(block.links ?? []).flatMap(link => [link.text, link.href]),
+    ].filter((value): value is string => Boolean(value)).join(" "),
+    ...(block.type === "table" && block.rowCount !== undefined ? { rowCount: block.rowCount } : {}),
+    ...(block.type === "table" && block.columnCount !== undefined ? { columnCount: block.columnCount } : {}),
+    ...(block.text ? { preview: block.text.slice(0, 240) } : block.snippet ? { preview: block.snippet.slice(0, 240) } : {}),
+    domOrder,
+  }));
+  const ranked = rankPageRegions({
+    query: input.query,
+    regions,
+    ...(input.maxResults === undefined ? {} : { maxResults: input.maxResults }),
+  });
+  return {
+    indexedBlockCount: ranked.indexedRegionCount,
+    results: ranked.results.map(result => ({ ref: result.ref, relevance: result.score })),
+  };
 }
 
 interface Passage {

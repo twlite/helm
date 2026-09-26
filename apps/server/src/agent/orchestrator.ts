@@ -105,7 +105,7 @@ export function deterministicObjectiveAction(
     objective.requirementIds.includes(requirement.id)
     && requirement.id === 'outputDirectory'
     && requirement.type === 'filesystem'
-    && requirement.target?.mode === 'exists'
+    && (requirement.target?.mode === 'exists' || requirement.target?.mode === 'created')
     && typeof requirement.target.path === 'string'
   ));
   if (outputDirectoryRequirement) {
@@ -129,7 +129,7 @@ export function deterministicObjectiveAction(
       typeof window.title === 'string'
       && window.title.toLocaleLowerCase().includes(fileName)
     )) ?? false;
-    if (!alreadyOpen) {
+    if (openFileRequirement.target?.freshness === 'current-run' || !alreadyOpen) {
       return {
         tool: 'app.openFile',
         input: { path },

@@ -545,8 +545,8 @@ describe('LM Studio AI adapters', () => {
       expect.objectContaining({ id: 'latestReleaseVersion', target: { factId: 'latestReleaseVersion' } }),
       expect.objectContaining({ id: 'releaseDate', target: { factId: 'releaseDate' } }),
       expect.objectContaining({ id: 'releaseUrl', target: { factId: 'releaseUrl' } }),
-      expect.objectContaining({ id: 'outputDirectory', target: { path: '~/Desktop/helm-demo', mode: 'exists' } }),
-      expect.objectContaining({ id: 'outputFile', target: expect.objectContaining({ path: '~/Desktop/helm-demo/bun-release.md', mode: 'contains-facts' }) }),
+      expect.objectContaining({ id: 'outputDirectory', target: expect.objectContaining({ path: '~/Desktop/helm-demo', mode: 'created', freshness: 'current-run', action: 'fs.mkdir' }) }),
+      expect.objectContaining({ id: 'outputFile', target: expect.objectContaining({ path: '~/Desktop/helm-demo/bun-release.md', mode: 'contains-facts', freshness: 'current-run', action: 'fs.write' }) }),
     ]));
     expect(requirements.find(requirement => requirement.id === 'outputFile')?.target?.factIds).toEqual(expect.arrayContaining([
       'repositoryName', 'latestReleaseVersion', 'releaseDate', 'releaseUrl', 'currentDate',
@@ -872,7 +872,12 @@ describe('LM Studio AI adapters', () => {
       expect.objectContaining({ id: 'browserResearch', target: { factId: 'pageContent' } }),
       expect.objectContaining({
         id: 'outputFile',
-        target: { path: 'twlite.txt', mode: 'non-empty' },
+        target: expect.objectContaining({
+          path: 'twlite.txt',
+          mode: 'written',
+          freshness: 'current-run',
+          action: 'fs.write',
+        }),
       }),
     ]));
 
@@ -883,11 +888,37 @@ describe('LM Studio AI adapters', () => {
     expect(combinedTask.requirements).toEqual(expect.arrayContaining([
       expect.objectContaining({
         id: 'outputFile',
-        target: { path: 'twlite.md', mode: 'non-empty' },
+        target: expect.objectContaining({
+          path: 'twlite.md',
+          mode: 'written',
+          freshness: 'current-run',
+          action: 'fs.write',
+        }),
       }),
       expect.objectContaining({
         id: 'openFile',
-        target: { path: 'twlite.md', content: 'twlite.md' },
+        target: expect.objectContaining({
+          path: 'twlite.md',
+          content: 'twlite.md',
+          mode: 'opened',
+          freshness: 'current-run',
+          action: 'app.openFile',
+        }),
+      }),
+    ]));
+
+    const dataRequest = "Fetch the exchange rate data from Nepal Rastra Bank's official forex website and save that data to forex.txt.";
+    const dataTask = await planner.createTask({ threadId: 'forex-data-thread', userMessage: dataRequest });
+    expect(dataTask.requirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'browserResearch', target: { factId: 'pageContent' } }),
+      expect.objectContaining({
+        id: 'outputFile',
+        target: expect.objectContaining({
+          path: 'forex.txt',
+          mode: 'written',
+          freshness: 'current-run',
+          action: 'fs.write',
+        }),
       }),
     ]));
 
@@ -917,7 +948,13 @@ describe('LM Studio AI adapters', () => {
       expect.objectContaining({
         id: 'openFile',
         type: 'desktop',
-        target: { path: 'twlite.txt', content: 'twlite.txt' },
+        target: expect.objectContaining({
+          path: 'twlite.txt',
+          content: 'twlite.txt',
+          mode: 'opened',
+          freshness: 'current-run',
+          action: 'app.openFile',
+        }),
       }),
     ]));
   });

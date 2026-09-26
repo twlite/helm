@@ -25,7 +25,7 @@ The guest rejects unknown methods, malformed parameters, traversal outside `/hom
 The initial method groups are:
 
 - `fs.read`, `fs.write`, `fs.mkdir`, `fs.exists`, `fs.list`, `fs.stat`
-- `browser.navigate`, `browser.getState`, `browser.snapshot`, `browser.read`, `browser.search`, `browser.inspectRegion`, `browser.click`, `browser.type`, `browser.download`
+- `browser.navigate`, `browser.getState`, `browser.snapshot`, `browser.read`, `browser.search`, `browser.open`, `browser.inspectRegion`, `browser.click`, `browser.type`, `browser.download`
 - `app.launch`, `app.openFile`
 - `desktop.getState`, `desktop.listWindows`, `desktop.focusWindow`, `desktop.hotkey`, `desktop.type`, `desktop.click`, `desktop.screenshot`
 
@@ -41,23 +41,30 @@ retrieval query. Results are ranked and compact: tables include their headers,
 row count, heading ancestry, and a short row preview; prose, lists, code,
 forms, navigation, and search results retain their block type. With no query,
 the read returns a compact page overview. The complete block remains inside
-the guest and is addressable through its revision-bound `c<revision>-<n>` ref.
-Pass that ref back to `browser.read` to retrieve the full block or paginate a
-large table with `offset` and `limit`.
+the guest and is addressable through its revision and page-bound
+`c<revision>-<session>-<index>` ref. Pass that ref back to `browser.read` to
+inspect the selected block. Table rows and list items use `offset` and `limit`;
+long prose blocks use `offset` with `maxChars` and return a `nextOffset` while
+content remains.
 
 `fs.write` accepts either `content` or `sourceRef`, never both. A source ref
 can be serialized locally as `text`, `markdown`, `json`, or `csv`; normal
 arbitrary-content writes continue to use `content`. A stale or unknown ref
 returns a clear error instead of resolving to newer page data.
 
-`browser.search` performs local lexical ranking over visible semantic regions
-in the current page. The guest builds bounded query-hit windows inside those
-regions, then scores body text with BM25-like IDF weighting and field boosts
-for headings, table headers, and form labels. Phrase, proximity, region kind,
-and DOM ancestry also affect ranking. Nested matches with substantially
-overlapping query terms are deduplicated in favor of a more specific useful
-region. Results include query snippets and explicit `matchCount` and
-`pageReadable` fields. A zero match count describes only the query.
+`browser.search` ranks the same semantic blocks as `browser.read`; it does not
+build a separate region index. Ranking uses local lexical scoring with field
+boosts for headings, table headers, form labels, titles, snippets, and observed
+hrefs. Search results include the semantic type, stable content ref, exact
+hrefs observed in the DOM, relevance, and a compact preview. A zero match count
+describes only the query, while `pageReadable` separately reports whether
+semantic page content was extracted.
+
+`browser.open({ ref })` resolves a current semantic block inside the guest and
+navigates to its observed `href`. For a block with several links, pass its
+zero-based `linkIndex`. Unknown, forged, or stale refs fail; refs are bound to
+the current URL and DOM revision. DuckDuckGo `uddg` and equivalent redirect
+parameters are unwrapped locally before the destination is returned or opened.
 
 `browser.inspectRegion` reads one selected region as bounded text, local links,
 or structured table columns and rows. Text responses default to 8,000
@@ -70,12 +77,10 @@ Region and interactive element refs include the DOM revision, for example
 the previous revision; using one returns a stale-ref error. The model should
 request a fresh snapshot or search result after that error.
 
-`browser.search` remains available for finding semantic regions and reports
-`pageReadable` separately from matches. A zero-match search is not evidence
-that a page has no readable content. Navigation uses exact user URLs, exact
-verified-memory URLs, DuckDuckGo result links, or links observed on the page.
-Unobserved model proposals are redirected to a DuckDuckGo search before they
-can become a destination.
+Navigation uses exact user URLs, exact verified-memory URLs, or refs that
+resolve to observed DuckDuckGo and page links. Unobserved model-proposed URLs
+are never accepted as destinations; the runtime can begin DuckDuckGo discovery
+without trusting the proposed URL.
 
 `browser.download` accepts a semantic element ref or an explicit URL. The guest
 waits for Playwright's download event and returns the source URL, final URL,
@@ -86,3 +91,6 @@ Mutating and navigational host tools also expose an evidence receipt describing
 URL changes, new tabs, browser DOM revision changes, filesystem
 existence/bytes/hash, or download effects. A receipt is diagnostic evidence;
 the runtime still verifies the user's requirements against current guest state.
+File-write receipts include whether the target existed before, its prior hash
+when it was a regular file, the new hash, and whether the bytes changed. A
+successful write remains a performed action even if its bytes are identical.

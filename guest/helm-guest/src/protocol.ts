@@ -57,11 +57,12 @@ export const GuestMethodContracts: Readonly<
     description: "Return a bounded page outline and visible interactive elements with semantic refs.",
   },
   "browser.read": {
-    description: "Read a compact semantic overview or locally ranked page content. Content refs remain internal to the current page revision and can be exported through fs.write.",
+    description: "Read a compact semantic overview or locally ranked page content. Content refs remain internal to the current page revision and can be opened or exported through fs.write.",
   },
   "browser.search": {
-    description: "Search page content for a specific query and return bounded matching snippets and refs.",
+    description: "Search locally extracted semantic page blocks and return typed content refs and observed hrefs.",
   },
+  "browser.open": { description: "Open an exact observed destination from a current semantic content ref." },
   "browser.inspectRegion": {
     description: "Inspect one current semantic page region, including structured table rows or local links.",
   },

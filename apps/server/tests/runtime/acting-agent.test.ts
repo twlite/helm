@@ -115,7 +115,7 @@ function requestTools(request: CapturedRequest): string[] {
 }
 
 describe('native acting agent', () => {
-  it('exposes separate bounded page reading and query search operations', async () => {
+  it('exposes semantic page reading and query search operations', async () => {
     const guest = new MockGuestTransport();
     const requests: CapturedRequest[] = [];
     const { runtime, tools } = createRuntime(guest, [
@@ -133,7 +133,8 @@ describe('native acting agent', () => {
     const readParameters = readDefinition!.function!.parameters!;
     const readProperties = readParameters.properties as Record<string, Record<string, unknown>>;
     expect(readProperties).toHaveProperty('mode');
-    expect(readProperties).toHaveProperty('cursor');
+    expect(readProperties).toHaveProperty('offset');
+    expect(readProperties).not.toHaveProperty('cursor');
     expect(readProperties).toHaveProperty('query');
     expect(readProperties.maxChars?.maximum).toBe(12_000);
     expect(readParameters.required ?? []).not.toContain('query');
@@ -142,6 +143,8 @@ describe('native acting agent', () => {
 
     const rejected = await tools.execute('browser.read', { query: 'exchange rates', mode: 'readable', unexpected: true });
     expect(rejected).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
+    const legacyRegionRead = await tools.execute('browser.read', { ref: 'r1-1' });
+    expect(legacyRegionRead).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
     expect(guest.browser.url).toBeUndefined();
   });
 
@@ -460,7 +463,7 @@ describe('native acting agent', () => {
       toolReply('failed-nav', 'browser.navigate', { url }),
       toolReply('failed-snapshot', 'browser.snapshot', {}),
       toolReply('zero-search', 'browser.search', { query: 'qzxwvv-9347182-uniquetoken' }),
-      toolReply('failed-read', 'browser.read', { ref: 'r1-9999', maxChars: 5_000 }),
+      toolReply('failed-read', 'browser.read', { ref: 'c1-12345678-1', maxChars: 5_000 }),
       toolReply('blocked-write', 'fs.write', { path: 'kd.txt', content: errorText }),
       toolReply('blocked-open', 'app.openFile', { path: 'kd.txt', application: 'text-editor' }),
       toolReply('blocked-complete', 'helm.complete', completion),
@@ -485,7 +488,7 @@ describe('native acting agent', () => {
     expect(tools.invocations.find(invocation => invocation.tool === 'browser.search')?.result)
       .toMatchObject({ ok: true, data: { matchCount: 0, pageReadable: true } });
     expect(result.steps.find(step => step.toolName === 'browser.read')?.toolResult)
-      .toMatchObject({ ok: false, error: { code: 'STALE_REGION_REF' } });
+      .toMatchObject({ ok: false, error: { code: 'STALE_CONTENT_REF' } });
     expect(result.steps.find(step => step.toolName === 'fs.write')?.toolResult)
       .toMatchObject({ ok: false, error: { code: 'UNREAD_PAGE_CONTENT' } });
     expect(result.steps.find(step => step.toolName === 'app.openFile')?.toolResult?.ok).toBe(false);

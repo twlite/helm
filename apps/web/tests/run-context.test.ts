@@ -52,14 +52,14 @@ describe('run context activity display', () => {
 
   it('formats targeted page search and region inspection results for activity rows', () => {
     expect(browserSearchDisplay({
-      indexedRegionCount: 124,
+      semanticBlockCount: 124,
       matchCount: 1,
       pageReadable: true,
-      results: [{ ref: 'r7-18', kind: 'table', heading: 'Daily rates', score: 0.98, preview: 'Currency Unit Buying Selling', snippet: 'USD buying 132.10 selling 132.70' }],
+      results: [{ ref: 'c7-abcdef12-18', type: 'table', heading: 'Daily rates', relevance: 0.98, preview: 'Currency Unit Buying Selling', snippet: 'USD buying 132.10 selling 132.70' }],
     }, 'currency buying selling')).toEqual({
       query: 'currency buying selling',
-      coverage: '124 regions indexed · 1 match · readable page content found',
-      matches: 'r7-18 · table · Daily rates · 0.98 · USD buying 132.10 selling 132.70',
+      coverage: '124 semantic blocks indexed · 1 match · readable page content found',
+      matches: 'c7-abcdef12-18 · table · Daily rates · 0.98 · USD buying 132.10 selling 132.70',
     });
     expect(browserInspectionSummary({
       format: 'table',

@@ -35,17 +35,18 @@ export function createScriptedDemoDecisions(): ScriptedDecision[] {
     {
       type: 'action',
       tool: 'browser.read',
-      input: { mode: 'readable', maxChars: 12_000 },
-      reasoningSummary: 'Read bounded content from the loaded browser page.',
+      input: { query: 'Helm deterministic demo content' },
+      reasoningSummary: 'Locate the requested text in the semantic page content.',
     },
     {
       type: 'action',
       tool: 'fs.write',
       input: {
         path: DEMO_OUTPUT_PATH,
-        content: { fromStep: 2, path: 'data.sections.0.text' },
+        sourceRef: { fromStep: 2, path: 'data.blocks.0.ref' },
+        format: 'text',
       },
-      reasoningSummary: 'Persist the extracted result in the requested workspace file.',
+      reasoningSummary: 'Persist the complete selected browser content block in the requested workspace file.',
     },
     {
       type: 'action',

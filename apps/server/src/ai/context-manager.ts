@@ -226,7 +226,7 @@ function browserObservationKey(tool: string, data: Record<string, unknown> | und
     case 'browser.snapshot':
       return `${tool}|${url}|${revision}`;
     case 'browser.read':
-      return `${tool}|${url}|${revision}|${data.mode ?? ''}|${data.ref ?? ''}|${stringify(data.sections ?? [])}|${data.nextCursor ?? ''}`;
+      return `${tool}|${url}|${revision}|${data.mode ?? ''}|${data.ref ?? ''}|${stringify(data.blocks ?? [])}|${stringify(data.sections ?? [])}`;
     case 'browser.search':
       return `${tool}|${url}|${revision}|${data.query ?? ''}|${stringify(data.results ?? [])}`;
     case 'browser.inspectRegion':
@@ -443,7 +443,7 @@ function latestBrowserState(exchanges: readonly ContextExchange[]): { url: strin
 function scrubRefs(value: unknown, currentRevision: number | undefined, keepCurrentRefs: boolean): { value: unknown; removed: number } {
   if (typeof value === 'string') {
     let removed = 0;
-    const text = value.replace(/\b([er])(\d+)-\d+\b/gu, (ref, _kind: string, revision: string) => {
+    const text = value.replace(/\b([erc])(\d+)-(?:[a-f0-9]{8}-)?\d+\b/gu, (ref, _kind: string, revision: string) => {
       if (keepCurrentRefs && currentRevision !== undefined && Number(revision) === currentRevision) return ref;
       removed += 1;
       return '[expired browser ref]';

@@ -82,8 +82,8 @@ function desktopReleaseTask(): TaskDefinition {
       { id: 'releaseUrl', description: 'Capture the release URL.', type: 'fact', mandatory: true, target: { factId: 'releaseUrl' } },
       { id: 'repositoryName', description: 'Know the repository name.', type: 'fact', mandatory: true, target: { factId: 'repositoryName' } },
       { id: 'currentDate', description: 'Record the current date.', type: 'fact', mandatory: true, target: { factId: 'currentDate' } },
-      { id: 'outputDirectory', description: 'Create the requested output directory.', type: 'filesystem', mandatory: true, target: { path: '~/Desktop/helm-demo', mode: 'exists' } },
-      { id: 'outputFile', description: 'Create the requested output file with the collected facts.', type: 'filesystem', mandatory: true, target: { path: '~/Desktop/helm-demo/bun-release.md', mode: 'contains-facts', factIds: ['repositoryName', 'latestReleaseVersion', 'releaseDate', 'releaseUrl', 'currentDate'] } },
+      { id: 'outputDirectory', description: 'Create the requested output directory.', type: 'filesystem', mandatory: true, target: { path: '~/Desktop/helm-demo', mode: 'created', freshness: 'current-run', action: 'fs.mkdir' } },
+      { id: 'outputFile', description: 'Create the requested output file with the collected facts.', type: 'filesystem', mandatory: true, target: { path: '~/Desktop/helm-demo/bun-release.md', mode: 'contains-facts', freshness: 'current-run', action: 'fs.write', factIds: ['repositoryName', 'latestReleaseVersion', 'releaseDate', 'releaseUrl', 'currentDate'] } },
     ],
   };
 }
@@ -107,6 +107,155 @@ function runtimeFor(
 }
 
 describe('orchestrated agent loop', () => {
+  it('requires current-run writes and opens even when an old file and viewer window already exist', async () => {
+    const userMessage = "Fetch the exchange rate data from Nepal Rastra Bank's official forex website, save that data to forex.txt, and open it with the text viewer application.";
+    const searchUrl = browserResearchSearchUrl(deriveBrowserReadQuery(userMessage));
+    const resultUrl = 'https://www.nrb.org.np/forex';
+    const rows = [
+      ['USD', 'USD', '1', '152.28', '153.05', '153.65'],
+      ['Euro', 'EUR', '1', '173.65', '173.65', '175.36'],
+      ['Japanese Yen', 'JPY', '10', '9.69', '9.69', '9.78'],
+      ['Indian Currency', 'INR', '100', '160.00', '160.00', '160.15'],
+      ['British Pound', 'GBP', '1', '205.10', '205.80', '206.50'],
+      ['Swiss Franc', 'CHF', '1', '181.20', '181.90', '182.60'],
+      ['Australian Dollar', 'AUD', '1', '98.10', '98.50', '99.00'],
+      ['Canadian Dollar', 'CAD', '1', '110.10', '110.55', '111.00'],
+      ['Singapore Dollar', 'SGD', '1', '112.20', '112.65', '113.10'],
+      ['Chinese Yuan', 'CNY', '1', '20.90', '21.00', '21.10'],
+      ['Qatari Riyal', 'QAR', '1', '41.50', '41.65', '41.80'],
+      ['Saudi Riyal', 'SAR', '1', '40.40', '40.55', '40.70'],
+    ];
+    const tableHtml = `<table><caption>Exchange Rate of 24-September-2026</caption><thead><tr>
+      <th>Currency</th><th>Code</th><th>Unit</th><th>Buying below Deno 50</th><th>Buying 50 and above Deno</th><th>Selling</th>
+    </tr></thead><tbody>${rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+    const task: TaskDefinition = {
+      id: 'fresh-forex-run',
+      threadId: 'fresh-forex-run-thread',
+      goal: 'Find the current rates, save the fetched data, and open the new file.',
+      originalRequest: userMessage,
+      criteria: [],
+      requirements: [
+        { id: 'browserResearch', description: 'Read current rates from the official source.', type: 'fact', mandatory: true, target: { factId: 'pageContent' } },
+        { id: 'outputFile', description: 'Write fetched browser content during this run.', type: 'filesystem', mandatory: true, target: { path: 'forex.txt', mode: 'written-from-artifact', freshness: 'current-run', action: 'fs.write' } },
+        { id: 'openFile', description: 'Open the requested file during this run.', type: 'desktop', mandatory: true, target: { path: 'forex.txt', content: 'forex.txt', mode: 'opened', freshness: 'current-run', action: 'app.openFile' } },
+      ],
+    };
+    const guest = new MockGuestTransport({
+      initialFiles: { 'forex.txt': 'OLD DATA' },
+      pages: {
+        [searchUrl]: `<html><body><main><h1>Search results</h1></main><article><h2><a href="https://duckduckgo.com/l/?uddg=${encodeURIComponent(resultUrl)}">Foreign Exchange Rate - Nepal Rastra Bank</a></h2><p>Official foreign exchange rates with currency buying and selling values.</p></article></body></html>`,
+        [resultUrl]: `<html><head><title>Nepal Rastra Bank Foreign Exchange Rates</title></head><body><main><h1>Foreign Exchange Rate</h1><h2>Exchange Rate of 24-September-2026</h2>${tableHtml}</main></body></html>`,
+      },
+    });
+    await guest.request('app.openFile', { path: 'forex.txt', application: 'text-editor' });
+
+    const taskState = createTaskState(task);
+    const beforeObservation: EnvironmentObservation = {
+      timestamp: 1,
+      desktop: { windows: guest.desktopWindows },
+      task: { completedCriteria: [], remainingCriteria: ['outputFile', 'openFile'] },
+    };
+    const initialVerification = await verifyTaskState(
+      task,
+      taskState,
+      guest,
+      beforeObservation,
+      new CriterionVerifierRegistry(guest),
+    );
+    expect(initialVerification.requirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requirement: expect.objectContaining({ id: 'outputFile' }), passed: false }),
+      expect.objectContaining({ requirement: expect.objectContaining({ id: 'openFile' }), passed: false }),
+    ]));
+
+    const initialTaskState = createTaskState(task);
+    const observation: EnvironmentObservation = { timestamp: 1, task: { completedCriteria: [], remainingCriteria: [] } };
+    const browserObjective = objectiveForRequirement(initialTaskState, observation, 'browserResearch')!;
+    const fileObjective = objectiveForRequirement(initialTaskState, observation, 'outputFile')!;
+    const openObjective = objectiveForRequirement(initialTaskState, observation, 'openFile')!;
+    const worker = new FunctionalWorker([
+      async context => {
+        const navigate = await executeAction(context, 'browser.navigate', { url: searchUrl }, 'search-navigation');
+        const search = await executeAction(context, 'browser.search', { query: 'Nepal Rastra Bank official foreign exchange rate' }, 'search');
+        const searchData = search.result.data as { results?: Array<{ type: string; ref: string; href?: string }> };
+        const official = searchData.results?.find(item => item.type === 'search_result' && item.href === resultUrl);
+        if (!official) throw new Error('DuckDuckGo search did not return the observed official href.');
+        const invented = await executeAction(context, 'browser.navigate', { url: 'https://www.nrb.org.np' }, 'invented-host');
+        const opened = await executeAction(context, 'browser.open', { ref: official.ref }, 'open-result-ref');
+        const read = await executeAction(context, 'browser.read', { query: 'exchange rate currency buying selling' }, 'read-rates');
+        const readData = read.result.data as { sections?: Array<{ text: string }>; blocks?: Array<{ type: string; ref: string }> };
+        const receiptId = ((read.result.evidence as { receipt?: { id?: string } } | undefined)?.receipt?.id) ?? 'missing-receipt';
+        const pageContent = readData.sections?.[0]?.text.split('\n')[0] ?? 'Foreign Exchange Rate';
+        return {
+          status: 'completed', worker: 'browser', objectiveId: context.objective.id,
+          actions: [navigate, search, invented, opened, read],
+          facts: [fact('pageContent', pageContent, receiptId)], evidence: [], artifacts: [], blockers: [], environmentChanged: true,
+        };
+      },
+      async context => {
+        const previousRead = [...context.state.recentActions].reverse().find(action => action.tool === 'browser.read' && action.result.ok);
+        const blocks = (previousRead?.result.data as { blocks?: Array<{ type: string; ref: string }> } | undefined)?.blocks;
+        const table = blocks?.find(block => block.type === 'table');
+        if (!table) throw new Error('No table ref was retained from the browser worker.');
+        const intermediate = await executeAction(context, 'fs.write', { path: 'forex.txt', content: 'INTERMEDIATE VERSION' }, 'write-intermediate');
+        const finalWrite = await executeAction(context, 'fs.write', { path: 'forex.txt', sourceRef: table.ref, format: 'text' }, 'write-from-table');
+        return {
+          status: 'completed', worker: 'filesystem', objectiveId: context.objective.id,
+          actions: [intermediate, finalWrite], facts: [], evidence: [], artifacts: [], blockers: [], environmentChanged: true,
+        };
+      },
+      async context => {
+        const open = await executeAction(context, 'app.openFile', { path: 'forex.txt', application: 'text-editor' }, 'open-file');
+        return {
+          status: 'completed', worker: 'desktop', objectiveId: context.objective.id,
+          actions: [open], facts: [], evidence: [], artifacts: [], blockers: [], environmentChanged: true,
+        };
+      },
+    ]);
+    const result = await runtimeFor(guest, [
+      { type: 'objective', objective: browserObjective },
+      { type: 'objective', objective: fileObjective },
+      { type: 'objective', objective: openObjective },
+    ], worker, { maxSteps: 3 }).run({ threadId: task.threadId, userMessage, task });
+
+    expect(result.status).toBe('completed');
+    expect(result.finalVerification?.complete).toBe(true);
+    expect(guest.getFile('forex.txt')).toContain('Saudi Riyal | SAR | 1 | 40.40 | 40.55 | 40.70');
+    expect(guest.getFile('forex.txt')).not.toContain('OLD DATA');
+    expect(guest.getFile('forex.txt')).not.toContain('INTERMEDIATE VERSION');
+    const browserVerify = result.steps.find(step => step.phase === 'verify' && step.worker === 'browser')?.verification;
+    expect(browserVerify?.requirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requirement: expect.objectContaining({ id: 'outputFile' }), passed: false }),
+      expect.objectContaining({ requirement: expect.objectContaining({ id: 'openFile' }), passed: false }),
+    ]));
+    const filesystemVerify = result.steps.find(step => step.phase === 'verify' && step.worker === 'filesystem')?.verification;
+    expect(filesystemVerify?.requirements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requirement: expect.objectContaining({ id: 'outputFile' }), passed: true }),
+      expect.objectContaining({ requirement: expect.objectContaining({ id: 'openFile' }), passed: false }),
+    ]));
+
+    const actions = result.run.state?.recentActions ?? [];
+    const writes = actions.filter(action => action.tool === 'fs.write');
+    expect(writes).toHaveLength(2);
+    expect(writes[0]?.result.data).toMatchObject({ existedBefore: true, changed: true });
+    expect(writes[1]?.result.data).toMatchObject({ existedBefore: true, changed: true, sourceType: 'table' });
+    const writeReceipts = writes.map(action => (action.result.evidence as { receipt: { id: string; effect: { changed?: boolean; writePerformed?: boolean; beforeSha256?: string; sha256?: string } } }).receipt);
+    expect(writeReceipts[0]).toMatchObject({ tool: 'fs.write', ok: true, effect: { changed: true, writePerformed: true } });
+    expect(writeReceipts[1]).toMatchObject({ tool: 'fs.write', ok: true, effect: { changed: true, writePerformed: true, beforeSha256: writes[0]?.result.data && (writes[0].result.data as { sha256: string }).sha256 } });
+    const artifacts = result.run.state?.artifacts.filter(artifact => artifact.path.endsWith('/forex.txt')) ?? [];
+    expect(artifacts.map(artifact => artifact.version)).toEqual([1, 2]);
+    expect(artifacts[0]?.sha256).not.toBe(artifacts[1]?.sha256);
+    expect(artifacts[1]).toMatchObject({
+      sha256: (writes[1]?.result.data as { sha256: string }).sha256,
+      sourceRef: (writes[1]?.result.data as { sourceRef: string }).sourceRef,
+      sourceType: 'table',
+      writeReceiptId: writeReceipts[1]?.id,
+      version: 2,
+    });
+    expect(guest.desktopWindows.find(window => window.focused)?.title).toContain('forex.txt');
+    const openAction = actions.find(action => action.tool === 'app.openFile');
+    expect(openAction?.result.evidence).toMatchObject({ receipt: { tool: 'app.openFile', ok: true } });
+  });
+
   it('navigates explicit destinations but leaves semantic page retrieval to the model', () => {
     const task = taskWithRequirements({
       id: 'deterministic-browser-research',

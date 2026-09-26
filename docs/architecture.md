@@ -64,9 +64,10 @@ belong in an artifact or whether the response is semantically complete.
 When a run has observed readable page content, page-derived file writes require
 a successful content read or region inspection first. A zero-match search is
 query-local: it proves neither that the page is unreadable nor that its content
-was read. Legacy compiled tasks keep page reading as a prerequisite and verify
-transformed output as a non-empty file, without requiring a summary to
-reproduce the entire source page.
+was read. Explicit output actions are verified from a successful current-run
+write receipt for the requested path, then checked against filesystem state.
+Existing files cannot satisfy a new write action, while model-authored
+transformations do not have to reproduce the source page verbatim.
 
 ## Persistence and limits
 
@@ -89,33 +90,26 @@ snapshot. The acting model can request progressive detail when it needs it:
 browser.getState -> browser.snapshot -> browser.read / browser.search -> browser.inspectRegion
 ```
 
-`browser.snapshot` returns a bounded outline and visible controls. The guest
-indexes visible semantic elements such as main/article/section content,
-headings, tables, lists, forms, navigation, and large otherwise-unstructured
-text blocks. Region previews are short; the outline does not include full
-region text. For a query, the guest creates bounded windows around query hits
-inside indexed regions and sends only those windows to its local ranker. Search
-uses BM25-like IDF weighting for body terms, stronger heading, table-header,
-and form-label fields, phrase and proximity signals, and semantic-kind boosts.
-Nested results with substantially overlapping query matches are deduplicated
-in favor of the more specific useful region. Search returns five matches by
-default.
+`browser.snapshot` returns a bounded DOM outline and visible controls with
+legacy `r...` region refs for inspection and interaction. Information
+retrieval uses the semantic extractor: `browser.read` and `browser.search`
+extract and rank the same typed blocks for tables, headings, prose, lists,
+code, forms, navigation, search results, and other useful content. Search
+returns compact typed summaries, including observed hrefs, stable `c...`
+content refs, relevance, match count, and whether semantic content was
+extracted. Local ranking uses field boosts for headings, table headers, form
+labels, titles, snippets, and hrefs.
 
-`browser.read` extracts typed content blocks for tables, headings, prose,
-lists, code, forms, navigation, search results, and other useful regions. It
-accepts an optional query or focus, ranks blocks locally, and returns compact
-previews rather than the full page. With no query it returns a compact semantic
-overview. `browser.search` remains a separate query-only operation over the
-existing semantic-region index; its result reports both match count and
-whether readable page content exists.
-
-Full extracted blocks live in a guest content registry. A `c<revision>-<n>`
-ref retrieves a block or more table rows using `browser.read`; navigation or
-page mutations expire refs. `fs.write` accepts either normal string content or
-a content `sourceRef` and serializes the selected block locally as text,
-Markdown, JSON, or CSV. Tables preserve heading ancestry, columns, rows, and
-row/column spans where available. The source-ref write result reports the
-source revision and type along with normal filesystem evidence.
+Full extracted blocks live in a guest content registry. A `c...` ref can fetch
+a block or paginate table rows with `browser.read`; navigation or page
+mutations expire refs. `browser.open({ ref })` resolves a destination from a
+current block's observed href inside the guest, so the model does not retype
+URLs. DuckDuckGo redirect parameters are unwrapped locally. `fs.write` accepts
+either normal string content or a content `sourceRef` and serializes the
+selected full block locally as text, Markdown, JSON, or CSV. Tables preserve
+heading ancestry, complete rows, and row/column spans where available. The
+source-ref write result reports source URL, revision, and type with filesystem
+evidence.
 
 `browser.inspectRegion` reads one selected region as bounded text, local links,
 or structured table columns and rows. Text inspection defaults to 8,000
@@ -132,10 +126,13 @@ open shadow roots, and combine semantic DOM, table/grid, optional local
 Readability, and ARIA fallback signals. Raw HTML and the complete DOM stay out
 of model context.
 
-Navigation policy records whether a destination came from the user, verified
-memory, a DuckDuckGo result, or an observed page link. A model-proposed URL
-without that provenance starts a DuckDuckGo search using the current request;
-the runtime does not turn site or organization names into guessed routes.
+Navigation policy records whether a destination came from the user,
+verified-memory, a DuckDuckGo result, a page link, or a navigation result. A
+model-proposed URL without that provenance starts a DuckDuckGo search using
+the current request; the runtime does not turn site or organization names into
+guessed routes. An explicit file-open request also requires a successful
+current-run `app.openFile` receipt and matching desktop state, even if the file
+was already open before the run.
 
 ## Model context management
 

@@ -31,6 +31,8 @@ export interface FileWriteResult {
   size: number;
   sha256: string;
   existedBefore: boolean;
+  beforeSha256?: string;
+  changed: boolean;
 }
 
 export interface FileEntry {
@@ -135,26 +137,34 @@ export class GuestSandbox {
 
     const target = await this.writablePath(inputPath);
     let existedBefore = false;
+    let beforeSha256: string | undefined;
     try {
-      await lstat(target);
+      const metadata = await lstat(target);
       existedBefore = true;
+      if (metadata.isFile()) {
+        const previous = await readFile(target);
+        beforeSha256 = createHash("sha256").update(previous).digest("hex");
+      }
     } catch (error) {
       if (!this.isMissing(error)) throw error;
     }
     try {
       await writeFile(target, content, { encoding: "utf8", flag: "w" });
+      const sha256 = createHash("sha256").update(content, "utf8").digest("hex");
       return {
         path: target,
         size: bytes,
-        sha256: createHash("sha256").update(content, "utf8").digest("hex"),
+        sha256,
         existedBefore,
+        ...(beforeSha256 === undefined ? {} : { beforeSha256 }),
+        changed: !existedBefore || beforeSha256 === undefined || beforeSha256 !== sha256,
       };
     } catch (error) {
       throw this.fileError(error, "FILE_WRITE_FAILED", `Could not write ${target}.`);
     }
   }
 
-  async mkdir(inputPath: string): Promise<{ path: string; existedBefore: boolean }> {
+  async mkdir(inputPath: string): Promise<{ path: string; existedBefore: boolean; changed: boolean }> {
     const target = this.lexicalPath(inputPath);
     await this.assertLexicallyInside(target);
     await this.assertExistingParentInside(target);
@@ -173,7 +183,7 @@ export class GuestSandbox {
     try {
       await mkdir(target, { recursive: true });
       await this.assertExistingTargetInside(target);
-      return { path: target, existedBefore };
+      return { path: target, existedBefore, changed: !existedBefore };
     } catch (error) {
       throw this.fileError(error, "DIRECTORY_CREATE_FAILED", `Could not create ${target}.`);
     }

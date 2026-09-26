@@ -12,7 +12,7 @@ import { ToolRegistry, type ToolRegistryOptions } from './tool-registry';
 const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'guest.handshake': 'Check the guest protocol and capabilities.',
   'fs.read': 'Read a UTF-8 file inside the allowed guest filesystem root.',
-  'fs.write': 'Write a UTF-8 file inside the allowed guest filesystem root. Use content for model-generated text or sourceRef plus an optional format to copy a full browser artifact deterministically.',
+  'fs.write': 'Write a UTF-8 file inside the allowed guest filesystem root. Use content for new text or sourceRef plus a format to serialize the complete stored browser artifact. A successful write is a current-run action even when the bytes are unchanged.',
   'fs.mkdir': 'Create a directory inside the allowed guest filesystem root.',
   'fs.exists': 'Check whether a guest filesystem path exists.',
   'fs.list': 'List immediate entries inside an allowed guest directory.',
@@ -20,8 +20,9 @@ const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'browser.navigate': 'Navigate the visible guest browser to a URL.',
   'browser.getState': 'Read the visible browser URL, title, loading state, page count, and current DOM revision without reading page text.',
   'browser.snapshot': 'Return a bounded semantic outline of the current page and its visible interactive elements.',
-  'browser.read': 'Read a compact semantic overview or retrieve locally ranked page blocks for a query. Results include typed blocks and current-page content refs; use a block ref with fs.write sourceRef to transfer complete extracted content without copying it into tool arguments. Use a content ref with offset and limit to inspect more rows or items.',
-  'browser.search': 'Search page content for a specific query and return bounded matching snippets and refs. Zero matches describe only this query; pageReadable reports whether the page has readable content.',
+  'browser.read': 'Read a compact semantic overview or retrieve locally ranked page blocks for a query. Results include typed blocks and current-page content refs; use a block ref with fs.write sourceRef to transfer complete extracted content without copying it into tool arguments. Use offset and limit with a content ref to inspect more table rows or list items, and maxChars plus offset for prose chunks.',
+  'browser.search': 'Search the same locally extracted semantic blocks as browser.read. Results include typed content refs and exact observed hrefs; zero matches describe only this query.',
+  'browser.open': 'Open an observed destination directly from a current browser content ref. Use linkIndex for a block containing multiple links; the guest never accepts a model-created URL here.',
   'browser.inspectRegion': 'Inspect one current page region as bounded text, structured table rows, or local links. Large tables support offset and limit pagination.',
   'browser.download': 'Start and record a browser download from a semantic element or URL.',
   'browser.click': 'Click a semantic browser element or desktop coordinate fallback.',
@@ -159,8 +160,12 @@ function receiptEffect(
     effect.existsBefore = before.filesystem?.exists;
     effect.existsAfter = after.filesystem?.exists;
     if (typeof dataRecord?.size === 'number') effect.bytesWritten = dataRecord.size;
+    if (typeof dataRecord?.existedBefore === 'boolean') effect.existsBefore = dataRecord.existedBefore;
+    if (typeof dataRecord?.beforeSha256 === 'string') effect.beforeSha256 = dataRecord.beforeSha256;
     if (typeof dataRecord?.sha256 === 'string') effect.sha256 = dataRecord.sha256;
-    effect.changed = effect.existsBefore !== effect.existsAfter || typeof dataRecord?.sha256 === 'string';
+    if (typeof dataRecord?.changed === 'boolean') effect.changed = dataRecord.changed;
+    else effect.changed = effect.existsBefore !== effect.existsAfter;
+    if (method === 'fs.write' && typeof dataRecord?.sha256 === 'string') effect.writePerformed = true;
   }
   if (before.desktop || after.desktop) effect.changed = JSON.stringify(before.desktop) !== JSON.stringify(after.desktop);
   return effect;

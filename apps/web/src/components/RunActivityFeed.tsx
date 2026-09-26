@@ -232,7 +232,7 @@ function ActivityRowView({ row }: { row: ActivityRow }) {
           {row.toolName === 'browser.search' ? (
             <>
               <Detail label="Query" value={searchDisplay?.query ?? 'Page search'} />
-              <Detail label="Coverage" value={searchDisplay?.coverage ?? '0 regions indexed · 0 matches'} />
+              <Detail label="Coverage" value={searchDisplay?.coverage ?? '0 semantic blocks indexed · 0 matches'} />
               {searchDisplay?.matches ? <Detail label="Matches" value={searchDisplay.matches} pre /> : null}
             </>
           ) : null}

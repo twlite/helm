@@ -433,7 +433,9 @@ export function extractSemanticBrowserBlocks(
   }
   const searchLikeUrl = parsedPageUrl?.hostname === "duckduckgo.com"
     && (parsedPageUrl.searchParams.has("q") || parsedPageUrl.searchParams.has("query"));
-  const isSearchPage = searchResultCandidates.size >= 2 && (searchLikeUrl || searchResultCandidates.size >= 3);
+  const isSearchPage = searchLikeUrl
+    ? searchResultCandidates.size > 0
+    : searchResultCandidates.size >= 3;
   if (isSearchPage) {
     for (const result of searchResultCandidates.values()) {
       addElement(result.element, "search_result", 0.96, {

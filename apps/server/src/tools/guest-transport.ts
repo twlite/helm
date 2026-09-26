@@ -1,6 +1,7 @@
 import type {
   BrowserContentFormat,
   BrowserContentType,
+  BrowserOpenResult,
   BrowserRegionInspection,
   BrowserReadResult,
   BrowserSearchPageResult,
@@ -20,8 +21,9 @@ export type GuestMethodParams = {
   'browser.navigate': { url: string };
   'browser.getState': Record<string, never>;
   'browser.snapshot': { maxRegions?: number };
-  'browser.read': { mode?: 'readable' | 'document'; query?: string; ref?: string; maxChars?: number; offset?: number; limit?: number; cursor?: string };
-  'browser.search': { query: string; kinds?: import('@helm/shared').BrowserRegionKind[]; maxResults?: number };
+  'browser.read': { mode?: 'readable' | 'document'; query?: string; ref?: string; maxChars?: number; offset?: number; limit?: number };
+  'browser.search': { query: string; maxResults?: number };
+  'browser.open': { ref: string; linkIndex?: number };
   'browser.inspectRegion': { ref: string; format?: 'auto' | 'text' | 'table' | 'links'; maxChars?: number; offset?: number; limit?: number };
   'browser.download': { ref?: string; url?: string };
   'browser.click': { ref?: string; x?: number; y?: number };
@@ -51,12 +53,15 @@ export type GuestMethodResult = {
     size: number;
     sha256?: string;
     existedBefore?: boolean;
+    beforeSha256?: string;
+    changed?: boolean;
     sourceRef?: string;
     sourceType?: BrowserContentType;
     sourceRevision?: number;
+    sourceUrl?: string;
     format?: BrowserContentFormat;
   };
-  'fs.mkdir': { path: string; existedBefore: boolean };
+  'fs.mkdir': { path: string; existedBefore: boolean; changed?: boolean };
   'fs.exists': { path: string; exists: boolean };
   'fs.list': { path: string; entries: string[] };
   'fs.stat': {
@@ -78,6 +83,7 @@ export type GuestMethodResult = {
   'browser.snapshot': BrowserSnapshot;
   'browser.read': BrowserReadResult;
   'browser.search': BrowserSearchPageResult;
+  'browser.open': BrowserOpenResult;
   'browser.inspectRegion': BrowserRegionInspection;
   'browser.download': {
     sourceUrl: string;

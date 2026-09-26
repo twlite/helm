@@ -269,11 +269,59 @@ function rememberObservedBrowserUrls(
       add(block.href, provenance);
       if (Array.isArray(block.links)) {
         for (const link of block.links) {
-          if (typeof link === 'object' && link !== null) add((link as Record<string, unknown>).href, provenance);
+          if (typeof link === 'object' && link !== null) add((link as Record<string, unknown>).href, 'page-link');
         }
       }
     }
   }
+  if (tool === 'browser.search' && Array.isArray(record.results)) {
+    for (const item of record.results) {
+      if (typeof item !== 'object' || item === null) continue;
+      const block = item as Record<string, unknown>;
+      add(block.href, block.type === 'search_result' ? 'search-result' : 'page-link');
+      if (Array.isArray(block.links)) {
+        for (const link of block.links) {
+          if (typeof link === 'object' && link !== null) add((link as Record<string, unknown>).href, 'page-link');
+        }
+      }
+    }
+  }
+  if (tool === 'browser.open') {
+    add(record.openedHref, record.sourceType === 'search_result' ? 'search-result' : 'page-link');
+    add(record.url, 'navigation-result');
+  }
+}
+
+function recordBrowserOpenOutcome(result: ToolResult): ToolResult {
+  if (!result.ok || typeof result.data !== 'object' || result.data === null || Array.isArray(result.data)) return result;
+  const data = result.data as Record<string, unknown>;
+  const provenance: NavigationProvenance = data.sourceType === 'search_result' ? 'search-result' : 'page-link';
+  const evidence = typeof result.evidence === 'object' && result.evidence !== null && !Array.isArray(result.evidence)
+    ? result.evidence as Record<string, unknown>
+    : undefined;
+  const receipt = typeof evidence?.receipt === 'object' && evidence.receipt !== null && !Array.isArray(evidence.receipt)
+    ? evidence.receipt as Record<string, unknown>
+    : undefined;
+  const effect = typeof receipt?.effect === 'object' && receipt.effect !== null && !Array.isArray(receipt.effect)
+    ? receipt.effect as Record<string, unknown>
+    : undefined;
+  return {
+    ...result,
+    data: { ...data, urlProvenance: provenance },
+    ...(evidence && receipt ? {
+      evidence: {
+        ...evidence,
+        receipt: {
+          ...receipt,
+          effect: {
+            ...effect,
+            ...(typeof data.openedHref === 'string' ? { requestedUrl: data.openedHref } : {}),
+            urlProvenance: provenance,
+          },
+        },
+      },
+    } : {}),
+  };
 }
 
 function attachNavigationProvenance(result: ToolResult, navigation: PreparedNavigation): ToolResult {
@@ -816,6 +864,7 @@ export class AgentRuntime {
         if (decision.tool === 'browser.navigate') {
           result = recordNavigationOutcome(result, navigation, navigationPolicy);
         } else if (decision.tool === 'browser.download') result = attachNavigationProvenance(result, navigation);
+        else if (decision.tool === 'browser.open') result = recordBrowserOpenOutcome(result);
         rememberObservedBrowserUrls(decision.tool, result.data, navigationPolicy);
         if (decision.tool.startsWith('browser.') && decision.tool !== 'browser.read' && actionEffectChanged(result)) {
           browserContentResult = undefined;
@@ -1035,6 +1084,7 @@ export class AgentRuntime {
         if (tool === 'browser.navigate') {
           result = recordNavigationOutcome(result, navigation, navigationPolicy);
         } else if (tool === 'browser.download') result = attachNavigationProvenance(result, navigation);
+        else if (tool === 'browser.open') result = recordBrowserOpenOutcome(result);
       }
 
       rememberObservedBrowserUrls(tool, result.data, navigationPolicy);
@@ -1563,6 +1613,7 @@ export class AgentRuntime {
               if (tool === 'browser.navigate') {
                 result = recordNavigationOutcome(result, navigation, navigationPolicy);
               } else if (tool === 'browser.download') result = attachNavigationProvenance(result, navigation);
+              else if (tool === 'browser.open') result = recordBrowserOpenOutcome(result);
               rememberObservedBrowserUrls(tool, result.data, navigationPolicy);
               lastToolResult = result;
               return result;
@@ -1607,7 +1658,7 @@ export class AgentRuntime {
             ? fact
             : { ...fact, origin: 'hypothesis' as const, confidence: 'hypothesis' as const }
         ));
-        const actualArtifacts = cappedActions.flatMap(action => artifactsFromResult(action.result, this.now));
+        const actualArtifacts = cappedActions.flatMap(action => artifactsFromResult(action.result, this.now, action));
         const normalizedWorkerResult: WorkerResult = {
           ...workerResult,
           worker: objective.kind,

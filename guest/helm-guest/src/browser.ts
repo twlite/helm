@@ -1,16 +1,16 @@
 import { GuestRpcError } from "./errors";
 import type { GuestSandbox } from "./sandbox";
 import { normalizeBrowserUrl } from "../../../packages/shared/src/browser-url";
-import { deriveBrowserReadQuery, rankPageRegions, type IndexedBrowserRegion } from "../../../packages/shared/src/browser-perception";
+import { deriveBrowserReadQuery, rankBrowserContentBlocks } from "../../../packages/shared/src/browser-perception";
 import type {
   BrowserContentBlock,
   BrowserContentFormat,
   BrowserContentSummary,
+  BrowserOpenResult,
   BrowserPageType,
   BrowserPageRegion,
   BrowserReadMode,
   BrowserReadResult,
-  BrowserReadSection,
   BrowserRegionInspection,
   BrowserRegionKind,
   BrowserSearchPageResult,
@@ -103,7 +103,8 @@ interface SemanticElement {
   selected?: boolean;
 }
 
-interface PageRegionRecord extends IndexedBrowserRegion {
+interface PageRegionRecord extends BrowserPageRegion {
+  domOrder: number;
   candidateIndex: number;
 }
 
@@ -139,23 +140,12 @@ const REGION_SELECTOR = [
 const MAX_INDEXED_REGIONS = 1_200;
 const DEFAULT_OUTLINE_REGIONS = 60;
 const MAX_INTERACTIVE_ELEMENTS = 80;
-const MAX_SEARCH_INDEX_CHARS = 1_024_000;
-const MAX_SEARCH_REGION_CHARS = 800;
 const DEFAULT_READ_CHARS = 4_000;
 const DEFAULT_BLOCK_PREVIEW_CHARS = 520;
 const DEFAULT_REGION_CHARS = 8_000;
 const DEFAULT_TABLE_ROWS = 50;
 const BROWSER_OPERATION_TIMEOUT_MS = 10_000;
 const BROWSER_CONTEXT_RESET_TIMEOUT_MS = 1_000;
-
-type ReadSource = BrowserReadResult['source'];
-
-interface ExtractedBrowserContent {
-  source: ReadSource;
-  sections: BrowserReadSection[];
-  totalChars: number;
-  sourceTruncated: boolean;
-}
 
 interface IndexedSemanticContent {
   blocks: BrowserContentBlock[];
@@ -171,312 +161,8 @@ interface SerializableContentReference {
   url: string;
 }
 
-interface ReadCursorPosition {
-  sectionIndex: number;
-  charOffset: number;
-}
-
-function readScope(url: string, ref: string | undefined, mode: BrowserReadMode): string {
-  const value = `${url}\u0000${ref ?? ''}\u0000${mode}`;
-  let hash = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(36);
-}
-
 function createContentSessionId(): string {
   return crypto.randomUUID().replace(/-/gu, '').slice(0, 8);
-}
-
-function makeReadCursor(input: {
-  revision: number;
-  url: string;
-  ref?: string;
-  mode: BrowserReadMode;
-  sectionIndex: number;
-  charOffset: number;
-}): string {
-  return `br1.${input.revision}.${readScope(input.url, input.ref, input.mode)}.${input.sectionIndex}.${input.charOffset}`;
-}
-
-function parseReadCursor(value: string | undefined, input: {
-  revision: number;
-  url: string;
-  ref?: string;
-  mode: BrowserReadMode;
-}): ReadCursorPosition {
-  if (!value) return { sectionIndex: 0, charOffset: 0 };
-  const match = /^br1\.(\d+)\.([a-z0-9]+)\.(\d+)\.(\d+)$/u.exec(value);
-  if (!match
-    || Number(match[1]) !== input.revision
-    || match[2] !== readScope(input.url, input.ref, input.mode)) {
-    throw new GuestRpcError('STALE_BROWSER_CURSOR', 'The browser read cursor is invalid or belongs to a different page revision.', { httpStatus: 409 });
-  }
-  return { sectionIndex: Number(match[3]), charOffset: Number(match[4]) };
-}
-
-/**
- * Read visible text inside Chromium and convert it into bounded semantic
- * sections. This function is serialized by Playwright, so it intentionally
- * depends only on the DOM and the options passed to evaluateAll.
- */
-function extractBrowserContent(nodes: readonly unknown[], rawOptions?: unknown): ExtractedBrowserContent {
-  const maxSourceChars = 2_000_000;
-  const maxSections = 5_000;
-  const options = typeof rawOptions === 'object' && rawOptions !== null
-    ? rawOptions as { mode?: BrowserReadMode; region?: boolean }
-    : {};
-  const mode = options.mode === 'document' ? 'document' : 'readable';
-  const region = options.region === true;
-  const base = nodes[0];
-  if (!(base instanceof HTMLElement)) {
-    return { source: region ? 'region' : 'body', sections: [], totalChars: 0, sourceTruncated: false };
-  }
-
-  const normalizedText = (value: string): string => value
-    .replace(/\u00a0/gu, ' ')
-    .split(/\r?\n/u)
-    .map(line => line.replace(/[\t ]+/gu, ' ').trim())
-    .filter(Boolean)
-    .join('\n');
-  const isHeading = (element: HTMLElement): boolean => /^H[1-6]$/u.test(element.tagName)
-    || element.getAttribute('role') === 'heading';
-  const alwaysIgnored = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'TEMPLATE', 'IFRAME', 'CANVAS', 'HEAD']);
-  const boilerplate = new Set(['NAV', 'FOOTER', 'ASIDE']);
-
-  const isHidden = (element: HTMLElement): boolean => {
-    if (element.hidden || element.getAttribute('aria-hidden')?.toLowerCase() === 'true') return true;
-    const style = window.getComputedStyle(element);
-    return style.display === 'none'
-      || style.visibility === 'hidden'
-      || style.visibility === 'collapse'
-      || style.contentVisibility === 'hidden';
-  };
-
-  const isIgnored = (element: HTMLElement, root: HTMLElement): boolean => {
-    if (alwaysIgnored.has(element.tagName)) return true;
-    if (element !== root && mode === 'readable') {
-      return boilerplate.has(element.tagName)
-        || ['navigation', 'contentinfo', 'complementary'].includes(element.getAttribute('role') ?? '');
-    }
-    return false;
-  };
-
-  const textInside = (element: HTMLElement, root: HTMLElement): string => {
-    const pieces: string[] = [];
-    const visit = (node: Node, hiddenParent: boolean): void => {
-      if (node.nodeType === Node.TEXT_NODE) {
-        if (!hiddenParent) pieces.push(node.textContent ?? '');
-        return;
-      }
-      if (!(node instanceof HTMLElement)) return;
-      const hidden = hiddenParent || isHidden(node) || isIgnored(node, root);
-      if (hidden) return;
-      const before = pieces.length;
-      for (const child of Array.from(node.childNodes)) visit(child, hidden);
-      if (node !== element && /^(?:P|LI|BLOCKQUOTE|PRE|DT|DD|TR|BR|H[1-6])$/u.test(node.tagName)) {
-        pieces.splice(before, 0, '\n');
-        pieces.push('\n');
-      }
-    };
-    visit(element, false);
-    return normalizedText(pieces.join(''));
-  };
-
-  const collectSections = (root: HTMLElement): { sections: BrowserReadSection[]; totalChars: number; sourceTruncated: boolean } => {
-    const sections: BrowserReadSection[] = [];
-    let heading: string | undefined;
-    let parts: string[] = [];
-    let totalChars = 0;
-    let sourceTruncated = false;
-    const finish = (): void => {
-      const text = normalizedText(parts.join('\n'));
-      if (heading || text) {
-        if (sections.length >= maxSections) sourceTruncated = true;
-        else sections.push({ ...(heading ? { heading } : {}), text });
-      }
-      parts = [];
-    };
-    const append = (text: string): void => {
-      const clean = normalizedText(text);
-      if (!clean) return;
-      const remaining = maxSourceChars - totalChars;
-      if (remaining <= 0 || sections.length >= maxSections) {
-        sourceTruncated = true;
-        return;
-      }
-      const bounded = clean.slice(0, remaining);
-      parts.push(bounded);
-      totalChars += bounded.length;
-      if (bounded.length < clean.length) sourceTruncated = true;
-    };
-    const blockTags = new Set(['P', 'LI', 'BLOCKQUOTE', 'PRE', 'DT', 'DD', 'TD', 'TH']);
-    const visit = (node: Node, hiddenParent: boolean): void => {
-      if (sourceTruncated) return;
-      if (node.nodeType === Node.TEXT_NODE) {
-        if (!hiddenParent) append(node.textContent ?? '');
-        return;
-      }
-      if (!(node instanceof HTMLElement)) return;
-      const hidden = hiddenParent || isHidden(node) || isIgnored(node, root);
-      if (hidden) return;
-      if (isHeading(node)) {
-        finish();
-        heading = normalizedText(textInside(node, root)).slice(0, 240);
-        return;
-      }
-      if (blockTags.has(node.tagName)) {
-        append(textInside(node, root));
-        return;
-      }
-      if (node.tagName === 'DIV' && !node.querySelector('p,li,blockquote,pre,dt,dd,td,th,h1,h2,h3,h4,h5,h6,[role="heading"]')) {
-        append(textInside(node, root));
-        return;
-      }
-      for (const child of Array.from(node.childNodes)) visit(child, hidden);
-    };
-    visit(root, false);
-    finish();
-    return { sections, totalChars, sourceTruncated };
-  };
-
-  const sanitizedInnerText = (root: HTMLElement): string => {
-    const clone = root.cloneNode(true) as HTMLElement;
-    const sourceElements = [root, ...Array.from(root.querySelectorAll<HTMLElement>('*'))];
-    const clonedElements = [clone, ...Array.from(clone.querySelectorAll<HTMLElement>('*'))];
-    for (let index = 0; index < sourceElements.length; index += 1) {
-      const source = sourceElements[index];
-      const copy = clonedElements[index];
-      if (source && copy && (isHidden(source) || isIgnored(source, root))) copy.remove();
-    }
-    return normalizedText(clone.innerText);
-  };
-
-  if (region) {
-    const result = collectSections(base);
-    return { source: 'region', ...result };
-  }
-
-  const body = document.body;
-  if (!body) return { source: 'body', sections: [], totalChars: 0, sourceTruncated: false };
-  let selected: HTMLElement | undefined;
-  let source: ReadSource = 'body';
-  if (mode === 'readable') {
-    const candidates = Array.from(document.querySelectorAll<HTMLElement>(
-      'article,[itemprop="articleBody"],[class*="article-body" i],[id*="article-body" i],[class*="post-content" i],[id*="post-content" i]'
-    )).filter(candidate => !isHidden(candidate) && normalizedText(textInside(candidate, candidate)).length >= 80);
-    const scored = candidates.map(candidate => {
-      const text = normalizedText(textInside(candidate, candidate));
-      const links = Array.from(candidate.querySelectorAll('a')).reduce((sum, anchor) => sum + normalizedText(textInside(anchor, candidate)).length, 0);
-      const paragraphCount = candidate.querySelectorAll('p').length;
-      return { candidate, score: text.length * (1 - Math.min(0.85, links / Math.max(1, text.length))) + paragraphCount * 40 };
-    }).sort((left, right) => right.score - left.score);
-    if (scored[0]) {
-      selected = scored[0].candidate;
-      source = 'readability';
-    }
-    if (!selected) {
-      const main = document.querySelector<HTMLElement>('main');
-      if (main && !isHidden(main) && normalizedText(textInside(main, main))) {
-        selected = main;
-        source = 'main';
-      }
-    }
-    if (!selected) {
-      const article = document.querySelector<HTMLElement>('article');
-      if (article && !isHidden(article) && normalizedText(textInside(article, article))) {
-        selected = article;
-        source = 'article';
-      }
-    }
-    if (!selected) {
-      const roleMain = document.querySelector<HTMLElement>('[role="main"]');
-      if (roleMain && !isHidden(roleMain) && normalizedText(textInside(roleMain, roleMain))) {
-        selected = roleMain;
-        source = 'role-main';
-      }
-    }
-  }
-  selected ??= body;
-  if (selected === body && source === 'body' && mode === 'readable') {
-    const text = sanitizedInnerText(body);
-    const bounded = text.slice(0, maxSourceChars);
-    return {
-      source,
-      sections: bounded ? [{ text: bounded }] : [],
-      totalChars: bounded.length,
-      sourceTruncated: bounded.length < text.length,
-    };
-  }
-  const result = collectSections(selected);
-  return { source, ...result };
-}
-
-function pageReadChunk(input: {
-  sections: BrowserReadSection[];
-  maxChars: number;
-  position: ReadCursorPosition;
-  revision: number;
-  url: string;
-  ref?: string;
-  mode: BrowserReadMode;
-}): { sections: BrowserReadSection[]; returnedChars: number; nextCursor?: string } {
-  let sectionIndex = input.position.sectionIndex;
-  let charOffset = input.position.charOffset;
-  if (sectionIndex > input.sections.length
-    || (sectionIndex === input.sections.length && charOffset > 0)
-    || (sectionIndex < input.sections.length && charOffset > input.sections[sectionIndex]!.text.length)) {
-    throw new GuestRpcError('STALE_BROWSER_CURSOR', 'The browser read cursor points outside the current content.', { httpStatus: 409 });
-  }
-
-  const output: BrowserReadSection[] = [];
-  let used = 0;
-  let returnedChars = 0;
-  while (sectionIndex < input.sections.length && used < input.maxChars) {
-    const section = input.sections[sectionIndex]!;
-    const remainder = section.text.slice(charOffset);
-    if (!remainder) {
-      sectionIndex += 1;
-      charOffset = 0;
-      continue;
-    }
-    const headingCost = section.heading ? section.heading.length + 1 : 0;
-    let room = input.maxChars - used;
-    const includeHeading = headingCost > 0 && headingCost < room;
-    if (includeHeading) room -= headingCost;
-    const pieceLength = Math.min(remainder.length, room);
-    if (pieceLength <= 0) break;
-    output.push({
-      ...(includeHeading ? { heading: section.heading } : {}),
-      text: remainder.slice(0, pieceLength),
-      ...(section.ref ? { ref: section.ref } : {}),
-    });
-    used += pieceLength + (includeHeading ? headingCost : 0);
-    returnedChars += pieceLength;
-    if (pieceLength < remainder.length) {
-      charOffset += pieceLength;
-      break;
-    }
-    sectionIndex += 1;
-    charOffset = 0;
-  }
-  const hasMore = sectionIndex < input.sections.length;
-  return {
-    sections: output,
-    returnedChars,
-    ...(hasMore ? {
-      nextCursor: makeReadCursor({
-        revision: input.revision,
-        url: input.url,
-        ...(input.ref === undefined ? {} : { ref: input.ref }),
-        mode: input.mode,
-        sectionIndex,
-        charOffset,
-      }),
-    } : {}),
-  };
 }
 
 class BrowserOperationTimeout extends Error {
@@ -657,7 +343,6 @@ export class BrowserController {
   private contentReferences = new Map<string, SerializableContentReference>();
   private readabilitySource = readabilityInjectionSource();
   private outlineCache: { revision: number; records: PageRegionRecord[]; regionCount: number; truncated: boolean } | undefined;
-  private searchCache: { revision: number; query: string; records: PageRegionRecord[]; regionCount: number; truncated: boolean } | undefined;
 
   constructor(
     private readonly sandbox: GuestSandbox,
@@ -747,7 +432,7 @@ export class BrowserController {
     const candidates = page.locator(INTERACTIVE_SELECTOR);
     await this.refreshDomRevision(page);
     const revision = this.referenceRevision;
-    const regionIndex = await this.getRegionRecords(page, false);
+    const regionIndex = await this.getRegionRecords(page);
     const prioritized = [...regionIndex.records]
       .sort((left, right) => outlinePriority(left.kind) - outlinePriority(right.kind) || left.domOrder - right.domOrder);
     const maxRegions = Math.max(1, Math.min(100, Math.trunc(input.maxRegions ?? DEFAULT_OUTLINE_REGIONS)));
@@ -922,7 +607,6 @@ export class BrowserController {
     maxChars?: number;
     offset?: number;
     limit?: number;
-    cursor?: string;
   } = {}): Promise<BrowserReadResult> {
     return this.withWatchdog(() => this.readInternal(input), "browser.read");
   }
@@ -934,141 +618,22 @@ export class BrowserController {
     maxChars?: number;
     offset?: number;
     limit?: number;
-    cursor?: string;
-  }, attempt = 0): Promise<BrowserReadResult> {
-    if (input.ref?.startsWith("c")) return this.readContentReference({
+  }): Promise<BrowserReadResult> {
+    if (input.ref) return this.readContentReference({
       ref: input.ref,
       ...(input.mode === undefined ? {} : { mode: input.mode }),
       ...(input.maxChars === undefined ? {} : { maxChars: input.maxChars }),
       ...(input.offset === undefined ? {} : { offset: input.offset }),
       ...(input.limit === undefined ? {} : { limit: input.limit }),
     });
-    // Explicitly bounded/cursor reads retain the original text-section API.
-    // A normal browser.read() call now returns a compact typed overview.
-    if (input.ref?.startsWith("r") || input.cursor !== undefined
-      || (input.query === undefined && input.maxChars !== undefined)) {
-      return this.readLegacyInternal(input, attempt);
-    }
-    return this.readSemanticContent(input, attempt);
-  }
-
-  private async readLegacyInternal(input: {
-    mode?: BrowserReadMode;
-    query?: string;
-    ref?: string;
-    maxChars?: number;
-    offset?: number;
-    limit?: number;
-    cursor?: string;
-  }, attempt = 0): Promise<BrowserReadResult> {
-    const page = await this.ensurePage();
-    const mode = input.mode ?? 'readable';
-    const maxChars = Math.max(1, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
-    if (!input.ref) {
-      try {
-        await page.waitForLoadState('domcontentloaded', { timeout: 2_000 });
-      } catch {
-        // Some pages do not reach DOMContentLoaded after navigation. The
-        // bounded content polling below still permits reading their current state.
-      }
-      for (let wait = 0; wait < 5; wait += 1) {
-        const body = await page.locator('body').evaluateAll(nodes => {
-          const candidate = nodes[0];
-          return candidate instanceof HTMLElement ? candidate.innerText.trim().length : 0;
-        }).catch(() => 0);
-        if (body > 0) break;
-        await new Promise(resolve => setTimeout(resolve, 150));
-      }
-    }
-    await this.refreshDomRevision(page);
-    const revision = this.referenceRevision;
-    const url = page.url();
-    const title = await this.readTitle(page);
-    const reference = input.ref === undefined ? undefined : await this.resolveReference(input.ref);
-    const position = parseReadCursor(input.cursor, {
-      revision,
-      url,
-      ...(input.ref === undefined ? {} : { ref: input.ref }),
-      mode,
-    });
-    let extracted = reference
-      ? await reference.locator.evaluateAll(extractBrowserContent, { mode, region: true })
-      : await page.locator('body').evaluateAll(extractBrowserContent, { mode, region: false });
-
-    if (extracted.sections.every(section => !section.text.trim())) {
-      const indexed = await this.getRegionRecords(page, true, '');
-      const useful = indexed.records.filter(record => (
-        !['navigation', 'footer', 'aside'].includes(record.kind)
-        && Boolean(record.searchText.trim())
-      ));
-      if (useful.length > 0) {
-        const locator = page.locator(REGION_SELECTOR);
-        for (const record of useful) {
-          this.references.set(record.ref, {
-            locator: locator.nth(record.candidateIndex),
-            revision,
-            url,
-            kind: 'region',
-            regionKind: record.kind,
-            ...(record.heading ? { heading: record.heading } : {}),
-          });
-        }
-        const sections = useful.map(record => ({
-          ...(record.heading ? { heading: record.heading } : {}),
-          text: record.searchText,
-          ref: record.ref,
-        }));
-        extracted = {
-          source: 'snapshot-regions',
-          sections,
-          totalChars: sections.reduce((sum, section) => sum + section.text.length, 0),
-          sourceTruncated: indexed.truncated,
-        };
-      }
-    }
-
-    const stableRevision = await this.refreshDomRevision(page);
-    if (stableRevision !== revision || page.url() !== url) {
-      if (attempt < 2 && input.cursor === undefined) return this.readLegacyInternal(input, attempt + 1);
-      throw new GuestRpcError('STALE_BROWSER_CURSOR', 'The page changed while its content was being read.', { httpStatus: 409 });
-    }
-    if (reference && reference.revision !== revision) {
-      throw new GuestRpcError('STALE_REGION_REF', `Browser ref ${input.ref} is no longer available.`, { httpStatus: 409 });
-    }
-
-    const paged = pageReadChunk({
-      sections: extracted.sections,
-      maxChars,
-      position,
-      revision,
-      url,
-      ...(input.ref === undefined ? {} : { ref: input.ref }),
-      mode,
-    });
-    return {
-      operation: 'read',
-      url,
-      title,
-      revision,
-      mode,
-      source: reference ? 'region' : extracted.source,
-      readable: extracted.sections.some(section => Boolean(section.text.trim())),
-      sections: paged.sections,
-      totalChars: extracted.totalChars,
-      returnedChars: paged.returnedChars,
-      truncated: paged.nextCursor !== undefined || extracted.sourceTruncated,
-      ...(paged.nextCursor ? { nextCursor: paged.nextCursor } : {}),
-    };
+    return this.readSemanticContent(input);
   }
 
   private async readSemanticContent(input: {
     mode?: BrowserReadMode;
     query?: string;
-    ref?: string;
     maxChars?: number;
-    offset?: number;
-    limit?: number;
-    cursor?: string;
+    maxResults?: number;
   }, attempt = 0): Promise<BrowserReadResult> {
     const page = await this.ensurePage();
     await this.waitForReadableStability(page);
@@ -1077,32 +642,20 @@ export class BrowserController {
     const revision = this.referenceRevision;
     const url = page.url();
     const title = await this.readTitle(page);
-    const maxChars = Math.max(800, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
+    const maxChars = Math.max(1, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
     const query = input.query?.trim() || undefined;
     const extracted = await this.extractSemanticContent(page, url);
-    const indexed = extracted.blocks.map((block, domOrder): IndexedBrowserRegion => ({
-      ref: block.ref,
-      kind: this.contentRegionKind(block.type),
-      ...(block.heading ? { heading: block.heading } : {}),
-      ...(block.headingPath ? { headingPath: block.headingPath } : {}),
-      ...(block.type === "table" ? { tableHeaders: block.columns ?? [] } : {}),
-      ...(block.type === "form" ? { formLabels: (block.fields ?? []).map(field => field.label) } : {}),
-      ...(block.importance === undefined ? {} : { importance: block.importance }),
-      ...(block.boilerplate === undefined ? {} : { boilerplate: block.boilerplate }),
-      searchText: [block.text, block.caption, block.title, block.snippet, ...(block.columns ?? []), ...(block.rows ?? []).flat()]
-        .filter(Boolean).join(" "),
-      ...(block.type === "table" && block.rowCount !== undefined ? { rowCount: block.rowCount } : {}),
-      ...(block.type === "table" && block.columnCount !== undefined ? { columnCount: block.columnCount } : {}),
-      ...(block.text ? { preview: block.text.slice(0, 240) } : block.snippet ? { preview: block.snippet.slice(0, 240) } : {}),
-      domOrder,
-    }));
     let selected: BrowserContentBlock[];
     if (query) {
-      const ranked = rankPageRegions({ query, regions: indexed, maxResults: 10 });
+      const ranked = rankBrowserContentBlocks({
+        query,
+        blocks: extracted.blocks,
+        maxResults: input.maxResults ?? 10,
+      });
       selected = ranked.results.flatMap(result => {
         const block = this.contentReferences.get(result.ref)?.block;
         if (!block) return [];
-        return [{ ...block, relevance: result.score }];
+        return [{ ...block, relevance: result.relevance }];
       });
     } else {
       const substantive = extracted.blocks.filter(block => !block.boilerplate);
@@ -1142,7 +695,7 @@ export class BrowserController {
       title,
       revision,
       mode: input.mode ?? "readable",
-      source: "body",
+      source: "semantic",
       pageType: extracted.pageType,
       ...(query ? { query } : {}),
       blocks: summaries,
@@ -1153,7 +706,10 @@ export class BrowserController {
         extractors: extracted.extractors,
         inaccessibleFrames: extracted.inaccessibleFrames,
       },
-      readable: extracted.blocks.some(block => Boolean(block.text?.trim() || block.rows?.length || block.items?.length)),
+      readable: extracted.blocks.some(block => Boolean(
+        block.text?.trim() || block.rows?.length || block.items?.length || block.title?.trim()
+        || block.snippet?.trim() || block.links?.length || block.fields?.length || block.definitions?.length,
+      )),
       sections,
       totalChars: extracted.blocks.reduce((sum, block) => sum + this.contentBlockSize(block), 0),
       returnedChars,
@@ -1170,11 +726,12 @@ export class BrowserController {
   }): Promise<BrowserReadResult> {
     const page = await this.ensurePage();
     const reference = await this.resolveContentReference(input.ref);
-    const maxChars = Math.max(800, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
+    const maxChars = Math.max(1, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
     const offset = Math.max(0, Math.trunc(input.offset ?? 0));
     const limit = Math.max(1, Math.min(100, Math.trunc(input.limit ?? 20)));
     const full = reference.block;
     let block: BrowserContentBlock = full;
+    let hasMore = false;
     if (full.type === "table") {
       const rows = full.rows ?? [];
       block = {
@@ -1182,9 +739,23 @@ export class BrowserController {
         rows: rows.slice(offset, offset + limit),
         ...(full.cellSpans ? { cellSpans: full.cellSpans.slice(offset, offset + limit) } : {}),
       };
+      hasMore = offset + (block.rows?.length ?? 0) < rows.length;
     } else if (full.type === "list") {
       const items = full.items ?? [];
-      block = { ...full, items: items.slice(offset, offset + limit) };
+      const selected: string[] = [];
+      let itemChars = 0;
+      for (const item of items.slice(offset, offset + limit)) {
+        const nextChars = JSON.stringify(item).length;
+        if (selected.length > 0 && itemChars + nextChars > maxChars) break;
+        selected.push(item);
+        itemChars += nextChars;
+      }
+      block = { ...full, items: selected };
+      hasMore = offset + (block.items?.length ?? 0) < items.length;
+    } else if (["text", "code", "other"].includes(full.type) && full.text !== undefined) {
+      const text = full.text;
+      block = { ...full, text: text.slice(offset, offset + maxChars) };
+      hasMore = offset + (block.text?.length ?? 0) < text.length;
     }
     const summary = this.summarizeContentBlock(block, maxChars);
     if (block.type === "table") {
@@ -1199,6 +770,22 @@ export class BrowserController {
       summary.rows = rows;
       summary.offset = offset;
       summary.returnedRowCount = rows.length;
+      if (offset + rows.length < (full.rows?.length ?? 0)) {
+        summary.nextOffset = offset + rows.length;
+        hasMore = true;
+      }
+      summary.truncated = Boolean(summary.truncated || hasMore);
+    } else if (block.type === "list") {
+      summary.items = block.items ?? [];
+      summary.offset = offset;
+      summary.returnedRowCount = summary.items.length;
+      if (hasMore) summary.nextOffset = offset + summary.items.length;
+      summary.truncated = Boolean(summary.truncated || hasMore);
+    } else if (["text", "code", "other"].includes(block.type) && block.text !== undefined) {
+      summary.offset = offset;
+      summary.returnedChars = block.text.length;
+      if (hasMore) summary.nextOffset = offset + block.text.length;
+      summary.truncated = Boolean(summary.truncated || hasMore);
     }
     const preview = summary.preview ?? "";
     const stableRevision = await this.refreshDomRevision(page);
@@ -1211,7 +798,7 @@ export class BrowserController {
       title: await this.readTitle(page),
       revision: reference.revision,
       mode: input.mode ?? "readable",
-      source: "region",
+      source: "semantic",
       pageType: full.type === "table" ? "data_table" : "generic",
       blocks: [summary],
       diagnostics: {
@@ -1224,9 +811,7 @@ export class BrowserController {
       sections: [{ ...(summary.heading ? { heading: summary.heading } : {}), text: preview, ref: input.ref }],
       totalChars: this.contentBlockSize(full),
       returnedChars: preview.length,
-      truncated: Boolean(full.truncated)
-        || (full.type === "table" && offset + (block.rows?.length ?? 0) < (full.rowCount ?? 0))
-        || (full.type === "list" && offset + (block.items?.length ?? 0) < (full.items?.length ?? 0)),
+      truncated: Boolean(full.truncated || hasMore),
     };
   }
 
@@ -1235,6 +820,7 @@ export class BrowserController {
     sourceRef: string;
     sourceType: BrowserContentBlock["type"];
     sourceRevision: number;
+    sourceUrl: string;
     format: BrowserContentFormat;
   }> {
     return this.withWatchdog(async () => {
@@ -1244,6 +830,7 @@ export class BrowserController {
         sourceRef: ref,
         sourceType: reference.block.type,
         sourceRevision: reference.revision,
+        sourceUrl: reference.url,
         format,
       };
     }, "browser.serializeContentRef");
@@ -1330,19 +917,6 @@ export class BrowserController {
       this.contentReferences.set(ref, { block, revision: this.referenceRevision, url: pageUrl });
     });
     return extracted;
-  }
-
-  private contentRegionKind(type: BrowserContentBlock["type"]): BrowserRegionKind {
-    switch (type) {
-      case "table": return "table";
-      case "list": return "list";
-      case "form": return "form";
-      case "heading": return "heading";
-      case "navigation": return "navigation";
-      case "search_result": return "article";
-      case "text": return "text";
-      default: return "section";
-    }
   }
 
   private contentTypePriority(type: BrowserContentBlock["type"]): number {
@@ -1455,71 +1029,76 @@ export class BrowserController {
 
   async search(input: {
     query: string;
-    kinds?: BrowserRegionKind[];
     maxResults?: number;
   }): Promise<BrowserSearchPageResult> {
     return this.withWatchdog(() => this.searchInternal(input), "browser.search");
   }
 
+  async open(input: { ref: string; linkIndex?: number }): Promise<BrowserOpenResult> {
+    return this.withWatchdog(async () => {
+      const reference = await this.resolveContentReference(input.ref);
+      const block = reference.block;
+      const link = input.linkIndex === undefined
+        ? undefined
+        : block.links?.[input.linkIndex];
+      if (input.linkIndex !== undefined && !link) {
+        throw new GuestRpcError("INVALID_LINK_INDEX", `Content ref ${input.ref} has no link at index ${input.linkIndex}.`, { httpStatus: 400 });
+      }
+      const observedHref = input.linkIndex === undefined
+        ? block.href ?? (block.links?.length === 1 ? block.links[0]?.href : undefined)
+        : link?.href;
+      if (!observedHref) {
+        throw new GuestRpcError(
+          block.links && block.links.length > 1 ? "LINK_INDEX_REQUIRED" : "CONTENT_REF_HAS_NO_LINK",
+          block.links && block.links.length > 1
+            ? `Content ref ${input.ref} contains multiple links; specify linkIndex.`
+            : `Content ref ${input.ref} does not contain an observed destination URL.`,
+          { httpStatus: 400 },
+        );
+      }
+      let destination: URL;
+      try {
+        destination = new URL(observedHref);
+      } catch {
+        throw new GuestRpcError("INVALID_OBSERVED_LINK", "The observed link is not an absolute URL.", { httpStatus: 400 });
+      }
+      if (!(["http:", "https:"] as string[]).includes(destination.protocol)) {
+        throw new GuestRpcError("INVALID_OBSERVED_LINK", "Observed page links must use HTTP or HTTPS.", { httpStatus: 400 });
+      }
+      const state = await this.navigate({ url: observedHref });
+      return {
+        ref: input.ref,
+        openedHref: observedHref,
+        sourceType: block.type,
+        ...state,
+      };
+    }, "browser.open");
+  }
+
   private async searchInternal(input: {
     query: string;
-    kinds?: BrowserRegionKind[];
     maxResults?: number;
   }, attempt = 0): Promise<BrowserSearchPageResult> {
-    const page = await this.ensurePage();
-    await this.refreshDomRevision(page);
-    const revision = this.referenceRevision;
-    const url = page.url();
-    const title = await this.readTitle(page);
-    const outline = await this.getRegionRecords(page, false);
-    const indexedReadable = outline.records.some(record => (
-      !['navigation', 'footer', 'aside'].includes(record.kind)
-      && Boolean(record.preview?.trim())
-    ));
-    const contentProbe = await page.locator('body').evaluateAll(extractBrowserContent, { mode: 'readable', region: false });
-    const pageReadable = indexedReadable || contentProbe.sections.some(section => Boolean(section.text.trim()));
-    const indexed = await this.getRegionRecords(page, true, input.query);
-    const ranked = rankPageRegions({
+    const result = await this.readSemanticContent({
       query: input.query,
-      regions: indexed.records,
-      ...(input.kinds ? { kinds: input.kinds } : {}),
+      maxChars: 12_000,
       ...(input.maxResults === undefined ? {} : { maxResults: input.maxResults }),
-    });
-    const regionLocator = page.locator(REGION_SELECTOR);
-    for (const result of ranked.results) {
-      const record = indexed.records.find(region => region.ref === result.ref);
-      if (!record) continue;
-      this.references.set(result.ref, {
-        locator: regionLocator.nth(record.candidateIndex),
-        revision,
-        url,
-        kind: "region",
-        regionKind: record.kind,
-        ...(record.heading ? { heading: record.heading } : {}),
-      });
-    }
-    const stableRevision = await this.refreshDomRevision(page);
-    if (stableRevision !== revision) {
-      if (attempt < 2) return this.searchInternal(input, attempt + 1);
-      throw new GuestRpcError("BROWSER_DOM_UNSTABLE", "The page changed repeatedly while regions were being searched.");
-    }
+    }, attempt);
+    const results = result.blocks ?? [];
     return {
-      operation: 'search',
+      operation: "search",
       searchCompleted: true,
-      url,
-      title,
-      revision,
+      url: result.url,
+      title: result.title,
+      revision: result.revision,
       query: input.query,
-      indexedRegionCount: ranked.indexedRegionCount,
-      matchCount: ranked.results.length,
-      pageReadable,
-      message: ranked.results.length > 0
-        ? `Search completed successfully. Found ${ranked.results.length} matching page region${ranked.results.length === 1 ? '' : 's'}.`
-        : 'Search completed successfully. No page text matched the query.',
-      results: ranked.results.map(result => {
-        const record = indexed.records.find(candidate => candidate.ref === result.ref);
-        return { ...result, snippet: record?.searchText ?? result.preview ?? result.heading ?? '' };
-      }),
+      semanticBlockCount: result.diagnostics?.blockCount ?? 0,
+      matchCount: results.length,
+      pageReadable: result.readable,
+      message: results.length > 0
+        ? `Search completed successfully. Found ${results.length} matching semantic block${results.length === 1 ? "" : "s"}.`
+        : "Search completed successfully. No semantic content matched the query.",
+      results,
     };
   }
 
@@ -1902,7 +1481,6 @@ export class BrowserController {
     this.lastDomMutationCount = undefined;
     this.lastFrameMutationSignature = undefined;
     this.outlineCache = undefined;
-    this.searchCache = undefined;
   }
 
   private async refreshDomRevision(page: PlaywrightPage): Promise<number> {
@@ -1980,226 +1558,119 @@ export class BrowserController {
     return this.referenceRevision;
   }
 
-  private async getRegionRecords(page: PlaywrightPage, includeText: boolean, query = ""): Promise<{
+  private async getRegionRecords(page: PlaywrightPage): Promise<{
     records: PageRegionRecord[];
     regionCount: number;
     truncated: boolean;
   }> {
     const revision = this.referenceRevision;
-    const cache = includeText
-      ? this.searchCache?.revision === revision && this.searchCache.query === query ? this.searchCache : undefined
-      : this.outlineCache;
-    if (cache) return cache;
-    if (includeText && this.outlineCache?.revision === revision) {
-      // The outline index is deliberately text-light; search builds its own
-      // local searchable region data only when requested.
-    }
+    if (this.outlineCache?.revision === revision) return this.outlineCache;
     const candidates = page.locator(REGION_SELECTOR);
-    const result = await candidates.evaluateAll((nodes, options) => {
-      const includeText = typeof options === "object" && options !== null && "includeText" in options
-        ? Boolean((options as { includeText: boolean }).includeText)
-        : false;
-      const regionLimit = typeof options === "object" && options !== null && "limit" in options
-        ? Number((options as { limit: number }).limit)
-        : 1_200;
-      const query = typeof options === "object" && options !== null && "query" in options
-        ? String((options as { query: string }).query)
-        : "";
-      const maxSearchChars = typeof options === "object" && options !== null && "maxSearchChars" in options
-        ? Number((options as { maxSearchChars: number }).maxSearchChars)
-        : 800;
-      const totalSearchCharsLimit = typeof options === "object" && options !== null && "totalSearchCharsLimit" in options
-        ? Number((options as { totalSearchCharsLimit: number }).totalSearchCharsLimit)
-        : 256_000;
-      const queryTokens = [...new Set(query.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])]
-        .filter(token => token.length > 1);
-      const excerpt = (value: string): string => {
-        if (!includeText) return "";
-        if (queryTokens.length === 0) return value.slice(0, maxSearchChars);
-        const lower = value.toLocaleLowerCase();
-        const windows: Array<{ start: number; end: number }> = [];
-        for (const token of queryTokens) {
-          let position = 0;
-          let found = 0;
-          while (found < 3) {
-            const match = lower.indexOf(token, position);
-            if (match < 0) break;
-            windows.push({ start: Math.max(0, match - 100), end: Math.min(value.length, match + token.length + 180) });
-            position = match + token.length;
-            found += 1;
-          }
-        }
-        windows.sort((left, right) => left.start - right.start);
-        let output = "";
-        let consumedUntil = -1;
-        for (const window of windows) {
-          if (window.end <= consumedUntil) continue;
-          const start = Math.max(window.start, consumedUntil);
-          const piece = `${output.length > 0 && start > consumedUntil ? " … " : ""}${value.slice(start, window.end)}`;
-          const remaining = maxSearchChars - output.length;
-          if (remaining <= 0) break;
-          output += piece.slice(0, remaining);
-          consumedUntil = window.end;
-          if (output.length >= maxSearchChars) break;
-        }
-        return output.replace(/\s+/gu, " ").trim();
-      };
-      const clean = (value: string | null | undefined, max = 220) => {
-        const normalized = (value ?? "").replace(/\s+/g, " ").trim();
+    const result = await candidates.evaluateAll((nodes, rawLimit) => {
+      const regionLimit = Math.max(1, Number(rawLimit) || 1_200);
+      const clean = (value: string | null | undefined, max = 220): string => {
+        const normalized = (value ?? '').replace(/\s+/gu, ' ').trim();
         return normalized.length > max ? `${normalized.slice(0, max - 1)}…` : normalized;
       };
-      const headings = nodes.filter((node): node is HTMLElement => node instanceof HTMLElement
-        && /^(H[1-6])$/u.test(node.tagName) || node instanceof HTMLElement && node.getAttribute("role") === "heading");
-      const structuralSelector = "main,article,section,table,ul,ol,form,nav,aside,footer,h1,h2,h3,h4,h5,h6,[role='main'],[role='article'],[role='region'],[role='navigation'],[role='contentinfo'],[role='complementary'],[role='list'],[role='form'],p,blockquote,pre,dl";
       const kindOf = (node: HTMLElement): BrowserRegionKind => {
         const tag = node.tagName.toLowerCase();
-        const role = node.getAttribute("role");
-        if (/^h[1-6]$/u.test(tag) || role === "heading") return "heading";
-        if (tag === "article" || role === "article") return "article";
-        if (tag === "table" || role === "table") return "table";
-        if (tag === "ul" || tag === "ol" || role === "list") return "list";
-        if (tag === "form" || role === "form") return "form";
-        if (tag === "nav" || role === "navigation") return "navigation";
-        if (tag === "footer" || role === "contentinfo") return "footer";
-        if (tag === "aside" || role === "complementary") return "aside";
-        if (tag === "main" || tag === "section" || role === "main" || role === "region") return "section";
-        return "text";
+        const role = node.getAttribute('role');
+        if (/^h[1-6]$/u.test(tag) || role === 'heading') return 'heading';
+        if (tag === 'article' || role === 'article') return 'article';
+        if (tag === 'table' || role === 'table') return 'table';
+        if (tag === 'ul' || tag === 'ol' || role === 'list') return 'list';
+        if (tag === 'form' || role === 'form') return 'form';
+        if (tag === 'nav' || role === 'navigation') return 'navigation';
+        if (tag === 'footer' || role === 'contentinfo') return 'footer';
+        if (tag === 'aside' || role === 'complementary') return 'aside';
+        if (tag === 'main' || tag === 'section' || role === 'main' || role === 'region') return 'section';
+        return 'text';
       };
-      const visible = (node: HTMLElement) => {
+      const visible = (node: HTMLElement): boolean => {
+        if (node.hidden || node.getAttribute('aria-hidden')?.toLowerCase() === 'true') return false;
         const style = window.getComputedStyle(node);
         const rect = node.getBoundingClientRect();
-        return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
       };
+      const priority = (node: unknown): number => {
+        if (!(node instanceof HTMLElement)) return 99;
+        const tag = node.tagName.toLowerCase();
+        const role = node.getAttribute('role');
+        if (tag === 'table' || role === 'table') return 0;
+        if (tag === 'main' || tag === 'article' || tag === 'section' || role === 'main' || role === 'article' || role === 'region') return 1;
+        if (/^h[1-6]$/u.test(tag) || role === 'heading') return 2;
+        if (tag === 'ul' || tag === 'ol' || role === 'list' || tag === 'form' || role === 'form') return 3;
+        if (tag === 'nav' || role === 'navigation' || tag === 'footer' || role === 'contentinfo' || tag === 'aside' || role === 'complementary') return 5;
+        if (tag === 'div') return 6;
+        return 4;
+      };
+      const headings = nodes.filter((node): node is HTMLElement => node instanceof HTMLElement
+        && (/^H[1-6]$/u.test(node.tagName) || node.getAttribute('role') === 'heading'));
+      const structuralSelector = "main,article,section,table,ul,ol,form,nav,aside,footer,h1,h2,h3,h4,h5,h6,[role='main'],[role='article'],[role='region'],[role='navigation'],[role='contentinfo'],[role='complementary'],[role='list'],[role='form'],p,blockquote,pre,dl";
+      const candidateIndexes = Array.from({ length: nodes.length }, (_, index) => index)
+        .sort((left, right) => priority(nodes[left]) - priority(nodes[right]) || left - right);
       const records: Array<{
         candidateIndex: number;
-        ancestorIndexes: number[];
         kind: BrowserRegionKind;
         heading?: string;
         preview?: string;
-        searchText: string;
-        tableHeaders?: string[];
-        formLabels?: string[];
         rowCount?: number;
         columnCount?: number;
         domOrder: number;
       }> = [];
       let visibleCount = 0;
-      let totalSearchChars = 0;
-      const candidateIndexByElement = new Map<HTMLElement, number>();
-      nodes.forEach((candidate, candidateIndex) => {
-        if (candidate instanceof HTMLElement) candidateIndexByElement.set(candidate, candidateIndex);
-      });
-      const priority = (node: unknown) => {
-        if (!(node instanceof HTMLElement)) return 99;
-        const tag = node.tagName.toLowerCase();
-        const role = node.getAttribute("role");
-        if (tag === "table" || role === "table") return 0;
-        if (tag === "main" || tag === "article" || tag === "section" || role === "main" || role === "article" || role === "region") return 1;
-        if (/^h[1-6]$/u.test(tag) || role === "heading") return 2;
-        if (tag === "ul" || tag === "ol" || role === "list" || tag === "form" || role === "form") return 3;
-        if (tag === "nav" || role === "navigation" || tag === "footer" || role === "contentinfo" || tag === "aside" || role === "complementary") return 5;
-        if (tag === "div") return 6;
-        return 4;
-      };
-      const candidateIndexes = Array.from({ length: nodes.length }, (_, index) => index)
-        .sort((left, right) => priority(nodes[left]) - priority(nodes[right]) || left - right);
       let truncated = false;
-      for (const index of candidateIndexes) {
+      for (const candidateIndex of candidateIndexes) {
         if (records.length >= regionLimit) {
           truncated = true;
           break;
         }
-        const node = nodes[index];
+        const node = nodes[candidateIndex];
         if (!(node instanceof HTMLElement) || !visible(node)) continue;
         const tag = node.tagName.toLowerCase();
-        const text = node.innerText.replace(/\s+/g, " ").trim();
-        if (tag === "div") {
+        const text = node.innerText.replace(/\s+/gu, ' ').trim();
+        if (tag === 'div') {
           if (text.length < 120 || node.querySelector(structuralSelector)) continue;
-          const childDivHasText = Array.from(node.querySelectorAll("div")).some(child => child.innerText.trim().length >= 120);
+          const childDivHasText = Array.from(node.querySelectorAll('div')).some(child => child.innerText.trim().length >= 120);
           if (childDivHasText) continue;
         }
-        if (text.length === 0) continue;
+        if (!text) continue;
         const kind = kindOf(node);
         let headingNode: HTMLElement | undefined;
-        if (kind === "heading") headingNode = node;
-        else headingNode = Array.from(node.querySelectorAll("h1,h2,h3,h4,h5,h6,[role='heading']"))
+        if (kind === 'heading') headingNode = node;
+        else headingNode = Array.from(node.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'))
           .find((candidate): candidate is HTMLElement => candidate instanceof HTMLElement);
         if (!headingNode) {
-          const regionContainer = node.closest("section,article,main,[role='main'],[role='region']");
+          const regionContainer = node.closest('section,article,main,[role="main"],[role="region"]');
           for (const candidate of headings) {
-            if (!(candidate instanceof HTMLElement)) continue;
             const followsNode = Boolean(candidate.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING);
             if (!followsNode) continue;
-            const headingContainer = candidate.closest("section,article,main,[role='main'],[role='region']");
+            const headingContainer = candidate.closest('section,article,main,[role="main"],[role="region"]');
             if (headingContainer === regionContainer || headingContainer?.contains(node)) headingNode = candidate;
           }
         }
         const heading = clean(headingNode?.innerText, 160);
-        const rows = kind === "table" ? Array.from(node.querySelectorAll("tr")) : [];
-        const headerRow = rows.find(row => row.querySelector("th")) ?? rows[0];
-        const tableHeaders = kind === "table" && headerRow
-          ? Array.from(headerRow.querySelectorAll("th,td")).map(cell => clean(cell.textContent, 120))
-          : undefined;
-        const formLabels = kind === "form"
-          ? Array.from(node.querySelectorAll("input,textarea,select,button,[role='textbox'],[role='combobox']"))
-            .flatMap(control => {
-              const names: string[] = [];
-              const ariaLabel = control.getAttribute("aria-label");
-              if (ariaLabel) names.push(ariaLabel);
-              const labelledBy = control.getAttribute("aria-labelledby")?.split(/\s+/u) ?? [];
-              for (const id of labelledBy) {
-                const label = document.getElementById(id)?.textContent;
-                if (label) names.push(label);
-              }
-              const nativeLabels = (control as HTMLInputElement).labels;
-              if (nativeLabels) {
-                for (const label of Array.from(nativeLabels)) names.push(label.innerText);
-              }
-              return names;
-            })
-            .map(label => clean(label, 120))
-            .filter(Boolean)
-            .slice(0, 80)
-          : undefined;
-        const dataRows = rows.filter(row => row !== headerRow && row.querySelector("th,td"));
-        const columnCount = Math.max(0, ...rows.map(row => row.querySelectorAll("th,td").length));
-        const previewSource = kind === "table" && tableHeaders
-          ? `${tableHeaders.join(" ")} ${dataRows[0]?.innerText ?? ""}`
+        const rows = kind === 'table' ? Array.from(node.querySelectorAll('tr')) : [];
+        const headerRow = rows.find(row => row.querySelector('th')) ?? rows[0];
+        const dataRows = rows.filter(row => row !== headerRow && row.querySelector('th,td'));
+        const columnCount = Math.max(0, ...rows.map(row => row.querySelectorAll('th,td').length));
+        const tableHeaders = headerRow ? Array.from(headerRow.querySelectorAll('th,td')).map(cell => clean(cell.textContent, 120)) : [];
+        const previewSource = kind === 'table' && tableHeaders.length > 0
+          ? `${tableHeaders.join(' ')} ${dataRows[0]?.innerText ?? ''}`
           : text;
         const preview = clean(previewSource, 180);
-        const ancestorIndexes: number[] = [];
-        for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
-          const ancestorIndex = candidateIndexByElement.get(ancestor);
-          if (ancestorIndex !== undefined) ancestorIndexes.push(ancestorIndex);
-        }
-        let searchText = excerpt(text);
-        if (totalSearchChars + searchText.length > totalSearchCharsLimit) {
-          searchText = searchText.slice(0, Math.max(0, totalSearchCharsLimit - totalSearchChars));
-          truncated = true;
-        }
-        totalSearchChars += searchText.length;
-        visibleCount += 1;
         records.push({
-          candidateIndex: index,
-          ancestorIndexes,
+          candidateIndex,
           kind,
           ...(heading ? { heading } : {}),
           ...(preview ? { preview } : {}),
-          searchText,
-          ...(tableHeaders ? { tableHeaders } : {}),
-          ...(formLabels && formLabels.length > 0 ? { formLabels } : {}),
-          ...(kind === "table" ? { rowCount: dataRows.length, columnCount } : {}),
-          domOrder: index,
+          ...(kind === 'table' ? { rowCount: dataRows.length, columnCount } : {}),
+          domOrder: candidateIndex,
         });
+        visibleCount += 1;
       }
       return { records, regionCount: visibleCount, truncated: truncated || nodes.length > regionLimit };
-    }, {
-      includeText,
-      query,
-      limit: MAX_INDEXED_REGIONS,
-      maxSearchChars: MAX_SEARCH_REGION_CHARS,
-      totalSearchCharsLimit: MAX_SEARCH_INDEX_CHARS,
-    });
+    }, MAX_INDEXED_REGIONS);
     const records: PageRegionRecord[] = result.records.map(record => ({
       ref: `r${revision}-${record.candidateIndex + 1}`,
       kind: record.kind,
@@ -2207,18 +1678,11 @@ export class BrowserController {
       ...(record.preview ? { preview: record.preview } : {}),
       ...(record.rowCount === undefined ? {} : { rowCount: record.rowCount }),
       ...(record.columnCount === undefined ? {} : { columnCount: record.columnCount }),
-      searchText: record.searchText,
-      ...(record.tableHeaders ? { tableHeaders: record.tableHeaders } : {}),
-      ...(record.formLabels ? { formLabels: record.formLabels } : {}),
       domOrder: record.domOrder,
       candidateIndex: record.candidateIndex,
-      ...(record.ancestorIndexes.length > 0
-        ? { ancestorRefs: record.ancestorIndexes.map(index => `r${revision}-${index + 1}`) }
-        : {}),
     }));
     const normalized = { records, regionCount: result.regionCount, truncated: result.truncated };
-    if (includeText) this.searchCache = { revision, query, ...normalized };
-    else this.outlineCache = { revision, ...normalized };
+    this.outlineCache = { revision, ...normalized };
     return normalized;
   }
 

@@ -32,10 +32,6 @@ export const completionCriterionSchema = z.discriminatedUnion('type', [
 ]);
 
 const coordinateSchema = z.object({ x: z.number().finite(), y: z.number().finite() });
-const browserRegionKindSchema = z.enum([
-  'heading', 'section', 'article', 'table', 'list', 'form', 'navigation', 'text', 'footer', 'aside',
-]);
-
 export const guestMethodSchemas = {
   'guest.handshake': z.object({}),
   'fs.read': z.object({ path: pathSchema }),
@@ -61,16 +57,18 @@ export const guestMethodSchemas = {
   'browser.read': z.object({
     mode: z.enum(['readable', 'document']).optional(),
     query: z.string().trim().min(1).max(1_000).optional(),
-    ref: z.string().regex(/^(?:r\d+-[1-9]\d*|c\d+-[a-f0-9]{8}-[1-9]\d*)$/u).optional(),
+    ref: z.string().regex(/^c\d+-[a-f0-9]{8}-[1-9]\d*$/u).optional(),
     maxChars: z.number().int().min(1).max(12_000).optional(),
     offset: z.number().int().min(0).max(1_000_000).optional(),
     limit: z.number().int().min(1).max(100).optional(),
-    cursor: z.string().min(1).max(2_048).optional(),
   }).strict(),
   'browser.search': z.object({
     query: z.string().trim().min(1).max(1_000),
-    kinds: z.array(browserRegionKindSchema).max(10).optional(),
     maxResults: z.number().int().min(1).max(20).optional(),
+  }),
+  'browser.open': z.object({
+    ref: z.string().regex(/^c\d+-[a-f0-9]{8}-[1-9]\d*$/u),
+    linkIndex: z.number().int().min(0).max(1_000).optional(),
   }),
   'browser.inspectRegion': z.object({
     ref: z.string().regex(/^r\d+-[1-9]\d*$/u),

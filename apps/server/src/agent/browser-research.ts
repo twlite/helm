@@ -56,7 +56,7 @@ export function browserResearchTask(input: { threadId: string; userMessage: stri
   return {
     id: `ai-browser-research-${input.threadId}`,
     threadId: input.threadId,
-    goal: `Use Helm's browser to search with DuckDuckGo and read the relevant public web pages for this request, prioritizing any named source and relevant memory guidance. If the user did not supply an exact destination URL and memory does not contain an exact verified URL, search DuckDuckGo first; never infer a website hostname or route. Inspect the visible results and navigate using the selected result's observed href. An exact verified-memory URL may be opened directly, but if it fails or redirects unexpectedly, search DuckDuckGo again. DuckDuckGo is the only supported search engine. Do not repeat the same search navigation: ${request}`,
+    goal: `Use Helm's browser to search with DuckDuckGo and read the relevant public web pages for this request, prioritizing any named source and relevant memory guidance. If the user did not supply an exact destination URL and memory does not contain an exact verified URL, search DuckDuckGo first; never infer a website hostname or route. Use semantic browser.search/read results and browser.open({ ref }) to follow the selected result's observed href without retyping it. An exact verified-memory URL may be opened directly, but if it fails or redirects unexpectedly, search DuckDuckGo again. DuckDuckGo is the only supported search engine. Do not repeat the same search navigation: ${request}`,
     criteria: [browserResearchCriterion()],
   };
 }

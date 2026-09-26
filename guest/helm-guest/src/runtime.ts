@@ -114,6 +114,7 @@ export class GuestRuntime {
             sourceRef: serialized.sourceRef,
             sourceType: serialized.sourceType,
             sourceRevision: serialized.sourceRevision,
+            sourceUrl: serialized.sourceUrl,
             format: serialized.format,
           };
         }
@@ -163,7 +164,6 @@ export class GuestRuntime {
         const maxChars = optionalInteger(params, "maxChars", { min: 1, max: 12_000 });
         const offset = optionalInteger(params, "offset", { min: 0, max: 1_000_000 });
         const limit = optionalInteger(params, "limit", { min: 1, max: 100 });
-        const cursor = optionalString(params, "cursor", { maxLength: 2_048 });
         return this.browser.read({
           mode,
           ...(query === undefined ? {} : { query }),
@@ -171,15 +171,20 @@ export class GuestRuntime {
           ...(maxChars === undefined ? {} : { maxChars }),
           ...(offset === undefined ? {} : { offset }),
           ...(limit === undefined ? {} : { limit }),
-          ...(cursor === undefined ? {} : { cursor }),
         });
       }
       case "browser.search": {
         const maxResults = optionalInteger(params, "maxResults", { min: 1, max: 20 });
         return this.browser.search({
           query: requiredString(params, "query", { maxLength: 1_000 }),
-          ...(Array.isArray(params.kinds) ? { kinds: params.kinds as import("../../../packages/shared/src/types").BrowserRegionKind[] } : {}),
           ...(maxResults === undefined ? {} : { maxResults }),
+        });
+      }
+      case "browser.open": {
+        const linkIndex = optionalInteger(params, "linkIndex", { min: 0, max: 1_000 });
+        return this.browser.open({
+          ref: requiredString(params, "ref", { maxLength: 64 }),
+          ...(linkIndex === undefined ? {} : { linkIndex }),
         });
       }
       case "browser.inspectRegion":

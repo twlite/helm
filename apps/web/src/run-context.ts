@@ -89,10 +89,10 @@ export function browserSearchDisplay(value: unknown, queryValue: unknown): Brows
     const match = record(item);
     if (!match) return [];
     return [[
-      typeof match.ref === 'string' ? match.ref : 'region',
-      typeof match.kind === 'string' ? match.kind : 'unknown',
+      typeof match.ref === 'string' ? match.ref : 'content',
+      typeof match.type === 'string' ? match.type : 'unknown',
       typeof match.heading === 'string' ? match.heading : '',
-      typeof match.score === 'number' ? match.score.toFixed(2) : '',
+      typeof match.relevance === 'number' ? match.relevance.toFixed(2) : '',
       typeof match.snippet === 'string' ? match.snippet : typeof match.preview === 'string' ? match.preview : '',
     ].filter(Boolean).join(' · ')];
   }) : [];
@@ -104,7 +104,7 @@ export function browserSearchDisplay(value: unknown, queryValue: unknown): Brows
       : undefined;
   return {
     query: typeof queryValue === 'string' ? queryValue : 'Page search',
-    coverage: `${typeof data?.indexedRegionCount === 'number' ? data.indexedRegionCount : 0} regions indexed · ${count} match${count === 1 ? '' : 'es'}${readability ? ` · ${readability}` : ''}`,
+    coverage: `${typeof data?.semanticBlockCount === 'number' ? data.semanticBlockCount : 0} semantic blocks indexed · ${count} match${count === 1 ? '' : 'es'}${readability ? ` · ${readability}` : ''}`,
     matches: results.join('\n'),
   };
 }

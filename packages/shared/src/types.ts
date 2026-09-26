@@ -46,7 +46,10 @@ export interface RequirementTarget {
   url?: string;
   factIds?: string[];
   content?: string;
-  mode?: 'exists' | 'non-empty' | 'contains-facts' | 'contains-text' | 'downloaded' | 'matches-fact';
+  mode?: 'exists' | 'non-empty' | 'contains-facts' | 'contains-text' | 'downloaded' | 'matches-fact'
+    | 'written' | 'written-from-artifact' | 'created' | 'open' | 'opened';
+  freshness?: 'current-run';
+  action?: 'fs.write' | 'fs.mkdir' | 'app.openFile';
   factId?: string;
 }
 
@@ -102,9 +105,15 @@ export interface Artifact {
   id: string;
   type: 'file' | 'directory' | 'download';
   path: string;
+  version?: number;
   size?: number;
   sha256?: string;
   sourceUrl?: string;
+  sourceRef?: string;
+  sourceType?: BrowserContentType;
+  sourceRevision?: number;
+  format?: BrowserContentFormat;
+  writeReceiptId?: string;
   download?: DownloadRecord;
   observedAt: string;
 }
@@ -124,8 +133,10 @@ export interface ActionEffect {
   path?: string;
   existsBefore?: boolean;
   existsAfter?: boolean;
+  beforeSha256?: string;
   bytesWritten?: number;
   sha256?: string;
+  writePerformed?: boolean;
   downloadStarted?: boolean;
   download?: DownloadRecord;
   changed?: boolean;
@@ -465,6 +476,7 @@ export type GuestMethod =
   | 'browser.snapshot'
   | 'browser.read'
   | 'browser.search'
+  | 'browser.open'
   | 'browser.inspectRegion'
   | 'browser.download'
   | 'browser.click'
@@ -559,11 +571,22 @@ export interface BrowserSearchPageResult {
   title: string;
   revision: number;
   query: string;
-  indexedRegionCount: number;
+  semanticBlockCount: number;
   matchCount: number;
   pageReadable: boolean;
   message: string;
-  results: BrowserSearchResult[];
+  results: BrowserContentSummary[];
+}
+
+export interface BrowserOpenResult {
+  ref: string;
+  openedHref: string;
+  sourceType: BrowserContentType;
+  url: string;
+  title: string;
+  loading: boolean;
+  pageCount: number;
+  revision: number;
 }
 
 export type BrowserReadMode = 'readable' | 'document';
@@ -637,6 +660,8 @@ export interface BrowserContentBlock {
 export interface BrowserContentSummary extends Omit<BrowserContentBlock, 'text' | 'rows' | 'items' | 'definitions' | 'fields' | 'links'> {
   preview?: string;
   offset?: number;
+  nextOffset?: number;
+  returnedChars?: number;
   returnedRowCount?: number;
   rows?: string[][];
   items?: string[];
@@ -657,7 +682,7 @@ export interface BrowserReadResult {
   title: string;
   revision: number;
   mode: BrowserReadMode;
-  source: 'readability' | 'main' | 'article' | 'role-main' | 'body' | 'region' | 'snapshot-regions';
+  source: 'semantic';
   pageType?: BrowserPageType;
   query?: string;
   blocks?: BrowserContentSummary[];
@@ -673,7 +698,6 @@ export interface BrowserReadResult {
   totalChars: number;
   returnedChars: number;
   truncated: boolean;
-  nextCursor?: string;
 }
 
 export type BrowserRegionInspection =
