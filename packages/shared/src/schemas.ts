@@ -81,7 +81,7 @@ export const guestMethodSchemas = {
   'browser.read': z.object({
     mode: z.enum(['readable', 'document']).optional(),
     query: z.string().trim().min(1).max(1_000).optional(),
-    ref: z.string().regex(/^c\d+-[a-f0-9]{8}-[1-9]\d*$/u).optional(),
+    ref: z.string().regex(/^(?:c\d+-[a-f0-9]{8}-[1-9]\d*|n-[a-f0-9]{8}-[1-9]\d*)$/u).optional(),
     maxChars: z.number().int().min(1).max(12_000).optional(),
     offset: z.number().int().min(0).max(1_000_000).optional(),
     limit: z.number().int().min(1).max(100).optional(),
@@ -95,7 +95,7 @@ export const guestMethodSchemas = {
     maxResults: z.number().int().min(1).max(20).optional(),
   }),
   'browser.open': z.object({
-    ref: z.string().regex(/^c\d+-[a-f0-9]{8}-[1-9]\d*$/u),
+    ref: z.string().regex(/^(?:c\d+-[a-f0-9]{8}-[1-9]\d*|n-[a-f0-9]{8}-[1-9]\d*)$/u),
     linkIndex: z.number().int().min(0).max(1_000).optional(),
   }),
   'browser.inspectRegion': z.object({

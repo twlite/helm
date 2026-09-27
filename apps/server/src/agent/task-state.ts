@@ -223,6 +223,7 @@ export function createTaskState(task: TaskDefinition, now: () => number = Date.n
     artifacts: [],
     completedRequirementIds: [],
     recentActions: [],
+    durableActions: [],
     failedStrategies: [],
     blockers: [],
     progress: {
@@ -422,9 +423,10 @@ function observedSemanticContentRef(
   sourceUrl: string,
   sourceType?: string,
 ): boolean {
-  const writeIndex = state.recentActions.lastIndexOf(writeAction);
+  const actions = verificationActions(state);
+  const writeIndex = actions.lastIndexOf(writeAction);
   if (writeIndex < 0) return false;
-  return state.recentActions.slice(0, writeIndex).some(action => {
+  return actions.slice(0, writeIndex).some(action => {
     if (!['browser.read', 'browser.findPage'].includes(action.tool) || !action.result.ok) return false;
     const receipt = actionReceipt(action);
     if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
@@ -468,9 +470,26 @@ function previouslyObservedBrowserContentRef(
   url: string,
   revision: number,
 ): boolean {
-  const selectedIndex = state.recentActions.lastIndexOf(selectedAction);
-  if (selectedIndex < 0) return false;
-  return state.recentActions.slice(0, selectedIndex).some(action => {
+  const actions = verificationActions(state);
+  const selectedIndex = actions.lastIndexOf(selectedAction);
+  if (selectedIndex < 0) {
+    // Fallback to recentActions identity when durable copies differ by object identity.
+    const fallbackIndex = state.recentActions.lastIndexOf(selectedAction);
+    if (fallbackIndex < 0) return false;
+    return state.recentActions.slice(0, fallbackIndex).some(action => {
+      if (!['browser.read', 'browser.findPage', 'browser.webSearch'].includes(action.tool) || !action.result.ok) return false;
+      const receipt = actionReceipt(action);
+      if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
+      const data = recordValue(action.result.data);
+      if (data?.url !== url || data.revision !== revision) return false;
+      const collection = action.tool === 'browser.read' ? data.blocks : data.results;
+      return Array.isArray(collection) && collection.some(item => {
+        const block = recordValue(item);
+        return block?.ref === ref && isSubstantiveBrowserContentBlock(block);
+      });
+    });
+  }
+  return actions.slice(0, selectedIndex).some(action => {
     if (!['browser.read', 'browser.findPage', 'browser.webSearch'].includes(action.tool) || !action.result.ok) return false;
     const receipt = actionReceipt(action);
     if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
@@ -491,7 +510,7 @@ function browserResearchAction(state: TaskState): WorkerAction | undefined {
   const artifactSelectionRequired = requirementsForTask(state.task).some(requirement => (
     requirement.id === 'outputFile' && requirement.target?.mode === 'written-from-artifact'
   ));
-  return [...state.recentActions].reverse().find(action => {
+  return [...verificationActions(state)].reverse().find(action => {
     if (action.tool !== 'browser.read' || !action.result.ok) return false;
     const receipt = actionReceipt(action);
     if (!receipt || receipt.ok !== true || receipt.tool !== 'browser.read') return false;
@@ -519,7 +538,7 @@ export function selectedBrowserArtifact(state: TaskState): {
   revision: number;
   type: string;
 } | undefined {
-  for (const action of [...state.recentActions].reverse()) {
+  for (const action of [...verificationActions(state)].reverse()) {
     if (action.tool !== 'browser.read' || !action.result.ok || typeof action.input.ref !== 'string') continue;
     const data = recordValue(action.result.data);
     if (data?.operation !== 'read' || data.readable !== true
@@ -529,6 +548,102 @@ export function selectedBrowserArtifact(state: TaskState): {
       || typeof block.type !== 'string'
       || !previouslyObservedBrowserContentRef(state, action, action.input.ref, data.url, data.revision)) continue;
     return { ref: action.input.ref, url: data.url, revision: data.revision, type: block.type };
+  }
+  return undefined;
+}
+
+/** All actions available for verification: bounded UI buffer plus durable run-scoped successes. */
+export function verificationActions(state: TaskState): WorkerAction[] {
+  const seen = new Set(state.recentActions.map(action => action.id));
+  const durable = (state.durableActions ?? []).filter(action => !seen.has(action.id));
+  return [...durable, ...state.recentActions];
+}
+
+export interface ObservedSearchResultRef {
+  ref: string;
+  href: string;
+}
+
+export interface SearchDiscovery {
+  action: WorkerAction;
+  actionIndex: number;
+  results: ObservedSearchResultRef[];
+  url: string;
+  query: string;
+}
+
+function searchResultsFromAction(action: WorkerAction): ObservedSearchResultRef[] | undefined {
+  if (action.tool !== 'browser.webSearch' || !action.result.ok) return undefined;
+  const data = recordValue(action.result.data);
+  if (!data || data.searchCompleted !== true || !Array.isArray(data.results)) return undefined;
+  const results = data.results.map(recordValue).flatMap(item => {
+    if (!item || item.type !== 'search_result' || typeof item.ref !== 'string' || typeof item.href !== 'string') return [];
+    return [{ ref: item.ref, href: item.href }];
+  });
+  return results.length > 0 ? results : undefined;
+}
+
+/** Most recent successful webSearch with observed result refs, searching durable evidence as well. */
+export function latestSuccessfulWebSearch(state: TaskState): SearchDiscovery | undefined {
+  const actions = verificationActions(state);
+  for (let index = actions.length - 1; index >= 0; index -= 1) {
+    const action = actions[index]!;
+    const results = searchResultsFromAction(action);
+    if (!results) continue;
+    const data = recordValue(action.result.data);
+    if (typeof data?.url !== 'string' || typeof data?.query !== 'string') continue;
+    return { action, actionIndex: index, results, url: data.url, query: data.query };
+  }
+  return undefined;
+}
+
+/** Successful browser.open actions after the latest search that opened one of its observed refs. */
+export function latestOpenedSearchResult(state: TaskState, discovery?: SearchDiscovery): WorkerAction | undefined {
+  const search = discovery ?? latestSuccessfulWebSearch(state);
+  if (!search) return undefined;
+  const refs = new Set(search.results.map(item => item.ref));
+  const hrefs = search.results.map(item => item.href);
+  const actions = verificationActions(state);
+  for (let index = actions.length - 1; index > search.actionIndex; index -= 1) {
+    const action = actions[index]!;
+    if (action.tool !== 'browser.open' || !action.result.ok) continue;
+    if (typeof action.input.ref === 'string' && refs.has(action.input.ref)) return action;
+    const data = recordValue(action.result.data);
+    const openedHref = typeof data?.openedHref === 'string' ? data.openedHref : undefined;
+    if (openedHref && hrefs.some(href => {
+      try { return browserUrlsMatch(openedHref, href); } catch { return openedHref === href; }
+    })) return action;
+  }
+  return undefined;
+}
+
+/** True when a successful search exists but none of its observed results has been opened yet. */
+export function hasUnopenedSearchResults(state: TaskState): boolean {
+  const search = latestSuccessfulWebSearch(state);
+  if (!search) return false;
+  return latestOpenedSearchResult(state, search) === undefined;
+}
+
+/** Unopened observed result refs from the latest successful search. */
+export function unopenedSearchResults(state: TaskState): ObservedSearchResultRef[] {
+  const search = latestSuccessfulWebSearch(state);
+  if (!search || latestOpenedSearchResult(state, search)) return [];
+  return search.results;
+}
+
+/** Exact match of a proposed webSearch query URL against already-observed search hrefs. */
+export function findObservedSearchRefForUrl(state: TaskState, query: string): string | undefined {
+  const search = latestSuccessfulWebSearch(state);
+  if (!search) return undefined;
+  const trimmed = query.trim();
+  if (!trimmed) return undefined;
+  for (const result of search.results) {
+    if (trimmed === result.href) return result.ref;
+    try {
+      if (browserUrlsMatch(trimmed, result.href)) return result.ref;
+    } catch {
+      // Not a URL; continue to exact comparison only.
+    }
   }
   return undefined;
 }
@@ -561,7 +676,7 @@ function successfulCurrentRunAction(
   const target = requirement.target;
   const expectedTool = requiredActionForRequirement(requirement);
   if (!expectedTool || target?.freshness !== 'current-run') return undefined;
-  for (const action of [...state.recentActions].reverse()) {
+  for (const action of [...verificationActions(state)].reverse()) {
     if (action.tool !== expectedTool || !action.result.ok) continue;
     const receipt = actionReceipt(action);
     if (!receipt || receipt.ok !== true || receipt.tool !== expectedTool) continue;
@@ -691,12 +806,16 @@ export function mergeWorkerResult(
   const mergedFacts = [...factMap.values()];
   const actions = [...state.recentActions, ...compactActions].slice(-24);
   const blockers = [...state.blockers, ...result.blockers].slice(-12);
+  const durableBase = state.durableActions ?? [];
+  const newDurable = compactActions.filter(action => action.result.ok);
+  const durableActions = [...durableBase, ...newDurable].slice(-100);
   return {
     ...state,
     facts: mergedFacts,
     evidence: retainEvidence(evidence, mergedFacts),
     artifacts: artifacts.slice(-40),
     recentActions: actions,
+    durableActions,
     blockers,
     currentEnvironment: compactEnvironmentObservation(observation),
     workerResults: [...state.workerResults, compactResult].slice(-12),
@@ -820,10 +939,10 @@ async function requirementCheck(
       && browserDestinationReached(
         observation.browser?.url,
         requirement.criterion.url,
-        state.recentActions,
+        verificationActions(state),
       )
     ) {
-      const resolution = navigationResolutionFor(state.recentActions, requirement.criterion.url);
+      const resolution = navigationResolutionFor(verificationActions(state), requirement.criterion.url);
       return {
         passed: true,
         message: resolution?.redirected
@@ -902,7 +1021,7 @@ async function requirementCheck(
           };
         }
         if (target.mode === 'written-from-artifact') {
-          const latestWrite = [...state.recentActions].reverse().find(action => action.tool === 'fs.write'
+          const latestWrite = [...verificationActions(state)].reverse().find(action => action.tool === 'fs.write'
             && action.result.ok
             && normalizedRequirementPath(String(action.input.path ?? '')) === normalizedRequirementPath(target.path!));
           if (!latestWrite || latestWrite.id !== currentAction?.action.id
@@ -984,12 +1103,12 @@ async function requirementCheck(
     }
     const expected = target.url ?? (target.factId ? supportedFact(state, target.factId)?.value : undefined);
     const resolution = typeof expected === 'string'
-      ? navigationResolutionFor(state.recentActions, expected)
+      ? navigationResolutionFor(verificationActions(state), expected)
       : undefined;
     const passed = typeof expected === 'string' && browserDestinationReached(
       observation.browser?.url,
       expected,
-      state.recentActions,
+      verificationActions(state),
     );
     return {
       passed,
@@ -1045,9 +1164,9 @@ export async function verifyTaskState(
     if (
       !check.passed
       && check.criterion.type === 'browser.url'
-      && browserDestinationReached(observation.browser?.url, check.criterion.url, state.recentActions)
+      && browserDestinationReached(observation.browser?.url, check.criterion.url, verificationActions(state))
     ) {
-      const resolution = navigationResolutionFor(state.recentActions, check.criterion.url);
+      const resolution = navigationResolutionFor(verificationActions(state), check.criterion.url);
       return {
         ...check,
         passed: true,
@@ -1110,7 +1229,7 @@ export function updateCompletedRequirements(state: TaskState, verification: Veri
 
 /** A short runtime-owned progress view for the acting model's next turn. */
 export function taskRequirementSummary(state: TaskState): string {
-  return requirementsForTask(state.task).map(requirement => {
+  const lines = requirementsForTask(state.task).map(requirement => {
     const status = state.completedRequirementIds.includes(requirement.id)
       ? 'satisfied'
       : (requirement.dependsOn ?? []).some(id => !state.completedRequirementIds.includes(id))
@@ -1125,7 +1244,24 @@ export function taskRequirementSummary(state: TaskState): string {
             : target?.application ? ` application=${target.application}` : '';
     const dependencies = status === 'blocked' ? ` dependsOn=${(requirement.dependsOn ?? []).filter(id => !state.completedRequirementIds.includes(id)).join(',')}` : '';
     return `- [${status}] ${requirement.id}${targetSummary}${dependencies}`;
-  }).join('\n');
+  });
+  if (hasUnopenedSearchResults(state)) {
+    const unopened = unopenedSearchResults(state);
+    const searchLineIndex = lines.findIndex(line => line.includes('browserSearch'));
+    const derived = `- [pending] searchResultOpen observed results: ${unopened.length} allowed action: browser.open`;
+    if (searchLineIndex >= 0) lines.splice(searchLineIndex + 1, 0, derived);
+    else lines.push(derived);
+  } else {
+    const opened = latestOpenedSearchResult(state);
+    if (opened && latestSuccessfulWebSearch(state)) {
+      const searchLineIndex = lines.findIndex(line => line.includes('browserSearch'));
+      if (searchLineIndex >= 0) {
+        const existing = lines.find(line => line.includes('searchResultOpen'));
+        if (!existing) lines.splice(searchLineIndex + 1, 0, '- [satisfied] searchResultOpen');
+      }
+    }
+  }
+  return lines.join('\n');
 }
 
 export function blocker(code: string, message: string, requirementIds?: string[], details?: JsonValue): Blocker {

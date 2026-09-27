@@ -402,7 +402,7 @@ describe('AgentRuntime', () => {
       .results.find(result => result.type === 'search_result');
     expect(searchResult).toMatchObject({
       type: 'search_result',
-      ref: expect.stringMatching(/^c\d+-/),
+      ref: expect.stringMatching(/^n-[a-f0-9]{8}-/),
       href: observedHref,
     });
     expect(tools.invocations.find(invocation => invocation.tool === 'browser.open')?.input).toEqual({ ref: searchResult?.ref });

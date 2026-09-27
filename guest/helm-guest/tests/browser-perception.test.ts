@@ -257,12 +257,15 @@ describe('progressive browser perception', () => {
       const result = search.results.find(block => block.href === destinationUrl);
       expect(result?.type).toBe('search_result');
       expect(typeof result?.ref).toBe('string');
-      expect(result?.ref.startsWith('c')).toBe(true);
+      expect(result?.ref.startsWith('n-')).toBe(true);
       expect(result?.href).toBe(destinationUrl);
 
       const opened = await controller.open({ ref: result!.ref });
       expect(opened).toMatchObject({ openedHref: destinationUrl, url: destinationUrl, sourceType: result!.type });
-      await expect(controller.open({ ref: result!.ref })).rejects.toMatchObject({ code: 'STALE_CONTENT_REF' });
+      // Navigation capabilities survive navigation; reopening the same observed
+      // destination must still succeed.
+      const reopened = await controller.open({ ref: result!.ref });
+      expect(reopened).toMatchObject({ openedHref: destinationUrl, url: destinationUrl });
     } finally {
       await controller.close();
       await new Promise<void>(resolve => server.close(() => resolve()));
@@ -431,7 +434,7 @@ describe('progressive browser perception', () => {
       const nrbResult = ddgSearch.results.find(block => block.title === 'Foreign Exchange Rate - Nepal Rastra Bank');
       expect(nrbResult).toMatchObject({
         type: 'search_result',
-        ref: expect.stringMatching(/^c\d+-/),
+        ref: expect.stringMatching(/^n-[a-f0-9]{8}-/),
         href: 'https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.nrb.org.np%2Fforex',
         relevance: expect.any(Number),
       });

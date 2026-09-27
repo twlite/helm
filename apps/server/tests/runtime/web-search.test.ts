@@ -61,7 +61,7 @@ describe('browser web search', () => {
       type: 'search_result',
       title: 'Nepal Rastra Bank | Foreign Exchange Rates',
       href: destinationUrl,
-      ref: expect.stringMatching(/^c\d+-[a-f0-9]{8}-\d+$/u),
+      ref: expect.stringMatching(/^n-[a-f0-9]{8}-\d+$/u),
     });
 
     const opened = await tools.execute('browser.open', { ref: officialRef });

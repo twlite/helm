@@ -273,6 +273,105 @@ describe('production acting agent requirements', () => {
     }
   });
 
+  it('recovers when a weak model searches the already-observed URL instead of opening it', async () => {
+    const persistence = testDatabase();
+    try {
+      const officialUrl = 'https://www.nrb.org.np/forex/';
+      const query = 'Nepal Rastra Bank official forex';
+      const searchUrl = buildDuckDuckGoSearchUrl(query);
+      const rows = [
+        '<tr><th>Currency</th><th>Unit</th><th>Buy</th><th>Sell</th></tr>',
+        '<tr><td>USD</td><td>1</td><td>133.20</td><td>134.10</td></tr>',
+        '<tr><td>EUR</td><td>1</td><td>145.25</td><td>146.80</td></tr>',
+      ].join('');
+      const guest = new MockGuestTransport({ pages: {
+        [searchUrl]: `<html><head><title>DuckDuckGo Search</title></head><body><main>
+          <article class="result"><h2><a href="${officialUrl}">Nepal Rastra Bank | Foreign Exchange Rates</a></h2><p>Official daily rates.</p></article>
+          <article class="result"><h2><a href="https://rates.example.test/nepal">Nepal currency rates</a></h2><p>Third party.</p></article>
+        </main></body></html>`,
+        [officialUrl]: `<html><head><title>Nepal Rastra Bank Foreign Exchange</title></head><body>
+          <main><h1>Foreign Exchange Rates</h1><table><caption>Daily Exchange Rates</caption>${rows}</table></main>
+        </body></html>`,
+      } });
+      const memory = new MemoryService(persistence.sqlite);
+      const requests: CapturedRequest[] = [];
+      const { runtime, tools } = createRuntime(guest, [
+        toolReply('discover', 'browser.webSearch', { query }),
+        // Weak model mistake: searches the already-observed destination URL instead of opening it.
+        // The runtime must not execute a second DuckDuckGo search; the agent recovers by opening.
+        toolReply('bad-url-search', 'browser.webSearch', { query: officialUrl }),
+        body => {
+          const ref = findOfficialSearchRef(body.messages, officialUrl);
+          if (!ref) throw new Error('The official observed search ref was not visible to the model.');
+          return toolReply('open-official', 'browser.open', { ref });
+        },
+        toolReply('read-rates', 'browser.read', { query: 'exchange rate data' }),
+        body => {
+          const ref = findTableRef(body.messages);
+          if (!ref) throw new Error('The table ref was not visible to the model.');
+          return toolReply('select-table', 'browser.read', { ref });
+        },
+        textReply('final-forex', 'I saved the Nepal Rastra Bank exchange-rate table to forex.txt and opened it.'),
+      ], requests, { maxSteps: 12, maxModelTurns: 12 });
+      registerMemoryTools(tools, memory);
+
+      const result = await runtime.run({
+        threadId: 'forex-url-as-search-recovery',
+        userMessage: 'fetch the exchange rate data from nepal rastra bank\'s official forex website and save that data to forex.txt file and open it with text viewer application. Use duckduckgo search to find the relevant website. remember to use https://www.nrb.org.np/forex/ for all forex requests about nepal.',
+      });
+      expect(result.status).toBe('completed');
+      // Only one real DuckDuckGo search may execute; the URL-as-search proposal must not create a second search loop.
+      expect(tools.invocations.filter(item => item.tool === 'browser.webSearch')).toHaveLength(1);
+      // The runtime directed the agent to open rather than search again.
+      expect(requestedTools(requests[1]!)).toContain('browser.open');
+      expect(requestedTools(requests[1]!)).not.toContain('browser.webSearch');
+      expect(guest.browser.url).toBe(officialUrl);
+      expect(guest.getFile('/home/helm/workspace/forex.txt')).toContain('USD | 1 | 133.20 | 134.10');
+      expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining([
+        'browserSearch', 'browserResearch', 'outputFile', 'openFile',
+      ]));
+    } finally {
+      persistence.close();
+    }
+  });
+
+  it('does not offer a repeated search while observed results remain unopened', async () => {
+    const officialUrl = 'https://www.nrb.org.np/forex/';
+    const query = 'Nepal Rastra Bank official forex';
+    const searchUrl = buildDuckDuckGoSearchUrl(query);
+    const guest = new MockGuestTransport({ pages: {
+      [searchUrl]: `<html><body><main>
+        <article class="result"><h2><a href="${officialUrl}">Nepal Rastra Bank | Foreign Exchange Rates</a></h2><p>Official.</p></article>
+        <article class="result"><h2><a href="https://rates.example.test/nepal">Other</a></h2><p>Third party.</p></article>
+      </main></body></html>`,
+      [officialUrl]: '<html><body><main><h1>Rates</h1><p>USD 133.20</p></main></body></html>',
+    } });
+    const requests: CapturedRequest[] = [];
+    const { runtime, tools } = createRuntime(guest, [
+      toolReply('discover', 'browser.webSearch', { query }),
+      toolReply('repeat-search', 'browser.webSearch', { query: 'forex rates today' }),
+      body => {
+        const ref = findOfficialSearchRef(body.messages, officialUrl);
+        if (!ref) throw new Error('Official ref not visible');
+        return toolReply('open-official', 'browser.open', { ref });
+      },
+      toolReply('read-rates', 'browser.read', { query: 'rates' }),
+      textReply('final', 'Done.'),
+    ], requests, { maxSteps: 10, maxModelTurns: 10 });
+
+    // Use a task that does not require file output so the run can finish after research.
+    const result = await runtime.run({
+      threadId: 'unrelated-repeat-search',
+      userMessage: 'Use duckduckgo search to find Nepal Rastra Bank official forex exchange rates.',
+    });
+    // The SDK enforces activeTools: the repeated search proposal cannot execute a second DuckDuckGo navigation.
+    expect(tools.invocations.filter(item => item.tool === 'browser.webSearch')).toHaveLength(1);
+    expect(requestedTools(requests[1]!)).not.toContain('browser.webSearch');
+    expect(requestedTools(requests[1]!)).toContain('browser.open');
+    expect(result.status).toBe('completed');
+    expect(guest.browser.url).toBe(officialUrl);
+  });
+
   it('compiles a real task and carries browser table lineage through write and open within a small turn budget', async () => {
     const url = 'https://example.test/forex/';
     const table = '<table><tr><th>Currency</th><th>Buy</th><th>Sell</th></tr><tr><td>USD</td><td>133.20</td><td>134.10</td></tr></table>';

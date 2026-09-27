@@ -88,6 +88,17 @@ interface MockContentReference {
   url: string;
 }
 
+interface MockNavigationReference {
+  href: string;
+  sourceUrl: string;
+  sourceType: 'search_result' | 'page_link';
+  title?: string;
+  snippet?: string;
+  observedRevision: number;
+  searchId?: number;
+  block?: BrowserContentBlock;
+}
+
 function decodeHtml(value: string): string {
   return value
     .replace(/&amp;/g, '&')
@@ -254,6 +265,8 @@ function mockContentBlocks(
   browser: MockBrowserState,
   contentReferences: Map<string, MockContentReference>,
   contentSessionId: string,
+  navigationReferences?: Map<string, MockNavigationReference>,
+  navigationCounter?: { index: number; searchId: number },
 ): BrowserContentBlock[] {
   const isDuckDuckGoResults = (() => {
     try {
@@ -264,7 +277,7 @@ function mockContentBlocks(
     }
   })();
   const blocks = browser.regions.map((region, index): BrowserContentBlock => {
-    const ref = `c${browser.revision}-${contentSessionId}-${index + 1}`;
+    const contentRef = `c${browser.revision}-${contentSessionId}-${index + 1}`;
     const observedLinks = (region.links ?? []).flatMap(link => {
       try {
         const target = new URL(link.href, browser.url);
@@ -282,8 +295,24 @@ function mockContentBlocks(
       : undefined;
     if (searchResultLink) {
       const snippet = region.searchText.replace(searchResultLink.text, ' ').replace(/\s+/gu, ' ').trim();
+      if (navigationReferences && navigationCounter) {
+        navigationCounter.index += 1;
+        const navRef = `n-${contentSessionId}-${navigationCounter.index}`;
+        return {
+          ref: navRef,
+          type: 'search_result',
+          title: searchResultLink.text,
+          href: searchResultLink.href,
+          ...(snippet ? { snippet } : {}),
+          text: [searchResultLink.text, snippet].filter(Boolean).join('\n'),
+          source: { extractor: 'dom' },
+          role: 'search-result',
+          importance: 0.96,
+          boilerplate: false,
+        };
+      }
       return {
-        ref,
+        ref: contentRef,
         type: 'search_result',
         title: searchResultLink.text,
         href: searchResultLink.href,
@@ -297,7 +326,7 @@ function mockContentBlocks(
     }
     if (region.kind === 'table') {
       return {
-        ref,
+        ref: contentRef,
         type: 'table',
         ...(region.heading ? { heading: region.heading, headingPath: [region.heading] } : {}),
         source: { extractor: 'dom' },
@@ -312,7 +341,7 @@ function mockContentBlocks(
     }
     if (region.kind === 'navigation' || region.kind === 'footer' || region.kind === 'aside') {
       return {
-        ref,
+        ref: contentRef,
         type: 'navigation',
         heading: region.heading,
         source: { extractor: 'dom' },
@@ -325,7 +354,7 @@ function mockContentBlocks(
     }
     if (region.kind === 'heading') {
       return {
-        ref,
+        ref: contentRef,
         type: 'heading',
         heading: region.heading ?? region.searchText,
         headingPath: region.heading ? [region.heading] : [region.searchText],
@@ -336,7 +365,7 @@ function mockContentBlocks(
       };
     }
     return {
-      ref,
+      ref: contentRef,
       type: region.kind === 'list' ? 'list' : region.kind === 'form' ? 'form' : 'text',
       ...(region.heading ? { heading: region.heading, headingPath: [region.heading] } : {}),
       source: { extractor: 'dom' },
@@ -348,7 +377,20 @@ function mockContentBlocks(
     };
   });
   for (const block of blocks) {
-    contentReferences.set(block.ref, { block, revision: browser.revision, url: browser.url ?? '' });
+    if (block.type === 'search_result' && navigationReferences && block.ref.startsWith('n-')) {
+      navigationReferences.set(block.ref, {
+        href: block.href ?? '',
+        sourceUrl: browser.url ?? '',
+        sourceType: 'search_result',
+        ...(block.title === undefined ? {} : { title: block.title }),
+        ...(block.snippet === undefined ? {} : { snippet: block.snippet }),
+        observedRevision: browser.revision,
+        ...(navigationCounter ? { searchId: navigationCounter.searchId } : {}),
+        block,
+      });
+    } else {
+      contentReferences.set(block.ref, { block, revision: browser.revision, url: browser.url ?? '' });
+    }
   }
   return blocks;
 }
@@ -496,6 +538,9 @@ export class MockGuestTransport implements GuestTransport {
   private readonly downloads: Record<string, { finalUrl?: string; filename: string; content?: string; context?: string }>;
   private readonly windows = new Map<string, WindowInfo>();
   private readonly contentReferences = new Map<string, MockContentReference>();
+  private readonly navigationReferences = new Map<string, MockNavigationReference>();
+  private navigationIndex = 0;
+  private searchGeneration = 0;
   private contentSessionId = randomUUID().replace(/-/gu, '').slice(0, 8);
   private browser: MockBrowserState = {
     loaded: false,
@@ -546,6 +591,14 @@ export class MockGuestTransport implements GuestTransport {
     return [...this.windows.values()].map(window => ({ ...window }));
   }
 
+  /** Simulate an irrelevant DOM mutation that invalidates content refs but preserves navigation capabilities. */
+  simulateDomMutation(): void {
+    if (!this.browser.loaded) return;
+    this.browser.revision += 1;
+    this.contentReferences.clear();
+    this.browser.regions = mockRegions(this.browser.html ?? '', this.browser.revision);
+  }
+
   reset(): void {
     this.files.clear();
     this.directories.clear();
@@ -554,6 +607,9 @@ export class MockGuestTransport implements GuestTransport {
     this.addDirectoryParents(DEMO_PAGE_PATH);
     this.windows.clear();
     this.contentReferences.clear();
+    this.navigationReferences.clear();
+    this.navigationIndex = 0;
+    this.searchGeneration = 0;
     this.contentSessionId = randomUUID().replace(/-/gu, '').slice(0, 8);
     this.browser = { loaded: false, text: '', elements: [], pageCount: 1, revision: 0, regions: [] };
     this.screenshotCounter = 0;
@@ -759,6 +815,9 @@ export class MockGuestTransport implements GuestTransport {
         const input = params as GuestMethodParams['browser.read'];
         const mode: BrowserReadMode = input.mode ?? 'readable';
         const maxChars = Math.max(1, Math.min(12_000, input.maxChars ?? 4_000));
+        if (input.ref && this.navigationReferences.has(input.ref)) {
+          throw new GuestTransportError('NAVIGATION_REF_REQUIRES_OPEN', `Browser ref ${input.ref} is an observed navigation destination. Use browser.open({ ref: "${input.ref}" }) to navigate to it.`);
+        }
         if (input.ref) {
           const reference = this.contentReferences.get(input.ref);
           if (!reference || reference.revision !== this.browser.revision || reference.url !== this.browser.url) {
@@ -824,7 +883,9 @@ export class MockGuestTransport implements GuestTransport {
           } as GuestMethodResult[M];
         }
 
-        const blocks = mockContentBlocks(this.browser, this.contentReferences, this.contentSessionId);
+        const navCounter = { index: this.navigationIndex, searchId: this.searchGeneration };
+        const blocks = mockContentBlocks(this.browser, this.contentReferences, this.contentSessionId, this.navigationReferences, navCounter);
+        this.navigationIndex = navCounter.index;
         let selected: Array<{ block: BrowserContentBlock; relevance?: number }>;
         if (input.query) {
           const ranked = rankBrowserContentBlocks({ query: input.query, blocks, maxResults: 8 });
@@ -880,7 +941,9 @@ export class MockGuestTransport implements GuestTransport {
             'browser.findPage searches the current page only. Use browser.webSearch for DuckDuckGo web discovery.',
           );
         }
-        const blocks = mockContentBlocks(this.browser, this.contentReferences, this.contentSessionId);
+        const findCounter = { index: this.navigationIndex, searchId: this.searchGeneration };
+        const blocks = mockContentBlocks(this.browser, this.contentReferences, this.contentSessionId, this.navigationReferences, findCounter);
+        this.navigationIndex = findCounter.index;
         const ranked = rankBrowserContentBlocks({ query: input.query, blocks, maxResults: input.maxResults });
         const blocksByRef = new Map(blocks.map(block => [block.ref, block]));
         const results: BrowserContentSummary[] = ranked.results.flatMap(match => {
@@ -909,7 +972,13 @@ export class MockGuestTransport implements GuestTransport {
         const input = params as GuestMethodParams['browser.webSearch'];
         const requestedUrl = buildDuckDuckGoSearchUrl(input.query);
         const navigation = this.navigateMock(requestedUrl);
-        const blocks = mockContentBlocks(this.browser, this.contentReferences, this.contentSessionId);
+        this.searchGeneration += 1;
+        for (const [key, value] of [...this.navigationReferences]) {
+          if (value.sourceType === 'search_result') this.navigationReferences.delete(key);
+        }
+        const webCounter = { index: this.navigationIndex, searchId: this.searchGeneration };
+        const blocks = mockContentBlocks(this.browser, this.contentReferences, this.contentSessionId, this.navigationReferences, webCounter);
+        this.navigationIndex = webCounter.index;
         const searchResults = blocks.filter(block => block.type === 'search_result');
         const ranked = rankBrowserContentBlocks({
           query: input.query,
@@ -948,6 +1017,26 @@ export class MockGuestTransport implements GuestTransport {
       }
       case 'browser.open': {
         const input = params as GuestMethodParams['browser.open'];
+        const navigationRef = this.navigationReferences.get(input.ref);
+        if (navigationRef) {
+          if (input.linkIndex !== undefined) {
+            throw new GuestTransportError('INVALID_LINK_INDEX', `Navigation ref ${input.ref} does not use linkIndex.`);
+          }
+          let navDestination: URL;
+          try { navDestination = new URL(navigationRef.href); } catch {
+            throw new GuestTransportError('INVALID_OBSERVED_LINK', 'The observed link is not an absolute URL.');
+          }
+          if (!['http:', 'https:'].includes(navDestination.protocol)) {
+            throw new GuestTransportError('INVALID_OBSERVED_LINK', 'Observed page links must use HTTP or HTTPS.');
+          }
+          const navResult = this.navigateMock(navigationRef.href);
+          return {
+            ...navResult,
+            ref: input.ref,
+            openedHref: navigationRef.href,
+            sourceType: navigationRef.sourceType,
+          } as GuestMethodResult[M];
+        }
         const reference = this.contentReferences.get(input.ref);
         if (!reference || reference.revision !== this.browser.revision || reference.url !== this.browser.url) {
           throw new GuestTransportError('STALE_CONTENT_REF', `Browser content ref ${input.ref} is unknown or stale.`);

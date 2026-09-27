@@ -426,6 +426,17 @@ interface SerializableContentReference {
   url: string;
 }
 
+export interface NavigationReference {
+  href: string;
+  sourceUrl: string;
+  sourceType: "search_result" | "page_link";
+  title?: string;
+  snippet?: string;
+  observedRevision: number;
+  searchId?: number;
+  block?: BrowserContentBlock;
+}
+
 function createContentSessionId(): string {
   return crypto.randomUUID().replace(/-/gu, '').slice(0, 8);
 }
@@ -608,6 +619,9 @@ export class BrowserController {
   private webSearchReferenceIndex = 0;
   private references = new Map<string, BrowserReference>();
   private contentReferences = new Map<string, SerializableContentReference>();
+  private navigationReferences = new Map<string, NavigationReference>();
+  private navigationIndex = 0;
+  private searchGeneration = 0;
   private readabilitySource = readabilityInjectionSource();
   private outlineCache: { revision: number; records: PageRegionRecord[]; regionCount: number; truncated: boolean } | undefined;
 
@@ -886,6 +900,13 @@ export class BrowserController {
     offset?: number;
     limit?: number;
   }): Promise<BrowserReadResult> {
+    if (input.ref && this.navigationReferences.has(input.ref)) {
+      throw new GuestRpcError(
+        "NAVIGATION_REF_REQUIRES_OPEN",
+        `Browser ref ${input.ref} is an observed navigation destination. Use browser.open({ ref: "${input.ref}" }) to navigate to it.`,
+        { httpStatus: 400 },
+      );
+    }
     if (input.ref) return this.readContentReference({
       ref: input.ref,
       ...(input.mode === undefined ? {} : { mode: input.mode }),
@@ -925,7 +946,8 @@ export class BrowserController {
         maxResults: input.maxResults ?? 10,
       });
       selected = ranked.results.flatMap(result => {
-        const block = this.contentReferences.get(result.ref)?.block;
+        const block = this.contentReferences.get(result.ref)?.block
+          ?? this.navigationReferences.get(result.ref)?.block;
         if (!block) return [];
         return [{ ...block, relevance: result.relevance }];
       });
@@ -1129,6 +1151,38 @@ export class BrowserController {
     return block;
   }
 
+  private registerNavigationReference(input: {
+    href: string;
+    sourceUrl: string;
+    sourceType: NavigationReference["sourceType"];
+    title?: string;
+    snippet?: string;
+    block?: BrowserContentBlock;
+  }): string {
+    const ref = `n-${this.contentSessionId}-${++this.navigationIndex}`;
+    this.navigationReferences.set(ref, {
+      href: input.href,
+      sourceUrl: input.sourceUrl,
+      sourceType: input.sourceType,
+      ...(input.title === undefined ? {} : { title: input.title }),
+      ...(input.snippet === undefined ? {} : { snippet: input.snippet }),
+      observedRevision: this.referenceRevision,
+      ...(this.searchGeneration > 0 ? { searchId: this.searchGeneration } : {}),
+      ...(input.block === undefined ? {} : { block: input.block }),
+    });
+    return ref;
+  }
+
+  private clearSearchNavigationReferences(): void {
+    for (const [key, value] of [...this.navigationReferences]) {
+      if (value.sourceType === "search_result") this.navigationReferences.delete(key);
+    }
+  }
+
+  private clearAllNavigationReferences(): void {
+    this.navigationReferences.clear();
+  }
+
   private async extractSemanticContent(page: PlaywrightPage, pageUrl: string): Promise<IndexedSemanticContent> {
     const frames = page.frames();
     const extracted: IndexedSemanticContent = {
@@ -1204,7 +1258,22 @@ export class BrowserController {
     });
     extracted.blocks = unique;
     extracted.extractors = [...new Set(extracted.extractors)];
-    extracted.blocks.forEach((block, index) => this.registerContentReference(block, pageUrl, String(index + 1)));
+    extracted.blocks.forEach((block, index) => {
+      if (block.type === "search_result" && typeof block.href === "string" && block.href.length > 0) {
+        const ref = this.registerNavigationReference({
+          href: block.href,
+          sourceUrl: pageUrl,
+          sourceType: "search_result",
+          ...(block.title === undefined ? {} : { title: block.title }),
+          ...(block.snippet === undefined ? {} : { snippet: block.snippet }),
+        });
+        block.ref = ref;
+        const entry = this.navigationReferences.get(ref);
+        if (entry) entry.block = { ...block };
+        return;
+      }
+      this.registerContentReference(block, pageUrl, String(index + 1));
+    });
     return extracted;
   }
 
@@ -1425,9 +1494,18 @@ export class BrowserController {
         }
         if (inspection.outcome !== "results") continue;
 
+        this.searchGeneration += 1;
+        this.clearSearchNavigationReferences();
         const blocks = inspection.results.map((result): BrowserContentBlock => {
+          const ref = this.registerNavigationReference({
+            href: result.href,
+            sourceUrl: observedUrl,
+            sourceType: "search_result",
+            title: result.title,
+            snippet: result.snippet,
+          });
           const block: BrowserContentBlock = {
-            ref: "",
+            ref,
             type: "search_result",
             title: result.title,
             href: result.href,
@@ -1438,7 +1516,9 @@ export class BrowserController {
             boilerplate: false,
             role: "search-result",
           };
-          return this.registerContentReference(block, observedUrl, `s${++this.webSearchReferenceIndex}`);
+          const entry = this.navigationReferences.get(ref);
+          if (entry) entry.block = { ...block };
+          return block;
         });
         const results = blocks.map(block => ({
           ...this.summarizeContentBlock(block, DEFAULT_BLOCK_PREVIEW_CHARS),
@@ -1499,6 +1579,28 @@ export class BrowserController {
 
   async open(input: { ref: string; linkIndex?: number }): Promise<BrowserOpenResult> {
     return this.withWatchdog(async () => {
+      const navigation = this.navigationReferences.get(input.ref);
+      if (navigation) {
+        if (input.linkIndex !== undefined) {
+          throw new GuestRpcError("INVALID_LINK_INDEX", `Navigation ref ${input.ref} does not use linkIndex.`, { httpStatus: 400 });
+        }
+        let destination: URL;
+        try {
+          destination = new URL(navigation.href);
+        } catch {
+          throw new GuestRpcError("INVALID_OBSERVED_LINK", "The observed link is not an absolute URL.", { httpStatus: 400 });
+        }
+        if (!(["http:", "https:"] as string[]).includes(destination.protocol)) {
+          throw new GuestRpcError("INVALID_OBSERVED_LINK", "Observed page links must use HTTP or HTTPS.", { httpStatus: 400 });
+        }
+        const state = await this.navigate({ url: navigation.href });
+        return {
+          ref: input.ref,
+          openedHref: navigation.href,
+          sourceType: navigation.sourceType as BrowserContentBlock["type"],
+          ...state,
+        };
+      }
       const reference = await this.resolveContentReference(input.ref);
       const block = reference.block;
       const link = input.linkIndex === undefined
@@ -1875,6 +1977,7 @@ export class BrowserController {
     this.context = undefined;
     this.page = undefined;
     this.invalidateReferences();
+    this.clearAllNavigationReferences();
     if (context !== undefined) {
       await context.close().catch(() => undefined);
     }
@@ -1947,6 +2050,12 @@ export class BrowserController {
     this.referenceRevision += 1;
     this.references.clear();
     this.contentReferences.clear();
+    // Navigation capabilities (observed search-result destinations) are
+    // intentionally preserved across DOM revisions. They are immutable
+    // evidence of a destination that was actually seen and must not disappear
+    // because an unrelated ad container, CSS class, or lazy-loaded node
+    // mutated. They are cleared only on controller reset/close or when a new
+    // unrelated search replaces them.
     this.referenceUrl = "";
     this.lastDomMutationCount = undefined;
     this.lastFrameMutationSignature = undefined;
@@ -2181,6 +2290,7 @@ export class BrowserController {
     this.context = undefined;
     this.page = undefined;
     this.invalidateReferences();
+    this.clearAllNavigationReferences();
     if (!context) return;
     const close = context.close().catch(() => undefined);
     await Promise.race([

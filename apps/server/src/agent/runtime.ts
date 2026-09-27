@@ -28,6 +28,7 @@ import {
   explicitBrowserNavigationUrls,
   isAbsoluteBrowserNavigationUrl,
   isSearchEngineUrl,
+  isSearchResultsUrl,
   isUnsupportedSearchEngineUrl,
 } from './browser-research';
 import { fingerprintAction, LoopDetector } from './fingerprint';
@@ -41,16 +42,21 @@ import {
   compactEnvironmentObservation,
   createTaskState,
   evidenceFromObservation,
+  findObservedSearchRefForUrl,
+  hasUnopenedSearchResults,
   isTaskOutputPathNavigation,
+  latestSuccessfulWebSearch,
   mergeWorkerResult,
   observedFactsFromToolResult,
   progressFingerprint,
+  unopenedSearchResults,
   updateCompletedRequirements,
   updateProgress,
   taskRequirementSummary,
   requirementsForTask,
   requiredActionForRequirement,
   selectedBrowserArtifact,
+  verificationActions,
   verifyTaskState,
 } from './task-state';
 import type {
@@ -676,6 +682,25 @@ function actionableToolsForState(
     return [...new Set([...names, ...(!exhaustedRequirements.has(pendingDuckDuckGo.id)
       && availableTools.includes('browser.webSearch') ? ['browser.webSearch'] : [])])].sort();
   }
+  if (hasUnopenedSearchResults(state)) {
+    // Search completed but no observed result has been opened yet. The browser
+    // is intentionally still on DuckDuckGo; the only productive browser step
+    // is opening one of the observed result refs. Do not offer another search
+    // or page-local research on the search page itself.
+    const independent = actionable.filter(requirement => {
+      if (requirement.id === 'browserResearch' || requirement.target?.factId === 'pageContent') return false;
+      if (requirement.type === 'browser') return false;
+      const action = requiredActionForRequirement(requirement);
+      if (action && action.startsWith('browser.')) return false;
+      return true;
+    });
+    const names = independent.flatMap(requirement => {
+      const action = requiredActionForRequirement(requirement);
+      return action && !action.startsWith('browser.') && availableTools.includes(action) ? [action] : [];
+    });
+    if (availableTools.includes('browser.open')) names.push('browser.open');
+    return [...new Set(names)].sort();
+  }
   const explicitSearchCompleted = requirements.some(requirement => requirement.target?.action === 'browser.webSearch'
     && requirement.target.freshness === 'current-run'
     && completed.has(requirement.id));
@@ -733,9 +758,11 @@ function hasRelevantBlockerEvidence(
     'INVALID_BROWSER_PROTOCOL',
     'VERIFIED_URL_RECOVERY_REQUIRED',
     'STALE_CONTENT_REF',
+    'SEARCH_ALREADY_COMPLETED_USE_OBSERVED_RESULT',
+    'NAVIGATION_REF_REQUIRES_OPEN',
   ]);
   const expectedAction = requiredActionForRequirement(requirement);
-  for (const action of [...state.recentActions].reverse()) {
+  for (const action of [...verificationActions(state)].reverse()) {
     const receipt = embeddedReceipt(action.result) ?? action.receipt;
     if (!receipt || receipt.ok !== false || ignoredErrors.has(receipt.error?.code ?? action.result.error?.code ?? '')) {
       if (!(requirement.id === 'browserResearch' && action.tool === 'browser.read' && action.result.ok
@@ -1392,9 +1419,56 @@ export class AgentRuntime {
       let navigation: PreparedNavigation | undefined;
       let executionInput: Record<string, unknown> | undefined;
       let toolWasInvoked = false;
+      let effectiveToolName = toolName;
       const receiptStartedAt = this.isoNow();
 
-      if (stepIndex >= maxToolActions) {
+      // Searching must not substitute for opening. While a successful search
+      // has unopened observed results, a further webSearch cannot execute
+      // another DuckDuckGo navigation. An exact URL match to an observed href
+      // is safely routed to browser.open with the stored ref; otherwise the
+      // proposal is rejected without side effects.
+      let searchGuardRejection: ToolResult | undefined;
+      let searchRewriteRef: string | undefined;
+      if (toolName === 'browser.webSearch' && hasUnopenedSearchResults(state)) {
+        const query = typeof preparedInput.query === 'string' ? preparedInput.query : '';
+        const matchingRef = query ? findObservedSearchRefForUrl(state, query) : undefined;
+        if (matchingRef) {
+          effectiveToolName = 'browser.open';
+          searchRewriteRef = matchingRef;
+        } else {
+          const unopened = unopenedSearchResults(state);
+          searchGuardRejection = {
+            ok: false,
+            error: {
+              code: 'SEARCH_ALREADY_COMPLETED_USE_OBSERVED_RESULT',
+              message: 'A DuckDuckGo search already returned observed results. Open one of the observed results with browser.open({ ref }) instead of searching again.',
+              details: {
+                availableResultRefs: unopened.map(item => item.ref),
+                hint: 'Open one of the observed results with browser.open({ ref }).',
+              },
+            },
+          };
+        }
+      }
+
+      if (searchGuardRejection) {
+        result = searchGuardRejection;
+      } else if (searchRewriteRef) {
+        executionInput = { ref: searchRewriteRef };
+        toolWasInvoked = true;
+        await this.emit('run.progress', {
+          threadId: run.threadId,
+          summary: `Running browser.open.`,
+        }, runId);
+        result = await this.tools.execute(effectiveToolName, executionInput, {
+          signal: cancellation.signal,
+          runId,
+          stepIndex,
+          previousResults: clone(previousResults.slice(-12)),
+          timeoutMs: this.budgetOptions?.toolTimeoutMs,
+        });
+        if (effectiveToolName === 'browser.open') result = recordBrowserOpenOutcome(result);
+      } else if (stepIndex >= maxToolActions) {
         result = { ok: false, error: { code: 'ACTION_BUDGET_EXCEEDED', message: 'The run reached its ' + maxToolActions + '-action budget.' } };
       } else if (previousNoProgress && previousNoProgress.count >= maxRepeatedAction) {
         result = { ok: false, error: { code: 'REPEATED_ACTION', message: 'This exact action has already repeated without a concrete state change. Choose another action or report the blocker.' } };
@@ -1454,19 +1528,19 @@ export class AgentRuntime {
       }
 
       if (toolWasInvoked) {
-        result = withRuntimeReceipt(toolName, executionInput ?? preparedInput, result, receiptStartedAt, this.now);
+        result = withRuntimeReceipt(effectiveToolName, executionInput ?? preparedInput, result, receiptStartedAt, this.now);
       }
-      if (toolName === 'browser.navigate' && navigation) {
+      if (effectiveToolName === 'browser.navigate' && navigation) {
         result = recordNavigationOutcome(result, navigation, navigationPolicy);
       }
-      rememberObservedBrowserUrls(toolName, result.data, navigationPolicy);
+      rememberObservedBrowserUrls(effectiveToolName, result.data, navigationPolicy);
       const compactResult = compactAgentToolResult(result);
       lastToolResult = compactResult;
 
       if (result.ok) consecutiveFailures = 0;
       else consecutiveFailures += 1;
 
-      if (toolName === 'browser.webSearch') {
+      if (effectiveToolName === 'browser.webSearch' && !searchRewriteRef) {
         const searchRequirement = requirementsForTask(state.task).find(requirement =>
           requirement.mandatory && requirement.target?.action === 'browser.webSearch'
           && !state.completedRequirementIds.includes(requirement.id));
@@ -1492,7 +1566,7 @@ export class AgentRuntime {
         }
       }
 
-      const resultFingerprint = fingerprintAction(toolName, preparedInput, undefined, {
+      const resultFingerprint = fingerprintAction(effectiveToolName, executionInput ?? preparedInput, undefined, {
         ok: compactResult.ok,
         data: compactResult.data,
         error: compactResult.error,
@@ -1509,12 +1583,12 @@ export class AgentRuntime {
       }
       previousResults.push(compactResult);
 
-      const worker = toolName.startsWith('browser.') ? 'browser'
-        : toolName.startsWith('fs.') ? 'filesystem'
-          : toolName.startsWith('desktop.') || toolName.startsWith('app.') ? 'desktop' : 'system';
+      const worker = effectiveToolName.startsWith('browser.') ? 'browser'
+        : effectiveToolName.startsWith('fs.') ? 'filesystem'
+          : effectiveToolName.startsWith('desktop.') || effectiveToolName.startsWith('app.') ? 'desktop' : 'system';
       const workerAction = {
         id: this.idFactory('action'),
-        tool: toolName,
+        tool: effectiveToolName,
         input: executionInput ?? preparedInput,
         result,
         ...(embeddedReceipt(result) ? { receipt: embeddedReceipt(result) } : {}),
@@ -1543,7 +1617,7 @@ export class AgentRuntime {
         stepIndex,
         phase: 'act',
         decision: action,
-        toolName,
+        toolName: effectiveToolName,
         // toolInput is the input actually sent when tool execution began.
         // The model proposal remains available in decision.input.
         ...(executionInput ? { toolInput: clone(executionInput) } : {}),
@@ -1560,17 +1634,20 @@ export class AgentRuntime {
       if (toolWasInvoked && result.ok) {
         await this.emit('run.progress', {
           threadId: run.threadId,
-          summary: `Completed ${toolName}.`,
+          summary: `Completed ${effectiveToolName}.`,
         }, runId);
       }
       const executedAction: AgentDecision = {
-        ...action,
+        type: 'action',
+        tool: effectiveToolName,
         input: clone(executionInput ?? preparedInput),
       };
       await this.emit('run.step.completed', {
         stepIndex,
         action: executedAction,
+        proposedTool: toolName,
         proposedInput,
+        effectiveTool: effectiveToolName,
         effectiveInput: executionInput,
         toolResult: compactResult,
         verification,

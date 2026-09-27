@@ -220,6 +220,8 @@ export interface TaskState {
   currentObjective?: WorkerObjective;
   currentEnvironment?: EnvironmentObservation;
   recentActions: WorkerAction[];
+  /** Durable run-scoped successful actions retained independently of the bounded recentActions UI buffer. */
+  durableActions?: WorkerAction[];
   failedStrategies: FailedStrategy[];
   blockers: Blocker[];
   progress: ProgressState;
