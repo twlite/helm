@@ -2,7 +2,7 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { describe, expect, it } from 'bun:test';
 
 import { AiSdkActingAgent } from '../../src/ai/acting-agent';
-import type { Message, VerificationResult } from '@helm/shared';
+import type { Message, TaskDefinition, VerificationResult } from '@helm/shared';
 
 type ChatReply = {
   id: string;
@@ -70,17 +70,32 @@ describe('acting agent context integration', () => {
       requirements: [],
       summary: 'No external effect was requested.',
     };
+    const task: TaskDefinition = {
+      id: 'context-task',
+      threadId: 'invalid-context-thread',
+      goal: currentRequest,
+      originalRequest: currentRequest,
+      criteria: [],
+      requirements: [],
+      constraints: [],
+      isConversation: true,
+    };
 
     let caught: unknown;
     try {
       await agent.execute({
         userMessage: currentRequest,
+        task,
         conversation,
         memories: [],
         toolDefinitions: [],
         executeTool: async () => ({ ok: false, error: { code: 'UNEXPECTED_TOOL', message: 'No tool was expected.' } }),
         verifyCompletion: async () => ({ ok: true, data: verification }),
-        maxSteps: 2,
+        reportBlocked: async () => ({ ok: false, error: { code: 'BLOCKER_NOT_VERIFIED', message: 'No blocker.' } }),
+        getRequirementSummary: () => '',
+        maxToolActions: 2,
+        maxModelTurns: 2,
+        maxCompletionRecoveryTurns: 1,
         maxRepeatedAction: 2,
         maxConsecutiveFailures: 2,
       });
@@ -106,18 +121,7 @@ describe('acting agent context integration', () => {
           failedApproaches: [],
         }),
       }, 'stop'),
-      reply('complete', {
-        role: 'assistant',
-        content: null,
-        tool_calls: [{
-          id: 'call-complete',
-          type: 'function',
-          function: {
-            name: 'helm.complete',
-            arguments: JSON.stringify({ response: 'The conversation is complete.', requiredEffects: [] }),
-          },
-        }],
-      }, 'tool_calls'),
+      reply('complete', { role: 'assistant', content: 'The conversation is complete.' }, 'stop'),
     ];
     const requests: Record<string, unknown>[] = [];
     const provider = createOpenAICompatible({
@@ -172,17 +176,32 @@ describe('acting agent context integration', () => {
       requirements: [],
       summary: 'No external effect was requested.',
     };
+    const task: TaskDefinition = {
+      id: 'context-task',
+      threadId: 'context-thread',
+      goal: currentRequest,
+      originalRequest: currentRequest,
+      criteria: [],
+      requirements: [],
+      constraints: [],
+      isConversation: true,
+    };
 
     const result = await agent.execute({
       userMessage: currentRequest,
+      task,
       conversation,
       memories: [],
       toolDefinitions: [],
       executeTool: async () => ({ ok: false, error: { code: 'UNEXPECTED_TOOL', message: 'No tool was expected.' } }),
       verifyCompletion: async () => ({ ok: true, data: verification }),
+      reportBlocked: async () => ({ ok: false, error: { code: 'BLOCKER_NOT_VERIFIED', message: 'No blocker.' } }),
+      getRequirementSummary: () => '',
       onContextUsage: event => usageEvents.push(event),
       onContextCompacted: event => compactionEvents.push(event as unknown as Record<string, unknown>),
-      maxSteps: 2,
+      maxToolActions: 2,
+      maxModelTurns: 2,
+      maxCompletionRecoveryTurns: 1,
       maxRepeatedAction: 2,
       maxConsecutiveFailures: 2,
     });

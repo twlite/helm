@@ -9,8 +9,8 @@ describe('persistence migrations', () => {
   it('creates all persistence tables and is idempotent', () => {
     const persistence = testDatabase();
     try {
-      expect(persistence.migrations.currentVersion).toBe(5);
-      expect(persistence.migrations.applied.map(migration => migration.version)).toEqual([1, 2, 3, 4, 5]);
+      expect(persistence.migrations.currentVersion).toBe(6);
+      expect(persistence.migrations.applied.map(migration => migration.version)).toEqual([1, 2, 3, 4, 5, 6]);
 
       const tables = persistence.sqlite
         .prepare(
@@ -29,9 +29,9 @@ describe('persistence migrations', () => {
         'threads',
       ]);
 
-      expect(runMigrations(persistence.sqlite)).toEqual({ applied: [], currentVersion: 5 });
-      expect(getAppliedMigrations(persistence.sqlite)).toHaveLength(5);
-      expect(persistence.sqlite.prepare('PRAGMA user_version').get()).toEqual({ user_version: 5 });
+      expect(runMigrations(persistence.sqlite)).toEqual({ applied: [], currentVersion: 6 });
+      expect(getAppliedMigrations(persistence.sqlite)).toHaveLength(6);
+      expect(persistence.sqlite.prepare('PRAGMA user_version').get()).toEqual({ user_version: 6 });
     } finally {
       persistence.close();
     }
@@ -48,8 +48,11 @@ describe('persistence migrations', () => {
           JSON.stringify({ source: 'automatic-user-memory' }), '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z');
 
       expect(runMigrations(persistence.sqlite)).toEqual({
-        applied: [{ version: 5, name: 'persistent-memory-provenance-and-keys' }],
-        currentVersion: 5,
+        applied: [
+          { version: 5, name: 'persistent-memory-provenance-and-keys' },
+          { version: 6, name: 'run-execution-diagnostics' },
+        ],
+        currentVersion: 6,
       });
       const memories = new MemoryRepository(persistence.sqlite);
       expect(memories.getById('legacy-memory')).toMatchObject({
@@ -75,6 +78,34 @@ describe('persistence migrations', () => {
       expect(persistence.messages.countByThread(thread.id)).toBe(0);
       expect(persistence.runs.getById(run.id)).toBeUndefined();
       expect(persistence.runSteps.getById(step.id)).toBeUndefined();
+    } finally {
+      persistence.close();
+    }
+  });
+
+  it('round-trips acting-agent diagnostics with the run record', () => {
+    const persistence = testDatabase();
+    try {
+      const thread = persistence.threads.create({ title: 'Diagnostics' });
+      const diagnostics = {
+        modelTurns: 2,
+        modelRequests: 2,
+        toolActions: 1,
+        completionAttempts: 1,
+        completionRejections: 0,
+        contextCompactions: 0,
+        lastUnsatisfiedRequirements: [],
+      };
+      const run = persistence.runs.create({
+        threadId: thread.id,
+        goal: 'Remember a setting.',
+        criteria: [],
+        diagnostics,
+      });
+      expect(persistence.runs.getById(run.id)?.diagnostics).toEqual(diagnostics);
+
+      persistence.runs.update(run.id, { diagnostics: { ...diagnostics, modelTurns: 3, modelRequests: 4 } });
+      expect(persistence.runs.getById(run.id)?.diagnostics).toMatchObject({ modelTurns: 3, modelRequests: 4 });
     } finally {
       persistence.close();
     }

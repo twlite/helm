@@ -1,13 +1,18 @@
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { describe, expect, it } from 'bun:test';
 
+import type { GuestMethod, Memory, TaskDefinition, TaskRequirement } from '@helm/shared';
 import { AgentRuntime } from '../../src/agent/runtime';
 import { AiSdkActingAgent } from '../../src/ai/acting-agent';
+import { DeterministicTaskCompiler } from '../../src/ai/adapter';
 import { MemoryService } from '../../src/memory/service';
 import { registerMemoryTools } from '../../src/memory/tools';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
 import { createGuestToolRegistry } from '../../src/tools/guest-tools';
 import { MockGuestTransport } from '../../src/tools/mock-guest-transport';
+import type { GuestMethodParams, GuestMethodResult, GuestRequestOptions } from '../../src/tools/guest-transport';
+import { GuestTransportError } from '../../src/tools/guest-transport';
+import { createTaskState, validateRequirementDependencies, verifyTaskState } from '../../src/agent/task-state';
 import { testDatabase } from '../persistence/helpers';
 
 type ChatReply = {
@@ -23,11 +28,7 @@ type ChatReply = {
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
 };
 
-type CapturedRequest = {
-  body: Record<string, unknown>;
-  reply: ChatReply;
-};
-
+type CapturedRequest = { body: Record<string, unknown>; reply: ChatReply };
 type ScriptedReply = ChatReply | ((body: Record<string, unknown>) => ChatReply);
 
 function textReply(id: string, content: string): ChatReply {
@@ -64,11 +65,54 @@ function toolReply(id: string, name: string, args: unknown): ChatReply {
   };
 }
 
+function findTableRef(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    try { return findTableRef(JSON.parse(value) as unknown); } catch { return undefined; }
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const result = findTableRef(item);
+      if (result) return result;
+    }
+    return undefined;
+  }
+  if (typeof value !== 'object' || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.type === 'table' && typeof record.ref === 'string') return record.ref;
+  for (const child of Object.values(record)) {
+    const result = findTableRef(child);
+    if (result) return result;
+  }
+  return undefined;
+}
+
+function findBrowserOpenArgs(value: unknown): { ref: string; linkIndex?: number } | undefined {
+  if (typeof value === 'string') {
+    try { return findBrowserOpenArgs(JSON.parse(value) as unknown); } catch {
+      const match = value.match(/browser\.open\(\{ ref: "([^"]+)"(?:, linkIndex: (\d+))?/u);
+      return match ? { ref: match[1]!, ...(match[2] ? { linkIndex: Number(match[2]) } : {}) } : undefined;
+    }
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const result = findBrowserOpenArgs(item);
+      if (result) return result;
+    }
+    return undefined;
+  }
+  if (typeof value !== 'object' || value === null) return undefined;
+  for (const child of Object.values(value as Record<string, unknown>)) {
+    const result = findBrowserOpenArgs(child);
+    if (result) return result;
+  }
+  return undefined;
+}
+
 function createRuntime(
   guest: MockGuestTransport,
   replies: ScriptedReply[],
   requests: CapturedRequest[],
-  maxSteps = 12,
+  options: { maxSteps?: number; maxModelTurns?: number; memories?: Memory[] } = {},
 ) {
   const provider = createOpenAICompatible({
     name: 'lmstudio',
@@ -96,13 +140,22 @@ function createRuntime(
       guestTransport: guest,
       toolRegistry: tools,
       verifier: new CriterionVerifierRegistry(guest),
+      taskCompiler: new DeterministicTaskCompiler(),
       actingAgent,
-      budgets: { maxSteps, maxRepeatedAction: 2, maxConsecutiveFailures: 3, toolTimeoutMs: 1_000 },
+      memories: options.memories,
+      budgets: {
+        maxSteps: options.maxSteps ?? 12,
+        maxModelTurns: options.maxModelTurns ?? 12,
+        maxCompletionRecoveryTurns: 2,
+        maxRepeatedAction: 2,
+        maxConsecutiveFailures: 3,
+        toolTimeoutMs: 1_000,
+      },
     }),
   };
 }
 
-function requestTools(request: CapturedRequest): string[] {
+function requestedTools(request: CapturedRequest): string[] {
   const tools = request.body.tools;
   if (!Array.isArray(tools)) return [];
   return tools.flatMap(value => {
@@ -114,472 +167,445 @@ function requestTools(request: CapturedRequest): string[] {
   });
 }
 
-describe('native acting agent', () => {
-  it('exposes semantic page reading and query search operations', async () => {
-    const guest = new MockGuestTransport();
-    const requests: CapturedRequest[] = [];
-    const { runtime, tools } = createRuntime(guest, [
-      toolReply('catalog-complete', 'helm.complete', { response: 'Ready.', requiredEffects: [] }),
-    ], requests);
+function requirementsFor(result: Awaited<ReturnType<AgentRuntime['run']>>) {
+  return result.run.state?.task.requirements ?? result.task.requirements ?? [];
+}
 
-    const result = await runtime.run({ threadId: 'browser-catalog', userMessage: 'Find useful information on a webpage.' });
-
-    expect(result.status).toBe('completed');
-    const definitions = requests[0]!.body.tools as Array<{ function?: { name?: string; parameters?: Record<string, unknown> } }>;
-    const readDefinition = definitions.find(definition => definition.function?.name === 'browser.read');
-    const searchDefinition = definitions.find(definition => definition.function?.name === 'browser.search');
-    expect(readDefinition).toBeDefined();
-    expect(searchDefinition).toBeDefined();
-    const readParameters = readDefinition!.function!.parameters!;
-    const readProperties = readParameters.properties as Record<string, Record<string, unknown>>;
-    expect(readProperties).toHaveProperty('mode');
-    expect(readProperties).toHaveProperty('offset');
-    expect(readProperties).not.toHaveProperty('cursor');
-    expect(readProperties).toHaveProperty('query');
-    expect(readProperties.maxChars?.maximum).toBe(12_000);
-    expect(readParameters.required ?? []).not.toContain('query');
-    const searchParameters = searchDefinition!.function!.parameters!;
-    expect(searchParameters.required).toContain('query');
-
-    const rejected = await tools.execute('browser.read', { query: 'exchange rates', mode: 'readable', unexpected: true });
-    expect(rejected).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
-    const legacyRegionRead = await tools.execute('browser.read', { ref: 'r1-1' });
-    expect(legacyRegionRead).toMatchObject({ ok: false, error: { code: 'INVALID_INPUT' } });
-    expect(guest.browser.url).toBeUndefined();
-  });
-
-  it('answers a conversational poem request without invoking computer tools', async () => {
-    const guest = new MockGuestTransport();
-    const requests: CapturedRequest[] = [];
-    const poem = 'A quiet cursor crosses the night,\nAnd turns a thought to gathered light.';
-    const { runtime, tools } = createRuntime(guest, [
-      toolReply('poem-complete', 'helm.complete', { response: poem, requiredEffects: [] }),
-    ], requests);
-
-    const result = await runtime.run({ threadId: 'poem-chat', userMessage: 'Write a beautiful poem about Helm.' });
-
-    expect(result.status).toBe('completed');
-    expect(result.assistantResponse).toBe(poem);
-    expect(tools.invocations).toHaveLength(0);
-    expect(guest.hasFile('/home/helm/workspace/poem.txt')).toBe(false);
-    expect(requestTools(requests[0]!)).toContain('fs.write');
-    expect(requestTools(requests[0]!)).toContain('browser.navigate');
-    expect(JSON.stringify(requests[0]!.body.messages)).toContain('Write a beautiful poem about Helm.');
-  });
-
-  it('saves a prior assistant poem from conversation context through fs.write', async () => {
-    const guest = new MockGuestTransport();
-    const requests: CapturedRequest[] = [];
-    const poem = 'Helm follows each new thought,\nAnd makes the distant task complete.';
-    const { runtime, tools } = createRuntime(guest, [
-      toolReply('poem-write', 'fs.write', { path: 'poem.txt', content: poem }),
-      toolReply('poem-saved', 'helm.complete', {
-        response: 'Saved the poem in poem.txt.',
-        requiredEffects: [{ tool: 'fs.write' }],
-      }),
-    ], requests);
-
-    const result = await runtime.run({
-      threadId: 'poem-follow-up',
-      userMessage: 'Save it in a text file.',
-      conversation: [
-        { id: 'u1', threadId: 'poem-follow-up', role: 'user', content: 'Write a beautiful poem about Helm.', metadata: {}, createdAt: '2026-01-01T00:00:00.000Z' },
-        { id: 'a1', threadId: 'poem-follow-up', role: 'assistant', content: poem, metadata: {}, createdAt: '2026-01-01T00:00:01.000Z' },
-        { id: 'u2', threadId: 'poem-follow-up', role: 'user', content: 'Save it in a text file.', metadata: {}, createdAt: '2026-01-01T00:00:02.000Z' },
-      ],
-    });
-
-    expect(result.status).toBe('completed');
-    expect(guest.getFile('/home/helm/workspace/poem.txt')).toBe(poem);
-    expect(result.assistantResponse).toBe('Saved the poem in poem.txt.');
-    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['fs.write']);
-    const nextMessages = JSON.stringify(requests[1]!.body.messages);
-    expect(nextMessages).toContain('Helm follows each new thought,');
-    expect(nextMessages).toContain('tool');
-  });
-
-  it('handles an unspecified "poem txt file" name without a phrase parser', async () => {
-    const guest = new MockGuestTransport();
-    const requests: CapturedRequest[] = [];
-    const content = 'A local agent, steady and clear,\nTurns small intentions into work here.';
-    const { runtime } = createRuntime(guest, [
-      toolReply('poem-txt-write', 'fs.write', { path: 'poem.txt', content }),
-      toolReply('poem-txt-complete', 'helm.complete', {
-        response: 'I saved the poem in poem.txt.',
-        requiredEffects: [{ tool: 'fs.write' }],
-      }),
-    ], requests);
-
-    const result = await runtime.run({
-      threadId: 'poem-txt',
-      userMessage: 'Write a beautiful poem about Helm in a poem txt file.',
-    });
-
-    expect(result.status).toBe('completed');
-    expect(guest.getFile('/home/helm/workspace/poem.txt')).toBe(content);
-    expect(requestTools(requests[0]!)).toContain('fs.write');
-  });
-
-  it('writes meaningful model-generated poem contents directly to poem.txt', async () => {
-    const guest = new MockGuestTransport();
-    const requests: CapturedRequest[] = [];
-    const content = 'A steady helm through open skies,\nWhere every useful answer lies.';
-    const { runtime } = createRuntime(guest, [
-      toolReply('explicit-poem-write', 'fs.write', { path: 'poem.txt', content }),
-      toolReply('explicit-poem-complete', 'helm.complete', {
-        response: 'I wrote the poem to poem.txt.',
-        requiredEffects: [{ tool: 'fs.write' }],
-      }),
-    ], requests);
-
-    const result = await runtime.run({
-      threadId: 'explicit-poem-file',
-      userMessage: 'Write a beautiful poem about Helm in a poem.txt file.',
-    });
-
-    expect(result.status).toBe('completed');
-    expect(guest.getFile('/home/helm/workspace/poem.txt')).toBe(content);
-    expect(result.steps.some(step => step.toolName === 'fs.write' && step.toolResult?.ok)).toBe(true);
-  });
-
-  it('returns a failed tool result to the model so it can recover', async () => {
-    const guest = new MockGuestTransport();
-    const requests: CapturedRequest[] = [];
-    const content = 'A useful tool learns from what went wrong.';
-    const { runtime } = createRuntime(guest, [
-      toolReply('bad-write', 'fs.write', { path: '/tmp/outside.txt', content }),
-      toolReply('recovered-write', 'fs.write', { path: 'recovered.txt', content }),
-      toolReply('recovered-complete', 'helm.complete', {
-        response: 'I recovered from the first write error and saved recovered.txt.',
-        requiredEffects: [{ tool: 'fs.write' }],
-      }),
-    ], requests);
-
-    const result = await runtime.run({
-      threadId: 'tool-recovery',
-      userMessage: 'Write a short line to a text file.',
-    });
-
-    expect(result.status).toBe('completed');
-    expect(guest.getFile('/home/helm/workspace/recovered.txt')).toBe(content);
-    expect(JSON.stringify(requests[1]!.body.messages)).toContain('PATH_OUTSIDE_ALLOWED_ROOT');
-  });
-
-  it('answers a browser research question from the page content it inspected', async () => {
-    const followerCount = String(700 + Math.floor(Math.random() * 8_000));
-    const profileUrl = 'https://github.com/twlite';
+describe('production acting agent requirements', () => {
+  it('compiles a real task and carries browser table lineage through write and open within a small turn budget', async () => {
+    const url = 'https://example.test/forex/';
+    const table = '<table><tr><th>Currency</th><th>Buy</th><th>Sell</th></tr><tr><td>USD</td><td>133.20</td><td>134.10</td></tr></table>';
     const guest = new MockGuestTransport({
-      pages: { [profileUrl]: `<html><body><h1>Twilight</h1><p>${followerCount} followers</p></body></html>` },
+      pages: { [url]: `<html><body><main><h1>Exchange Rates</h1>${table}</main></body></html>` },
     });
     const requests: CapturedRequest[] = [];
-    const response = `The profile currently shows ${followerCount} followers.`;
+    const expected = 'Exchange Rates\nCurrency | Buy | Sell\nUSD | 133.20 | 134.10';
     const { runtime, tools } = createRuntime(guest, [
-      toolReply('followers-nav', 'browser.navigate', { url: profileUrl }),
-      toolReply('followers-text', 'browser.search', { query: 'followers count' }),
-      toolReply('followers-complete', 'helm.complete', {
-        response,
-        requiredEffects: [{ tool: 'browser.navigate' }, { tool: 'browser.search' }],
-      }),
-    ], requests);
-
-    const result = await runtime.run({
-      threadId: 'github-followers',
-      userMessage: 'go to github.com/twlite and find out how many followers he has',
-    });
-
-    expect(result.status).toBe('completed');
-    expect(result.assistantResponse).toBe(response);
-    expect(result.assistantResponse).toContain(followerCount);
-    expect(tools.invocations.map(invocation => invocation.tool)).toEqual([
-      'browser.navigate', 'browser.search',
-    ]);
-    expect(JSON.stringify(requests[2]!.body.messages)).toContain(followerCount);
-  });
-
-  it('rejects a completion claim without a successful file effect and returns the rejection to the model', async () => {
-    const guest = new MockGuestTransport();
-    const requests: CapturedRequest[] = [];
-    const { runtime, tools } = createRuntime(guest, [
-      textReply('draft-1', 'I saved the poem in poem.txt.'),
-      toolReply('check-1', 'helm.complete', {
-        response: 'I saved the poem in poem.txt.',
-        requiredEffects: [{ tool: 'fs.write' }],
-      }),
-      textReply('draft-2', 'The file is not saved yet.'),
-      toolReply('check-2', 'helm.complete', {
-        response: 'The file is not saved yet.',
-        requiredEffects: [{ tool: 'fs.write' }],
-      }),
-      textReply('draft-3', 'The file is still unavailable.'),
-    ], requests, 1);
-
-    const result = await runtime.run({
-      threadId: 'completion-guard',
-      userMessage: 'Write a poem and save it in poem.txt.',
-    });
-
-    expect(result.status).toBe('failed');
-    expect(guest.hasFile('/home/helm/workspace/poem.txt')).toBe(false);
-    expect(tools.invocations).toHaveLength(0);
-    expect(JSON.stringify(requests[2]!.body.messages)).toContain('UNVERIFIED_SIDE_EFFECT');
-  });
-
-  it('bounds repeated identical tool calls that make no state change', async () => {
-    const guest = new MockGuestTransport();
-    const requests: CapturedRequest[] = [];
-    const { runtime, tools } = createRuntime(guest, [
-      toolReply('exists-1', 'fs.exists', { path: 'missing.txt' }),
-      toolReply('exists-2', 'fs.exists', { path: 'missing.txt' }),
-      toolReply('exists-3', 'fs.exists', { path: 'missing.txt' }),
-      toolReply('exists-complete', 'helm.complete', {
-        response: 'The file does not exist.',
-        requiredEffects: [],
-      }),
-    ], requests);
-
-    const result = await runtime.run({
-      threadId: 'repeated-tool-call',
-      userMessage: 'Check whether missing.txt exists.',
-    });
-
-    expect(result.status).toBe('completed');
-    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['fs.exists', 'fs.exists']);
-    expect(JSON.stringify(requests[3]!.body.messages)).toContain('REPEATED_ACTION');
-  });
-
-  it('returns browser evidence to the acting model before it generates and writes a portfolio', async () => {
-    const followerCount = String(700 + Math.floor(Math.random() * 8_000));
-    const repositoryName = `repo-${crypto.randomUUID().slice(0, 8)}`;
-    const profileUrl = 'https://github.com/twlite';
-    const profileImageUrl = 'https://github.com/twlite.png';
-    const page = `<html><body><h1>Twilight</h1><p>Followers: ${followerCount}</p><h2>Pinned</h2><p>${repositoryName}: observed repository detail</p></body></html>`;
-    const portfolio = `<!doctype html><html><head><style>body{font-family:system-ui;background:#111;color:#f5f5f5}</style></head><body><main><img src="${profileImageUrl}" alt="Twilight"><h1>Twilight</h1><p>Followers: ${followerCount}</p><article>${repositoryName}: observed repository detail</article></main></body></html>`;
-    const guest = new MockGuestTransport({ pages: { [profileUrl]: page } });
-    const requests: CapturedRequest[] = [];
-    const { runtime, tools } = createRuntime(guest, [
-      toolReply('profile-nav', 'browser.navigate', { url: profileUrl }),
-      toolReply('profile-text', 'browser.read', { mode: 'readable', maxChars: 12_000 }),
-      toolReply('portfolio-write', 'fs.write', { path: 'twlite.html', content: portfolio }),
-      toolReply('portfolio-complete', 'helm.complete', {
-        response: 'Created twlite.html using the observed profile information.',
-        requiredEffects: [
-          { tool: 'browser.navigate' },
-          { tool: 'browser.read' },
-          { tool: 'fs.write' },
-        ],
-      }),
-    ], requests);
-
-    const result = await runtime.run({
-      threadId: 'github-portfolio',
-      userMessage: `go to github.com/twlite and find out how many followers he has and his pinned repos with their details. Using that information, create twlite.html with a good looking portfolio website for Twilight. Use this as the profile picture image url: ${profileImageUrl}`,
-    });
-
-    expect(result.status).toBe('completed');
-    const html = guest.getFile('/home/helm/workspace/twlite.html') ?? '';
-    expect(html.toLowerCase()).toContain('<!doctype html>');
-    expect(html).toContain('<style>');
-    expect(html).toContain(`<img src="${profileImageUrl}"`);
-    expect(html).toContain(followerCount);
-    expect(html).toContain(repositoryName);
-    expect(tools.invocations.map(invocation => invocation.tool)).toEqual([
-      'browser.navigate', 'browser.read', 'fs.write',
-    ]);
-    expect(requests[2]!.body.tools).toBeDefined();
-    expect(JSON.stringify(requests[2]!.body.messages)).toContain(followerCount);
-    expect(JSON.stringify(requests[2]!.body.messages)).toContain(repositoryName);
-    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.navigate'))
-      .toHaveLength(1);
-    expect((tools.invocations.find(invocation => invocation.tool === 'browser.navigate')?.input as { url: string }).url)
-      .toBe(profileUrl);
-  });
-
-  it('reads, summarizes, saves, and opens the portfolio page using separate browser operations', async () => {
-    const url = 'https://dhunganakunjan.com.np/';
-    const guest = new MockGuestTransport({
-      pages: {
-        [url]: `<!doctype html><html><head><title>Kunjan Dhungana</title></head><body><nav>Home Blog Contact</nav>
-          <main><h1>Kunjan Dhungana</h1><p>Self-taught software engineer from Nepal and co-founder of Neplex.</p>
-            <h2>Work</h2><p>Interested in runtimes and developer experience.</p>
-            <h2>Outside software</h2><p>Slowly learning piano.</p>
-            <h2>Work with me</h2><p>Book a call to discuss developer tooling.</p></main></body></html>`,
+      toolReply('forex-nav', 'browser.navigate', { url }),
+      toolReply('forex-read', 'browser.read', { query: 'exchange rate data' }),
+      body => {
+        const sourceRef = findTableRef(body.messages);
+        if (!sourceRef) throw new Error('The browser table ref was not returned to the acting model.');
+        return toolReply('forex-write', 'fs.write', { path: 'forex.txt', sourceRef, format: 'text' });
       },
-    });
-    const requests: CapturedRequest[] = [];
-    const summary = 'Kunjan Dhungana is a self-taught software engineer from Nepal and Neplex co-founder. He is interested in runtimes and developer experience, is learning piano, and invites calls about developer tooling.';
-    const { runtime, tools } = createRuntime(guest, [
-      toolReply('portfolio-nav', 'browser.navigate', { url }),
-      toolReply('portfolio-snapshot', 'browser.snapshot', {}),
-      toolReply('portfolio-read', 'browser.read', { mode: 'readable', maxChars: 12_000 }),
-      toolReply('portfolio-write', 'fs.write', { path: 'kd.txt', content: summary }),
-      toolReply('portfolio-open', 'app.openFile', { path: 'kd.txt', application: 'text-editor' }),
-      toolReply('portfolio-complete', 'helm.complete', {
-        response: 'Saved the page summary to kd.txt and opened it in the text viewer.',
-        requiredEffects: [
-          { tool: 'browser.navigate' },
-          { tool: 'browser.read' },
-          { tool: 'fs.write' },
-          { tool: 'app.openFile' },
-        ],
-      }),
-    ], requests);
+      toolReply('forex-open', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
+      textReply('forex-final', 'I saved the current exchange-rate table to forex.txt and opened it in the text viewer.'),
+    ], requests, { maxSteps: 8, maxModelTurns: 8 });
 
     const result = await runtime.run({
-      threadId: 'portfolio-summary',
-      userMessage: 'go to dhunganakunjan.com.np and summarize the page content and save it to kd.txt file and open it with text viewer app',
+      threadId: 'forex-production-compile',
+      userMessage: `Fetch exchange rate data from ${url}, save that data to forex.txt, and open it with the text viewer application.`,
     });
 
     expect(result.status).toBe('completed');
-    expect(guest.getFile('/home/helm/workspace/kd.txt')).toBe(summary);
-    expect(guest.desktopWindows.find(window => window.focused)?.title).toContain('kd.txt');
+    expect(result.task.requirements?.map(requirement => requirement.id)).toEqual(
+      expect.arrayContaining(['browserResearch', 'outputFile', 'openFile']),
+    );
+    const requirements = result.task.requirements ?? [];
+    const output = requirements.find(requirement => requirement.id === 'outputFile')!;
+    const open = requirements.find(requirement => requirement.id === 'openFile')!;
+    expect(output).toMatchObject({
+      dependsOn: ['browserResearch'],
+      target: { path: 'forex.txt', freshness: 'current-run', action: 'fs.write', mode: 'written-from-artifact' },
+    });
+    expect(open).toMatchObject({
+      dependsOn: ['outputFile'],
+      target: { path: 'forex.txt', application: 'text-editor', freshness: 'current-run', action: 'app.openFile', mode: 'opened' },
+    });
+    expect(guest.getFile('/home/helm/workspace/forex.txt')).toContain(expected);
+    expect(result.run.state?.artifacts.some(artifact => artifact.path?.endsWith('/forex.txt') && artifact.sourceRef)).toBe(true);
+    const writeArguments = JSON.parse(
+      (requests[2]!.reply.choices[0]!.message.tool_calls as Array<{ function: { arguments: string } }>)[0]!.function.arguments,
+    ) as Record<string, unknown>;
+    expect(writeArguments).toMatchObject({ path: 'forex.txt', sourceRef: expect.any(String), format: 'text' });
+    expect(writeArguments).not.toHaveProperty('content');
+    expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining(['browserResearch', 'outputFile', 'openFile']));
     expect(tools.invocations.map(invocation => invocation.tool)).toEqual([
-      'browser.navigate', 'browser.snapshot', 'browser.read', 'fs.write', 'app.openFile',
+      'browser.navigate', 'browser.read', 'fs.write', 'app.openFile',
     ]);
-    const read = tools.invocations.find(invocation => invocation.tool === 'browser.read');
-    expect(read?.input).toEqual({ mode: 'readable', maxChars: 12_000 });
-    expect(read?.input).not.toHaveProperty('query');
-    expect(JSON.stringify(requests[3]!.body.messages)).toContain('Self-taught software engineer from Nepal');
+    expect(requests).toHaveLength(5);
+    expect(result.run.diagnostics).toMatchObject({ modelTurns: 5, modelRequests: 5, toolActions: 4 });
+    expect(JSON.stringify(requests[2]!.body)).toContain('[pending] outputFile');
+    expect(JSON.stringify(requests[3]!.body)).toContain('[pending] openFile');
   });
 
-  it('does not let a zero-match search or error-file write complete a page-summary task', async () => {
-    const url = 'https://dhunganakunjan.com.np/';
+  it('blocks browser-derived output until the current-run page read prerequisite is satisfied', async () => {
+    const url = 'https://example.test/rates';
     const guest = new MockGuestTransport({
-      pages: {
-        [url]: '<html><body><main><h1>Kunjan Dhungana</h1><p>Readable portfolio content is present.</p></main></body></html>',
-      },
+      pages: { [url]: '<html><body><main><h1>Rates</h1><table><tr><th>Currency</th><th>Rate</th></tr><tr><td>USD</td><td>133.20</td></tr></table></main></body></html>' },
     });
     const requests: CapturedRequest[] = [];
-    const errorText = 'Error: Could not extract meaningful content from the page.';
-    const completion = {
-      response: 'I could not summarize the page.',
-      requiredEffects: [
-        { tool: 'browser.navigate' },
-        { tool: 'fs.write' },
-        { tool: 'app.openFile' },
-      ],
-    };
-    const blockedResponse = 'The page has readable content, so I need to read it before saving a summary.';
     const { runtime, tools } = createRuntime(guest, [
-      toolReply('failed-nav', 'browser.navigate', { url }),
-      toolReply('failed-snapshot', 'browser.snapshot', {}),
-      toolReply('zero-search', 'browser.search', { query: 'qzxwvv-9347182-uniquetoken' }),
-      toolReply('failed-read', 'browser.read', { ref: 'c1-12345678-1', maxChars: 5_000 }),
-      toolReply('blocked-write', 'fs.write', { path: 'kd.txt', content: errorText }),
-      toolReply('blocked-open', 'app.openFile', { path: 'kd.txt', application: 'text-editor' }),
-      toolReply('blocked-complete', 'helm.complete', completion),
-      textReply('report-blocker-1', blockedResponse),
-      toolReply('finalize-blocker-1', 'helm.complete', completion),
-      textReply('report-blocker-2', blockedResponse),
-      toolReply('finalize-blocker-2', 'helm.complete', completion),
-      textReply('report-blocker-3', blockedResponse),
-      toolReply('finalize-blocker-3', 'helm.complete', completion),
-      textReply('report-blocker-4', blockedResponse),
-      toolReply('finalize-blocker-4', 'helm.complete', completion),
-      textReply('report-blocker-final', blockedResponse),
+      toolReply('early-write', 'fs.write', { path: 'rates.txt', content: 'fabricated' }),
+      toolReply('rates-nav', 'browser.navigate', { url }),
+      toolReply('rates-read', 'browser.read', { query: 'exchange rates' }),
+      body => {
+        const sourceRef = findTableRef(body.messages);
+        if (!sourceRef) throw new Error('The read table ref was not returned to the acting model.');
+        return toolReply('rates-write', 'fs.write', { path: 'rates.txt', sourceRef, format: 'text' });
+      },
+      textReply('rates-final', 'I saved the observed rates to rates.txt.'),
     ], requests);
 
     const result = await runtime.run({
-      threadId: 'unreadable-summary',
-      userMessage: 'Go to dhunganakunjan.com.np, summarize the page, save it to kd.txt, and open it in a text viewer.',
+      threadId: 'browser-read-prerequisite',
+      userMessage: `Read ${url}, save the data to rates.txt.`,
     });
 
-    expect(result.status).toBe('failed');
-    expect(guest.hasFile('/home/helm/workspace/kd.txt')).toBe(false);
-    expect(tools.invocations.find(invocation => invocation.tool === 'browser.search')?.result)
-      .toMatchObject({ ok: true, data: { matchCount: 0, pageReadable: true } });
-    expect(result.steps.find(step => step.toolName === 'browser.read')?.toolResult)
-      .toMatchObject({ ok: false, error: { code: 'STALE_CONTENT_REF' } });
+    expect(result.status).toBe('completed');
     expect(result.steps.find(step => step.toolName === 'fs.write')?.toolResult)
-      .toMatchObject({ ok: false, error: { code: 'UNREAD_PAGE_CONTENT' } });
-    expect(result.steps.find(step => step.toolName === 'app.openFile')?.toolResult?.ok).toBe(false);
-    const searches = tools.invocations.filter(invocation => invocation.tool === 'browser.search');
-    const queries = searches.map(invocation => (invocation.input as { query: string }).query.toLowerCase());
-    expect(queries.every(query => !['main content', 'full content', 'page content', 'summary'].includes(query))).toBe(true);
+      .toMatchObject({ ok: false, error: { code: 'TASK_PREREQUISITE_NOT_SATISFIED', details: { prerequisite: 'browserResearch', requiredAction: 'browser.read', path: 'rates.txt' } } });
+    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['browser.navigate', 'browser.read', 'fs.write']);
+    expect(guest.getFile('/home/helm/workspace/rates.txt')).toContain('USD | 133.20');
+    expect(requests).toHaveLength(5);
   });
 
-  it('remembers discovered information only after browser receipts reach the acting model', async () => {
+  it('rejects open-before-write and ignores an old file and already-open window', async () => {
+    const guest = new MockGuestTransport({ initialFiles: { '/home/helm/workspace/forex.txt': 'OLD DATA' } });
+    await guest.request('app.openFile', { path: 'forex.txt', application: 'text-editor' });
+    const oldWindowCount = guest.desktopWindows.length;
+    const requests: CapturedRequest[] = [];
+    const { runtime, tools } = createRuntime(guest, [
+      textReply('early-claim', 'forex.txt is already open, so the task is done.'),
+      toolReply('early-open', 'app.openFile', { path: 'forex.txt' }),
+      toolReply('fresh-write', 'fs.write', { path: 'forex.txt', content: 'NEW DATA' }),
+      toolReply('fresh-open', 'app.openFile', { path: 'forex.txt' }),
+      textReply('after-open', 'I wrote the new contents and opened forex.txt during this run.'),
+    ], requests);
+
+    const result = await runtime.run({
+      threadId: 'current-run-open',
+      userMessage: 'Write new text to forex.txt and open it in the text viewer.',
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.steps.find(step => step.toolName === 'app.openFile')?.toolResult)
+      .toMatchObject({ ok: false, error: { code: 'TASK_PREREQUISITE_NOT_SATISFIED' } });
+    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['fs.write', 'app.openFile']);
+    expect(tools.invocations.find(invocation => invocation.tool === 'fs.write')?.input).toMatchObject({ path: 'forex.txt' });
+    expect(guest.getFile('/home/helm/workspace/forex.txt')).toBe('NEW DATA');
+    expect(guest.desktopWindows.length).toBeGreaterThanOrEqual(oldWindowCount);
+    expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining(['outputFile', 'openFile']));
+    expect(JSON.stringify(requests[1]!.body)).toContain('[blocked] openFile');
+    expect(JSON.stringify(requests[3]!.body)).toContain('[satisfied] outputFile');
+    expect(JSON.stringify(requests[3]!.body)).toContain('[pending] openFile');
+  });
+
+  it('does not let an unrelated write satisfy the compiled output requirement or accept a model claim', async () => {
+    const guest = new MockGuestTransport();
+    const requests: CapturedRequest[] = [];
+    const { runtime, tools } = createRuntime(guest, [
+      toolReply('wrong-path', 'fs.write', { path: 'other.txt', content: 'unrelated' }),
+      textReply('claim-one', 'I wrote forex.txt.'),
+      textReply('claim-two', 'The file has been saved.'),
+      textReply('claim-three', 'Done.'),
+    ], requests);
+
+    const result = await runtime.run({ threadId: 'wrong-output-path', userMessage: 'Write the requested data to forex.txt.' });
+
+    expect(result.status).toBe('failed');
+    expect(result.run.error).toMatchObject({ code: 'COMPLETION_RECOVERY_BUDGET_EXCEEDED' });
+    expect(guest.getFile('/home/helm/workspace/other.txt')).toBe('unrelated');
+    expect(guest.hasFile('/home/helm/workspace/forex.txt')).toBe(false);
+    expect(requirementsFor(result).find(requirement => requirement.id === 'outputFile')?.status).toBe('pending');
+    expect(result.run.diagnostics).toMatchObject({ modelTurns: 4, toolActions: 1, completionRejections: 3 });
+    expect(requestedTools(requests[0]!)).not.toContain('helm.complete');
+    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['fs.write']);
+  });
+
+  it('finishes an explicit memory mutation in two model requests without a completion ceremony', async () => {
     const persistence = testDatabase();
     try {
       const memory = new MemoryService(persistence.sqlite);
-      const sourceUrl = 'https://example.test/acme/benchmark';
-      const benchmark = '42.75';
-      const guest = new MockGuestTransport({
-        pages: {
-          [sourceUrl]: '<html><body><h1>Acme Benchmark</h1><p>Current published benchmark: 42.75</p></body></html>',
-        },
-      });
+      const guest = new MockGuestTransport();
       const requests: CapturedRequest[] = [];
-      let tools: ReturnType<typeof createGuestToolRegistry> | undefined;
-      const { runtime, tools: runtimeTools } = createRuntime(guest, [
-        toolReply('acme-nav', 'browser.navigate', { url: sourceUrl }),
-        toolReply('acme-text', 'browser.search', { query: 'published benchmark value' }),
-        () => {
-          const evidenceIds = tools?.invocations.flatMap(invocation => {
-            const result = invocation.result;
-            if (!result.ok || !result.evidence || typeof result.evidence !== 'object') return [];
-            const receipt = (result.evidence as Record<string, unknown>).receipt;
-            if (!receipt || typeof receipt !== 'object') return [];
-            const id = (receipt as Record<string, unknown>).id;
-            return typeof id === 'string' ? [id] : [];
-          }) ?? [];
-          return toolReply('acme-remember', 'memory.remember', {
-            content: `The current Acme published benchmark is ${benchmark}.`,
-            kind: 'fact',
-            key: 'acme:current-benchmark',
-            importance: 0.8,
-            source: 'observed',
-            sourceUrl,
-            evidenceIds,
-            durability: 'refreshable',
-          });
-        },
-        toolReply('acme-complete', 'helm.complete', {
-          response: `The current published Acme benchmark is ${benchmark}.`,
-          requiredEffects: [
-            { tool: 'browser.navigate' },
-            { tool: 'browser.search' },
-            { tool: 'memory.remember' },
-          ],
+      const { runtime, tools } = createRuntime(guest, [
+        toolReply('remember-forex', 'memory.remember', {
+          key: 'nepal_forex_url',
+          content: 'Use https://www.nrb.org.np/forex/ for forex requests about Nepal.',
+          kind: 'instruction',
+          importance: 0.9,
         }),
-      ], requests);
-      tools = runtimeTools;
-      registerMemoryTools(runtimeTools, memory);
+        textReply('memory-final', 'I will use that verified source for Nepal forex requests.'),
+      ], requests, { maxModelTurns: 6 });
+      registerMemoryTools(tools, memory);
 
-      expect(memory.repository.count()).toBe(0);
       const result = await runtime.run({
-        threadId: 'remember-discovered-acme',
-        userMessage: `Visit ${sourceUrl}, find the current benchmark, remember it for later, and tell me the value.`,
+        threadId: 'memory-action-budget',
+        userMessage: 'Remember to use https://www.nrb.org.np/forex/ for all forex requests about Nepal.',
       });
 
       expect(result.status).toBe('completed');
-      expect(memory.repository.count()).toBe(1);
-      const saved = memory.getByKey('acme:current-benchmark');
-      const receiptIds = tools?.invocations.slice(0, 2).flatMap(invocation => {
-        const evidence = invocation.result.evidence;
-        if (!evidence || typeof evidence !== 'object') return [];
-        const receipt = (evidence as Record<string, unknown>).receipt;
-        if (!receipt || typeof receipt !== 'object') return [];
-        const id = (receipt as Record<string, unknown>).id;
-        return typeof id === 'string' ? [id] : [];
-      }) ?? [];
-      expect(saved).toMatchObject({
-        content: `The current Acme published benchmark is ${benchmark}.`,
-        source: 'observed',
-        sourceUrl,
-        durability: 'refreshable',
-      });
-      expect(saved?.evidenceIds).toEqual(receiptIds);
-      expect(receiptIds).toHaveLength(2);
-      expect(receiptIds.every(id => id.startsWith('receipt-'))).toBe(true);
-      expect(saved?.lastVerifiedAt).toBeString();
-      expect(tools?.invocations.map(invocation => invocation.tool)).toEqual([
-        'browser.navigate', 'browser.search', 'memory.remember',
-      ]);
-      expect(requestTools(requests[0]!)).toContain('memory.remember');
-      expect(JSON.stringify(requests[2]!.body.messages)).toContain(benchmark);
-      expect(result.assistantResponse).toContain(benchmark);
+      expect(memory.getByKey('nepal_forex_url')?.content).toContain('https://www.nrb.org.np/forex/');
+      expect(requirementsFor(result).find(requirement => requirement.id === 'memoryMutation')?.status).toBe('satisfied');
+      expect(requests).toHaveLength(2);
+      expect(result.run.diagnostics).toMatchObject({ modelTurns: 2, modelRequests: 2, toolActions: 1, completionAttempts: 1 });
+      expect(requestedTools(requests[0]!)).not.toContain('helm.complete');
+      expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['memory.remember']);
     } finally {
       persistence.close();
     }
+  });
+
+  it('keeps normal chat to one model request and no computer actions', async () => {
+    const guest = new MockGuestTransport();
+    const requests: CapturedRequest[] = [];
+    const { runtime, tools } = createRuntime(guest, [textReply('hello', 'Hello!')], requests);
+
+    const result = await runtime.run({ threadId: 'cheap-chat', userMessage: 'hello' });
+
+    expect(result.status).toBe('completed');
+    expect(result.assistantResponse).toBe('Hello!');
+    expect(requests).toHaveLength(1);
+    expect(result.run.diagnostics).toMatchObject({ modelTurns: 1, modelRequests: 1, toolActions: 0, contextCompactions: 0 });
+    expect(tools.invocations).toHaveLength(0);
+    expect(guest.desktopWindows).toHaveLength(0);
+    expect(guest.browser.url).toBeUndefined();
+  });
+
+  it('keeps an ordinary creative-writing request in conversation mode', async () => {
+    const guest = new MockGuestTransport();
+    const requests: CapturedRequest[] = [];
+    const { runtime, tools } = createRuntime(guest, [textReply('poem', 'A small poem about rain.')], requests);
+
+    const result = await runtime.run({ threadId: 'poem-conversation', userMessage: 'Write me a poem.' });
+
+    expect(result.status).toBe('completed');
+    expect(result.task.isConversation).toBe(true);
+    expect(result.task.requirements).toEqual([]);
+    expect(requests).toHaveLength(1);
+    expect(tools.invocations).toHaveLength(0);
+  });
+
+  it('compiles an explicit application launch as a current-run action requirement', async () => {
+    const guest = new MockGuestTransport();
+    const requests: CapturedRequest[] = [];
+    const { runtime, tools } = createRuntime(guest, [
+      toolReply('launch-editor', 'app.launch', { application: 'text-editor' }),
+      textReply('launch-final', 'The text editor is open.'),
+    ], requests);
+
+    const result = await runtime.run({ threadId: 'explicit-app-launch', userMessage: 'Launch the text editor.' });
+
+    expect(result.status).toBe('completed');
+    expect(result.task.requirements).toContainEqual(expect.objectContaining({
+      id: 'applicationLaunch',
+      target: { application: 'text-editor', freshness: 'current-run', action: 'app.launch' },
+    }));
+    expect(result.run.state?.completedRequirementIds).toContain('applicationLaunch');
+    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['app.launch']);
+    expect(requests).toHaveLength(2);
+  });
+
+  it('records the effective DuckDuckGo navigation separately from an unobserved model proposal', async () => {
+    const guest = new MockGuestTransport();
+    const requests: CapturedRequest[] = [];
+    const proposedUrl = 'https://www.nbr.gov.np/forex';
+    const { runtime } = createRuntime(guest, [
+      toolReply('unobserved-nav', 'browser.navigate', { url: proposedUrl }),
+      textReply('nav-final-one', 'I started with search discovery.'),
+      textReply('nav-final-two', 'I could not finish the remaining research.'),
+      textReply('nav-final-three', 'The source still needs inspection.'),
+    ], requests);
+
+    const result = await runtime.run({ threadId: 'effective-navigation', userMessage: 'Use the web to find current Nepal forex exchange rates.' });
+
+    const nav = result.steps.find(step => step.toolName === 'browser.navigate');
+    expect(nav?.decision?.type).toBe('action');
+    expect(nav?.decision?.type === 'action' ? nav.decision.input.url : undefined).toBe(proposedUrl);
+    expect(nav?.toolInput?.url).toContain('duckduckgo.com/?q=');
+    expect(nav?.toolInput?.url).not.toBe(proposedUrl);
+    expect(nav?.toolResult?.data).toMatchObject({ url: nav?.toolInput?.url, proposedUrl });
+  });
+
+  it('requires browser.open refs after a search or page read observes a destination', async () => {
+    const sourceUrl = 'https://example.test/start';
+    const targetUrl = 'https://example.test/rates/';
+    const guest = new MockGuestTransport({ pages: {
+      [sourceUrl]: '<html><body><main><h1>Forex</h1><a href="https://example.test/rates/">Current rates</a></main></body></html>',
+      [targetUrl]: '<html><body><main><h1>Current rates</h1><p>USD 133.20</p></main></body></html>',
+    } });
+    const requests: CapturedRequest[] = [];
+    const { runtime, tools } = createRuntime(guest, [
+      toolReply('source-nav', 'browser.navigate', { url: sourceUrl }),
+      toolReply('source-read', 'browser.read', { query: 'current rates link' }),
+      toolReply('copied-href', 'browser.navigate', { url: targetUrl }),
+      body => {
+        const observed = findBrowserOpenArgs(body.messages);
+        if (!observed) throw new Error('The runtime did not provide the observed semantic ref to recover navigation.');
+        return toolReply('open-observed-ref', 'browser.open', observed);
+      },
+      toolReply('rates-read', 'browser.read', { query: 'USD rate' }),
+      textReply('opened-result', 'I opened the observed current rates result.'),
+    ], requests);
+
+    const result = await runtime.run({
+      threadId: 'semantic-ref-navigation',
+      userMessage: `Open ${sourceUrl} and follow its current rates link.`,
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.steps.find(step => step.toolName === 'browser.navigate' && step.toolResult?.error?.code === 'OBSERVED_DESTINATION_REQUIRES_REF'))
+      .toBeDefined();
+    expect(tools.invocations.map(invocation => invocation.tool)).toEqual([
+      'browser.navigate', 'browser.read', 'browser.open', 'browser.read',
+    ]);
+    expect(tools.invocations[2]?.input).toMatchObject({ ref: expect.any(String), linkIndex: expect.any(Number) });
+    expect(guest.browser.url).toBe(targetUrl);
+  });
+
+  it('uses an exact verified-memory URL directly before search discovery', async () => {
+    const url = 'https://www.nrb.org.np/forex/';
+    const verifiedAt = '2026-09-27T00:00:00.000Z';
+    const memory: Memory = {
+      id: 'memory-nepal-forex',
+      key: 'nepal_forex_url',
+      content: `Use ${url} for all forex requests about Nepal.`,
+      kind: 'instruction',
+      importance: 0.9,
+      metadata: {},
+      source: 'observed',
+      sourceUrl: url,
+      evidenceIds: ['receipt-verified-memory'],
+      durability: 'refreshable',
+      lastVerifiedAt: verifiedAt,
+      createdAt: verifiedAt,
+      updatedAt: verifiedAt,
+    };
+    const guest = new MockGuestTransport({ pages: { [url]: '<html><body><main><h1>Nepal Foreign Exchange Rates</h1><p>USD buying rate: 133.20</p></main></body></html>' } });
+    const requests: CapturedRequest[] = [];
+    const { runtime, tools } = createRuntime(guest, [
+      toolReply('verified-nav', 'browser.navigate', { url }),
+      toolReply('verified-read', 'browser.read', { query: 'forex rates' }),
+      textReply('verified-final', 'The verified Nepal Rastra Bank page lists the current rate data.'),
+    ], requests, { memories: [memory] });
+
+    const result = await runtime.run({ threadId: 'verified-memory-url', userMessage: 'Use the web to find current Nepal forex exchange rates.' });
+
+    expect(result.status).toBe('completed');
+    expect((tools.invocations[0]?.input as { url: string }).url).toBe(url);
+    expect(tools.invocations.some(invocation => (invocation.input as { url?: string }).url?.includes('duckduckgo.com'))).toBe(false);
+    expect(result.steps.find(step => step.toolName === 'browser.navigate')?.toolResult?.data)
+      .toMatchObject({ url, urlProvenance: 'verified-memory' });
+  });
+
+  it('accepts a blocker only when the pending output requirement has a matching failed receipt', async () => {
+    class DiskFullGuest extends MockGuestTransport {
+      override async request<M extends GuestMethod>(
+        method: M,
+        params: GuestMethodParams[M],
+        options?: GuestRequestOptions,
+      ): Promise<GuestMethodResult[M]> {
+        if (method === 'fs.write') throw new GuestTransportError('DISK_FULL', 'The guest could not store the file.');
+        return super.request(method, params, options);
+      }
+    }
+    const guest = new DiskFullGuest();
+    const requests: CapturedRequest[] = [];
+    const { runtime } = createRuntime(guest, [
+      toolReply('failed-output', 'fs.write', { path: 'forex.txt', content: 'new data' }),
+      toolReply('verified-blocker', 'helm.blocked', {
+        response: 'I could not save forex.txt because the guest filesystem reported that it is full.',
+        requirementIds: ['outputFile'],
+      }),
+    ], requests);
+
+    const result = await runtime.run({ threadId: 'verified-blocker', userMessage: 'Write new data to forex.txt.' });
+
+    expect(result.status).toBe('blocked');
+    expect(result.assistantResponse).toContain('filesystem reported that it is full');
+    expect(result.run.error).toMatchObject({ code: 'TASK_BLOCKED' });
+    expect(result.run.state?.blockers.at(-1)?.requirementIds).toEqual(['outputFile']);
+    expect(result.steps.find(step => step.toolName === 'fs.write')?.toolResult)
+      .toMatchObject({ ok: false, error: { code: 'DISK_FULL' } });
+    expect(requests).toHaveLength(2);
+  });
+
+  it('rejects cyclic dependency graphs before a task can run', () => {
+    const requirement = (id: string, dependsOn: string[]): TaskRequirement => ({
+      id,
+      description: id,
+      type: 'semantic',
+      mandatory: true,
+      status: 'pending',
+      dependsOn,
+    });
+
+    expect(() => validateRequirementDependencies([
+      requirement('first', ['second']),
+      requirement('second', ['first']),
+    ])).toThrow(/dependency cycle/u);
+  });
+
+  it('compiles directory-to-file and download-to-open dependencies generically', async () => {
+    const compiler = new DeterministicTaskCompiler();
+    const directoryTask = await compiler.createTask({
+      threadId: 'directory-dependency',
+      userMessage: 'Create the directory ~/Desktop/reports and write notes.txt in it.',
+    });
+    const downloadTask = await compiler.createTask({
+      threadId: 'download-dependency',
+      userMessage: 'Download the report and open it in the text viewer.',
+    });
+
+    expect(directoryTask.requirements?.find(requirement => requirement.id === 'outputFile')?.dependsOn)
+      .toContain('outputDirectory');
+    expect(downloadTask.requirements?.find(requirement => requirement.id === 'openFile')?.dependsOn)
+      .toContain('downloadArtifact');
+  });
+
+  it('requires a downloaded artifact itself to be opened when its filename is discovered at runtime', async () => {
+    const task: TaskDefinition = {
+      id: 'download-open-task',
+      threadId: 'download-open-task',
+      goal: 'Download the report and open it in the text viewer.',
+      originalRequest: 'Download the report and open it in the text viewer.',
+      criteria: [],
+      requirements: [
+        { id: 'downloadArtifact', description: 'Download the requested artifact.', type: 'artifact', mandatory: true, target: { mode: 'downloaded' } },
+        { id: 'openFile', description: 'Open the downloaded artifact.', type: 'desktop', mandatory: true, dependsOn: ['downloadArtifact'], target: { mode: 'opened', freshness: 'current-run', action: 'app.openFile', application: 'text-editor' } },
+      ],
+    };
+    const state = createTaskState(task);
+    const downloadedPath = '/home/helm/Downloads/monthly-report.pdf';
+    state.artifacts.push({
+      id: 'download-artifact',
+      type: 'download',
+      path: downloadedPath,
+      download: { sourceUrl: 'https://example.test/report.pdf', savedPath: downloadedPath, startedAt: new Date().toISOString() },
+      observedAt: new Date().toISOString(),
+    });
+    state.recentActions.push({
+      id: 'open-wrong-download',
+      tool: 'app.openFile',
+      input: { path: '/home/helm/Downloads/other-report.pdf', application: 'text-editor' },
+      result: { ok: true, data: { path: '/home/helm/Downloads/other-report.pdf', application: 'text-editor' } },
+      receipt: {
+        id: 'open-wrong-receipt',
+        tool: 'app.openFile',
+        ok: true,
+        effect: { path: '/home/helm/Downloads/other-report.pdf' },
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+      },
+    });
+    const guest = new MockGuestTransport();
+    const observation = {
+      timestamp: 1,
+      desktop: { windows: [{ id: 'text-editor', title: 'other-report.pdf - Text Editor', focused: true }] },
+      task: { completedCriteria: [], remainingCriteria: ['downloadArtifact', 'openFile'] },
+    };
+
+    const wrongFileVerification = await verifyTaskState(task, state, guest, observation);
+    expect(wrongFileVerification.requirements?.find(check => check.requirement.id === 'downloadArtifact')?.passed).toBe(true);
+    expect(wrongFileVerification.requirements?.find(check => check.requirement.id === 'openFile')?.passed).toBe(false);
+
+    state.recentActions[0]!.input.path = downloadedPath;
+    state.recentActions[0]!.result.data = { path: downloadedPath, application: 'text-editor' };
+    state.recentActions[0]!.receipt!.effect!.path = downloadedPath;
+    observation.desktop.windows[0]!.title = 'monthly-report.pdf - Text Editor';
+    const matchingFileVerification = await verifyTaskState(task, state, guest, observation);
+    expect(matchingFileVerification.complete).toBe(true);
+    expect(matchingFileVerification.requirements?.find(check => check.requirement.id === 'openFile')?.passed).toBe(true);
   });
 });

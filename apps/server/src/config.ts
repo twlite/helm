@@ -20,6 +20,11 @@ function numberFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): 
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
+function nonNegativeIntegerFromEnv(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const value = Number(env[name]);
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new Error(`Model configuration field \"${name}\" must be a non-empty string`);
@@ -201,6 +206,8 @@ export interface HelmConfig {
   guestHost: string;
   guestPort: number;
   maxSteps: number;
+  maxModelTurns: number;
+  maxCompletionRecoveryTurns: number;
   maxRepeatedAction: number;
   maxConsecutiveFailures: number;
   toolTimeoutMs: number;
@@ -243,6 +250,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HelmConfig {
     guestHost: env.HELM_GUEST_HOST ?? '127.0.0.1',
     guestPort: numberFromEnv(env, 'HELM_GUEST_PORT', 4242),
     maxSteps: numberFromEnv(env, 'HELM_MAX_STEPS', 32),
+    maxModelTurns: numberFromEnv(env, 'HELM_MAX_MODEL_TURNS', 12),
+    maxCompletionRecoveryTurns: nonNegativeIntegerFromEnv(env, 'HELM_MAX_COMPLETION_RECOVERY_TURNS', 2),
     maxRepeatedAction: numberFromEnv(env, 'HELM_MAX_REPEATED_ACTION', 3),
     maxConsecutiveFailures: numberFromEnv(env, 'HELM_MAX_CONSECUTIVE_FAILURES', 3),
     toolTimeoutMs: numberFromEnv(env, 'HELM_TOOL_TIMEOUT_MS', 30_000),

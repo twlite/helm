@@ -6,6 +6,10 @@ describe('Helm model configuration', () => {
   it('loads the checked-in LM Studio models', () => {
     const config = loadConfig({});
 
+    expect(config.maxSteps).toBe(32);
+    expect(config.maxModelTurns).toBe(12);
+    expect(config.maxCompletionRecoveryTurns).toBe(2);
+
     expect(config.models).toMatchObject({
       providerName: 'lmstudio',
       baseUrl: 'http://localhost:1234/v1',
@@ -31,6 +35,9 @@ describe('Helm model configuration', () => {
       HELM_LLM_CONTEXT_CRITICAL_AT_RATIO: '0.9',
       HELM_LLM_CONTEXT_RECENT_EXCHANGES: '4',
       HELM_LLM_CONTEXT_CRITICAL_RECENT_EXCHANGES: '1',
+      HELM_MAX_STEPS: '20',
+      HELM_MAX_MODEL_TURNS: '7',
+      HELM_MAX_COMPLETION_RECOVERY_TURNS: '1',
     });
 
     expect(config.models.baseUrl).toBe('http://localhost:4321/v1');
@@ -41,6 +48,9 @@ describe('Helm model configuration', () => {
     expect(config.models.contextCriticalAtRatio).toBe(0.9);
     expect(config.models.contextRecentExchanges).toBe(4);
     expect(config.models.contextCriticalRecentExchanges).toBe(1);
+    expect(config.maxSteps).toBe(20);
+    expect(config.maxModelTurns).toBe(7);
+    expect(config.maxCompletionRecoveryTurns).toBe(1);
   });
 
   it('rejects context thresholds that cannot be applied in order', () => {
@@ -48,6 +58,10 @@ describe('Helm model configuration', () => {
       HELM_LLM_CONTEXT_COMPACT_AT_RATIO: '0.9',
       HELM_LLM_CONTEXT_CRITICAL_AT_RATIO: '0.8',
     })).toThrow('contextCriticalAtRatio');
+  });
+
+  it('allows completion recovery to be disabled explicitly', () => {
+    expect(loadConfig({ HELM_MAX_COMPLETION_RECOVERY_TURNS: '0' }).maxCompletionRecoveryTurns).toBe(0);
   });
 
   it('derives separate provisioning artifacts from the VM data directory', () => {

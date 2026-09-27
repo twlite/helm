@@ -7,6 +7,7 @@ import type {
   Message,
   MessageRole,
   Run,
+  RunDiagnostics,
   RunStatus,
   RunStep,
   RunStepPhase,
@@ -124,6 +125,7 @@ function mapRun(row: unknown): Run {
     errorJson: string | null;
     taskJson: string | null;
     stateJson: string | null;
+    diagnosticsJson: string | null;
     createdAt: string;
     startedAt: string | null;
     completedAt: string | null;
@@ -140,6 +142,7 @@ function mapRun(row: unknown): Run {
     criteria: parseJson<CompletionCriterion[]>(value.criteriaJson, 'run.criteria_json'),
     ...(value.taskJson === null ? {} : { task: parseJson<TaskDefinition>(value.taskJson, 'run.task_json') }),
     ...(value.stateJson === null ? {} : { state: parseJson<TaskState>(value.stateJson, 'run.state_json') }),
+    ...(value.diagnosticsJson === null ? {} : { diagnostics: parseJson<RunDiagnostics>(value.diagnosticsJson, 'run.diagnostics_json') }),
     ...(value.errorJson === null ? {} : { error: parseJson<ToolError>(value.errorJson, 'run.error') }),
     createdAt: requiredString(value.createdAt, 'run.createdAt'),
     ...(value.startedAt === null ? {} : { startedAt: value.startedAt }),
@@ -379,6 +382,7 @@ export interface CreateRunInput {
   completedAt?: string;
   task?: TaskDefinition;
   state?: TaskState;
+  diagnostics?: RunDiagnostics;
 }
 
 export interface UpdateRunInput {
@@ -390,6 +394,7 @@ export interface UpdateRunInput {
   completedAt?: string | null;
   task?: TaskDefinition | null;
   state?: TaskState | null;
+  diagnostics?: RunDiagnostics | null;
 }
 
 const TRANSITIONS: Record<RunStatus, readonly RunStatus[]> = {
@@ -424,7 +429,7 @@ export class RunRepository {
     const createdAt = input.createdAt ?? now();
     this.database
       .prepare(
-        'INSERT INTO runs (id, thread_id, source_message_id, goal, status, criteria_json, task_json, state_json, error, created_at, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO runs (id, thread_id, source_message_id, goal, status, criteria_json, task_json, state_json, diagnostics_json, error, created_at, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         id,
@@ -435,6 +440,7 @@ export class RunRepository {
         stableStringify(input.criteria),
         input.task === undefined ? null : stableStringify(input.task),
         input.state === undefined ? null : stableStringify(input.state),
+        input.diagnostics === undefined ? null : stableStringify(input.diagnostics),
         input.error === undefined ? null : stableStringify(input.error),
         createdAt,
         input.startedAt ?? null,
@@ -446,7 +452,7 @@ export class RunRepository {
   getById(id: string): Run | undefined {
     const row = this.database
       .prepare(
-        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, task_json AS taskJson, state_json AS stateJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs WHERE id = ?',
+        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, task_json AS taskJson, state_json AS stateJson, diagnostics_json AS diagnosticsJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs WHERE id = ?',
       )
       .get(id);
     return row === undefined ? undefined : mapRun(row);
@@ -463,7 +469,7 @@ export class RunRepository {
   listByThread(threadId: string, limit?: number): Run[] {
     const rows = this.database
       .prepare(
-        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, task_json AS taskJson, state_json AS stateJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT ?',
+        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, task_json AS taskJson, state_json AS stateJson, diagnostics_json AS diagnosticsJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT ?',
       )
       .all(threadId, normalizeLimit(limit));
     return rows.map(mapRun);
@@ -473,7 +479,7 @@ export class RunRepository {
     if (threadId !== undefined) return this.listByThread(threadId, limit);
     const rows = this.database
       .prepare(
-        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, task_json AS taskJson, state_json AS stateJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs ORDER BY created_at DESC, id DESC LIMIT ?',
+        'SELECT id, thread_id AS threadId, source_message_id AS sourceMessageId, goal, status, criteria_json AS criteriaJson, task_json AS taskJson, state_json AS stateJson, diagnostics_json AS diagnosticsJson, error AS errorJson, created_at AS createdAt, started_at AS startedAt, completed_at AS completedAt FROM runs ORDER BY created_at DESC, id DESC LIMIT ?',
       )
       .all(normalizeLimit(limit));
     return rows.map(mapRun);
@@ -489,7 +495,7 @@ export class RunRepository {
     const error = input.error === undefined ? current.error : input.error;
     this.database
       .prepare(
-        'UPDATE runs SET source_message_id = ?, goal = ?, criteria_json = ?, task_json = ?, state_json = ?, error = ?, started_at = ?, completed_at = ? WHERE id = ?',
+        'UPDATE runs SET source_message_id = ?, goal = ?, criteria_json = ?, task_json = ?, state_json = ?, diagnostics_json = ?, error = ?, started_at = ?, completed_at = ? WHERE id = ?',
       )
       .run(
         input.sourceMessageId === undefined ? current.sourceMessageId ?? null : input.sourceMessageId,
@@ -497,6 +503,7 @@ export class RunRepository {
         stableStringify(criteria),
         input.task === undefined ? current.task === undefined ? null : stableStringify(current.task) : input.task === null ? null : stableStringify(input.task),
         input.state === undefined ? current.state === undefined ? null : stableStringify(current.state) : input.state === null ? null : stableStringify(input.state),
+        input.diagnostics === undefined ? current.diagnostics === undefined ? null : stableStringify(current.diagnostics) : input.diagnostics === null ? null : stableStringify(input.diagnostics),
         error === undefined || error === null ? null : stableStringify(error),
         input.startedAt === undefined ? current.startedAt ?? null : input.startedAt,
         input.completedAt === undefined ? current.completedAt ?? null : input.completedAt,

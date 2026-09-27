@@ -102,6 +102,53 @@ export function requirementsForTask(task: TaskDefinition): TaskRequirement[] {
     }));
 }
 
+export function validateRequirementDependencies(requirements: readonly TaskRequirement[]): void {
+  const byId = new Map<string, TaskRequirement>();
+  for (const requirement of requirements) {
+    if (byId.has(requirement.id)) throw new Error(`Duplicate task requirement ID: ${requirement.id}`);
+    byId.set(requirement.id, requirement);
+  }
+  for (const requirement of requirements) {
+    for (const dependencyId of requirement.dependsOn ?? []) {
+      if (!byId.has(dependencyId)) {
+        throw new Error(`Task requirement ${requirement.id} depends on unknown requirement ${dependencyId}.`);
+      }
+      if (dependencyId === requirement.id) {
+        throw new Error(`Task requirement ${requirement.id} cannot depend on itself.`);
+      }
+    }
+  }
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (id: string): void => {
+    if (visited.has(id)) return;
+    if (visiting.has(id)) throw new Error(`Task requirement dependency cycle includes ${id}.`);
+    visiting.add(id);
+    for (const dependencyId of byId.get(id)?.dependsOn ?? []) visit(dependencyId);
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const id of byId.keys()) visit(id);
+}
+
+function requirementsInDependencyOrder(requirements: readonly TaskRequirement[]): TaskRequirement[] {
+  validateRequirementDependencies(requirements);
+  const byId = new Map(requirements.map(requirement => [requirement.id, requirement]));
+  const ordered: TaskRequirement[] = [];
+  const visited = new Set<string>();
+  const visit = (requirement: TaskRequirement): void => {
+    if (visited.has(requirement.id)) return;
+    visited.add(requirement.id);
+    for (const id of requirement.dependsOn ?? []) {
+      const dependency = byId.get(id);
+      if (dependency) visit(dependency);
+    }
+    ordered.push(requirement);
+  };
+  for (const requirement of requirements) visit(requirement);
+  return ordered;
+}
+
 function pathBasename(value: string): string {
   return value.split(/[\\/]/u).at(-1)?.split(/[?#]/u)[0]?.toLocaleLowerCase() ?? '';
 }
@@ -163,6 +210,7 @@ function userFacts(task: TaskDefinition, now: () => number): { facts: Fact[]; ev
 
 export function createTaskState(task: TaskDefinition, now: () => number = Date.now): TaskState {
   const requirements = requirementsForTask(task);
+  validateRequirementDependencies(requirements);
   const seeded = userFacts(task, now);
   const state: TaskState = {
     task: {
@@ -349,7 +397,8 @@ function actionReceipt(action: WorkerAction): WorkerAction['receipt'] | undefine
   return receipt as WorkerAction['receipt'] | undefined;
 }
 
-function requiredAction(target: TaskRequirement['target']): string | undefined {
+export function requiredActionForRequirement(requirement: TaskRequirement): string | undefined {
+  const target = requirement.target;
   if (target?.action) return target.action;
   switch (target?.mode) {
     case 'written':
@@ -385,7 +434,7 @@ function successfulCurrentRunAction(
   state: TaskState,
 ): { action: WorkerAction; receipt: NonNullable<WorkerAction['receipt']>; data?: Record<string, unknown> } | undefined {
   const target = requirement.target;
-  const expectedTool = requiredAction(target);
+  const expectedTool = requiredActionForRequirement(requirement);
   if (!expectedTool || target?.freshness !== 'current-run') return undefined;
   for (const action of [...state.recentActions].reverse()) {
     if (action.tool !== expectedTool || !action.result.ok) continue;
@@ -397,11 +446,43 @@ function successfulCurrentRunAction(
       const observedPaths = [data?.path, receipt.effect?.path, action.input.path]
         .filter((value): value is string => typeof value === 'string');
       if (!observedPaths.some(observedPath => normalizedRequirementPath(observedPath) === normalizedRequirementPath(path))) continue;
+    } else if (expectedTool === 'app.openFile' && requirement.dependsOn?.includes('downloadArtifact')) {
+      const downloadedPaths = state.artifacts
+        .filter(artifact => artifact.type === 'download')
+        .map(artifact => artifact.path);
+      const openedPaths = [data?.path, receipt.effect?.path, action.input.path]
+        .filter((value): value is string => typeof value === 'string');
+      if (!downloadedPaths.some(downloadedPath => openedPaths.some(openedPath => (
+        normalizedRequirementPath(openedPath) === normalizedRequirementPath(downloadedPath)
+      )))) continue;
     }
+    if (target.application && data?.application !== target.application && action.input.application !== target.application) continue;
     if (expectedTool === 'fs.write' && (
       receipt.effect?.writePerformed !== true
       || typeof data?.sha256 !== 'string'
     )) continue;
+    if (expectedTool === 'browser.read') {
+      const sections = Array.isArray(data?.sections) ? data.sections : [];
+      const hasSectionText = sections.some(section => {
+        const value = recordValue(section);
+        return typeof value?.text === 'string' && value.text.trim().length > 0;
+      });
+      const blocks = Array.isArray(data?.blocks) ? data.blocks : [];
+      if (data?.operation !== 'read' || data.readable !== true || (!hasSectionText && blocks.length === 0)) continue;
+    }
+    if (target.url) {
+      const observedUrl = typeof data?.url === 'string' ? data.url : receipt.effect?.urlAfter;
+      const requestedUrl = expectedTool === 'browser.open'
+        ? data?.openedHref
+        : receipt.effect?.requestedUrl ?? action.input.url;
+      if (
+        typeof observedUrl !== 'string'
+        || (typeof requestedUrl !== 'string'
+          ? !browserUrlsMatch(target.url, observedUrl)
+          : !browserUrlsMatch(target.url, requestedUrl) && !browserUrlsMatch(target.url, observedUrl))
+        || !['user', 'verified-memory', 'search-result', 'page-link'].includes(String(data?.urlProvenance))
+      ) continue;
+    }
     if (typeof data?.sourceRef === 'string' && (
       typeof data.sourceType !== 'string'
       || typeof data.sourceRevision !== 'number'
@@ -610,7 +691,7 @@ async function requirementCheck(
     }
   }
   const target = requirement.target ?? {};
-  const expectedAction = requiredAction(target);
+  const expectedAction = requiredActionForRequirement(requirement);
   const currentAction = target.freshness === 'current-run' && expectedAction
     ? successfulCurrentRunAction(requirement, state)
     : undefined;
@@ -619,6 +700,11 @@ async function requirementCheck(
       passed: false,
       message: `A successful current-run ${expectedAction} action for ${target.path ?? requirement.id} has not been recorded.`,
     };
+  }
+  if (requirement.type === 'semantic' && target.freshness === 'current-run' && expectedAction) {
+    return currentAction
+      ? { passed: true, message: `The requested current-run ${expectedAction} action has a successful receipt.`, evidence: currentAction }
+      : { passed: false, message: `A successful current-run ${expectedAction} action has not been recorded.` };
   }
   if (requirement.type === 'fact') {
     const fact = supportedFact(state, target.factId ?? requirement.id);
@@ -702,6 +788,16 @@ async function requirementCheck(
     }
   }
   if (requirement.type === 'browser') {
+    if (target.freshness === 'current-run' && target.url && currentAction) {
+      const finalUrl = typeof currentAction.data?.url === 'string'
+        ? currentAction.data.url
+        : currentAction.receipt.effect?.urlAfter;
+      return {
+        passed: true,
+        message: `The requested current-run browser action reached ${finalUrl ?? target.url}.`,
+        evidence: currentAction,
+      };
+    }
     const expected = target.url ?? (target.factId ? supportedFact(state, target.factId)?.value : undefined);
     const resolution = typeof expected === 'string'
       ? navigationResolutionFor(state.recentActions, expected)
@@ -775,26 +871,40 @@ export async function verifyTaskState(
     }
     return check;
   });
-  const requirements = await Promise.all(requirementsForTask(task).map(async requirement => {
-    const check = await requirementCheck(requirement, state, guest, observation, verifier, lastToolResult);
-    return { requirement, ...check };
-  }));
-  const mandatoryRequirements = requirements.filter(check => check.requirement.mandatory);
+  const requirements = requirementsForTask(task);
+  const checksById = new Map<string, { requirement: TaskRequirement; passed: boolean; message: string; evidence?: unknown }>();
+  for (const requirement of requirementsInDependencyOrder(requirements)) {
+    const unsatisfiedDependencies = (requirement.dependsOn ?? [])
+      .filter(id => checksById.get(id)?.passed !== true);
+    const check = unsatisfiedDependencies.length > 0
+      ? {
+          passed: false,
+          message: `Blocked by prerequisite${unsatisfiedDependencies.length === 1 ? '' : 's'}: ${unsatisfiedDependencies.join(', ')}.`,
+        }
+      : await requirementCheck(requirement, state, guest, observation, verifier, lastToolResult);
+    checksById.set(requirement.id, { requirement, ...check });
+  }
+  const requirementChecks = requirements.flatMap(requirement => {
+    const check = checksById.get(requirement.id);
+    return check ? [check] : [];
+  });
+  const mandatoryRequirements = requirementChecks.filter(check => check.requirement.mandatory);
   const criteriaComplete = task.criteria.length === 0 || criteria.every(check => check.passed);
   const requirementsComplete = mandatoryRequirements.every(check => check.passed);
   const complete = criteriaComplete && requirementsComplete;
   return {
     complete,
     criteria,
-    requirements,
+    requirements: requirementChecks,
     summary: complete
       ? 'All mandatory requirements and deterministic criteria are satisfied.'
-      : `${requirements.filter(check => check.passed).length}/${requirements.length} requirements and ${criteria.filter(check => check.passed).length}/${criteria.length} legacy criteria passed.`,
+      : `${requirementChecks.filter(check => check.passed).length}/${requirementChecks.length} requirements and ${criteria.filter(check => check.passed).length}/${criteria.length} legacy criteria passed.`,
   };
 }
 
 export function updateCompletedRequirements(state: TaskState, verification: VerificationResult): TaskState {
   const completed = verification.requirements?.filter(check => check.passed).map(check => check.requirement.id) ?? [];
+  const completedSet = new Set(completed);
   return {
     ...state,
     completedRequirementIds: completed,
@@ -802,10 +912,32 @@ export function updateCompletedRequirements(state: TaskState, verification: Veri
       ...state.task,
       requirements: requirementsForTask(state.task).map(requirement => ({
         ...requirement,
-        status: completed.includes(requirement.id) ? 'satisfied' : 'pending',
+        status: completedSet.has(requirement.id)
+          ? 'satisfied'
+          : (requirement.dependsOn ?? []).some(id => !completedSet.has(id)) ? 'blocked' : 'pending',
       })),
     },
   };
+}
+
+/** A short runtime-owned progress view for the acting model's next turn. */
+export function taskRequirementSummary(state: TaskState): string {
+  return requirementsForTask(state.task).map(requirement => {
+    const status = state.completedRequirementIds.includes(requirement.id)
+      ? 'satisfied'
+      : (requirement.dependsOn ?? []).some(id => !state.completedRequirementIds.includes(id))
+        ? 'blocked'
+        : 'pending';
+    const target = requirement.target;
+    const targetSummary = target?.path
+      ? ` path=${target.path}${target.action ? ` action=${target.action}` : ''}${target.application ? ` application=${target.application}` : ''}`
+      : target?.url ? ` url=${target.url}`
+        : target?.factId ? ` fact=${target.factId}`
+          : target?.action ? ` action=${target.action}${target.application ? ` application=${target.application}` : ''}`
+            : target?.application ? ` application=${target.application}` : '';
+    const dependencies = status === 'blocked' ? ` dependsOn=${(requirement.dependsOn ?? []).filter(id => !state.completedRequirementIds.includes(id)).join(',')}` : '';
+    return `- [${status}] ${requirement.id}${targetSummary}${dependencies}`;
+  }).join('\n');
 }
 
 export function blocker(code: string, message: string, requirementIds?: string[], details?: JsonValue): Blocker {

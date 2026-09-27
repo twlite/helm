@@ -4,8 +4,10 @@ Production AI runs use one acting model conversation for chat, computer-use
 decisions, tool results, recovery, and the final reply.
 
 ```text
-conversation request
+user request
+    -> deterministic TaskDefinition compiler
     -> acting model
+    -> runtime verifies final reply
     -> final reply
 
 computer-use request
@@ -13,15 +15,17 @@ computer-use request
     -> validated ToolRegistry execution in the guest
     -> receipt and tool result returned to the same conversation
     -> more tool calls as needed
-    -> generic effect check
+    -> runtime verifies TaskDefinition against current-run receipts
     -> final reply from the acting model
 ```
 
-The acting model sees the original user message and recent thread messages. It
-decides whether a computer tool is useful. Conversation-only turns do not call
-the guest transport, so they do not start the VM, browser, or desktop. There is
-no natural-language requirement compiler or browser-keyword router in the
-production path.
+The acting model sees the original user message, recent thread messages, the
+compiled task, and a compact current requirement summary. The deterministic
+compiler creates concrete effect requirements from explicit user requests,
+paths, URLs, and action verbs without a planning-model call. It does not make
+semantic choices about what a report or other artifact should contain. A
+conversation task has no computer requirements and does not call the guest
+transport, so it does not start the VM, browser, or desktop.
 
 ## Native tool loop
 
@@ -39,39 +43,50 @@ model can use registered browser, filesystem, desktop, and application tools;
 all calls still pass through `ToolRegistry.execute` and the guest RPC boundary.
 There is no unrestricted host shell tool.
 
-The prompt is intentionally short. It establishes Helm's role, says to use
-actual results and not claim unverified effects, and tells the model how to
-finish. It does not prescribe browser sequences, artifact formats, or domain
-facts. Browser reads accept a task-derived or model-supplied query and return
-ranked semantic block summaries with compact previews. Full blocks remain in a
-revision-bound guest registry and can be fetched through their content refs.
+The prompt is intentionally compact. It establishes Helm's role, says to use
+actual results and not claim unverified effects, and includes the current
+requirement states. Dependencies are shown as blocked until their prerequisites
+are satisfied. Browser reads accept a task-derived or model-supplied query and
+return ranked semantic block summaries with compact previews. Full blocks
+remain in a revision-bound guest registry and can be fetched through their
+content refs.
 
 ## Completion and concrete evidence
 
-The model finishes through the internal `helm.complete` tool with a user-facing
-response and a list of registered tool effects required for the request. The
-runtime counts successful calls for each listed tool and accepts completion
-only when those calls have successful results. If an effect is missing, the
-tool returns the missing names and counts in its error result; the acting model
-receives that result in the same conversation and may continue. If the model
-returns ordinary text without calling `helm.complete`, Helm asks that same
-model to perform the completion check through a forced native call.
+Ordinary assistant text is a completion proposal. The runtime checks it against
+the compiled `TaskDefinition`, `TaskState`, exact action receipts, artifacts,
+and dependency graph. For example, a current-run write to `other.txt` cannot
+satisfy a requirement to write `forex.txt`, and an old file or editor window
+cannot satisfy a request to write or open it during this run. A dependent
+`app.openFile` call is rejected with `TASK_PREREQUISITE_NOT_SATISFIED` until
+the matching `fs.write` receipt exists. When a proposal is incomplete, the
+runtime returns concise missing-requirement feedback in the same conversation.
 
-This check verifies execution evidence only. The model determines what the
-request means, which effects are needed, what to write, and how to answer. Helm
-does not generate file contents or decide whether a portfolio, report, or poem
-is semantically good.
+The model does not author a required-effects list. The model determines the
+meaning of the request, chooses actions, creates artifact content, and writes
+the answer. The runtime decides whether actions satisfy requirements and does
+not decide whether a report, portfolio, or poem is semantically good. A
+`helm.blocked` report is accepted only when a relevant failed action receipt
+supports the pending requirement.
 
 Guest calls produce action receipts with real success/failure and available
 effects such as navigation, filesystem changes, downloads, and desktop state.
-Run steps persist tool names, inputs, results, and receipts. Before context is
+Host-side memory mutations also receive current-run receipts. Run steps persist
+the model-proposed input separately from the effective input sent to a tool.
+Run diagnostics persist model turns, total model requests, tool actions,
+completion attempts and rejections, context compactions, and the last
+unsatisfied requirements. Before context is
 estimated or passed to the model, tool results receive a 24,000-character
 last-resort bound, with string and array limits that preserve structured fields
 such as table columns, row counts, and truncation state. Browser tools already
 apply tighter retrieval limits; this context cap handles unexpected results.
-Duplicate boundary snapshots are dropped. Repeated identical actions without a
-concrete state change, tool failures, model steps, and tool execution time are
-bounded. Cancellation is passed through to both model and guest calls.
+Duplicate boundary snapshots are dropped. Tool actions and model turns use
+separate budgets: the default acting run allows 32 tool actions, 12 model
+turns, and at most two completion-recovery turns. Repeated identical actions
+without a concrete state change, tool failures, and tool execution time are
+also bounded. `HELM_MAX_STEPS`, `HELM_MAX_MODEL_TURNS`, and
+`HELM_MAX_COMPLETION_RECOVERY_TURNS` configure those independent limits.
+Cancellation is passed through to both model and guest calls.
 
 ## Progressive browser inspection
 
@@ -104,10 +119,12 @@ for prose-heavy pages. Page settling uses bounded DOM readiness and a short
 content-stability check rather than waiting indefinitely for network idle.
 
 Browser navigation accepts a user-supplied destination, an exact verified
-memory URL, or a URL observed in browser results or page links. If the model
-proposes an unobserved destination, the runtime starts a DuckDuckGo search
-using the current task's terms. The model must select a destination from the
-visible result links; URLs are not inferred from organization names.
+memory URL, or a DuckDuckGo search URL. An unobserved proposal is rewritten to
+a DuckDuckGo search using the current request. After results expose semantic
+refs, the model should use `browser.open({ ref })`; raw navigation to an
+observed result is rejected so the guest resolves the original observed href.
+The activity record keeps the proposed URL and the effective executed URL
+separate.
 
 ## Context budgeting and compaction
 
@@ -153,21 +170,22 @@ the complete lifecycle and ranking details.
 - The guest owns filesystem, Playwright browser, and desktop operations inside
   the isolated VM.
 
-The older planner, orchestrator, and worker interfaces remain for scripted
-compatibility tests and the deterministic demo. Their previous queryless
-whole-page extraction rewrites have been removed. `createAiRuntime` uses the
-native acting-agent path; legacy state and verification utilities do not
-influence its tool catalog or execution.
+The older model-backed planner, orchestrator, worker, and legacy decision
+interfaces remain for scripted compatibility tests and the deterministic
+demo. Production uses the deterministic compiler and the coherent acting-model
+conversation, while sharing `TaskDefinition`, `TaskState`, action receipts,
+and `verifyTaskState` with the requirements-first path. Those legacy loops
+still duplicate some action and recovery plumbing and can be consolidated in a
+later change.
 
 ## Current limits
 
 Native tool calls require an LM Studio model and compatibility mode that accept
 OpenAI-compatible function definitions and return function calls. Helm does
 not fall back to synthetic JSON tool calling. Tool output is bounded to protect
-the model context, and the acting model supplies the effect list used by the
-generic completion check. The runtime verifies that list against receipts; it
-does not independently infer task meaning. Local lexical ranking uses the
-visible page DOM and does not handle content available only after client-side
-actions the model has not taken.
+the model context. The deterministic compiler covers concrete action effects;
+the model retains semantic decisions. Local lexical ranking uses the visible
+page DOM and does not handle content available only after client-side actions
+the model has not taken.
 
 Behavior-focused tests live in `apps/server/tests/runtime/acting-agent.test.ts`.

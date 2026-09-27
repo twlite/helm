@@ -11,7 +11,7 @@ import type {
   ToolResult,
   WebSocketEvent,
 } from '@helm/shared';
-import { createLmStudioModels, fallbackThreadTitle } from './ai';
+import { createLmStudioModels, DeterministicTaskCompiler, fallbackThreadTitle } from './ai';
 import { MockGuestTransport } from './tools/mock-guest-transport';
 import { createGuestToolRegistry } from './tools/guest-tools';
 import { CriterionVerifierRegistry } from './tools/criterion-verifier';
@@ -175,6 +175,7 @@ class RuntimeDatabaseAdapter implements RuntimeRepository {
         criteria: run.criteria,
         task: run.task,
         state: run.state,
+        diagnostics: run.diagnostics,
         status: run.status,
         error: run.error,
         createdAt: run.createdAt,
@@ -196,6 +197,7 @@ class RuntimeDatabaseAdapter implements RuntimeRepository {
       error: run.error ?? null,
       task: run.task ?? null,
       state: run.state ?? null,
+      diagnostics: run.diagnostics ?? null,
       startedAt: run.startedAt ?? null,
       completedAt: run.completedAt ?? null,
     });
@@ -348,6 +350,8 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       events: runtimeEvents,
       budgets: {
         maxSteps: config.maxSteps,
+        maxModelTurns: config.maxModelTurns,
+        maxCompletionRecoveryTurns: config.maxCompletionRecoveryTurns,
         maxRepeatedAction: config.maxRepeatedAction,
         maxConsecutiveFailures: config.maxConsecutiveFailures,
         toolTimeoutMs: config.toolTimeoutMs,
@@ -396,6 +400,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       toolRegistry: tools,
       verifier: new CriterionVerifierRegistry(agentGuest),
       actingAgent: models.actingAgent,
+      taskCompiler: new DeterministicTaskCompiler(),
       repository: runAdapter,
       events: runtimeEvents,
       memories: async ({ userMessage, conversation }) => {
@@ -404,6 +409,8 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       },
       budgets: {
         maxSteps: config.maxSteps,
+        maxModelTurns: config.maxModelTurns,
+        maxCompletionRecoveryTurns: config.maxCompletionRecoveryTurns,
         maxRepeatedAction: config.maxRepeatedAction,
         maxConsecutiveFailures: config.maxConsecutiveFailures,
         toolTimeoutMs: config.toolTimeoutMs,
@@ -456,7 +463,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
     }).then(async result => {
       const persistedRun = database.runs.getById(result.run.id) ?? result.run;
       const fallbackResponse = assistantMessageForResult(result);
-      const generatedResponse = result.status === 'completed' ? result.assistantResponse ?? '' : '';
+      const generatedResponse = result.assistantResponse ?? '';
       const responseMessageId = generatedResponse ? `message-${randomUUID()}` : undefined;
       if (responseMessageId) {
         events.publish('assistant.message.started', jsonValue({

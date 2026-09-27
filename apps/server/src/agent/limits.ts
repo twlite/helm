@@ -4,6 +4,8 @@ import type { RuntimeBudgets } from './types';
 
 export const DEFAULT_RUNTIME_BUDGETS: RuntimeBudgets = {
   maxSteps: 32,
+  maxModelTurns: 12,
+  maxCompletionRecoveryTurns: 2,
   maxRepeatedAction: 3,
   maxConsecutiveFailures: 3,
   toolTimeoutMs: 30_000,
@@ -21,6 +23,7 @@ export interface BudgetSnapshot {
 
 export class RunBudget {
   readonly maxSteps: number;
+  readonly maxModelTurns: number;
   readonly maxConsecutiveFailures: number;
   private stepCount = 0;
   private failureCount = 0;
@@ -28,10 +31,12 @@ export class RunBudget {
   constructor(options: Partial<RuntimeBudgets> = {}) {
     const values = { ...DEFAULT_RUNTIME_BUDGETS, ...options };
     if (!Number.isInteger(values.maxSteps) || values.maxSteps < 1) throw new Error('maxSteps must be positive');
+    if (!Number.isInteger(values.maxModelTurns) || values.maxModelTurns < 1) throw new Error('maxModelTurns must be positive');
     if (!Number.isInteger(values.maxConsecutiveFailures) || values.maxConsecutiveFailures < 1) {
       throw new Error('maxConsecutiveFailures must be positive');
     }
     this.maxSteps = values.maxSteps;
+    this.maxModelTurns = values.maxModelTurns;
     this.maxConsecutiveFailures = values.maxConsecutiveFailures;
   }
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { z } from 'zod';
-import type { AgentDecision, Memory } from '@helm/shared';
+import type { AgentDecision, AgentTurnContext, Memory } from '@helm/shared';
 
 import { AgentRuntime } from '../../src/agent/runtime';
 import { browserResearchSearchUrl, browserResearchTask } from '../../src/agent/browser-research';
@@ -69,12 +69,12 @@ describe('AgentRuntime', () => {
       });
       const tools = createGuestToolRegistry(guest);
       const verifier = new CriterionVerifierRegistry(guest);
-      const decisions: AgentDecision[] = [
+      const decisions: Array<AgentDecision | 'open-observed-follow-link'> = [
         { type: 'action', tool: 'browser.navigate', input: { url: input.proposedUrl } },
         ...(input.retryNavigation ? [{ type: 'action' as const, tool: 'browser.navigate', input: { url: input.retryNavigation } }] : []),
         { type: 'action', tool: 'browser.read', input: { query: 'content' } },
         ...(input.followLink ? [
-          { type: 'action' as const, tool: 'browser.navigate', input: { url: input.followLink } },
+          'open-observed-follow-link' as const,
           { type: 'action' as const, tool: 'browser.read', input: { query: 'content' } },
         ] : []),
         { type: 'complete' },
@@ -95,7 +95,25 @@ describe('AgentRuntime', () => {
                 if (typeof provenance === 'string') seenProvenance.add(provenance);
               }
             }
-            return decisions[decisionIndex++] ?? { type: 'complete' };
+            const decision = decisions[decisionIndex++];
+            if (decision === 'open-observed-follow-link') {
+              const read = [...context.previousResults].reverse().find(result => (
+                result.ok && typeof result.data === 'object' && result.data !== null
+                && (result.data as { operation?: unknown }).operation === 'read'
+              ));
+              const data = read?.data as { blocks?: Array<{ ref?: string; href?: string; links?: Array<{ href?: string }> }> } | undefined;
+              const block = data?.blocks?.find(candidate => candidate.href === input.followLink
+                || candidate.links?.some(link => link.href === input.followLink));
+              if (!block?.ref) throw new Error('The read result did not provide an observed ref for the requested link.');
+              const linkIndex = block.links?.findIndex(link => link.href === input.followLink) ?? -1;
+              return {
+                type: 'action',
+                tool: 'browser.open',
+                input: { ref: block.ref, ...(linkIndex >= 0 ? { linkIndex } : {}) },
+                reasoningSummary: 'Opening the observed page link by semantic ref.',
+              };
+            }
+            return decision ?? { type: 'complete' };
           },
         },
       });
@@ -107,6 +125,7 @@ describe('AgentRuntime', () => {
       return {
         result,
         navigations: tools.invocations.filter(invocation => invocation.tool === 'browser.navigate'),
+        opens: tools.invocations.filter(invocation => invocation.tool === 'browser.open'),
         seenProvenance,
       };
     };
@@ -237,10 +256,12 @@ describe('AgentRuntime', () => {
       },
     });
     expect(followed.result.status).toBe('completed');
-    expect(followed.navigations.map(invocation => invocation.input)).toEqual([
-      { url: startUrl },
-      { url: observedHref },
-    ]);
+    expect(followed.navigations.map(invocation => invocation.input)).toEqual([{ url: startUrl }]);
+    expect(followed.opens).toHaveLength(1);
+    expect(followed.opens[0]?.input).toMatchObject({ ref: expect.any(String), linkIndex: expect.any(Number) });
+    expect(followed.opens[0]?.result.data).toMatchObject({ url: observedHref });
+    expect(followed.result.steps.find(step => step.toolName === 'browser.open')?.toolResult)
+      .toMatchObject({ ok: true, data: { url: observedHref, urlProvenance: 'page-link' } });
     expect(followed.seenProvenance).toContain('page-link');
   });
 
@@ -404,19 +425,32 @@ describe('AgentRuntime', () => {
     const resultUrl = 'https://neplextech.com/projects';
     const guest = new MockGuestTransport({
       pages: {
-        [searchUrl]: `<html><body><main><h1>Search results</h1><p>Neplex Technologies projects listing content.</p><a href="${resultUrl}">Neplex Technologies projects</a></main></body></html>`,
+        [searchUrl]: `<html><body><main><h1>Search results</h1></main><article><a href="${resultUrl}">Neplex Technologies projects</a><p>Neplex Technologies projects listing content.</p></article></body></html>`,
         [resultUrl]: '<html><body><main><h1>Neplex projects</h1><p>Project details content.</p></main></body></html>',
       },
     });
     const tools = createGuestToolRegistry(guest);
     const verifier = new CriterionVerifierRegistry(guest);
-    const provider = new ScriptedDecisionProvider([
-      { type: 'action', tool: 'browser.navigate', input: { url: searchUrl } },
-      { type: 'action', tool: 'browser.read', input: { query: 'Neplex projects' } },
-      { type: 'action', tool: 'browser.navigate', input: { url: resultUrl } },
-      { type: 'action', tool: 'browser.read', input: { query: 'Neplex projects' } },
-      { type: 'complete' },
-    ]);
+    let decisionIndex = 0;
+    const provider: { next(context: AgentTurnContext): Promise<AgentDecision> } = {
+      next: async context => {
+        const step = decisionIndex++;
+        if (step === 0) return { type: 'action' as const, tool: 'browser.navigate', input: { url: searchUrl } };
+        if (step === 1) return { type: 'action' as const, tool: 'browser.search', input: { query: 'Neplex projects' } };
+        if (step === 2) {
+          const result = [...context.previousResults].reverse().find(previous => (
+            previous.ok && typeof previous.data === 'object' && previous.data !== null
+            && (previous.data as { operation?: unknown }).operation === 'search'
+          ));
+          const searchResult = (result?.data as { results?: Array<{ type?: string; ref?: string; href?: string }> } | undefined)
+            ?.results?.find(item => item.type === 'search_result' && item.href === resultUrl);
+          if (!searchResult?.ref) throw new Error('Search results did not provide an observed ref for the Neplex projects page.');
+          return { type: 'action' as const, tool: 'browser.open', input: { ref: searchResult.ref } };
+        }
+        if (step === 3) return { type: 'action' as const, tool: 'browser.read', input: { query: 'Neplex projects' } };
+        return { type: 'complete' as const };
+      },
+    };
     const runtime = new AgentRuntime({
       guestTransport: guest,
       toolRegistry: tools,
@@ -436,9 +470,13 @@ describe('AgentRuntime', () => {
     expect(result.status).toBe('completed');
     expect(tools.invocations.filter(invocation => invocation.tool === 'browser.navigate').map(invocation => invocation.input)).toEqual([
       { url: searchUrl },
-      { url: resultUrl },
     ]);
-    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.read')).toHaveLength(2);
+    expect(tools.invocations.find(invocation => invocation.tool === 'browser.open')?.result.data)
+      .toMatchObject({ openedHref: resultUrl });
+    expect(result.steps.find(step => step.toolName === 'browser.open')?.toolResult)
+      .toMatchObject({ ok: true, data: { url: resultUrl, urlProvenance: 'search-result' } });
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.search')).toHaveLength(1);
+    expect(tools.invocations.filter(invocation => invocation.tool === 'browser.read')).toHaveLength(1);
     expect(tools.invocations.filter(invocation => invocation.tool === 'browser.snapshot')).toHaveLength(0);
   });
 

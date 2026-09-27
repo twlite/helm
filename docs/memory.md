@@ -18,9 +18,10 @@ The production acting agent has four native host tools:
 All four use validated schemas and return structured tool results to the same
 acting-agent conversation. Persistence errors return tool failures, so Helm
 cannot claim an explicit memory write succeeded without a successful result.
-The model includes a successful memory tool in `helm.complete.requiredEffects`
-when the user explicitly requested that operation. The regular runtime effect
-check verifies that the call succeeded.
+Explicit remember, update, and forget requests compile to current-run action
+requirements. The runtime adds a receipt to host-side memory mutations and
+verifies the exact requested memory action before accepting the model's normal
+final response.
 
 When the requested memory depends on research or another action, the model can
 perform that work first and call `memory.remember` afterward. Observed memories
@@ -103,5 +104,7 @@ the current run only and is never copied into persistent memory.
 
 SQLite remains authoritative. Migration 5 adds keys, source and provenance,
 durability, verification/access metadata, and indexes; it backfills legacy
-source information and rebuilds the FTS index to include keys. A partial unique
-index allows multiple unkeyed memories while enforcing one row per stable key.
+source information and rebuilds the FTS index to include keys. Migration 6
+adds persisted per-run model, action, completion, and compaction diagnostics. A
+partial unique index allows multiple unkeyed memories while enforcing one row
+per stable key.

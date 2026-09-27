@@ -6,6 +6,7 @@ and a guarded execution runtime.
 ```text
 browser UI -- REST + WebSocket --> Bun server
                                    |- acting model + native Helm tools
+                                   |- deterministic task compiler + requirement state
                                    |- ToolRegistry -> validated guest RPC
                                    |- action receipts + effect verification
                                    |- repositories -> better-sqlite3
@@ -24,8 +25,9 @@ browser UI -- REST + WebSocket --> Bun server
   passes native function definitions to the configured LM Studio model,
   budgets the retained conversation, and returns AI SDK tool results to the
   same conversation.
-- `apps/server/src/agent/runtime.ts` owns cancellation, budgets, persistence,
-  action-loop protection, receipts, and generic completion checks.
+- `apps/server/src/agent/runtime.ts` owns cancellation, separate model/action
+  budgets, persistence, action-loop protection, current-run receipts,
+  dependency enforcement, and requirement verification.
 - `apps/server/src/tools` owns Zod input validation, guest calls, and action
   receipt generation.
 - `apps/server/src/memory` owns persistent memory, its native acting-agent
@@ -36,11 +38,15 @@ browser UI -- REST + WebSocket --> Bun server
 - `apps/web` renders persisted and live messages, runs, and activity. It does
   not infer completion from UI state.
 
-Production AI turns do not use a task compiler, orchestrator, bounded worker,
-or second response-generation model call. The runtime stores a minimal request
-envelope for the run; the complete user request and recent conversation go to
-the acting model. Scripted compatibility tests and the deterministic demo may
-still use the legacy interfaces.
+Production AI turns compile each request into a `TaskDefinition` before the
+acting model runs. `DeterministicTaskCompiler` derives concrete effects,
+requested paths and URLs, current-run action semantics, and a small dependency
+graph without a planning-model request. It does not generate an action plan or
+artifact content. The complete original request and recent conversation still
+go to the acting model. Production does not use the model-backed planner,
+orchestrator, bounded worker, or a separate response-generation model.
+Scripted compatibility tests and the deterministic demo may still use legacy
+interfaces.
 
 ## Model and runtime boundary
 
@@ -54,27 +60,34 @@ including failures and action receipts, return to the same model conversation.
 The runtime does not replace model-generated HTML, documents, reports, or
 other artifacts with content of its own.
 
-Before Helm accepts the final answer, the model lists the concrete registered
-tool effects needed for its response through the internal completion tool. The
-runtime checks successful call counts against real results. A missing effect
-becomes a tool error in the same conversation, giving the acting model a chance
-to finish the work or report a blocker. This check does not decide what fields
-belong in an artifact or whether the response is semantically complete.
+Ordinary assistant text is a completion proposal. The runtime checks it using
+the compiled task and current-run `TaskState`: exact action receipts, matching
+paths and URLs, source refs, artifact lineage, and dependencies. Missing
+effects produce concise feedback in the same model conversation. The model
+cannot redefine required effects in its response. A `helm.blocked` report is
+accepted only when a relevant failed action receipt supports the pending
+requirement. This check does not decide what fields belong in an artifact or
+whether the response is semantically complete.
 
-When a run has observed readable page content, page-derived file writes require
-a successful content read or region inspection first. A zero-match search is
-query-local: it proves neither that the page is unreadable nor that its content
-was read. Explicit output actions are verified from a successful current-run
-write receipt for the requested path, then checked against filesystem state.
-Existing files cannot satisfy a new write action, while model-authored
-transformations do not have to reproduce the source page verbatim.
+When a task saves page-derived content, its output-file requirement depends on
+a successful readable browser result. A zero-match search is query-local: it
+proves neither that the page is unreadable nor that its content was read.
+Explicit output actions are verified from a successful current-run write
+receipt for the requested path. Existing files cannot satisfy a new write
+action, while `sourceRef` writes preserve source URL, revision, and content
+lineage. Explicit file opens depend on their current-run write and require a
+matching `app.openFile` receipt even if the file or editor window existed
+before the run.
 
 ## Persistence and limits
 
-`runs.task_json` stores the request envelope. `run_steps` stores each validated
-tool invocation, its input and result, plus completion verification. The UI
-continues to receive live events and can reconcile durable run status and
-steps after reconnecting.
+`runs.task_json`, `state_json`, and `diagnostics_json` store the compiled
+requirements, current state, and execution counts. `run_steps` stores each
+validated tool invocation, its effective input, the model proposal, result,
+and verification. The activity UI shows effective navigation alongside the
+model-proposed destination. It also displays compact requirement and budget
+state. Live events can be reconciled with durable run status and steps after
+reconnecting.
 
 Tool calls, model steps, consecutive tool errors, repeated no-progress actions,
 timeouts, and cancellation are bounded. Guest tools retain filesystem
@@ -130,9 +143,10 @@ Navigation policy records whether a destination came from the user,
 verified-memory, a DuckDuckGo result, a page link, or a navigation result. A
 model-proposed URL without that provenance starts a DuckDuckGo search using
 the current request; the runtime does not turn site or organization names into
-guessed routes. An explicit file-open request also requires a successful
-current-run `app.openFile` receipt and matching desktop state, even if the file
-was already open before the run.
+guessed routes. Once a search result or page link has a semantic ref, opening
+it should use `browser.open({ ref })`. Exact relevant verified-memory URLs are
+allowed directly and are removed from the temporary capability if they fail
+or redirect unexpectedly.
 
 ## Model context management
 

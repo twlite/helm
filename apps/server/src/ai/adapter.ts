@@ -35,6 +35,7 @@ import {
   isTaskOutputPathNavigation,
   requirementsForTask,
   trustedFacts,
+  validateRequirementDependencies,
   type BrowserNavigationResolution,
 } from '../agent/task-state';
 import {
@@ -195,6 +196,9 @@ function preferredResearchUrl(context: AgentTurnContext, request: string): strin
 
   let best: { url: string; score: number } | undefined;
   for (const memory of context.memories ?? []) {
+    const verified = Boolean(memory.lastVerifiedAt)
+      || (memory.source === 'observed' && (memory.evidenceIds?.length ?? 0) > 0);
+    if (!verified) continue;
     const url = memory.content.match(/https?:\/\/[^\s"'<>]+/iu)?.[0]?.replace(/[),.;!?]+$/u, '');
     if (!url) continue;
     const memoryText = memory.content.toLocaleLowerCase();
@@ -411,7 +415,7 @@ type DesktopOutputPaths = {
   directoryPath?: string;
 };
 
-const OUTPUT_FILENAME_PATTERN = /\b([A-Za-z0-9][A-Za-z0-9._-]*\.(?:txt|md|json|csv|log|html?))\b/iu;
+const OUTPUT_FILENAME_PATTERN = /\b([A-Za-z0-9][A-Za-z0-9._-]*\.(?:txt|md|markdown|json|csv|tsv|log|html?|css|js|jsx|mjs|cjs|ts|tsx|xml|ya?ml|toml|ini|conf|env|pdf|docx?|xlsx?|pptx?|zip|tar|gz))\b/iu;
 const BARE_FILE_REFERENCE_PATTERN = /\.(?:txt|md|markdown|json|csv|tsv|log|html?|css|js|jsx|mjs|cjs|ts|tsx|xml|ya?ml|toml|ini|conf|env|pdf|docx?|xlsx?|pptx?|zip|tar|gz)(?:[?#].*)?$/iu;
 const FILE_REFERENCE_INTENT_PATTERN = /\b(?:save|write|create|put|copy|store|output|file|filename|document|text\s+viewer|text\s+editor)\b/iu;
 
@@ -443,6 +447,11 @@ function savesPageContent(request: string): boolean {
   return mentionsWebContent && writesFile(request);
 }
 
+function savesRawPageContent(request: string): boolean {
+  if (/\b(?:summari[sz](?:e|ation)|explain|describe|analy[sz](?:e|is)|paraphrase|rewrite)\b/iu.test(request)) return false;
+  return /\b(?:save|write|copy|store)\b[^.!?\n]{0,100}\b(?:data|contents?|tables?|lists?)\b|\b(?:data|contents?|tables?|lists?)\b[^.!?\n]{0,100}\b(?:save|write|copy|store)\b/iu.test(request);
+}
+
 function writesFile(request: string): boolean {
   return /\b(?:save|write|create|put|copy|store)\b/iu.test(request);
 }
@@ -450,6 +459,27 @@ function writesFile(request: string): boolean {
 function opensFileInViewer(request: string): boolean {
   return /\b(?:show|view|display|open|read|launch)\b/iu.test(request)
     && /\b(?:file|document|text|viewer|editor)\b/iu.test(request);
+}
+
+function explicitlyLaunchedApplication(request: string): 'browser' | 'text-editor' | 'file-manager' | undefined {
+  const appMatches = [
+    { application: 'browser' as const, pattern: /\b(?:web\s+)?browser\b/iu },
+    { application: 'text-editor' as const, pattern: /\b(?:text\s+viewer|text\s+editor)\b/iu },
+    { application: 'file-manager' as const, pattern: /\bfile\s+manager\b/iu },
+  ];
+  for (const { application, pattern } of appMatches) {
+    const match = pattern.exec(request);
+    if (!match) continue;
+    const sentenceStart = Math.max(
+      request.lastIndexOf('.', match.index),
+      request.lastIndexOf('!', match.index),
+      request.lastIndexOf('?', match.index),
+      request.lastIndexOf('\n', match.index),
+    );
+    const before = request.slice(Math.max(sentenceStart + 1, match.index - 80), match.index);
+    if (/\b(?:launch|start)\b/iu.test(before)) return application;
+  }
+  return undefined;
 }
 
 function asksToEnsureFileIsOpen(request: string): boolean {
@@ -517,7 +547,7 @@ function bareCandidateIsExplicitlyNavigated(request: string, candidate: string):
   return EXPLICIT_NAVIGATION_PATTERN.test(navigationClause) && !FILE_REFERENCE_INTENT_PATTERN.test(context);
 }
 
-type ExplicitUrlRole = 'navigation' | 'asset';
+type ExplicitUrlRole = 'navigation' | 'asset' | 'reference';
 
 type ExplicitUrlReference = {
   url: string;
@@ -527,6 +557,7 @@ type ExplicitUrlReference = {
 const STATIC_ASSET_URL_PATTERN = /\.(?:png|jpe?g|gif|webp|svg|ico|avif|bmp|tiff?)(?:[?#].*)?$/iu;
 const ASSET_REFERENCE_PATTERN = /\b(?:image|picture|photo|avatar|profile\s+(?:picture|image|photo)|logo|icon|thumbnail|background|cover|src|href)\b/iu;
 const EXPLICIT_NAVIGATION_PATTERN = /\b(?:go\s+to|navigate(?:\s+to)?|visit|open|browse|read|inspect|research|look\s+(?:it\s+)?up|find(?:\s+out)?|extract|download)\b/iu;
+const MEMORY_VALUE_PATTERN = /\b(?:remember|memory|memories)\b/iu;
 
 function urlSentenceContext(request: string, url: string): string {
   const normalizedRequest = request.toLocaleLowerCase();
@@ -564,8 +595,12 @@ function explicitUrlReferences(request: string): ExplicitUrlReference[] {
     // earlier "go to" does not turn the later image into another destination.
     const navigationClause = contextBeforeUrl.split(/\b(?:and|but|then|using|use|as)\b/iu).at(-1) ?? contextBeforeUrl;
     const explicitNavigation = EXPLICIT_NAVIGATION_PATTERN.test(navigationClause);
-    const role: ExplicitUrlRole = assetLanguage && !explicitNavigation
-      ? 'asset'
+    const memoryReference = MEMORY_VALUE_PATTERN.test(contextBeforeUrl)
+      && !/\b(?:go\s+to|navigate|visit|open|browse|research|inspect|read)\b/iu.test(contextBeforeUrl);
+    const role: ExplicitUrlRole = memoryReference
+      ? 'reference'
+      : assetLanguage && !explicitNavigation
+        ? 'asset'
       : STATIC_ASSET_URL_PATTERN.test(url) && !explicitNavigation
         ? 'asset'
         : 'navigation';
@@ -608,9 +643,27 @@ function explicitRepository(request: string): string | undefined {
 }
 
 function requestRequiresComputer(request: string): boolean {
-  return browserSourceUrls(request).length > 0
+  if (browserSourceUrls(request).length > 0
     || explicitPaths(request).length > 0
-    || /\b(?:browser|desktop|file|folder|directory|website|webpage|page|navigate|visit|open|show|view|display|viewer|text\s+editor|text\s+viewer|click|type|write|save|create|delete|edit|download|upload|launch|focus|extract|browse|read|inspect)\b/iu.test(request);
+    || memoryMutationTool(request) !== undefined) return true;
+
+  const fileTarget = Boolean(fileNameFromText(request))
+    || /\b(?:file|folder|directory|document|text\s+editor|text\s+viewer)\b/iu.test(request);
+  const fileAction = /\b(?:read|open|show|view|display|save|write|create|delete|edit|copy|store|move|rename|inspect|check|list|stat)\b/iu.test(request);
+  if (fileTarget && fileAction) return true;
+
+  const browserContext = /\b(?:browser|website|webpage|web\s+page|site|url|link)\b/iu.test(request);
+  const browserAction = /\b(?:navigate|visit|open|browse|inspect|read|search|find|extract|summarize|research|compare|follow|click)\b/iu.test(request);
+  return (browserContext && browserAction)
+    || /\b(?:download|upload|launch|focus|click|type)\b/iu.test(request);
+}
+
+function memoryMutationTool(request: string): 'memory.remember' | 'memory.update' | 'memory.forget' | undefined {
+  if (/\b(?:forget|delete|remove)\b[^.!?\n]{0,100}\b(?:memory|remembered|from memory)\b/iu.test(request)) return 'memory.forget';
+  if (/\bupdate\b[^.!?\n]{0,100}\b(?:memory|remembered|memory item)\b/iu.test(request)) return 'memory.update';
+  if (/\b(?:remember|memorize|store)\b[^.!?\n]{0,100}/iu.test(request)
+    && (MEMORY_VALUE_PATTERN.test(request) || /\bremember\s+to\b/iu.test(request))) return 'memory.remember';
+  return undefined;
 }
 
 function criterionWasExplicit(request: string, criterion: CompletionCriterion): boolean {
@@ -648,6 +701,9 @@ function compiledRequirements(
   };
   const repository = explicitRepository(request);
   const pageContentSave = savesPageContent(request);
+  const memoryAction = memoryMutationTool(request);
+  const launchedApplication = explicitlyLaunchedApplication(request);
+  const explicitNavigationAction = /\b(?:go\s+to|navigate(?:\s+to)?|visit|open|browse)\b/iu.test(request);
   for (const [index, url] of browserSourceUrls(request).entries()) {
     add({
       id: `browserDestination${index + 1}`,
@@ -655,7 +711,10 @@ function compiledRequirements(
       type: 'browser',
       mandatory: true,
       status: 'pending',
-      target: { url: browserResearchStartUrl(url) },
+      target: {
+        url: browserResearchStartUrl(url),
+        ...(explicitNavigationAction ? { freshness: 'current-run', action: 'browser.navigate' as const } : {}),
+      },
     });
   }
   const asksRelease = /\b(?:latest|current|newest|stable)\b[^.\n]{0,80}\b(?:release|version|tag)\b|\b(?:release|version)\b[^.\n]{0,80}\b(?:latest|current|newest|stable)\b/iu.test(request);
@@ -669,7 +728,38 @@ function compiledRequirements(
     // Page content is an actionable prerequisite for all browser-derived
     // facts. Keep it ahead of those facts so a deterministic fallback starts
     // research instead of treating the prerequisite as a terminal blocker.
-    add({ id: 'browserResearch', description: 'Collect readable evidence from the relevant public web page.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'pageContent' } });
+    add({
+      id: 'browserResearch',
+      description: 'Collect readable evidence from the relevant public web page.',
+      type: 'fact',
+      mandatory: true,
+      status: 'pending',
+      target: { factId: 'pageContent', freshness: 'current-run', action: 'browser.read' },
+    });
+  }
+  if (memoryAction) {
+    add({
+      id: 'memoryMutation',
+      description: 'Perform the explicit durable memory change during this run.',
+      type: 'semantic',
+      mandatory: true,
+      status: 'pending',
+      target: { action: memoryAction, freshness: 'current-run' },
+    });
+  }
+  if (launchedApplication) {
+    add({
+      id: 'applicationLaunch',
+      description: `Launch the explicitly requested ${launchedApplication} application during this run.`,
+      type: 'semantic',
+      mandatory: true,
+      status: 'pending',
+      target: {
+        application: launchedApplication,
+        freshness: 'current-run',
+        action: 'app.launch',
+      },
+    });
   }
   if (asksRelease) {
     add({ id: 'latestReleaseVersion', description: 'Determine the latest stable release version from an authoritative release page.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'latestReleaseVersion' } });
@@ -695,6 +785,10 @@ function compiledRequirements(
   // The page read is a prerequisite, but its full text is not the expected
   // file content: the model may be asked to summarize or transform it.
   const outputFactIds = factIds;
+  const downloadRequested = /\bdownload\b/iu.test(request);
+  if (downloadRequested) {
+    add({ id: 'downloadArtifact', description: 'Download the requested artifact and retain its recorded file.', type: 'artifact', mandatory: true, status: 'pending', target: { mode: 'downloaded' } });
+  }
   if (directoryPath && (!filePath || /\b(?:mkdir|folder|directory)\b/iu.test(request))) {
     const actionRequested = createsDirectory(request);
     add({
@@ -714,13 +808,20 @@ function compiledRequirements(
     // Every explicit file output is an action requirement. The model may write
     // a raw content ref or a model-authored transformation; sourceRef lineage
     // is retained whenever the selected write actually uses it.
-    const mode = outputFactIds.length > 0 ? 'contains-facts' : 'written';
+    const mode = pageContentSave && savesRawPageContent(request)
+      ? 'written-from-artifact'
+      : outputFactIds.length > 0 ? 'contains-facts' : 'written';
+    const dependsOn = [
+      ...(pageContentSave ? ['browserResearch'] : []),
+      ...(requirements.some(requirement => requirement.id === 'outputDirectory') ? ['outputDirectory'] : []),
+    ];
     add({
       id: 'outputFile',
       description: 'Write the requested output file during this run.',
       type: 'filesystem',
       mandatory: true,
       status: 'pending',
+      ...(dependsOn.length > 0 ? { dependsOn } : {}),
       target: {
         path: filePath,
         mode,
@@ -730,24 +831,31 @@ function compiledRequirements(
       },
     });
   }
-  if (filePath && opensFileInViewer(request)) {
+  const opensDownloadedArtifact = downloadRequested && /\b(?:open|view|show|display)\b/iu.test(request);
+  if ((filePath && opensFileInViewer(request)) || opensDownloadedArtifact) {
     const actionRequested = !asksToEnsureFileIsOpen(request);
+    const dependencies = [
+      ...(requirements.some(requirement => requirement.id === 'outputFile') ? ['outputFile'] : []),
+      ...(requirements.some(requirement => requirement.id === 'outputDirectory') ? ['outputDirectory'] : []),
+      ...(requirements.some(requirement => requirement.id === 'downloadArtifact') ? ['downloadArtifact'] : []),
+      ...(launchedApplication && requirements.some(requirement => requirement.id === 'applicationLaunch')
+        ? ['applicationLaunch']
+        : []),
+    ];
     add({
       id: 'openFile',
       description: actionRequested ? 'Open the requested file during this run.' : 'Ensure the requested file is open in the text viewer.',
       type: 'desktop',
       mandatory: true,
       status: 'pending',
+      ...(actionRequested && dependencies.length > 0 ? { dependsOn: dependencies } : {}),
       target: {
-        path: filePath,
-        content: fileNameFromPath(filePath),
+        ...(filePath ? { path: filePath, content: fileNameFromPath(filePath) } : {}),
         mode: actionRequested ? 'opened' : 'open',
+        ...(/\b(?:text\s+viewer|text\s+editor)\b/iu.test(request) ? { application: 'text-editor' } : {}),
         ...(actionRequested ? { freshness: 'current-run', action: 'app.openFile' } : {}),
       },
     });
-  }
-  if (/\bdownload\b/iu.test(request)) {
-    add({ id: 'downloadArtifact', description: 'Download the requested artifact and retain its recorded file.', type: 'artifact', mandatory: true, status: 'pending', target: { mode: 'downloaded' } });
   }
   for (const criterion of criteria.filter(candidate => candidate.type !== 'custom' && criterionWasExplicit(request, candidate))) {
     add({
@@ -794,7 +902,7 @@ function compileTask(
     { id: 'unknowns-remain-unknown', description: 'Do not invent URLs, filenames, versions, DOM elements, or outcomes; discover them through tools.', source: 'compiler' },
     { id: 'runtime-verifies', description: 'Only runtime observations and deterministic evidence can satisfy requirements.', source: 'compiler' },
   ];
-  return {
+  const task: TaskDefinition = {
     id: `ai-${mode}-${input.threadId}`,
     threadId: input.threadId,
     goal,
@@ -804,6 +912,24 @@ function compileTask(
     constraints,
     isConversation: mode === 'conversation',
   };
+  validateRequirementDependencies(task.requirements ?? []);
+  return task;
+}
+
+/** Compiles concrete action requirements without an additional model request. */
+export class DeterministicTaskCompiler implements TaskCompiler {
+  async createTask(input: TaskPlannerInput): Promise<TaskDefinition> {
+    const browserResearch = isBrowserResearchRequest(input.userMessage);
+    const requiresComputer = browserResearch || requestRequiresComputer(input.userMessage);
+    const researchTask = browserResearch ? browserResearchTask(input) : undefined;
+    const goal = (researchTask?.goal ?? input.userMessage.trim()) || 'Respond to the user.';
+    return compileTask(
+      input,
+      goal,
+      researchTask?.criteria ?? [],
+      requiresComputer ? 'task' : 'conversation',
+    );
+  }
 }
 
 export class AiSdkTaskPlanner implements TaskCompiler {

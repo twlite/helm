@@ -50,6 +50,30 @@ async function executeAction(context: WorkerContext, tool: string, input: Record
   return { id, tool, input, result };
 }
 
+function observedOpenTarget(value: unknown, href: string): { ref: string; linkIndex?: number } | undefined {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const target = observedOpenTarget(item, href);
+      if (target) return target;
+    }
+    return undefined;
+  }
+  if (typeof value !== 'object' || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.href === href && typeof record.ref === 'string') return { ref: record.ref };
+  if (typeof record.ref === 'string' && Array.isArray(record.links)) {
+    const linkIndex = record.links.findIndex(link => (
+      typeof link === 'object' && link !== null && (link as Record<string, unknown>).href === href
+    ));
+    if (linkIndex >= 0) return { ref: record.ref, linkIndex };
+  }
+  for (const item of Object.values(record)) {
+    const target = observedOpenTarget(item, href);
+    if (target) return target;
+  }
+  return undefined;
+}
+
 function taskWithRequirements(overrides: Partial<TaskDefinition> = {}): TaskDefinition {
   return {
     id: 'orchestrated-task',
@@ -578,10 +602,14 @@ describe('orchestrated agent loop', () => {
     const worker = new FunctionalWorker([
       async context => {
         const search = await executeAction(context, 'browser.navigate', { url: repositoryUrl }, 'search');
-        const results = await executeAction(context, 'browser.read', { query: 'oven-sh bun repository' }, 'search-results');
-        const repository = await executeAction(context, 'browser.navigate', { url: repositoryUrl }, 'repository');
+        const results = await executeAction(context, 'browser.search', { query: 'oven-sh bun repository' }, 'search-results');
+        const repositoryTarget = observedOpenTarget(results.result.data, repositoryUrl);
+        if (!repositoryTarget) throw new Error('Search results did not provide an observed repository ref.');
+        const repository = await executeAction(context, 'browser.open', repositoryTarget, 'repository');
         const repositoryRead = await executeAction(context, 'browser.read', { query: 'oven bun latest release' }, 'repository-read');
-        const release = await executeAction(context, 'browser.navigate', { url: releaseUrl }, 'release');
+        const releaseTarget = observedOpenTarget(repositoryRead.result.data, releaseUrl);
+        if (!releaseTarget) throw new Error('The repository read did not provide an observed release-link ref.');
+        const release = await executeAction(context, 'browser.open', releaseTarget, 'release');
         const extract = await executeAction(context, 'browser.read', { query: 'bun release date 2026-09-20' }, 'read');
         const evidence = extract.result.evidence as { receipt?: { id: string } };
         const evidenceId = evidence.receipt?.id ?? 'missing-receipt';
@@ -624,11 +652,17 @@ describe('orchestrated agent loop', () => {
 
     expect(result.status).toBe('completed');
     expect(guest.browserState.url).toBe(releaseUrl);
-    const navigations = result.steps.flatMap(step => step.workerResult?.actions ?? []).filter(action => action.tool === 'browser.navigate');
-    expect(navigations.slice(0, 3).map(action => action.result.data && 'url' in action.result.data ? action.result.data.url : undefined))
-      .toEqual([searchUrl, repositoryUrl, releaseUrl]);
+    const browserActions = result.run.state?.recentActions.filter(action => action.tool.startsWith('browser.')) ?? [];
+    const navigations = browserActions.filter(action => action.tool === 'browser.navigate');
+    expect(navigations.map(action => action.result.data && 'url' in action.result.data ? action.result.data.url : undefined))
+      .toEqual([searchUrl]);
     expect((navigations[0]?.result.data as { urlProvenance?: string }).urlProvenance).toBe('duckduckgo-search');
-    expect((navigations[1]?.result.data as { urlProvenance?: string }).urlProvenance).toBe('search-result');
+    const opens = browserActions.filter(action => action.tool === 'browser.open');
+    expect(opens).toHaveLength(2);
+    expect((opens[0]?.result.data as { url?: string; urlProvenance?: string }).url).toBe(repositoryUrl);
+    expect((opens[0]?.result.data as { urlProvenance?: string }).urlProvenance).toBe('search-result');
+    expect((opens[1]?.result.data as { url?: string; urlProvenance?: string }).url).toBe(releaseUrl);
+    expect((opens[1]?.result.data as { urlProvenance?: string }).urlProvenance).toBe('page-link');
     expect(guest.getFile('~/Desktop/helm-demo/bun-release.md')).toContain('Release date: 2026-09-20');
     expect((await guest.request('fs.stat', { path: '~/Desktop/helm-demo' })).type).toBe('directory');
     expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining([

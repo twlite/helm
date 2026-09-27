@@ -204,6 +204,13 @@ export const migrations: readonly DatabaseMigration[] = [
       `);
     },
   },
+  {
+    version: 6,
+    name: 'run-execution-diagnostics',
+    up(database) {
+      database.exec('ALTER TABLE runs ADD COLUMN diagnostics_json TEXT;');
+    },
+  },
 ];
 
 export const MIGRATIONS = migrations;

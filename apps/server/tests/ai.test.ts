@@ -242,6 +242,10 @@ describe('LM Studio AI adapters', () => {
         kind: 'instruction',
         importance: 0.95,
         metadata: {},
+        source: 'observed',
+        sourceUrl: 'https://www.nrb.org.np/forex/',
+        evidenceIds: ['receipt-nrb-forex'],
+        lastVerifiedAt: '2026-09-27T00:00:00.000Z',
         createdAt: '2026-01-01T00:00:00.000Z',
         updatedAt: '2026-01-01T00:00:00.000Z',
       }],
@@ -358,10 +362,14 @@ describe('LM Studio AI adapters', () => {
 
     expect(task.isConversation).toBe(false);
     expect(task.criteria).toEqual([]);
-    expect(task.requirements).toEqual(expect.arrayContaining([
-      expect.objectContaining({ type: 'browser', target: { url: 'https://example.com/' } }),
-      expect.objectContaining({ type: 'filesystem', target: expect.objectContaining({ path: '~/Desktop/result.txt' }) }),
-    ]));
+    expect(task.requirements?.find(requirement => requirement.id === 'browserDestination1')).toMatchObject({
+      type: 'browser',
+      target: { url: 'https://example.com/', freshness: 'current-run', action: 'browser.navigate' },
+    });
+    expect(task.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
+      type: 'filesystem',
+      target: { path: '~/Desktop/result.txt', freshness: 'current-run', action: 'fs.write' },
+    });
     expect(JSON.stringify(task)).not.toContain('invented.example');
     expect(JSON.stringify(task)).not.toContain('invented content');
   });
@@ -540,14 +548,12 @@ describe('LM Studio AI adapters', () => {
     const task = await planner.createTask({ threadId: 'bun-release-plan', userMessage });
     const requirements = task.requirements ?? [];
 
-    expect(requirements).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'browserResearch', target: { factId: 'pageContent' } }),
-      expect.objectContaining({ id: 'latestReleaseVersion', target: { factId: 'latestReleaseVersion' } }),
-      expect.objectContaining({ id: 'releaseDate', target: { factId: 'releaseDate' } }),
-      expect.objectContaining({ id: 'releaseUrl', target: { factId: 'releaseUrl' } }),
-      expect.objectContaining({ id: 'outputDirectory', target: expect.objectContaining({ path: '~/Desktop/helm-demo', mode: 'created', freshness: 'current-run', action: 'fs.mkdir' }) }),
-      expect.objectContaining({ id: 'outputFile', target: expect.objectContaining({ path: '~/Desktop/helm-demo/bun-release.md', mode: 'contains-facts', freshness: 'current-run', action: 'fs.write' }) }),
-    ]));
+    expect(requirements.find(requirement => requirement.id === 'browserResearch')).toMatchObject({ target: { factId: 'pageContent', action: 'browser.read', freshness: 'current-run' } });
+    expect(requirements.find(requirement => requirement.id === 'latestReleaseVersion')).toMatchObject({ target: { factId: 'latestReleaseVersion' } });
+    expect(requirements.find(requirement => requirement.id === 'releaseDate')).toMatchObject({ target: { factId: 'releaseDate' } });
+    expect(requirements.find(requirement => requirement.id === 'releaseUrl')).toMatchObject({ target: { factId: 'releaseUrl' } });
+    expect(requirements.find(requirement => requirement.id === 'outputDirectory')).toMatchObject({ target: { path: '~/Desktop/helm-demo', mode: 'created', freshness: 'current-run', action: 'fs.mkdir' } });
+    expect(requirements.find(requirement => requirement.id === 'outputFile')).toMatchObject({ target: { path: '~/Desktop/helm-demo/bun-release.md', mode: 'contains-facts', freshness: 'current-run', action: 'fs.write' } });
     expect(requirements.find(requirement => requirement.id === 'outputFile')?.target?.factIds).toEqual(expect.arrayContaining([
       'repositoryName', 'latestReleaseVersion', 'releaseDate', 'releaseUrl', 'currentDate',
     ]));
@@ -868,59 +874,29 @@ describe('LM Studio AI adapters', () => {
     });
     const firstRequest = 'go to https://twlite.dev, summarize the page content, and save it in a twlite.txt file';
     const firstTask = await planner.createTask({ threadId: 'page-to-file-thread', userMessage: firstRequest });
-    expect(firstTask.requirements).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'browserResearch', target: { factId: 'pageContent' } }),
-      expect.objectContaining({
-        id: 'outputFile',
-        target: expect.objectContaining({
-          path: 'twlite.txt',
-          mode: 'written',
-          freshness: 'current-run',
-          action: 'fs.write',
-        }),
-      }),
-    ]));
+    expect(firstTask.requirements?.find(requirement => requirement.id === 'browserResearch')).toMatchObject({ target: { factId: 'pageContent', freshness: 'current-run', action: 'browser.read' } });
+    expect(firstTask.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
+      target: { path: 'twlite.txt', mode: 'written', freshness: 'current-run', action: 'fs.write' },
+    });
 
     const combinedTask = await planner.createTask({
       threadId: 'combined-page-to-file-thread',
       userMessage: 'go to https://twlite.dev and save the content in a twlite.md file and open it via text viewer app',
     });
-    expect(combinedTask.requirements).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        id: 'outputFile',
-        target: expect.objectContaining({
-          path: 'twlite.md',
-          mode: 'written',
-          freshness: 'current-run',
-          action: 'fs.write',
-        }),
-      }),
-      expect.objectContaining({
-        id: 'openFile',
-        target: expect.objectContaining({
-          path: 'twlite.md',
-          content: 'twlite.md',
-          mode: 'opened',
-          freshness: 'current-run',
-          action: 'app.openFile',
-        }),
-      }),
-    ]));
+    expect(combinedTask.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
+      target: { path: 'twlite.md', mode: 'written-from-artifact', freshness: 'current-run', action: 'fs.write' },
+    });
+    expect(combinedTask.requirements?.find(requirement => requirement.id === 'openFile')).toMatchObject({
+      target: { path: 'twlite.md', content: 'twlite.md', mode: 'opened', freshness: 'current-run', action: 'app.openFile' },
+    });
 
     const dataRequest = "Fetch the exchange rate data from Nepal Rastra Bank's official forex website and save that data to forex.txt.";
     const dataTask = await planner.createTask({ threadId: 'forex-data-thread', userMessage: dataRequest });
-    expect(dataTask.requirements).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'browserResearch', target: { factId: 'pageContent' } }),
-      expect.objectContaining({
-        id: 'outputFile',
-        target: expect.objectContaining({
-          path: 'forex.txt',
-          mode: 'written',
-          freshness: 'current-run',
-          action: 'fs.write',
-        }),
-      }),
-    ]));
+    expect(dataTask.requirements?.find(requirement => requirement.id === 'browserResearch')).toMatchObject({ target: { factId: 'pageContent', action: 'browser.read', freshness: 'current-run' } });
+    expect(dataTask.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
+      dependsOn: ['browserResearch'],
+      target: { path: 'forex.txt', mode: 'written-from-artifact', freshness: 'current-run', action: 'fs.write' },
+    });
 
     const followUp = await planner.createTask({
       threadId: 'page-to-file-thread',
@@ -944,19 +920,10 @@ describe('LM Studio AI adapters', () => {
         },
       ],
     });
-    expect(followUp.requirements).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        id: 'openFile',
-        type: 'desktop',
-        target: expect.objectContaining({
-          path: 'twlite.txt',
-          content: 'twlite.txt',
-          mode: 'opened',
-          freshness: 'current-run',
-          action: 'app.openFile',
-        }),
-      }),
-    ]));
+    expect(followUp.requirements?.find(requirement => requirement.id === 'openFile')).toMatchObject({
+      type: 'desktop',
+      target: { path: 'twlite.txt', content: 'twlite.txt', mode: 'opened', freshness: 'current-run', action: 'app.openFile' },
+    });
   });
 
   it('does not inject queryless extraction when a legacy browser worker hands control back', async () => {

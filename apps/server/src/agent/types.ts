@@ -11,6 +11,7 @@ import type {
   Message,
   OrchestratorDecision,
   ProgressState,
+  RunDiagnostics,
   Run,
   RunStep,
   TaskState,
@@ -115,28 +116,32 @@ export interface WorkerProvider {
   execute(input: WorkerContext): Promise<WorkerResult>;
 }
 
-export interface RequestedToolEffect {
-  tool: string;
-  /** Number of successful calls to this tool needed for the requested result. */
-  count?: number;
-}
-
 export interface ActingAgentContext {
   userMessage: string;
+  task: TaskDefinition;
   conversation: readonly Message[];
   memories: readonly Memory[];
   toolDefinitions: readonly ToolDefinition[];
   executeTool(tool: string, input: Record<string, unknown>): Promise<ToolResult>;
   verifyCompletion(input: {
     response: string;
-    requiredEffects: readonly RequestedToolEffect[];
   }): Promise<ToolResult<VerificationResult>>;
+  reportBlocked(input: {
+    response: string;
+    requirementIds: readonly string[];
+  }): Promise<ToolResult<{ blocked: boolean }>>;
+  getRequirementSummary(): string;
+  getToolActionCount?: () => number;
+  onDiagnostics?: (diagnostics: RunDiagnostics) => Promise<void> | void;
   drainSteering?: () => Message[];
   /** Emits a brief user-facing progress summary, never private model reasoning. */
   onProgress?: (summary: string) => Promise<void> | void;
   onContextUsage?: (usage: ContextUsage) => Promise<void> | void;
   onContextCompacted?: (event: ContextCompactionEvent) => Promise<void> | void;
-  maxSteps: number;
+  /** Maximum external tool calls. This is independent from inference turns. */
+  maxToolActions: number;
+  maxModelTurns: number;
+  maxCompletionRecoveryTurns: number;
   maxRepeatedAction: number;
   maxConsecutiveFailures: number;
   signal?: AbortSignal;
@@ -145,6 +150,11 @@ export interface ActingAgentContext {
 export interface ActingAgentResult {
   response: string;
   verification: VerificationResult;
+  diagnostics: RunDiagnostics;
+  blocked?: {
+    response: string;
+    requirementIds: string[];
+  };
 }
 
 /** One coherent model conversation with native, runtime-validated Helm tools. */
@@ -220,6 +230,8 @@ export type AgentRuntimeEventSink = RuntimeEventSink;
 
 export interface RuntimeBudgets {
   maxSteps: number;
+  maxModelTurns: number;
+  maxCompletionRecoveryTurns: number;
   maxRepeatedAction: number;
   maxConsecutiveFailures: number;
   toolTimeoutMs: number;

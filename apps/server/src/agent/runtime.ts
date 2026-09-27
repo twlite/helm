@@ -1,4 +1,5 @@
 import type {
+  ActionReceipt,
   AgentDecision,
   AgentStep,
   AgentTurnContext,
@@ -8,12 +9,15 @@ import type {
   Message,
   OrchestratorDecision,
   Run,
+  RunDiagnostics,
   RunStep,
   TaskDefinition,
   ToolError,
   ToolResult,
+  TaskRequirement,
   VerificationResult,
 } from '@helm/shared';
+import { browserUrlsMatch, deriveBrowserReadQuery } from '@helm/shared';
 
 import { CriterionVerifierRegistry } from '../tools/criterion-verifier';
 import type { GuestTransport } from '../tools/guest-transport';
@@ -26,7 +30,6 @@ import {
   isSearchEngineUrl,
   isUnsupportedSearchEngineUrl,
 } from './browser-research';
-import { deriveBrowserReadQuery } from '@helm/shared';
 import { fingerprintAction, LoopDetector } from './fingerprint';
 import { DEFAULT_RUNTIME_BUDGETS, RunBudget, RunCancellation } from './limits';
 import { GuestObservationProvider } from './observation';
@@ -44,6 +47,9 @@ import {
   progressFingerprint,
   updateCompletedRequirements,
   updateProgress,
+  taskRequirementSummary,
+  requirementsForTask,
+  requiredActionForRequirement,
   verifyTaskState,
 } from './task-state';
 import type {
@@ -57,7 +63,6 @@ import type {
   RuntimeEvent,
   RuntimeEventSink,
   RuntimeRepository,
-  RequestedToolEffect,
   OrchestratorProvider,
   TaskPlanner,
   TaskCompiler,
@@ -88,9 +93,14 @@ function criterionKey(criterion: CompletionCriterion): string {
 
 type NavigationProvenance = 'user' | 'search-result' | 'page-link' | 'verified-memory' | 'duckduckgo-search' | 'navigation-result';
 
+interface UrlCapability {
+  provenance: NavigationProvenance;
+  semanticRef?: { ref: string; linkIndex?: number };
+}
+
 interface BrowserNavigationPolicy {
   request: string;
-  allowedUrls: Map<string, NavigationProvenance>;
+  allowedUrls: Map<string, UrlCapability>;
   attempted: boolean;
   forceDuckDuckGo: boolean;
 }
@@ -116,17 +126,17 @@ function createBrowserNavigationPolicy(input: {
   userMessage: string;
   conversation?: readonly Message[];
 }, memories: readonly Memory[]): BrowserNavigationPolicy {
-  const allowedUrls = new Map<string, NavigationProvenance>();
+  const allowedUrls = new Map<string, UrlCapability>();
   for (const message of input.conversation ?? []) {
     if (message.role !== 'user') continue;
     for (const url of explicitBrowserNavigationUrls(message.content)) {
       const key = navigationKey(url);
-      if (key) allowedUrls.set(key, 'user');
+      if (key) allowedUrls.set(key, { provenance: 'user' });
     }
   }
   for (const url of explicitBrowserNavigationUrls(input.userMessage)) {
     const key = navigationKey(url);
-    if (key) allowedUrls.set(key, 'user');
+    if (key) allowedUrls.set(key, { provenance: 'user' });
   }
   for (const memory of memories) {
     const hasVerifiedProvenance = Boolean(
@@ -138,7 +148,7 @@ function createBrowserNavigationPolicy(input: {
     for (const url of verifiedMemoryUrls) {
       if (!url) continue;
       const key = navigationKey(url);
-      if (key && !allowedUrls.has(key)) allowedUrls.set(key, 'verified-memory');
+      if (key && !allowedUrls.has(key)) allowedUrls.set(key, { provenance: 'verified-memory' });
     }
   }
   return { request: input.userMessage, allowedUrls, attempted: false, forceDuckDuckGo: false };
@@ -163,8 +173,8 @@ function prepareBrowserNavigation(
   }
   if (tool === 'browser.download' && typeof toolInput.url === 'string') {
     const key = navigationKey(toolInput.url);
-    const provenance = key ? policy.allowedUrls.get(key) : undefined;
-    if (!provenance) {
+    const capability = key ? policy.allowedUrls.get(key) : undefined;
+    if (!capability) {
       return {
         input: toolInput,
         error: {
@@ -176,7 +186,7 @@ function prepareBrowserNavigation(
         },
       };
     }
-    return { input: toolInput, provenance, requestedUrl: toolInput.url };
+    return { input: toolInput, provenance: capability.provenance, requestedUrl: toolInput.url };
   }
   if (tool !== 'browser.navigate' || typeof toolInput.url !== 'string') return { input: toolInput };
   const requestedUrl = toolInput.url.trim();
@@ -185,7 +195,7 @@ function prepareBrowserNavigation(
     const explicit = policy.allowedUrls.get(navigationKey(`https://${requestedUrl}`) ?? '');
     if (explicit) {
       policy.attempted = true;
-      return { input: { ...toolInput, url: `https://${requestedUrl}` }, provenance: explicit, requestedUrl };
+      return { input: { ...toolInput, url: `https://${requestedUrl}` }, provenance: explicit.provenance, requestedUrl };
     }
   }
   if (!parsed || !['http:', 'https:'].includes(parsed.protocol)) return { input: toolInput };
@@ -207,10 +217,24 @@ function prepareBrowserNavigation(
     const query = deriveBrowserReadQuery(policy.request) || policy.request;
     return { input: { ...toolInput, url: browserResearchSearchUrl(query) }, provenance: 'duckduckgo-search', requestedUrl };
   }
-  const provenance = policy.allowedUrls.get(parsed.href);
-  if (provenance) {
+  const capability = policy.allowedUrls.get(parsed.href);
+  if (capability?.semanticRef) {
+    return {
+      input: toolInput,
+      requestedUrl,
+      error: {
+        ok: false,
+        error: {
+          code: 'OBSERVED_DESTINATION_REQUIRES_REF',
+          message: `This destination was observed in a browser result. Use browser.open({ ref: "${capability.semanticRef.ref}"${capability.semanticRef.linkIndex === undefined ? '' : `, linkIndex: ${capability.semanticRef.linkIndex}`} }) so the guest resolves the exact observed href.`,
+          details: capability.semanticRef,
+        },
+      },
+    };
+  }
+  if (capability) {
     policy.attempted = true;
-    return { input: toolInput, provenance, requestedUrl };
+    return { input: toolInput, provenance: capability.provenance, requestedUrl };
   }
   if (!policy.attempted) {
     policy.attempted = true;
@@ -241,13 +265,17 @@ function rememberObservedBrowserUrls(
 ): void {
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return;
   const record = data as Record<string, unknown>;
-  const add = (value: unknown, provenance: NavigationProvenance): void => {
+  const add = (
+    value: unknown,
+    provenance: NavigationProvenance,
+    semanticRef?: UrlCapability['semanticRef'],
+  ): void => {
     if (typeof value !== 'string') return;
     const key = navigationKey(value);
     if (!key) return;
     const current = policy.allowedUrls.get(key);
-    if (!current || (current === 'page-link' && provenance === 'search-result')) {
-      policy.allowedUrls.set(key, provenance);
+    if (!current || (current.provenance === 'page-link' && provenance === 'search-result')) {
+      policy.allowedUrls.set(key, { provenance, ...(semanticRef ? { semanticRef } : {}) });
     }
   };
   if (tool === 'browser.navigate') add(record.url, 'navigation-result');
@@ -266,10 +294,12 @@ function rememberObservedBrowserUrls(
       if (typeof item !== 'object' || item === null) continue;
       const block = item as Record<string, unknown>;
       const provenance: NavigationProvenance = block.type === 'search_result' ? 'search-result' : 'page-link';
-      add(block.href, provenance);
+      add(block.href, provenance, typeof block.ref === 'string' ? { ref: block.ref } : undefined);
       if (Array.isArray(block.links)) {
-        for (const link of block.links) {
-          if (typeof link === 'object' && link !== null) add((link as Record<string, unknown>).href, 'page-link');
+        for (const [linkIndex, link] of block.links.entries()) {
+          if (typeof link === 'object' && link !== null) {
+            add((link as Record<string, unknown>).href, 'page-link', typeof block.ref === 'string' ? { ref: block.ref, linkIndex } : undefined);
+          }
         }
       }
     }
@@ -278,10 +308,13 @@ function rememberObservedBrowserUrls(
     for (const item of record.results) {
       if (typeof item !== 'object' || item === null) continue;
       const block = item as Record<string, unknown>;
-      add(block.href, block.type === 'search_result' ? 'search-result' : 'page-link');
+      const provenance: NavigationProvenance = block.type === 'search_result' ? 'search-result' : 'page-link';
+      add(block.href, provenance, typeof block.ref === 'string' ? { ref: block.ref } : undefined);
       if (Array.isArray(block.links)) {
-        for (const link of block.links) {
-          if (typeof link === 'object' && link !== null) add((link as Record<string, unknown>).href, 'page-link');
+        for (const [linkIndex, link] of block.links.entries()) {
+          if (typeof link === 'object' && link !== null) {
+            add((link as Record<string, unknown>).href, 'page-link', typeof block.ref === 'string' ? { ref: block.ref, linkIndex } : undefined);
+          }
         }
       }
     }
@@ -405,8 +438,8 @@ function invalidBrowserNavigationResult(
   };
 }
 
-function error(code: string, message: string): ToolError {
-  return { code, message };
+function error(code: string, message: string, details?: unknown): ToolError {
+  return { code, message, ...(details === undefined ? {} : { details }) };
 }
 
 function browserNavigationGuard(tool: string, input: Record<string, unknown>): ToolResult | undefined {
@@ -459,6 +492,141 @@ function actionEffectChanged(result: ToolResult): boolean {
     || (typeof effect.existsBefore === 'boolean' && typeof effect.existsAfter === 'boolean' && effect.existsBefore !== effect.existsAfter)
     || (effect.changed === true && effect.existsBefore === undefined && effect.existsAfter === undefined),
   );
+}
+
+function embeddedReceipt(result: ToolResult): ActionReceipt | undefined {
+  if (!result.evidence || typeof result.evidence !== 'object' || Array.isArray(result.evidence)) return undefined;
+  const receipt = (result.evidence as Record<string, unknown>).receipt;
+  return receipt && typeof receipt === 'object' && !Array.isArray(receipt)
+    ? receipt as ActionReceipt
+    : undefined;
+}
+
+function withRuntimeReceipt(
+  tool: string,
+  input: Record<string, unknown>,
+  result: ToolResult,
+  startedAt: string,
+  now: () => number,
+): ToolResult {
+  if (embeddedReceipt(result)) return result;
+  const data = result.data && typeof result.data === 'object' && !Array.isArray(result.data)
+    ? result.data as Record<string, unknown>
+    : undefined;
+  const path = typeof input.path === 'string' ? input.path : typeof data?.path === 'string' ? data.path : undefined;
+  const receipt: ActionReceipt = {
+    id: `receipt-${crypto.randomUUID()}`,
+    tool,
+    ok: result.ok,
+    effect: {
+      ...(path ? { path } : {}),
+      ...(typeof input.url === 'string' ? { requestedUrl: input.url } : {}),
+      ...(typeof data?.sha256 === 'string' ? { sha256: data.sha256 } : {}),
+      ...(tool === 'fs.write' && result.ok && typeof data?.sha256 === 'string' ? { writePerformed: true } : {}),
+      ...(tool === 'memory.remember' && result.ok ? { changed: data?.action !== 'already-present' } : {}),
+      ...(tool === 'memory.update' && result.ok ? { changed: data?.action === 'updated' } : {}),
+      ...(tool === 'memory.forget' && result.ok ? { changed: data?.deleted === true } : {}),
+    },
+    startedAt,
+    completedAt: new Date(now()).toISOString(),
+    ...(result.error ? { error: result.error } : {}),
+  };
+  const priorEvidence = result.evidence && typeof result.evidence === 'object' && !Array.isArray(result.evidence)
+    ? result.evidence as Record<string, unknown>
+    : result.evidence === undefined ? {} : { originalEvidence: result.evidence };
+  return { ...result, evidence: { ...priorEvidence, receipt } };
+}
+
+function normalizedTaskPath(value: string): string {
+  return value.replace(/\\/gu, '/').replace(/^(?:\.\/)+/u, '')
+    .replace(/^\/home\/helm\/workspace\//u, '')
+    .replace(/^~\/(?:workspace\/)?/u, '')
+    .replace(/\/$/u, '');
+}
+
+function requirementMatchesToolCall(
+  requirement: TaskRequirement,
+  tool: string,
+  input: Record<string, unknown>,
+): boolean {
+  if (requiredActionForRequirement(requirement) !== tool) return false;
+  const target = requirement.target;
+  if (target?.path && (typeof input.path !== 'string' || normalizedTaskPath(input.path) !== normalizedTaskPath(target.path))) return false;
+  const actualApplication = tool === 'app.openFile' && input.application === undefined
+    ? 'text-editor'
+    : input.application;
+  if (target?.application && actualApplication !== target.application) return false;
+  if (target?.url && (typeof input.url !== 'string' || !browserUrlsMatch(input.url, target.url))) return false;
+  return true;
+}
+
+function unsatisfiedActionPrerequisite(
+  state: ReturnType<typeof createTaskState>,
+  tool: string,
+  input: Record<string, unknown>,
+): ToolResult | undefined {
+  const requirement = requirementsForTask(state.task).find(candidate => (
+    candidate.target?.freshness === 'current-run'
+    && requirementMatchesToolCall(candidate, tool, input)
+    && (candidate.dependsOn ?? []).some(id => !state.completedRequirementIds.includes(id))
+  ));
+  if (!requirement) return undefined;
+  const prerequisiteId = (requirement.dependsOn ?? []).find(id => !state.completedRequirementIds.includes(id));
+  const prerequisite = requirementsForTask(state.task).find(candidate => candidate.id === prerequisiteId);
+  if (!prerequisiteId) return undefined;
+  return {
+    ok: false,
+    error: {
+      code: 'TASK_PREREQUISITE_NOT_SATISFIED',
+      message: `Cannot perform ${tool} for ${requirement.id} until prerequisite ${prerequisiteId} is satisfied.`,
+      details: {
+        requirement: requirement.id,
+        prerequisite: prerequisiteId,
+        ...(prerequisite && requiredActionForRequirement(prerequisite)
+          ? { requiredAction: requiredActionForRequirement(prerequisite) }
+          : {}),
+        ...(prerequisite?.target?.path ? { path: prerequisite.target.path } : requirement.target?.path ? { path: requirement.target.path } : {}),
+      },
+    },
+  };
+}
+
+function hasRelevantBlockerEvidence(
+  requirement: TaskRequirement,
+  state: ReturnType<typeof createTaskState>,
+): ActionReceipt | undefined {
+  const ignoredErrors = new Set([
+    'TASK_PREREQUISITE_NOT_SATISFIED',
+    'UNOBSERVED_NAVIGATION_URL',
+    'OBSERVED_DESTINATION_REQUIRES_REF',
+    'INVALID_BROWSER_NAVIGATION',
+    'INVALID_BROWSER_URL',
+    'INVALID_BROWSER_PROTOCOL',
+    'VERIFIED_URL_RECOVERY_REQUIRED',
+    'STALE_CONTENT_REF',
+  ]);
+  const expectedAction = requiredActionForRequirement(requirement);
+  for (const action of [...state.recentActions].reverse()) {
+    const receipt = embeddedReceipt(action.result) ?? action.receipt;
+    if (!receipt || receipt.ok !== false || ignoredErrors.has(receipt.error?.code ?? action.result.error?.code ?? '')) {
+      if (!(requirement.id === 'browserResearch' && action.tool === 'browser.read' && action.result.ok
+        && isRecord(action.result.data) && action.result.data.readable === false && receipt?.ok === true)) continue;
+    }
+    const isBrowserResearch = requirement.id === 'browserResearch' || requirement.target?.factId === 'pageContent';
+    if (isBrowserResearch && action.tool.startsWith('browser.')) return receipt;
+    if (action.tool !== expectedAction) continue;
+    if (requirement.target?.path && normalizedTaskPath(String(action.input.path ?? '')) !== normalizedTaskPath(requirement.target.path)) continue;
+    const actionApplication = action.tool === 'app.openFile' && action.input.application === undefined
+      ? 'text-editor'
+      : action.input.application;
+    if (requirement.target?.application && actionApplication !== requirement.target.application) continue;
+    return receipt;
+  }
+  return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function compactAgentValue(value: unknown, depth = 0): unknown {
@@ -595,15 +763,7 @@ export class AgentRuntime {
     // steering messages between tool turns without changing the persisted
     // thread or starting a second runtime against the same desktop.
     const conversation = [...(input.conversation ?? [])];
-    const task = input.task ?? (this.actingAgent
-      ? {
-        id: this.idFactory('task'),
-        threadId: input.threadId,
-        goal: input.userMessage,
-        originalRequest: input.userMessage,
-        criteria: [],
-      }
-      : await this.createTask(input, memories));
+    const task = input.task ?? await this.createTask(input, memories);
     const navigationPolicy = createBrowserNavigationPolicy(input, memories);
     if (this.actingAgent) return this.runWithActingAgent(input, task, memories, conversation, navigationPolicy);
     if (this.orchestrator && this.worker) {
@@ -1013,6 +1173,16 @@ export class AgentRuntime {
     const runId = input.runId ?? this.idFactory('run');
     this.activeRunId = runId;
     const startedAt = this.isoNow();
+    let state = createTaskState(task, this.now);
+    const diagnostics: RunDiagnostics = {
+      modelTurns: 0,
+      modelRequests: 0,
+      toolActions: 0,
+      completionAttempts: 0,
+      completionRejections: 0,
+      contextCompactions: 0,
+      lastUnsatisfiedRequirements: [],
+    };
     const run: Run = {
       id: runId,
       threadId: task.threadId,
@@ -1021,116 +1191,125 @@ export class AgentRuntime {
       status: 'pending',
       criteria: clone(task.criteria),
       task: clone(task),
+      state: clone(state),
+      diagnostics: clone(diagnostics),
       createdAt: startedAt,
     };
     const history: AgentStep[] = [];
     const steps: RunStep[] = [];
     const observations: EnvironmentObservation[] = [];
     const previousResults: ToolResult[] = [];
-    const successfulCalls = new Map<string, number>();
     const noProgress = new Map<string, { result: string; count: number }>();
-    let readablePageEvidence = false;
-    let browserContentRead = false;
-    let browserReadAttemptedWithoutContent = false;
-    const maxSteps = this.budgetOptions?.maxSteps ?? DEFAULT_RUNTIME_BUDGETS.maxSteps;
+    const maxToolActions = this.budgetOptions?.maxSteps ?? DEFAULT_RUNTIME_BUDGETS.maxSteps;
     const maxRepeatedAction = this.budgetOptions?.maxRepeatedAction ?? DEFAULT_RUNTIME_BUDGETS.maxRepeatedAction;
     const maxConsecutiveFailures = this.budgetOptions?.maxConsecutiveFailures ?? DEFAULT_RUNTIME_BUDGETS.maxConsecutiveFailures;
+    const maxModelTurns = this.budgetOptions?.maxModelTurns ?? DEFAULT_RUNTIME_BUDGETS.maxModelTurns;
+    const maxCompletionRecoveryTurns = this.budgetOptions?.maxCompletionRecoveryTurns ?? DEFAULT_RUNTIME_BUDGETS.maxCompletionRecoveryTurns;
+    const conversationalTask = task.isConversation === true
+      && task.criteria.length === 0
+      && (task.requirements?.length ?? 0) === 0;
     let actionCount = 0;
     let consecutiveFailures = 0;
+    let lastToolResult: ToolResult | undefined;
     let finalVerification: VerificationResult | undefined;
     let assistantResponse: string | undefined;
     let actionQueue: Promise<void> = Promise.resolve();
 
-    const executeToolNow = async (tool: string, toolInput: Record<string, unknown>): Promise<ToolResult> => {
-      toolInput = withDerivedBrowserReadQuery(tool, toolInput, task, input.userMessage);
+    const syncDiagnostics = (): void => {
+      diagnostics.toolActions = actionCount;
+      diagnostics.lastUnsatisfiedRequirements = taskRequirementSummary(state)
+        .split('\n')
+        .filter(line => /\[(?:pending|blocked)\]/u.test(line))
+        .map(line => line.trim());
+      run.diagnostics = clone(diagnostics);
+    };
+    const persistState = async (): Promise<void> => {
+      run.task = clone(state.task);
+      run.state = clone(state);
+      syncDiagnostics();
+      await this.persistRun(run);
+    };
+    const observeCurrent = async (result?: ToolResult): Promise<EnvironmentObservation> => {
+      const remaining = requirementsForTask(state.task)
+        .filter(requirement => !state.completedRequirementIds.includes(requirement.id))
+        .map(requirement => requirement.id);
+      const observation = await this.observationProvider.observe({
+        task: state.task,
+        completedCriteria: [...state.completedRequirementIds],
+        remainingCriteria: remaining,
+        ...(result ? { lastToolResult: result } : {}),
+        signal: cancellation.signal,
+      });
+      observations.push(clone(observation));
+      return observation;
+    };
+
+    const executeToolNow = async (toolName: string, modelInput: Record<string, unknown>): Promise<ToolResult> => {
       cancellation.throwIfCancelled();
+      const proposedInput = clone(modelInput);
+      const preparedInput = withDerivedBrowserReadQuery(toolName, clone(modelInput), task, input.userMessage);
       const stepIndex = actionCount;
       actionCount += 1;
-      const action: AgentDecision = { type: 'action', tool, input: clone(toolInput) };
-      const actionKey = fingerprintAction(tool, toolInput);
+      const action: AgentDecision = { type: 'action', tool: toolName, input: proposedInput };
+      const actionKey = fingerprintAction(toolName, preparedInput);
       const previousNoProgress = noProgress.get(actionKey);
       await this.emit('run.step.started', { stepIndex, action }, runId);
-      let result: ToolResult;
 
-      if (stepIndex >= maxSteps) {
-        result = { ok: false, error: { code: 'ACTION_BUDGET_EXCEEDED', message: `The run reached its ${maxSteps}-action budget.` } };
+      let result: ToolResult;
+      let navigation: PreparedNavigation | undefined;
+      let executionInput: Record<string, unknown> | undefined;
+      let toolWasInvoked = false;
+      const receiptStartedAt = this.isoNow();
+
+      if (stepIndex >= maxToolActions) {
+        result = { ok: false, error: { code: 'ACTION_BUDGET_EXCEEDED', message: 'The run reached its ' + maxToolActions + '-action budget.' } };
       } else if (previousNoProgress && previousNoProgress.count >= maxRepeatedAction) {
         result = { ok: false, error: { code: 'REPEATED_ACTION', message: 'This exact action has already repeated without a concrete state change. Choose another action or report the blocker.' } };
       } else if (consecutiveFailures >= maxConsecutiveFailures) {
-        result = { ok: false, error: { code: 'TOOL_FAILURE_BUDGET_EXCEEDED', message: `The run reached its ${maxConsecutiveFailures}-consecutive-failure bound.` } };
-      } else if (tool === 'fs.write' && !browserContentRead && (readablePageEvidence || browserReadAttemptedWithoutContent)) {
-        result = {
-          ok: false,
-          error: {
-            code: 'UNREAD_PAGE_CONTENT',
-            message: browserReadAttemptedWithoutContent
-              ? 'File write rejected because the page read returned no content. Recover with a readable region or broader document read before writing a page-derived artifact.'
-              : 'File write rejected because the snapshot or search showed readable page content that has not been read. Read the page or a relevant region before writing a page-derived artifact.',
-          },
-        };
+        result = { ok: false, error: { code: 'TOOL_FAILURE_BUDGET_EXCEEDED', message: 'The run reached its ' + maxConsecutiveFailures + '-consecutive-failure bound.' } };
+      } else if (conversationalTask) {
+        result = { ok: false, error: { code: 'TOOLS_NOT_REQUIRED', message: 'The compiled task is conversational and has no computer-use requirements. Answer the user directly.' } };
       } else {
-        const navigation = prepareBrowserNavigation(tool, toolInput, navigationPolicy);
-        const invalidNavigation = navigation.error ?? browserNavigationGuard(tool, navigation.input);
-        if (invalidNavigation) result = invalidNavigation;
-        else {
-          result = await this.tools.execute(tool, navigation.input, {
-            signal: cancellation.signal,
-            runId,
-            stepIndex,
-            previousResults: clone(previousResults.slice(-12)),
-            timeoutMs: this.budgetOptions?.toolTimeoutMs,
-          });
+        const prerequisiteFailure = unsatisfiedActionPrerequisite(state, toolName, preparedInput);
+        if (prerequisiteFailure) {
+          result = prerequisiteFailure;
+        } else {
+          navigation = prepareBrowserNavigation(toolName, preparedInput, navigationPolicy);
+          const invalidNavigation = navigation.error
+            ?? invalidBrowserNavigationResult(toolName, navigation.input, true, task)
+            ?? browserNavigationGuard(toolName, navigation.input);
+          if (invalidNavigation) {
+            result = invalidNavigation;
+          } else {
+            executionInput = clone(navigation.input);
+            toolWasInvoked = true;
+            result = await this.tools.execute(toolName, executionInput, {
+              signal: cancellation.signal,
+              runId,
+              stepIndex,
+              previousResults: clone(previousResults.slice(-12)),
+              timeoutMs: this.budgetOptions?.toolTimeoutMs,
+            });
+            if (toolName === 'browser.download') result = attachNavigationProvenance(result, navigation);
+            else if (toolName === 'browser.open') result = recordBrowserOpenOutcome(result);
+          }
         }
-        if (tool === 'browser.navigate') {
-          result = recordNavigationOutcome(result, navigation, navigationPolicy);
-        } else if (tool === 'browser.download') result = attachNavigationProvenance(result, navigation);
-        else if (tool === 'browser.open') result = recordBrowserOpenOutcome(result);
       }
 
-      rememberObservedBrowserUrls(tool, result.data, navigationPolicy);
+      if (toolWasInvoked) {
+        result = withRuntimeReceipt(toolName, executionInput ?? preparedInput, result, receiptStartedAt, this.now);
+      }
+      if (toolName === 'browser.navigate' && navigation) {
+        result = recordNavigationOutcome(result, navigation, navigationPolicy);
+      }
+      rememberObservedBrowserUrls(toolName, result.data, navigationPolicy);
       const compactResult = compactAgentToolResult(result);
-      const resultData = result.data && typeof result.data === 'object' && !Array.isArray(result.data)
-        ? result.data as Record<string, unknown>
-        : undefined;
-      if (tool === 'browser.navigate') {
-        readablePageEvidence = false;
-        browserContentRead = false;
-        browserReadAttemptedWithoutContent = false;
-      }
-      if (tool === 'browser.snapshot') {
-        const outline = Array.isArray(resultData?.outline) ? resultData.outline : [];
-        readablePageEvidence ||= outline.some(region => (
-          typeof region === 'object' && region !== null && typeof (region as Record<string, unknown>).preview === 'string'
-          && ((region as Record<string, unknown>).preview as string).trim().length > 0
-        ));
-      }
-      if (tool === 'browser.search' && resultData?.pageReadable === true) readablePageEvidence = true;
-      if (tool === 'browser.read') {
-        const sections = Array.isArray(resultData?.sections) ? resultData.sections : [];
-        const hasText = sections.some(section => (
-          typeof section === 'object' && section !== null && typeof (section as Record<string, unknown>).text === 'string'
-          && ((section as Record<string, unknown>).text as string).trim().length > 0
-        ));
-        const hasBlocks = Array.isArray(resultData?.blocks) && resultData.blocks.length > 0;
-        browserContentRead = result.ok && resultData?.readable === true && (hasText || hasBlocks);
-        browserReadAttemptedWithoutContent = !browserContentRead;
-        readablePageEvidence ||= resultData?.readable === true || browserReadAttemptedWithoutContent;
-      }
-      if (tool === 'browser.inspectRegion' && result.ok) {
-        const text = typeof resultData?.text === 'string' ? resultData.text.trim() : '';
-        const rows = Array.isArray(resultData?.rows) ? resultData.rows : [];
-        if (text.length > 0 || rows.length > 0) {
-          browserContentRead = true;
-          browserReadAttemptedWithoutContent = false;
-        }
-      }
-      if (result.ok) {
-        consecutiveFailures = 0;
-        successfulCalls.set(tool, (successfulCalls.get(tool) ?? 0) + 1);
-      } else {
-        consecutiveFailures += 1;
-      }
-      const resultFingerprint = fingerprintAction(tool, toolInput, undefined, {
+      lastToolResult = compactResult;
+
+      if (result.ok) consecutiveFailures = 0;
+      else consecutiveFailures += 1;
+
+      const resultFingerprint = fingerprintAction(toolName, preparedInput, undefined, {
         ok: compactResult.ok,
         data: compactResult.data,
         error: compactResult.error,
@@ -1146,85 +1325,176 @@ export class AgentRuntime {
         });
       }
       previousResults.push(compactResult);
+
+      const worker = toolName.startsWith('browser.') ? 'browser'
+        : toolName.startsWith('fs.') ? 'filesystem'
+          : toolName.startsWith('desktop.') || toolName.startsWith('app.') ? 'desktop' : 'system';
+      const workerAction = {
+        id: this.idFactory('action'),
+        tool: toolName,
+        input: executionInput ?? preparedInput,
+        result,
+        ...(embeddedReceipt(result) ? { receipt: embeddedReceipt(result) } : {}),
+      };
+      const normalizedWorkerResult: WorkerResult = {
+        status: result.ok ? 'completed' : 'failed',
+        worker,
+        objectiveId: 'acting-agent',
+        actions: [workerAction],
+        facts: observedFactsFromToolResult(result, this.now),
+        evidence: [],
+        artifacts: artifactsFromResult(result, this.now, workerAction),
+        blockers: [],
+        environmentChanged: actionEffectChanged(result),
+      };
+      const postObservation = await observeCurrent(compactResult);
+      state = mergeWorkerResult(state, normalizedWorkerResult, postObservation, this.now);
+      const verification = await verifyTaskState(task, state, this.guest, postObservation, this.verifier, compactResult);
+      state = updateCompletedRequirements(state, verification);
+      finalVerification = verification;
+      syncDiagnostics();
+      await persistState();
+
       await this.persistStep(steps, {
         runId,
         stepIndex,
         phase: 'act',
         decision: action,
-        toolName: tool,
-        toolInput: clone(toolInput),
+        toolName,
+        // toolInput is the input actually sent when tool execution began.
+        // The model proposal remains available in decision.input.
+        ...(executionInput ? { toolInput: clone(executionInput) } : {}),
         toolResult: compactResult,
+        observation: postObservation,
+        verification,
       });
-      history.push({ action: { tool, input: clone(toolInput) }, observation: compactResult });
-      await this.emit('run.step.completed', { stepIndex, action, toolResult: compactResult }, runId);
+      history.push({
+        action: { tool: toolName, input: proposedInput },
+        observation: compactResult,
+        verification,
+      });
+      await this.emit('run.verification', verification, runId);
+      const executedAction: AgentDecision = {
+        ...action,
+        input: clone(executionInput ?? preparedInput),
+      };
+      await this.emit('run.step.completed', {
+        stepIndex,
+        action: executedAction,
+        proposedInput,
+        effectiveInput: executionInput,
+        toolResult: compactResult,
+        verification,
+      }, runId);
       return compactResult;
     };
 
-    const executeTool = (tool: string, toolInput: Record<string, unknown>): Promise<ToolResult> => {
-      const queued = actionQueue.then(() => executeToolNow(tool, toolInput));
+    const executeTool = (toolName: string, toolInput: Record<string, unknown>): Promise<ToolResult> => {
+      const queued = actionQueue.then(() => executeToolNow(toolName, toolInput));
       actionQueue = queued.then(() => undefined, () => undefined);
       return queued;
     };
 
-    const verifyCompletion = async (candidate: {
-      response: string;
-      requiredEffects: readonly RequestedToolEffect[];
-    }): Promise<ToolResult<VerificationResult>> => {
-      // Native providers may return several tool calls in one assistant turn.
-      // Let sibling calls enter the serialized queue, then verify after they
-      // finish so a parallel completion cannot race a requested side effect.
+    const verifyCompletion = async (candidate: { response: string }): Promise<ToolResult<VerificationResult>> => {
       await Promise.resolve();
       await actionQueue;
-      const missing: Array<{ tool: string; required: number; observed: number }> = [];
-      for (const effect of candidate.requiredEffects) {
-        const required = effect.count ?? 1;
-        if (!Number.isInteger(required) || required < 1 || !this.tools.has(effect.tool)) {
+      const observation = observations.at(-1) ?? await observeCurrent(lastToolResult);
+      const verification = await verifyTaskState(task, state, this.guest, observation, this.verifier, lastToolResult);
+      state = updateCompletedRequirements(state, verification);
+      finalVerification = verification;
+      syncDiagnostics();
+      await persistState();
+      await this.emit('run.verification', verification, runId);
+      if (verification.complete) {
+        assistantResponse = candidate.response.trim();
+        return { ok: true, data: verification };
+      }
+
+      const unsatisfied = (verification.requirements ?? [])
+        .filter(check => check.requirement.mandatory && !check.passed)
+        .map(check => ({
+          id: check.requirement.id,
+          message: check.message,
+          dependsOn: check.requirement.dependsOn ?? [],
+        }));
+      const unsatisfiedCriteria = verification.criteria
+        .filter(check => !check.passed)
+        .map(check => ({ id: JSON.stringify(check.criterion), message: check.message }));
+      const details = { requirements: unsatisfied, criteria: unsatisfiedCriteria };
+      const summary = [
+        ...unsatisfied.map(item => item.id + ': ' + item.message),
+        ...unsatisfiedCriteria.map(item => item.id + ': ' + item.message),
+      ];
+      return {
+        ok: false,
+        error: {
+          code: 'UNSATISFIED_TASK_REQUIREMENTS',
+          message: 'Completion cannot be accepted yet:\n' + summary.map(item => '- ' + item).join('\n'),
+          details,
+        },
+      };
+    };
+
+    const reportBlocked = async (candidate: {
+      response: string;
+      requirementIds: readonly string[];
+    }): Promise<ToolResult<{ blocked: boolean }>> => {
+      await Promise.resolve();
+      await actionQueue;
+      const requestedIds = [...new Set(candidate.requirementIds)];
+      const requirements = requirementsForTask(state.task);
+      const evidence = new Map<string, ActionReceipt>();
+      for (const requirementId of requestedIds) {
+        const requirement = requirements.find(item => item.id === requirementId);
+        if (!requirement || !requirement.mandatory || state.completedRequirementIds.includes(requirementId)) {
           return {
             ok: false,
             error: {
-              code: 'INVALID_REQUIRED_EFFECT',
-              message: `Completion listed an unavailable or invalid tool effect: ${effect.tool}. Use only registered Helm tool names.`,
+              code: 'BLOCKER_NOT_VERIFIED',
+              message: 'Requirement ' + requirementId + ' is not a pending mandatory requirement.',
             },
           };
         }
-        const observed = successfulCalls.get(effect.tool) ?? 0;
-        if (observed < required) missing.push({ tool: effect.tool, required, observed });
+        const receipt = hasRelevantBlockerEvidence(requirement, state);
+        if (!receipt) {
+          return {
+            ok: false,
+            error: {
+              code: 'BLOCKER_NOT_VERIFIED',
+              message: 'No relevant failed tool receipt supports a blocker for ' + requirementId + '. Continue recovery or choose a different pending requirement.',
+            },
+          };
+        }
+        evidence.set(requirementId, receipt);
       }
-      if (missing.length > 0) {
-        return {
-          ok: false,
-          error: {
-            code: 'UNVERIFIED_SIDE_EFFECT',
-            message: 'Completion rejected because one or more requested tool effects have no successful receipt. Continue the work or report the concrete blocker.',
-            details: missing,
-          },
-        };
-      }
-      const writesFile = candidate.requiredEffects.some(effect => effect.tool === 'fs.write');
-      if (writesFile && readablePageEvidence && !browserContentRead) {
-        return {
-          ok: false,
-          error: {
-            code: 'UNREAD_PAGE_CONTENT',
-            message: browserReadAttemptedWithoutContent
-              ? 'Completion rejected because page reading returned no content. Recover with a readable region or broader document read before writing a page-derived artifact.'
-              : 'Completion rejected because the page showed readable content but no content read succeeded. Read the page or a relevant region before writing a page-derived artifact.',
-          },
-        };
-      }
-      const effectCount = candidate.requiredEffects.reduce((total, effect) => total + (effect.count ?? 1), 0);
-      const verification: VerificationResult = {
-        complete: true,
-        criteria: [],
-        requirements: [],
-        summary: effectCount === 0
-          ? 'No external tool effect was required for this response.'
-          : `Verified ${effectCount} requested tool effect${effectCount === 1 ? '' : 's'} from successful tool results.`,
-      };
-      finalVerification = verification;
+      state.blockers = [
+        ...state.blockers,
+        blocker(
+          'VERIFIED_REQUIREMENT_BLOCKER',
+          candidate.response.trim(),
+          requestedIds,
+          Object.fromEntries([...evidence].map(([requirementId, receipt]) => [requirementId, receipt.id])),
+        ),
+      ].slice(-12);
       assistantResponse = candidate.response.trim();
-      await this.emit('run.verification', verification, runId);
-      return { ok: true, data: verification };
+      await persistState();
+      await this.persistStep(steps, {
+        runId,
+        stepIndex: actionCount,
+        phase: 'blocked',
+        toolName: 'helm.blocked',
+        toolInput: { requirementIds: requestedIds },
+        toolResult: {
+          ok: true,
+          data: {
+            blocked: true,
+            requirements: requestedIds,
+            receiptIds: [...evidence.values()].map(receipt => receipt.id),
+          },
+        },
+        verification: finalVerification,
+      });
+      return { ok: true, data: { blocked: true } };
     };
 
     try {
@@ -1260,13 +1530,26 @@ export class AgentRuntime {
         }, runId);
       }
 
+      const initialObservation = await observeCurrent();
+      finalVerification = await verifyTaskState(task, state, this.guest, initialObservation, this.verifier);
+      state = updateCompletedRequirements(state, finalVerification);
+      await persistState();
+
       const agentResult = await this.actingAgent!.execute({
         userMessage: input.userMessage,
+        task: clone(state.task),
         conversation: clone(conversation),
         memories: clone(memories),
         toolDefinitions: this.tools.list(),
         executeTool,
         verifyCompletion,
+        reportBlocked,
+        getRequirementSummary: () => taskRequirementSummary(state),
+        getToolActionCount: () => actionCount,
+        onDiagnostics: async agentDiagnostics => {
+          Object.assign(diagnostics, agentDiagnostics, { toolActions: actionCount });
+          await persistState();
+        },
         onProgress: summary => this.emit('run.progress', {
           threadId: run.threadId,
           summary,
@@ -1290,25 +1573,44 @@ export class AgentRuntime {
           }, runId);
         },
         drainSteering: input.drainSteering,
-        maxSteps,
+        maxToolActions,
+        maxModelTurns,
+        maxCompletionRecoveryTurns,
         maxRepeatedAction,
         maxConsecutiveFailures,
         signal: cancellation.signal,
       });
       await actionQueue;
 
-      if (!agentResult.verification.complete || !assistantResponse) {
-        throw new Error('The acting model returned without a verified completion.');
+      Object.assign(diagnostics, agentResult.diagnostics, { toolActions: actionCount });
+      run.diagnostics = clone(diagnostics);
+      if (agentResult.blocked) {
+        finalVerification = agentResult.verification;
+        assistantResponse = agentResult.blocked.response;
+        await this.persistStep(steps, {
+          runId,
+          stepIndex: actionCount,
+          phase: 'blocked',
+          verification: finalVerification,
+        });
+        await this.block(run, error('TASK_BLOCKED', assistantResponse, {
+          requirementIds: agentResult.blocked.requirementIds,
+          evidence: state.blockers.at(-1)?.details,
+        }));
+      } else {
+        if (!agentResult.verification.complete || !assistantResponse) {
+          throw new Error('The acting model returned without a verified completion.');
+        }
+        finalVerification = agentResult.verification;
+        assistantResponse = agentResult.response;
+        await this.persistStep(steps, {
+          runId,
+          stepIndex: actionCount,
+          phase: 'complete',
+          verification: finalVerification,
+        });
+        await this.complete(run, finalVerification);
       }
-      finalVerification = agentResult.verification;
-      assistantResponse = agentResult.response;
-      await this.persistStep(steps, {
-        runId,
-        stepIndex: actionCount,
-        phase: 'complete',
-        verification: finalVerification,
-      });
-      await this.complete(run, finalVerification);
     } catch (caught) {
       await actionQueue;
       if (cancellation.cancelled || input.signal?.aborted) {
@@ -1329,7 +1631,14 @@ export class AgentRuntime {
             await this.fail(run, error('ACTING_AGENT_ERROR', errorMessage(completionError)));
           }
         } else {
-          await this.fail(run, error('ACTING_AGENT_ERROR', errorMessage(caught)));
+          const coded = isRecord(caught) && typeof caught.code === 'string'
+            ? caught as { code: string; message?: unknown; details?: unknown }
+            : undefined;
+          await this.fail(run, error(
+            coded?.code ?? 'ACTING_AGENT_ERROR',
+            typeof coded?.message === 'string' ? coded.message : errorMessage(caught),
+            coded?.details,
+          ));
         }
       }
     } finally {

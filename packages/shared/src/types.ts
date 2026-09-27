@@ -31,6 +31,11 @@ export type RequirementType =
 
 export type RequirementStatus = 'pending' | 'satisfied' | 'blocked';
 
+export type RequirementAction = GuestMethod
+  | 'memory.remember'
+  | 'memory.update'
+  | 'memory.forget';
+
 export type FactOrigin = 'user' | 'observed' | 'derived' | 'hypothesis';
 
 export type FactConfidence = 'user-provided' | 'observed' | 'derived' | 'hypothesis';
@@ -49,8 +54,9 @@ export interface RequirementTarget {
   mode?: 'exists' | 'non-empty' | 'contains-facts' | 'contains-text' | 'downloaded' | 'matches-fact'
     | 'written' | 'written-from-artifact' | 'created' | 'open' | 'opened';
   freshness?: 'current-run';
-  action?: 'fs.write' | 'fs.mkdir' | 'app.openFile';
+  action?: RequirementAction;
   factId?: string;
+  application?: string;
 }
 
 export interface TaskRequirement {
@@ -61,6 +67,8 @@ export interface TaskRequirement {
   status?: RequirementStatus;
   /** Targets are compiler-owned and are only populated from user text or observed state. */
   target?: RequirementTarget;
+  /** Requirements named here must be verified before this requirement's action can run. */
+  dependsOn?: string[];
   /** A legacy criterion may be retained as a deterministic compatibility check. */
   criterion?: CompletionCriterion;
 }
@@ -404,10 +412,21 @@ export interface Run {
   criteria: CompletionCriterion[];
   task?: TaskDefinition;
   state?: TaskState;
+  diagnostics?: RunDiagnostics;
   error?: ToolError;
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
+}
+
+export interface RunDiagnostics {
+  modelTurns: number;
+  modelRequests: number;
+  toolActions: number;
+  completionAttempts: number;
+  completionRejections: number;
+  contextCompactions: number;
+  lastUnsatisfiedRequirements: string[];
 }
 
 export interface RunStep {

@@ -213,6 +213,9 @@ function ActivityRowView({ row }: { row: ActivityRow }) {
   const compaction = row.toolName === 'context.compaction' ? contextCompactionDisplay(row.step.observation) : undefined;
   const searchInput = row.step.toolInput;
   const searchDisplay = searchResult ? browserSearchDisplay(searchResult, searchInput?.query) : undefined;
+  const proposedInput = row.step.decision?.type === 'action' ? row.step.decision.input : undefined;
+  const proposedInputDiffers = proposedInput !== undefined
+    && JSON.stringify(proposedInput) !== JSON.stringify(row.step.toolInput);
   const inspectionSummary = browserInspectionSummary(inspectedRegion);
   return (
     <Collapsible className="border-b border-[var(--border)] last:border-b-0" onOpenChange={setExpanded} open={expanded}>
@@ -228,7 +231,9 @@ function ActivityRowView({ row }: { row: ActivityRow }) {
           {row.worker ? <Detail label="Worker" value={row.worker} /> : null}
           {objective?.rationale ? <Detail label="Why this objective" value={objective.rationale} /> : null}
           {row.toolName ? <Detail label="Tool" value={row.toolName} /> : null}
-          {row.step.toolInput ? <Detail label="Input" value={displayValue(row.step.toolInput)} pre /> : null}
+          {row.step.toolInput ? <Detail label="Executed input" value={displayValue(row.step.toolInput)} pre /> : null}
+          {proposedInputDiffers ? <Detail label="Requested by model" value={displayValue(proposedInput)} pre /> : null}
+          {!row.step.toolInput && proposedInput ? <Detail label="Attempted input" value={displayValue(proposedInput)} pre /> : null}
           {row.toolName === 'browser.search' ? (
             <>
               <Detail label="Query" value={searchDisplay?.query ?? 'Page search'} />
@@ -298,6 +303,7 @@ export function RunActivityFeed({
         compactions: typeof compactionData.compactions === 'number' ? compactionData.compactions : 1,
       }
       : undefined);
+  const diagnostics = run.diagnostics;
   const latestVerification = [...run.steps]
     .sort((left, right) => right.stepIndex - left.stepIndex)
     .find((step) => step.verification)?.verification;
@@ -333,6 +339,11 @@ export function RunActivityFeed({
       {liveForRun?.reasoningSummary ? <p className="text-xs leading-5 text-[#929aa5]">{liveForRun.reasoningSummary}</p> : null}
       {contextUsage ? (
         <p className="text-[10px] text-[#606975]">{contextUsageLabel(contextUsage)}</p>
+      ) : null}
+      {diagnostics ? (
+        <p className="text-[10px] text-[#606975]">
+          {diagnostics.modelTurns} model turns · {diagnostics.toolActions} tool actions · {diagnostics.completionAttempts} completion checks · {diagnostics.contextCompactions} context compactions
+        </p>
       ) : null}
 
       {rows.length > 0 ? (
