@@ -131,6 +131,267 @@ export interface BrowserState {
 
 export type BrowserSnapshot = SharedBrowserSnapshot;
 
+export interface DuckDuckGoSearchRecord {
+  title: string;
+  href: string;
+  snippet: string;
+}
+
+export interface DuckDuckGoSearchInspection {
+  outcome: "results" | "challenge" | "no_results" | "parse_failed";
+  pageUrl: string;
+  isSearchPage: boolean;
+  bodyTextLength: number;
+  visibleAnchorCount: number;
+  outboundAnchorCount: number;
+  candidateCount: number;
+  resultCount: number;
+  extractionStrategy?: "result_cards" | "main_outbound_links";
+  challengeSignals: string[];
+  noResultsSignals: string[];
+  selectorMatchCounts: Record<string, number>;
+  results: DuckDuckGoSearchRecord[];
+}
+
+/** This callback is serialized by Playwright. Keep helpers local to the function. */
+export function extractDuckDuckGoSearchPage(
+  nodes: readonly unknown[],
+  rawOptions?: unknown,
+): DuckDuckGoSearchInspection {
+  const options = typeof rawOptions === "object" && rawOptions !== null
+    ? rawOptions as { pageUrl?: string; maxResults?: number }
+    : {};
+  const body = nodes[0];
+  const pageUrl = options.pageUrl ?? location.href;
+  const maxResults = Math.max(1, Math.min(20, Math.trunc(options.maxResults ?? 10)));
+  const empty = (outcome: DuckDuckGoSearchInspection["outcome"]): DuckDuckGoSearchInspection => ({
+    outcome,
+    pageUrl,
+    isSearchPage: false,
+    bodyTextLength: 0,
+    visibleAnchorCount: 0,
+    outboundAnchorCount: 0,
+    candidateCount: 0,
+    resultCount: 0,
+    challengeSignals: [],
+    noResultsSignals: [],
+    selectorMatchCounts: {},
+    results: [],
+  });
+  if (!(body instanceof HTMLElement)) return empty("parse_failed");
+
+  const clean = (value: string): string => value.replace(/\u00a0/gu, " ").replace(/\s+/gu, " ").trim();
+  const textOf = (element: HTMLElement): string => clean(element.innerText || element.textContent || "");
+  const visible = (element: HTMLElement): boolean => {
+    if (element.hidden || element.getAttribute("aria-hidden")?.toLowerCase() === "true") return false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none"
+      && style.visibility !== "hidden"
+      && style.visibility !== "collapse"
+      && rect.width > 0
+      && rect.height > 0;
+  };
+  const ancestorsOf = (element: HTMLElement): HTMLElement[] => {
+    const ancestors: HTMLElement[] = [];
+    let current: HTMLElement | null = element;
+    while (current) {
+      ancestors.push(current);
+      if (current === body) break;
+      current = current.parentElement;
+    }
+    return ancestors;
+  };
+  const selectorList = [
+    "article",
+    "[data-testid*=result i]",
+    "[data-test*=result i]",
+    "[id*=result i]",
+    "[class*=result i]",
+    "#links",
+    ".react-results--main",
+    ".result__a",
+    ".result-link",
+    "[data-testid*=mainline i]",
+    ".no-results",
+    "[data-testid*=no-results i]",
+    ".anomaly-modal__modal",
+    "[data-testid=anomaly-modal]",
+    "#challenge-form",
+  ];
+  const selectorMatchCounts = Object.fromEntries(selectorList.map(selector => [
+    selector,
+    (() => {
+      try { return body.querySelectorAll(selector).length; } catch { return 0; }
+    })(),
+  ]));
+  let parsedPageUrl: URL | undefined;
+  try { parsedPageUrl = new URL(pageUrl); } catch { /* reported as a parse failure below */ }
+  const hostname = parsedPageUrl?.hostname.toLowerCase() ?? "";
+  const isDuckDuckGoHost = hostname === "duckduckgo.com" || hostname.endsWith(".duckduckgo.com");
+  const query = (parsedPageUrl?.searchParams.get("q") ?? parsedPageUrl?.searchParams.get("query") ?? "").trim();
+  const hasQuery = query.length > 0;
+  const hasSearchControl = Array.from(body.querySelectorAll("form,input,[role=search]")).some(element => {
+    if (!(element instanceof HTMLElement) || !visible(element)) return false;
+    if (element.getAttribute("role") === "search") return true;
+    if (element.tagName === "INPUT") {
+      const input = element as HTMLInputElement;
+      return input.type === "search" || /^(?:q|query|search)$/iu.test(input.name);
+    }
+    if (element.tagName !== "FORM") return false;
+    return Boolean(element.querySelector("input[type=search],input[name=q],input[name=query],input[name=search]"));
+  });
+  const allAnchors = Array.from(body.querySelectorAll("a[href]")).filter((element): element is HTMLAnchorElement => (
+    element instanceof HTMLAnchorElement && visible(element)
+  ));
+  const parsedHref = (anchor: HTMLAnchorElement): URL | undefined => {
+    try {
+      const value = new URL(anchor.href);
+      return ["http:", "https:"].includes(value.protocol) ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const isDuckDuckGoRedirect = (url: URL): boolean => {
+    const isDdgHost = url.hostname.toLowerCase() === "duckduckgo.com"
+      || url.hostname.toLowerCase().endsWith(".duckduckgo.com");
+    return isDdgHost && url.pathname === "/l/" && Boolean(url.searchParams.get("uddg"));
+  };
+  const isDuckDuckGoInternal = (url: URL): boolean => {
+    const host = url.hostname.toLowerCase();
+    return host === "duckduckgo.com" || host.endsWith(".duckduckgo.com");
+  };
+  const isOutboundResultHref = (url: URL): boolean => !isDuckDuckGoInternal(url) || isDuckDuckGoRedirect(url);
+  const bodyText = textOf(body);
+  const challengeSignals: string[] = [];
+  if (Array.from(body.querySelectorAll('.anomaly-modal__modal,.anomaly-modal__mask,[data-testid="anomaly-modal"],#challenge-form,form[action*="anomaly.js" i]')).some(element => (
+    element instanceof HTMLElement && visible(element)
+  ))) challengeSignals.push("anomaly_modal");
+  if (/unfortunately,\s*bots use duckduckgo too|complete the following challenge|select all squares containing/iu.test(bodyText)) {
+    challengeSignals.push("challenge_text");
+  }
+  const challenge = challengeSignals.length > 0;
+  const noResultsSignals: string[] = [];
+  if (body.querySelector(".no-results,[data-testid*=no-results i],[data-test*=no-results i]")) {
+    noResultsSignals.push("no_results_container");
+  }
+  if (/no (?:web )?results (?:were )?found|did not find (?:any )?results|no results for/iu.test(bodyText)) {
+    noResultsSignals.push("no_results_text");
+  }
+  const isSearchPage = isDuckDuckGoHost && hasQuery && (hasSearchControl || selectorMatchCounts["#links"]! > 0
+    || selectorMatchCounts[".react-results--main"]! > 0 || selectorMatchCounts["[data-testid*=mainline i]"]! > 0);
+  const outboundAnchorCount = allAnchors.filter(anchor => {
+    const href = parsedHref(anchor);
+    return href !== undefined && isOutboundResultHref(href);
+  }).length;
+  const base: DuckDuckGoSearchInspection = {
+    outcome: "parse_failed",
+    pageUrl,
+    isSearchPage,
+    bodyTextLength: bodyText.length,
+    visibleAnchorCount: allAnchors.length,
+    outboundAnchorCount,
+    candidateCount: 0,
+    resultCount: 0,
+    challengeSignals,
+    noResultsSignals,
+    selectorMatchCounts,
+    results: [],
+  };
+  if (challenge) return { ...base, outcome: "challenge" };
+  if (!isSearchPage) return { ...base, challengeSignals: [...challengeSignals, "not_confirmed_search_page"] };
+  if (noResultsSignals.length > 0) return { ...base, outcome: "no_results" };
+
+  const resultAnchorSelector = [
+    "a.result__a",
+    "a.result-link",
+    "a[data-testid*=result i]",
+    "a[data-test*=result i]",
+    "[data-testid*=result i] a[href]",
+    "[data-test*=result i] a[href]",
+  ].join(",");
+  const hasResultMarker = (element: HTMLElement): boolean => {
+    const values = [
+      element.id,
+      element.getAttribute("data-testid") ?? "",
+      element.getAttribute("data-test") ?? "",
+      element.getAttribute("role") ?? "",
+      typeof element.className === "string" ? element.className : "",
+    ];
+    return values.some(value => value.split(/[\s]+/u).some(token => (
+      /^(?:result|result[-_](?:card|item|web|organic|title|snippet|link)|result__a|results_links|web[-_]result|organic[-_]result|search[-_]result)$/iu.test(token)
+    )));
+  };
+  const inChrome = (element: HTMLElement): boolean => ancestorsOf(element).some(parent => {
+    const role = parent.getAttribute("role");
+    return parent.tagName === "NAV" || parent.tagName === "FOOTER" || parent.tagName === "ASIDE"
+      || role === "navigation" || role === "contentinfo" || role === "complementary"
+      || (parent.tagName === "HEADER" && !ancestorsOf(parent).some(ancestor => ancestor !== parent && ancestor.tagName === "MAIN"));
+  });
+  const adContainer = (element: HTMLElement): boolean => ancestorsOf(element).some(parent => {
+    const identity = `${parent.id} ${typeof parent.className === "string" ? parent.className : ""} ${parent.getAttribute("data-testid") ?? ""}`;
+    return /(?:^|[\s_-])(?:ad|ads|sponsored|advertisement|promoted)(?:$|[\s_-])/iu.test(identity);
+  });
+  const cardFor = (anchor: HTMLAnchorElement): HTMLElement | undefined => ancestorsOf(anchor).find(element => (
+    element !== body && element !== anchor && hasResultMarker(element)
+  ));
+  const exactResultAnchors = new Set(Array.from(body.querySelectorAll(resultAnchorSelector)).filter((element): element is HTMLAnchorElement => (
+    element instanceof HTMLAnchorElement
+  )));
+  const directCandidates = allAnchors.filter(anchor => cardFor(anchor) !== undefined || exactResultAnchors.has(anchor));
+  const results = new Map<string, DuckDuckGoSearchRecord>();
+  const addAnchor = (anchor: HTMLAnchorElement, container?: HTMLElement): boolean => {
+    const title = textOf(anchor).slice(0, 400);
+    const href = parsedHref(anchor);
+    if (title.length < 4 || !href || !isOutboundResultHref(href) || inChrome(anchor) || adContainer(anchor)) return false;
+    if (/\.(?:css|gif|jpe?g|js|png|svg|webp|woff2?)(?:$|[?#])/iu.test(href.pathname)) return false;
+    const card = container ?? anchor.parentElement ?? anchor;
+    const snippetParts = Array.from(card.querySelectorAll("p,[class*=snippet i],[data-testid*=snippet i]"))
+      .filter((element): element is HTMLElement => element instanceof HTMLElement && visible(element))
+      .map(textOf)
+      .filter(Boolean);
+    const snippet = (snippetParts.join(" ") || textOf(card).replace(title, " ")).slice(0, 800);
+    if (!results.has(anchor.href)) results.set(anchor.href, { title, href: anchor.href, snippet });
+    return true;
+  };
+  let candidateCount = directCandidates.length;
+  for (const anchor of directCandidates) addAnchor(anchor, cardFor(anchor));
+  let extractionStrategy: DuckDuckGoSearchInspection["extractionStrategy"] = "result_cards";
+
+  if (results.size === 0) {
+    const resultRoot = Array.from(body.querySelectorAll(
+      ".react-results--main,#links,[data-testid*=mainline i],[role=main],main,.results",
+    )).find((element): element is HTMLElement => element instanceof HTMLElement && visible(element));
+    if (resultRoot) {
+      extractionStrategy = "main_outbound_links";
+      const fallbackAnchors = Array.from(resultRoot.querySelectorAll("a[href]")).filter((element): element is HTMLAnchorElement => (
+        element instanceof HTMLAnchorElement && visible(element) && cardFor(element) === undefined
+      ));
+      candidateCount += fallbackAnchors.length;
+      for (const anchor of fallbackAnchors) {
+        if (inChrome(anchor) || adContainer(anchor)) continue;
+        let container: HTMLElement = anchor.parentElement ?? anchor;
+        let current = container.parentElement;
+        while (current && current !== resultRoot && textOf(container).length <= textOf(anchor).length + 12) {
+          container = current;
+          current = current.parentElement;
+        }
+        addAnchor(anchor, container);
+      }
+    }
+  }
+
+  const selected = Array.from(results.values()).slice(0, maxResults);
+  return {
+    ...base,
+    outcome: selected.length > 0 ? "results" : "parse_failed",
+    candidateCount,
+    resultCount: selected.length,
+    ...(extractionStrategy ? { extractionStrategy } : {}),
+    results: selected,
+  };
+}
+
 const INTERACTIVE_SELECTOR =
   "button, input, textarea, select, a[href], summary, [role], [contenteditable='true']";
 const REGION_SELECTOR = [
@@ -147,6 +408,8 @@ const DEFAULT_BLOCK_PREVIEW_CHARS = 520;
 const DEFAULT_REGION_CHARS = 8_000;
 const DEFAULT_TABLE_ROWS = 50;
 const BROWSER_OPERATION_TIMEOUT_MS = 10_000;
+const DUCKDUCKGO_NAVIGATION_TIMEOUT_MS = 5_000;
+const DUCKDUCKGO_OPERATION_TIMEOUT_MS = 22_000;
 const BROWSER_CONTEXT_RESET_TIMEOUT_MS = 1_000;
 
 interface IndexedSemanticContent {
@@ -341,6 +604,8 @@ export class BrowserController {
   private referenceUrl = "";
   private lastDomMutationCount: number | undefined;
   private lastFrameMutationSignature: string | undefined;
+  private lastNavigationHttpStatus: number | undefined;
+  private webSearchReferenceIndex = 0;
   private references = new Map<string, BrowserReference>();
   private contentReferences = new Map<string, SerializableContentReference>();
   private readabilitySource = readabilityInjectionSource();
@@ -628,7 +893,7 @@ export class BrowserController {
       ...(input.offset === undefined ? {} : { offset: input.offset }),
       ...(input.limit === undefined ? {} : { limit: input.limit }),
     });
-    return this.readSemanticContent(input);
+    return this.readSemanticContent({ ...input, primaryStructured: true });
   }
 
   private async readSemanticContent(input: {
@@ -637,6 +902,7 @@ export class BrowserController {
     maxChars?: number;
     maxResults?: number;
     blockTypes?: BrowserContentBlock["type"][];
+    primaryStructured?: boolean;
   }, attempt = 0): Promise<BrowserReadResult> {
     const page = await this.ensurePage();
     await this.waitForReadableStability(page);
@@ -663,6 +929,16 @@ export class BrowserController {
         if (!block) return [];
         return [{ ...block, relevance: result.relevance }];
       });
+      if (input.primaryStructured && extracted.pageType === 'data_table'
+        && !selected.some(block => block.type === 'table')) {
+        const primaryTable = rankingBlocks
+          .filter(block => block.type === 'table' && !block.boilerplate)
+          .sort((left, right) => (right.importance ?? 0) - (left.importance ?? 0))[0];
+        if (primaryTable) {
+          selected = [primaryTable, ...selected.filter(block => block.ref !== primaryTable.ref)]
+            .slice(0, Math.max(1, Math.min(20, Math.trunc(input.maxResults ?? 10))));
+        }
+      }
     } else {
       const substantive = rankingBlocks.filter(block => !block.boilerplate);
       const boilerplate = rankingBlocks.filter(block => block.boilerplate);
@@ -842,6 +1118,17 @@ export class BrowserController {
     }, "browser.serializeContentRef");
   }
 
+  private registerContentReference(
+    block: BrowserContentBlock,
+    pageUrl: string,
+    referenceIndex: string,
+  ): BrowserContentBlock {
+    const ref = `c${this.referenceRevision}-${this.contentSessionId}-${referenceIndex}`;
+    block.ref = ref;
+    this.contentReferences.set(ref, { block, revision: this.referenceRevision, url: pageUrl });
+    return block;
+  }
+
   private async extractSemanticContent(page: PlaywrightPage, pageUrl: string): Promise<IndexedSemanticContent> {
     const frames = page.frames();
     const extracted: IndexedSemanticContent = {
@@ -917,11 +1204,7 @@ export class BrowserController {
     });
     extracted.blocks = unique;
     extracted.extractors = [...new Set(extracted.extractors)];
-    extracted.blocks.forEach((block, index) => {
-      const ref = `c${this.referenceRevision}-${this.contentSessionId}-${index + 1}`;
-      block.ref = ref;
-      this.contentReferences.set(ref, { block, revision: this.referenceRevision, url: pageUrl });
-    });
+    extracted.blocks.forEach((block, index) => this.registerContentReference(block, pageUrl, String(index + 1)));
     return extracted;
   }
 
@@ -1046,40 +1329,172 @@ export class BrowserController {
   }): Promise<BrowserWebSearchResult> {
     return this.withWatchdog(async () => {
       const requestedUrl = buildDuckDuckGoSearchUrl(input.query);
-      const navigation = await this.navigate({ url: requestedUrl, waitUntil: "domcontentloaded" });
-      const page = await this.readSemanticContent({
+      const encodedQuery = encodeURIComponent(input.query);
+      const strategies = [
+        { id: "rendered", url: requestedUrl },
+        { id: "html", url: `https://html.duckduckgo.com/html/?q=${encodedQuery}` },
+        { id: "lite", url: `https://lite.duckduckgo.com/lite/?q=${encodedQuery}` },
+      ] as const;
+      const attempts: Array<Record<string, unknown>> = [];
+      let sawChallenge = false;
+      let sawExplicitNoResults = false;
+      let navigationFailureCount = 0;
+
+      for (const strategy of strategies) {
+        let navigation: BrowserState;
+        try {
+          navigation = await this.navigate({
+            url: strategy.url,
+            waitUntil: "domcontentloaded",
+            timeoutMs: DUCKDUCKGO_NAVIGATION_TIMEOUT_MS,
+          });
+        } catch (error) {
+          navigationFailureCount += 1;
+          attempts.push({
+            strategy: strategy.id,
+            requestedUrl: strategy.url,
+            outcome: "navigation_failed",
+            ...(error instanceof GuestRpcError ? { errorCode: error.code } : {}),
+            error: error instanceof Error ? error.message.slice(0, 180) : "DuckDuckGo navigation failed.",
+          });
+          continue;
+        }
+
+        const page = await this.ensurePage();
+        let inspection: DuckDuckGoSearchInspection | undefined;
+        let revision = navigation.revision;
+        let observedUrl = page.url();
+        let title = navigation.title;
+        let stable = false;
+        for (let stabilityAttempt = 0; stabilityAttempt < 3; stabilityAttempt += 1) {
+          await this.waitForReadableStability(page);
+          const beforeRevision = await this.refreshDomRevision(page);
+          observedUrl = page.url();
+          title = await this.readTitle(page);
+          try {
+            inspection = await page.locator("body").evaluateAll(extractDuckDuckGoSearchPage, {
+              pageUrl: observedUrl,
+              maxResults: input.maxResults ?? 10,
+            });
+          } catch {
+            inspection = undefined;
+          }
+          const afterRevision = await this.refreshDomRevision(page);
+          if (inspection && beforeRevision === afterRevision && observedUrl === page.url()) {
+            revision = afterRevision;
+            stable = true;
+            break;
+          }
+        }
+        if (!stable || !inspection) {
+          attempts.push({
+            strategy: strategy.id,
+            requestedUrl: strategy.url,
+            finalUrl: page.url(),
+            outcome: "parse_failed",
+            diagnostic: "The page changed repeatedly or could not be inspected.",
+          });
+          continue;
+        }
+
+        attempts.push({
+          strategy: strategy.id,
+          requestedUrl: strategy.url,
+          finalUrl: observedUrl,
+          outcome: inspection.outcome,
+          title,
+          httpStatus: this.lastNavigationHttpStatus,
+          bodyTextLength: inspection.bodyTextLength,
+          visibleAnchorCount: inspection.visibleAnchorCount,
+          outboundAnchorCount: inspection.outboundAnchorCount,
+          candidateCount: inspection.candidateCount,
+          resultCount: inspection.resultCount,
+          ...(inspection.extractionStrategy ? { extractionStrategy: inspection.extractionStrategy } : {}),
+          challengeSignals: inspection.challengeSignals,
+          noResultsSignals: inspection.noResultsSignals,
+          selectorMatchCounts: inspection.selectorMatchCounts,
+        });
+
+        if (inspection.outcome === "challenge") {
+          sawChallenge = true;
+          continue;
+        }
+        if (inspection.outcome === "no_results") {
+          sawExplicitNoResults = true;
+          continue;
+        }
+        if (inspection.outcome !== "results") continue;
+
+        const blocks = inspection.results.map((result): BrowserContentBlock => {
+          const block: BrowserContentBlock = {
+            ref: "",
+            type: "search_result",
+            title: result.title,
+            href: result.href,
+            snippet: result.snippet,
+            text: [result.title, result.snippet].filter(Boolean).join("\n"),
+            source: { frameUrl: observedUrl, extractor: "dom" },
+            importance: 0.96,
+            boilerplate: false,
+            role: "search-result",
+          };
+          return this.registerContentReference(block, observedUrl, `s${++this.webSearchReferenceIndex}`);
+        });
+        const results = blocks.map(block => ({
+          ...this.summarizeContentBlock(block, DEFAULT_BLOCK_PREVIEW_CHARS),
+          type: "search_result" as const,
+          title: block.title!,
+          href: block.href!,
+        }));
+        return {
+          operation: "web_search",
+          searchEngine: "duckduckgo",
+          searchCompleted: true,
+          requestedUrl,
+          url: observedUrl,
+          title,
+          revision,
+          query: input.query,
+          semanticBlockCount: inspection.resultCount,
+          matchCount: results.length,
+          pageReadable: true,
+          message: `DuckDuckGo returned ${results.length} observed result${results.length === 1 ? "" : "s"}.`,
+          results,
+        };
+      }
+
+      const details = {
         query: input.query,
-        maxChars: 12_000,
-        maxResults: input.maxResults ?? 10,
-        blockTypes: ["search_result"],
-      });
-      const results = (page.blocks ?? []).flatMap(block => (
-        block.type === "search_result" && block.title && block.href
-          ? [{ ...block, type: "search_result" as const, title: block.title, href: block.href }]
-          : []
-      ));
-      if (results.length === 0) {
+        requestedUrl,
+        strategies: attempts,
+      };
+      if (sawChallenge) {
         throw new GuestRpcError(
-          "WEB_SEARCH_RESULTS_UNAVAILABLE",
-          "DuckDuckGo did not expose any result links on the loaded page. Inspect the browser page or try another query.",
+          "WEB_SEARCH_CHALLENGE",
+          "DuckDuckGo requested human verification across the bounded local search attempts.",
+          { details },
         );
       }
-      return {
-        operation: "web_search",
-        searchEngine: "duckduckgo",
-        searchCompleted: true,
-        requestedUrl,
-        url: navigation.url,
-        title: navigation.title,
-        revision: page.revision,
-        query: input.query,
-        semanticBlockCount: page.diagnostics?.blockCount ?? 0,
-        matchCount: results.length,
-        pageReadable: page.readable,
-        message: `DuckDuckGo returned ${results.length} observed result${results.length === 1 ? "" : "s"}.`,
-        results,
-      };
-    }, "browser.webSearch");
+      if (sawExplicitNoResults) {
+        throw new GuestRpcError(
+          "WEB_SEARCH_NO_RESULTS",
+          "DuckDuckGo loaded the search page and explicitly reported no results.",
+          { details },
+        );
+      }
+      if (navigationFailureCount === strategies.length) {
+        throw new GuestRpcError(
+          "WEB_SEARCH_NAVIGATION_FAILED",
+          "DuckDuckGo could not load a search page after the bounded local attempts.",
+          { details },
+        );
+      }
+      throw new GuestRpcError(
+        "WEB_SEARCH_PARSE_FAILED",
+        "DuckDuckGo loaded pages, but no trustworthy search result records could be extracted.",
+        { details },
+      );
+    }, "browser.webSearch", DUCKDUCKGO_OPERATION_TIMEOUT_MS);
   }
 
   async open(input: { ref: string; linkIndex?: number }): Promise<BrowserOpenResult> {
@@ -1747,7 +2162,15 @@ export class BrowserController {
     waitUntil: WaitUntil,
     timeoutMs: number,
   ): Promise<BrowserState> {
-    await page.goto(url, { waitUntil, timeout: timeoutMs });
+    this.lastNavigationHttpStatus = undefined;
+    const response = await page.goto(url, { waitUntil, timeout: timeoutMs });
+    if (typeof response === "object" && response !== null && "status" in response) {
+      const status = (response as { status?: unknown }).status;
+      if (typeof status === "function") {
+        const value = (status as () => unknown).call(response);
+        if (typeof value === "number" && Number.isFinite(value)) this.lastNavigationHttpStatus = value;
+      }
+    }
     this.loading = false;
     await this.readTitle(page);
     return this.getState();
@@ -1766,13 +2189,17 @@ export class BrowserController {
     ]);
   }
 
-  private async withWatchdog<T>(operation: () => Promise<T>, name: string): Promise<T> {
+  private async withWatchdog<T>(
+    operation: () => Promise<T>,
+    name: string,
+    timeoutMs = BROWSER_OPERATION_TIMEOUT_MS,
+  ): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
         operation(),
         new Promise<T>((_, reject) => {
-          timer = setTimeout(() => reject(new BrowserOperationTimeout(name)), BROWSER_OPERATION_TIMEOUT_MS);
+          timer = setTimeout(() => reject(new BrowserOperationTimeout(name)), timeoutMs);
         }),
       ]);
     } catch (error) {
@@ -1780,7 +2207,7 @@ export class BrowserController {
         await this.resetContext();
         throw new GuestRpcError(
           "BROWSER_OPERATION_TIMEOUT",
-          `${name} exceeded ${BROWSER_OPERATION_TIMEOUT_MS} ms; the browser context was reset.`,
+          `${name} exceeded ${timeoutMs} ms; the browser context was reset.`,
         );
       }
       throw error;

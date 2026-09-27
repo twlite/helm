@@ -11,9 +11,16 @@ describe('helm-guest RPC', () => {
   it('answers handshake requests and returns structured validation errors', async () => {
     const runtime = new GuestRuntime();
     try {
-      const handshake = await runtime.dispatch({ id: 'handshake-1', method: 'guest.handshake', params: {} });
+      const serverId = '00000000-0000-4000-8000-000000000001';
+      const handshake = await runtime.dispatch({ id: 'handshake-1', method: 'guest.handshake', params: { serverId } });
       expect(handshake.ok).toBe(true);
-      if (handshake.ok) expect(handshake.result).toMatchObject({ runtime: 'helm-guest', protocolVersion: 1 });
+      if (handshake.ok) expect(handshake.result).toMatchObject({
+        runtime: 'helm-guest',
+        protocolVersion: 2,
+        serverId,
+        buildId: expect.any(String),
+        protocolContractSha256: expect.any(String),
+      });
 
       const rejected = await runtime.dispatch({ id: 'bad-1', method: 'fs.write', params: { path: '/tmp/nope', content: 'x' } });
       expect(rejected.ok).toBe(false);
@@ -49,7 +56,7 @@ describe('helm-guest RPC', () => {
               const handshake = `${JSON.stringify({
                 id: 'tcp-1',
                 method: 'guest.handshake',
-                params: {},
+                params: { serverId: '00000000-0000-4000-8000-000000000001' },
               })}\n`;
               socket.write(handshake.slice(0, 7));
               socket.write(handshake.slice(7));
@@ -57,7 +64,11 @@ describe('helm-guest RPC', () => {
               socket.write([
                 JSON.stringify({ id: 'tcp-2', method: 'not-a-method', params: {} }),
                 '{"id":"invalid-json"',
-                JSON.stringify({ id: 'tcp-3', method: 'guest.handshake', params: {} }),
+                JSON.stringify({
+                  id: 'tcp-3',
+                  method: 'guest.handshake',
+                  params: { serverId: '00000000-0000-4000-8000-000000000001' },
+                }),
               ].join('\n') + '\n');
             },
             data(socket, data) {

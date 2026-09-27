@@ -44,7 +44,7 @@ export type GuestResponse<T = unknown> =
 export const GuestMethodContracts: Readonly<
   Record<GuestMethod, { description: string }>
 > = {
-  "guest.handshake": { description: "Report guest runtime readiness and methods." },
+  "guest.handshake": { description: "Report the loaded guest build identity, protocol contract, server ID, and methods." },
   "fs.read": { description: "Read UTF-8 text from the guest sandbox." },
   "fs.write": { description: "Write UTF-8 text inside the guest sandbox." },
   "fs.mkdir": { description: "Create a directory inside the guest sandbox." },

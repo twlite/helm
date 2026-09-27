@@ -95,6 +95,13 @@ the UI. `vm:stop` requests a graceful guest shutdown and waits for confirmed
 stopped state; use `vm:force-stop` only for emergency power-off. If the helper
 is already running headlessly, stop it before retrying with `--gui`.
 
+Guest readiness includes a build identity check. The host verifies the guest's
+embedded source build ID, protocol/tool contract, loaded bundle SHA-256, and
+server process ID against the local manifest before accepting RPCs. If a guest
+build changes while the VM is already running, stop and start the VM to load
+the new bundle. `vm:status`, `/api/health`, and `vm:doctor` show identity
+mismatches with expected and running values.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md)

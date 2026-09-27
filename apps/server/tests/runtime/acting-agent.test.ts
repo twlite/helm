@@ -262,6 +262,12 @@ describe('production acting agent requirements', () => {
         expect.objectContaining({ kind: 'instruction', source: 'user', content: 'Use https://www.nrb.org.np/forex/ for all forex requests about nepal.' }),
       ]));
       expect(result.run.diagnostics).toMatchObject({ completionRejections: 0 });
+      await guest.request('fs.write', { path: 'forex.txt', content: 'unrelated replacement' });
+      const afterOverwrite = await verifyTaskState(result.run.task!, result.run.state!, guest, {
+        timestamp: Date.now(),
+        task: { completedCriteria: [], remainingCriteria: ['outputFile'] },
+      });
+      expect(afterOverwrite.requirements?.find(check => check.requirement.id === 'outputFile')?.passed).toBe(false);
     } finally {
       persistence.close();
     }
@@ -596,6 +602,139 @@ describe('production acting agent requirements', () => {
     expect(result.steps.find(step => step.toolName === 'fs.write')?.toolResult)
       .toMatchObject({ ok: false, error: { code: 'DISK_FULL' } });
     expect(requests).toHaveLength(2);
+  });
+
+  it('classifies a DuckDuckGo challenge as a terminal search strategy without another search turn', async () => {
+    class ChallengedGuest extends MockGuestTransport {
+      override async request<M extends GuestMethod>(
+        method: M, params: GuestMethodParams[M], options?: GuestRequestOptions,
+      ): Promise<GuestMethodResult[M]> {
+        if (method === 'browser.webSearch') throw new GuestTransportError('WEB_SEARCH_CHALLENGE', 'DuckDuckGo presented a human challenge.');
+        return super.request(method, params, options);
+      }
+    }
+    const guest = new ChallengedGuest();
+    const requests: CapturedRequest[] = [];
+    const { runtime } = createRuntime(guest, [
+      toolReply('search-challenged', 'browser.webSearch', { query: 'Nepal Rastra Bank forex rates' }),
+      toolReply('search-blocked', 'helm.blocked', {
+        response: 'DuckDuckGo presented a human challenge, so I could not observe search results.',
+        requirementIds: ['browserSearch'],
+      }),
+    ], requests);
+    const result = await runtime.run({
+      threadId: 'challenge-search',
+      userMessage: 'Use DuckDuckGo search to find current exchange rates.',
+    });
+    expect(result.status).toBe('blocked');
+    expect(result.steps.filter(step => step.toolName === 'browser.webSearch')).toHaveLength(1);
+    expect(requestedTools(requests[1]!)).not.toContain('browser.webSearch');
+    expect(requestedTools(requests[1]!)).toContain('helm.blocked');
+    expect(result.run.error).toMatchObject({ code: 'TASK_BLOCKED' });
+  });
+
+  it('persists the exact forex memory and cleanly blocks the dependent flow on a live-style challenge', async () => {
+    class ChallengedGuest extends MockGuestTransport {
+      override async request<M extends GuestMethod>(
+        method: M, params: GuestMethodParams[M], options?: GuestRequestOptions,
+      ): Promise<GuestMethodResult[M]> {
+        if (method === 'browser.webSearch') throw new GuestTransportError('WEB_SEARCH_CHALLENGE', 'DuckDuckGo presented a human challenge.');
+        return super.request(method, params, options);
+      }
+    }
+    const persistence = testDatabase();
+    try {
+      const guest = new ChallengedGuest();
+      const memory = new MemoryService(persistence.sqlite);
+      const requests: CapturedRequest[] = [];
+      const { runtime, tools } = createRuntime(guest, [
+        toolReply('forex-challenged', 'browser.webSearch', { query: 'Nepal Rastra Bank forex rates' }),
+        toolReply('forex-search-blocked', 'helm.blocked', {
+          response: 'DuckDuckGo presented a human challenge, so I could not obtain observed results or save the forex data.',
+          requirementIds: ['browserSearch'],
+        }),
+      ], requests);
+      registerMemoryTools(tools, memory);
+      const result = await runtime.run({
+        threadId: 'forex-challenge',
+        userMessage: 'fetch the exchange rate data from nepal rastra bank\'s official forex website and save that data to forex.txt file and open it with text viewer application. Use duckduckgo search to find the relevant website. remember to use https://www.nrb.org.np/forex/ for all forex requests about nepal.',
+      });
+      expect(result.status).toBe('blocked');
+      expect(result.run.task?.requirements?.some(item => item.id.startsWith('browserDestination'))).toBe(false);
+      expect(result.run.state?.completedRequirementIds).toContain('memoryMutation');
+      expect(result.run.state?.completedRequirementIds).not.toContain('outputFile');
+      expect(result.run.state?.completedRequirementIds).not.toContain('openFile');
+      expect(result.run.diagnostics?.modelTurns).toBe(2);
+      expect(requestedTools(requests[1]!)).not.toContain('browser.webSearch');
+      await expect(memory.search('forex requests about nepal')).resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ content: 'Use https://www.nrb.org.np/forex/ for all forex requests about nepal.' }),
+      ]));
+    } finally {
+      persistence.close();
+    }
+  });
+
+  it('bounds a failed search strategy across changed query arguments', async () => {
+    class UnreachableSearchGuest extends MockGuestTransport {
+      override async request<M extends GuestMethod>(
+        method: M, params: GuestMethodParams[M], options?: GuestRequestOptions,
+      ): Promise<GuestMethodResult[M]> {
+        if (method === 'browser.webSearch') throw new GuestTransportError('BROWSER_TIMEOUT', 'DuckDuckGo could not load.');
+        return super.request(method, params, options);
+      }
+    }
+    const guest = new UnreachableSearchGuest();
+    const requests: CapturedRequest[] = [];
+    const { runtime } = createRuntime(guest, [
+      toolReply('search-failed-1', 'browser.webSearch', { query: 'Nepal Rastra Bank forex rates' }),
+      toolReply('search-failed-2', 'browser.webSearch', { query: 'NRB official forex' }),
+      toolReply('search-terminal', 'helm.blocked', {
+        response: 'DuckDuckGo could not load after bounded attempts.',
+        requirementIds: ['browserSearch'],
+      }),
+    ], requests);
+    const result = await runtime.run({
+      threadId: 'navigation-failed-search',
+      userMessage: 'Use DuckDuckGo search to find current exchange rates.',
+    });
+    expect(result.status).toBe('blocked');
+    expect(result.steps.filter(step => step.toolName === 'browser.webSearch')).toHaveLength(2);
+    expect(requestedTools(requests[2]!)).not.toContain('browser.webSearch');
+    expect(requestedTools(requests[2]!)).toContain('helm.blocked');
+    expect(result.run.diagnostics?.modelTurns).toBe(3);
+  });
+
+  it('does not accept an empty successful search response as discovery', async () => {
+    class EmptySearchGuest extends MockGuestTransport {
+      override async request<M extends GuestMethod>(
+        method: M, params: GuestMethodParams[M], options?: GuestRequestOptions,
+      ): Promise<GuestMethodResult[M]> {
+        if (method === 'browser.webSearch') {
+          const query = (params as GuestMethodParams['browser.webSearch']).query;
+          const url = buildDuckDuckGoSearchUrl(query);
+          return {
+            operation: 'web_search', searchEngine: 'duckduckgo', searchCompleted: true,
+            requestedUrl: url, url, title: 'DuckDuckGo', revision: 1, query,
+            semanticBlockCount: 0, matchCount: 0, pageReadable: true,
+            message: 'No result refs were observed.', results: [],
+          } as GuestMethodResult[M];
+        }
+        return super.request(method, params, options);
+      }
+    }
+    const requests: CapturedRequest[] = [];
+    const { runtime } = createRuntime(new EmptySearchGuest(), [
+      toolReply('empty-search', 'browser.webSearch', { query: 'current exchange rates' }),
+      toolReply('empty-search-blocker', 'helm.blocked', {
+        response: 'The browser returned no observed search result refs.',
+        requirementIds: ['browserSearch'],
+      }),
+    ], requests);
+    const result = await runtime.run({ threadId: 'empty-search', userMessage: 'Use DuckDuckGo search to find current exchange rates.' });
+    expect(result.status).toBe('blocked');
+    expect(result.steps.find(step => step.toolName === 'browser.webSearch')?.toolResult)
+      .toMatchObject({ ok: false, error: { code: 'WEB_SEARCH_PARSE_FAILED' } });
+    expect(requestedTools(requests[1]!)).not.toContain('browser.webSearch');
   });
 
   it('rejects cyclic dependency graphs before a task can run', () => {

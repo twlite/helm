@@ -130,10 +130,13 @@ Helm can relaunch it with the viewer enabled.
 VM boot and guest readiness are separate states. A successful native boot with
 an unavailable helm-guest leaves the VM running and reports
 VM is running, but helm-guest is not ready: ... in the API, CLI, and desktop
-panel. The backend keeps retrying guest readiness while the native VM remains
-running; Reconnect is still available after the guest service becomes ready.
-Do not treat a guest handshake or individual guest-RPC failure as a reason to
-power off the VM. The desktop preview uses a best-effort screenshot stream,
+panel. Transient transport failures are retried while the native VM remains
+running. Identity mismatches stop automatic retries and report the expected and
+running build IDs, protocol contract hashes, bundle hashes, and server ID. After
+rebuilding the guest, stop and start the VM so its launcher loads the new
+runtime. A mismatch remains visible until a new handshake succeeds. Do not
+treat an individual guest-RPC failure as a reason to power off the VM. The
+desktop preview uses a best-effort screenshot stream,
 with a heartbeat-backed browser event connection and automatic guest transport
 recovery. Stop and Restart are intentionally not exposed in the desktop panel;
 use `bun run vm:stop`, `bun run vm:reset`, or `bun run vm:start` from a terminal
@@ -296,8 +299,9 @@ shared runtime directory or guest filesystem tools for files.
 
 `guest/helm-guest` keeps the Playwright Node package external to the bundled
 runtime. The package and its browser binary must therefore be installed inside
-Ubuntu. `bun run guest:build` only rebuilds the guest RPC bundle; it does not
-download Chromium.
+Ubuntu. `bun run guest:build` builds the guest RPC bundle and writes a sidecar
+manifest with its embedded build ID and bundle SHA-256; it does not download
+Chromium or restart a guest process that is already running.
 
 Open a terminal in the Ubuntu VM and run the browser install as the `helm`
 user. Do not run the browser install as root, because Playwright will then put

@@ -24,12 +24,14 @@ describe('Apple VM integration', () => {
       const status = await vm.status();
       expect(status.state).toBe('running');
       expect(status.guestConnected).toBe(true);
+      const serverId = status.guestIdentity?.serverId;
+      if (!serverId) throw new Error('VM status omitted its stable server ID');
       const handshake = await vm.guestRequest<{
         runtime: string;
         protocolVersion: number;
-      }>('guest.handshake', {});
+      }>('guest.handshake', { serverId });
       expect(handshake.runtime).toBe('helm-guest');
-      expect(handshake.protocolVersion).toBe(1);
+      expect(handshake.protocolVersion).toBe(2);
     } finally {
       await vm.close();
     }

@@ -1,5 +1,29 @@
 import { z } from 'zod';
 import { normalizeBrowserUrl } from './browser-url';
+import { GUEST_PROTOCOL_VERSION } from './guest-identity';
+
+const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
+
+export const guestBuildManifestSchema = z.object({
+  manifestVersion: z.literal(1),
+  runtime: z.literal('helm-guest'),
+  buildId: sha256Schema,
+  protocolVersion: z.number().int().positive(),
+  protocolContractSha256: sha256Schema,
+  bundleSha256: sha256Schema,
+  bundleSizeBytes: z.number().int().nonnegative(),
+  bunVersion: z.string().min(1),
+}).strict();
+
+export const guestHandshakeResultSchema = z.object({
+  runtime: z.literal('helm-guest'),
+  protocolVersion: z.number().int().positive(),
+  buildId: z.string().min(1),
+  protocolContractSha256: z.string().min(1),
+  bundleSha256: sha256Schema.optional(),
+  serverId: z.string().uuid(),
+  methods: z.array(z.string().min(1)),
+}).passthrough();
 
 const pathSchema = z.string().min(1);
 const browserUrlSchema = z.string().min(1).refine(
@@ -33,7 +57,7 @@ export const completionCriterionSchema = z.discriminatedUnion('type', [
 
 const coordinateSchema = z.object({ x: z.number().finite(), y: z.number().finite() });
 export const guestMethodSchemas = {
-  'guest.handshake': z.object({}),
+  'guest.handshake': z.object({ serverId: z.string().uuid() }).strict(),
   'fs.read': z.object({ path: pathSchema }),
   'fs.write': z.object({
     path: pathSchema,
@@ -50,7 +74,7 @@ export const guestMethodSchemas = {
   'fs.mkdir': z.object({ path: pathSchema }),
   'fs.exists': z.object({ path: pathSchema }),
   'fs.list': z.object({ path: pathSchema }),
-  'fs.stat': z.object({ path: pathSchema }),
+  'fs.stat': z.object({ path: pathSchema, includeSha256: z.boolean().optional() }),
   'browser.navigate': z.object({ url: z.string().min(1) }),
   'browser.getState': z.object({}),
   'browser.snapshot': z.object({ maxRegions: z.number().int().min(1).max(100).optional() }),
@@ -112,6 +136,13 @@ export const guestMethodSchemas = {
   'desktop.click': coordinateSchema,
   'desktop.screenshot': z.object({}),
 } as const;
+
+export function guestProtocolContractJson(): string {
+  const methods = Object.entries(guestMethodSchemas)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([method, schema]) => ({ method, params: z.toJSONSchema(schema) }));
+  return JSON.stringify({ protocolVersion: GUEST_PROTOCOL_VERSION, methods });
+}
 
 export const guestRequestEnvelopeSchema = z.object({
   id: z.string().min(1),

@@ -1,5 +1,6 @@
 import { ApplicationController, isGuestApplication, type GuestApplication } from "./apps";
 import { BrowserController } from "./browser";
+import { GUEST_BUILD_IDENTITY, type GuestBuildIdentity } from "./build-info";
 import { GuestRpcError, asGuestRpcError, errorPayload } from "./errors";
 import { BunCommandExecutor, type CommandExecutor } from "./commands";
 import { DesktopController } from "./desktop";
@@ -27,6 +28,7 @@ export interface GuestRuntimeOptions {
   browser?: BrowserController;
   desktop?: DesktopController;
   commands?: CommandExecutor;
+  identity?: GuestBuildIdentity;
 }
 
 export interface GuestHealth {
@@ -41,8 +43,10 @@ export class GuestRuntime {
   readonly browser: BrowserController;
   readonly desktop: DesktopController;
   readonly apps: ApplicationController;
+  private readonly identity: GuestBuildIdentity;
 
   constructor(options: GuestRuntimeOptions = {}) {
+    this.identity = options.identity ?? GUEST_BUILD_IDENTITY;
     const commands = options.commands ?? new BunCommandExecutor();
     this.sandbox = options.sandbox ?? new GuestSandbox();
     this.browser =
@@ -94,7 +98,11 @@ export class GuestRuntime {
       case "guest.handshake":
         return {
           runtime: "helm-guest",
-          protocolVersion: 1,
+          protocolVersion: this.identity.protocolVersion,
+          buildId: this.identity.buildId,
+          protocolContractSha256: this.identity.protocolContractSha256,
+          ...(this.identity.bundleSha256 === undefined ? {} : { bundleSha256: this.identity.bundleSha256 }),
+          serverId: requiredString(params, "serverId", { maxLength: 64 }),
           methods: [...GUEST_METHODS],
           sandbox: {
             root: this.sandbox.rootPath,
@@ -130,7 +138,7 @@ export class GuestRuntime {
       case "fs.list":
         return this.sandbox.list(requiredString(params, "path", { maxLength: 16_384 }));
       case "fs.stat":
-        return this.sandbox.stat(requiredString(params, "path", { maxLength: 16_384 }));
+        return this.sandbox.stat(requiredString(params, "path", { maxLength: 16_384 }), params.includeSha256 === true);
       case "browser.navigate":
         return this.browser.navigate(
           (() => {

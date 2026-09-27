@@ -1,5 +1,6 @@
 import type {
   CompletionCriterion,
+  GuestRuntimeIdentityStatus,
   JsonObject,
   JsonValue,
   MessageRole,
@@ -457,12 +458,45 @@ function parseVmStatus(value: unknown): VmStatus {
     state,
     helperAvailable: asBoolean(input.helperAvailable ?? input.helper_available),
     guestConnected: asBoolean(input.guestConnected ?? input.guest_connected),
+    guestIdentity: parseGuestRuntimeIdentity(input.guestIdentity),
     uncleanShutdownDetected:
       typeof input.uncleanShutdownDetected === 'boolean'
         ? input.uncleanShutdownDetected
         : undefined,
     message: asOptionalString(input.message),
     screenshot: asOptionalString(input.screenshot),
+  };
+}
+
+export function parseGuestRuntimeIdentity(value: unknown): GuestRuntimeIdentityStatus | undefined {
+  if (!isRecord(value) || typeof value.serverId !== 'string') return undefined;
+  const state = value.state;
+  if (state !== 'unverified' && state !== 'verified' && state !== 'mismatch') return undefined;
+  const error = isRecord(value.error) && typeof value.error.code === 'string'
+    && typeof value.error.message === 'string'
+    ? {
+      code: value.error.code,
+      message: value.error.message,
+      ...(value.error.details === undefined ? {} : { details: value.error.details }),
+    }
+    : undefined;
+  return {
+    serverId: value.serverId,
+    state,
+    ...(typeof value.sourceVerified === 'boolean' ? { sourceVerified: value.sourceVerified } : {}),
+    ...(asOptionalString(value.expectedBuildId) ? { expectedBuildId: asOptionalString(value.expectedBuildId) } : {}),
+    ...(asOptionalString(value.runningBuildId) ? { runningBuildId: asOptionalString(value.runningBuildId) } : {}),
+    ...(asOptionalString(value.expectedBundleSha256) ? { expectedBundleSha256: asOptionalString(value.expectedBundleSha256) } : {}),
+    ...(asOptionalString(value.runningBundleSha256) ? { runningBundleSha256: asOptionalString(value.runningBundleSha256) } : {}),
+    ...(typeof value.expectedProtocolVersion === 'number' ? { expectedProtocolVersion: value.expectedProtocolVersion } : {}),
+    ...(typeof value.runningProtocolVersion === 'number' ? { runningProtocolVersion: value.runningProtocolVersion } : {}),
+    ...(asOptionalString(value.expectedProtocolContractSha256)
+      ? { expectedProtocolContractSha256: asOptionalString(value.expectedProtocolContractSha256) }
+      : {}),
+    ...(asOptionalString(value.runningProtocolContractSha256)
+      ? { runningProtocolContractSha256: asOptionalString(value.runningProtocolContractSha256) }
+      : {}),
+    ...(error ? { error } : {}),
   };
 }
 

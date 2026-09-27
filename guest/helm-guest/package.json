@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun run src/index.ts",
-    "build": "bun build src/index.ts --target=bun --bundle --external playwright --outfile=../../runtime/guest/helm-guest.js",
+    "build": "bun run ../../scripts/guest-build.ts",
     "check": "tsc --noEmit",
     "test": "bun test"
   },

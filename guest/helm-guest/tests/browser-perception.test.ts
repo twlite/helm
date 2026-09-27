@@ -4,14 +4,34 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { chromium } from 'playwright';
 
 import { GuestRpcError } from '../src/errors';
-import { BrowserController } from '../src/browser';
+import { BrowserController, extractDuckDuckGoSearchPage } from '../src/browser';
 import { GuestRuntime } from '../src/runtime';
 import { GuestSandbox } from '../src/sandbox';
 import { extractAccessibleCandidate } from '../src/semantic-extraction';
 
 describe('progressive browser perception', () => {
+  it('exposes a primary data table ref even when the query has no lexical overlap with its labels', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-primary-table-'));
+    const workspace = join(root, 'workspace');
+    const sandbox = new GuestSandbox({ root, workspace });
+    const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
+    try {
+      const file = await sandbox.write('workspace/data.html', `<!doctype html><html><body>
+        <nav><ul><li><a href="/statistics">Statistics</a></li><li><a href="/reports">Data & Reports</a></li></ul></nav>
+        <main><h1>Current figures</h1><table><tr><th>Currency</th><th>Buy</th><th>Sell</th></tr>
+        <tr><td>USD</td><td>133.20</td><td>134.10</td></tr></table></main></body></html>`);
+      await controller.navigate({ url: pathToFileURL(file.path).href });
+      const read = await controller.read({ query: 'exchange rate data' });
+      expect(read.pageType).toBe('data_table');
+      expect(read.blocks?.[0]).toMatchObject({ type: 'table', ref: expect.any(String) });
+    } finally {
+      await controller.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it('keeps snapshots bounded, finds late tables, extracts relevant passages, and rejects stale refs', async () => {
     const root = await mkdtemp(join(tmpdir(), 'helm-browser-perception-'));
     const workspace = join(root, 'workspace');
@@ -452,4 +472,100 @@ describe('progressive browser perception', () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 15_000);
+});
+
+describe('DuckDuckGo search extraction', () => {
+  it('classifies the sanitized live challenge page without promoting UI links to results', async () => {
+    const html = await readFile(new URL('./fixtures/ddg-live-challenge.html', import.meta.url), 'utf8');
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+      await page.setContent(html);
+      const result = await page.locator('body').evaluateAll(extractDuckDuckGoSearchPage as any, {
+        pageUrl: 'https://duckduckgo.com/?q=Nepal+Rastra+Bank+forex+rates',
+      });
+
+      expect(result).toMatchObject({
+        outcome: 'challenge',
+        isSearchPage: true,
+        resultCount: 0,
+      });
+      expect(result.challengeSignals).toContain('anomaly_modal');
+      expect(result.challengeSignals).toContain('challenge_text');
+      expect(result.visibleAnchorCount).toBeGreaterThan(0);
+      expect(result.results).toEqual([]);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it('extracts observed DDG result cards and preserves the exact redirect href', async () => {
+    const html = await readFile(new URL('./fixtures/search-results.html', import.meta.url), 'utf8');
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+      await page.setContent(html);
+      const result = await page.locator('body').evaluateAll(extractDuckDuckGoSearchPage as any, {
+        pageUrl: 'https://duckduckgo.com/?q=Nepal+Rastra+Bank+foreign+exchange+rate',
+        maxResults: 10,
+      });
+      const nrb = result.results.find((item: { title: string }) => item.title.includes('Nepal Rastra Bank'));
+
+      expect(result.outcome).toBe('results');
+      expect(result.extractionStrategy).toBe('result_cards');
+      expect(nrb?.href).toBe('https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.nrb.org.np%2Fforex');
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it('uses a constrained main-region outbound-link fallback and rejects page chrome', async () => {
+    const html = `<!doctype html><html><body>
+      <form role="search" action="https://duckduckgo.com/"><input name="q" type="search" value="official data"></form>
+      <nav><a href="https://duckduckgo.com/settings">Settings</a><a href="https://outside.example.test/nav">External navigation</a></nav>
+      <main><section><h2><a href="https://official.example.test/data">Official data source</a></h2>
+        <p>Observed source result with the requested public data.</p></section></main>
+      <footer><a href="https://outside.example.test/footer">Footer promo</a></footer>
+    </body></html>`;
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+      await page.setContent(html);
+      const result = await page.locator('body').evaluateAll(extractDuckDuckGoSearchPage as any, {
+        pageUrl: 'https://duckduckgo.com/?q=official+data',
+      });
+
+      expect(result.outcome).toBe('results');
+      expect(result.extractionStrategy).toBe('main_outbound_links');
+      expect(result.results).toHaveLength(1);
+      expect(result.results[0]).toMatchObject({
+        title: 'Official data source',
+        href: 'https://official.example.test/data',
+        snippet: expect.stringContaining('requested public data'),
+      });
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it('distinguishes explicit no-results pages from unrecognized markup', async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+      await page.setContent('<form role="search"><input name="q"></form><main><p>No results found for this search.</p></main>');
+      const noResults = await page.locator('body').evaluateAll(extractDuckDuckGoSearchPage as any, {
+        pageUrl: 'https://duckduckgo.com/?q=unmatched',
+      });
+      await page.setContent('<form role="search"><input name="q"></form><main><p>Unrecognized result page markup.</p></main>');
+      const parseFailure = await page.locator('body').evaluateAll(extractDuckDuckGoSearchPage as any, {
+        pageUrl: 'https://duckduckgo.com/?q=unknown',
+      });
+
+      expect(noResults.outcome).toBe('no_results');
+      expect(noResults.noResultsSignals).toContain('no_results_text');
+      expect(parseFailure.outcome).toBe('parse_failed');
+    } finally {
+      await browser.close();
+    }
+  });
 });

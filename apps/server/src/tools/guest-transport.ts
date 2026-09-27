@@ -7,18 +7,19 @@ import type {
   BrowserPageSearchResult,
   BrowserWebSearchResult,
   BrowserSnapshot,
+  GuestHandshakeResult,
   GuestMethod,
   WindowInfo,
 } from '@helm/shared';
 
 export type GuestMethodParams = {
-  'guest.handshake': Record<string, never>;
+  'guest.handshake': { serverId: string };
   'fs.read': { path: string };
   'fs.write': { path: string; content?: string; sourceRef?: string; format?: BrowserContentFormat };
   'fs.mkdir': { path: string };
   'fs.exists': { path: string };
   'fs.list': { path: string };
-  'fs.stat': { path: string };
+  'fs.stat': { path: string; includeSha256?: boolean };
   'browser.navigate': { url: string };
   'browser.getState': Record<string, never>;
   'browser.snapshot': { maxRegions?: number };
@@ -45,10 +46,7 @@ export type GuestMethodParams = {
 };
 
 export type GuestMethodResult = {
-  'guest.handshake': {
-    guestVersion: string;
-    capabilities: GuestMethod[];
-  };
+  'guest.handshake': GuestHandshakeResult;
   'fs.read': { path: string; content: string; size: number };
   'fs.write': {
     path: string;
@@ -71,6 +69,7 @@ export type GuestMethodResult = {
     exists: boolean;
     type: 'file' | 'directory' | 'other' | 'missing';
     size: number;
+    sha256?: string;
   };
   'browser.navigate': { url: string; title: string; loading: boolean; pageCount: number; revision: number };
   'browser.getState': {

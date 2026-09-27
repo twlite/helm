@@ -652,6 +652,7 @@ function artifactWriteFailure(
 function actionableToolsForState(
   state: ReturnType<typeof createTaskState>,
   availableTools: readonly string[],
+  exhaustedRequirements: ReadonlySet<string> = new Set(),
 ): string[] {
   const requirements = requirementsForTask(state.task);
   const completed = new Set(state.completedRequirementIds);
@@ -660,10 +661,21 @@ function actionableToolsForState(
     && requirement.target.freshness === 'current-run'
     && !completed.has(requirement.id)
     && (requirement.dependsOn ?? []).every(id => completed.has(id)));
-  if (pendingDuckDuckGo) return availableTools.includes('browser.webSearch') ? ['browser.webSearch'] : [];
   const actionable = requirements.filter(requirement => requirement.mandatory
     && !completed.has(requirement.id)
+    && !exhaustedRequirements.has(requirement.id)
     && (requirement.dependsOn ?? []).every(id => completed.has(id)));
+  if (pendingDuckDuckGo) {
+    // Discovery is a process constraint, but other independent requirements
+    // must remain executable if the search strategy fails.
+    const independent = actionable.filter(requirement => requirement.id !== pendingDuckDuckGo.id);
+    const names = independent.flatMap(requirement => {
+      const action = requiredActionForRequirement(requirement);
+      return action && !action.startsWith('browser.') && availableTools.includes(action) ? [action] : [];
+    });
+    return [...new Set([...names, ...(!exhaustedRequirements.has(pendingDuckDuckGo.id)
+      && availableTools.includes('browser.webSearch') ? ['browser.webSearch'] : [])])].sort();
+  }
   const explicitSearchCompleted = requirements.some(requirement => requirement.target?.action === 'browser.webSearch'
     && requirement.target.freshness === 'current-run'
     && completed.has(requirement.id));
@@ -1317,6 +1329,10 @@ export class AgentRuntime {
     const observations: EnvironmentObservation[] = [];
     const previousResults: ToolResult[] = [];
     const noProgress = new Map<string, { result: string; count: number }>();
+    // Strategy attempts belong to the compiled requirement, not a literal
+    // tool argument. Query changes cannot reset a failed discovery strategy.
+    const strategyAttempts = new Map<string, { count: number; lastFailureClass: string }>();
+    const exhaustedRequirements = new Set<string>();
     const maxToolActions = this.budgetOptions?.maxSteps ?? DEFAULT_RUNTIME_BUDGETS.maxSteps;
     const maxRepeatedAction = this.budgetOptions?.maxRepeatedAction ?? DEFAULT_RUNTIME_BUDGETS.maxRepeatedAction;
     const maxConsecutiveFailures = this.budgetOptions?.maxConsecutiveFailures ?? DEFAULT_RUNTIME_BUDGETS.maxConsecutiveFailures;
@@ -1413,6 +1429,24 @@ export class AgentRuntime {
               previousResults: clone(previousResults.slice(-12)),
               timeoutMs: this.budgetOptions?.toolTimeoutMs,
             });
+            if (toolName === 'browser.webSearch' && result.ok) {
+              const data = isRecord(result.data) ? result.data : undefined;
+              const observedResults = Array.isArray(data?.results) ? data.results : [];
+              if (typeof data?.url !== 'string' || !isSearchResultsUrl(data.url)
+                || observedResults.length === 0 || observedResults.some(item => {
+                const record = isRecord(item) ? item : undefined;
+                return record?.type !== 'search_result'
+                  || typeof record.ref !== 'string' || typeof record.href !== 'string';
+              })) {
+                result = {
+                  ok: false,
+                  error: {
+                    code: 'WEB_SEARCH_PARSE_FAILED',
+                    message: 'The browser search returned no valid observed result refs.',
+                  },
+                };
+              }
+            }
             if (toolName === 'browser.download') result = attachNavigationProvenance(result, navigation);
             else if (toolName === 'browser.open') result = recordBrowserOpenOutcome(result);
           }
@@ -1431,6 +1465,32 @@ export class AgentRuntime {
 
       if (result.ok) consecutiveFailures = 0;
       else consecutiveFailures += 1;
+
+      if (toolName === 'browser.webSearch') {
+        const searchRequirement = requirementsForTask(state.task).find(requirement =>
+          requirement.mandatory && requirement.target?.action === 'browser.webSearch'
+          && !state.completedRequirementIds.includes(requirement.id));
+        if (searchRequirement) {
+          if (result.ok) {
+            strategyAttempts.delete(searchRequirement.id);
+            exhaustedRequirements.delete(searchRequirement.id);
+          } else {
+            const failureClass = result.error?.code ?? 'UNKNOWN_SEARCH_FAILURE';
+            const previous = strategyAttempts.get(searchRequirement.id)?.count ?? 0;
+            const count = previous + 1;
+            strategyAttempts.set(searchRequirement.id, { count, lastFailureClass: failureClass });
+            // The browser macro has already exhausted its local DDG variants
+            // for these outcomes. Other failures get one bounded retry, even
+            // when the model changes the query text.
+            if (['WEB_SEARCH_CHALLENGE', 'WEB_SEARCH_NO_RESULTS', 'WEB_SEARCH_PARSE_FAILED',
+              'WEB_SEARCH_NAVIGATION_FAILED',
+              'WEB_SEARCH_RESULTS_UNAVAILABLE', 'TOOL_FAILURE_BUDGET_EXCEEDED'].includes(failureClass)
+              || count >= 2) {
+              exhaustedRequirements.add(searchRequirement.id);
+            }
+          }
+        }
+      }
 
       const resultFingerprint = fingerprintAction(toolName, preparedInput, undefined, {
         ok: compactResult.ok,
@@ -1740,7 +1800,7 @@ export class AgentRuntime {
         verifyCompletion,
         reportBlocked,
         getRequirementSummary: () => taskRequirementSummary(state),
-        getActionableTools: () => actionableToolsForState(state, this.tools.names()),
+        getActionableTools: () => actionableToolsForState(state, this.tools.names(), exhaustedRequirements),
         getBlockableRequirementIds: () => {
           const completed = new Set(state.completedRequirementIds);
           const actionable = requirementsForTask(state.task).filter(requirement => requirement.mandatory
@@ -1752,10 +1812,12 @@ export class AgentRuntime {
           // A transient failed action cannot end the run while a retry or an
           // independent requirement still has an executable path. Exhausted
           // action failure budgets and explicit resource failures are terminal.
-          return actionable.length > 0 && failures.every(Boolean)
-            && (terminalFailures || consecutiveFailures >= maxConsecutiveFailures)
-            ? actionable.map(requirement => requirement.id)
-            : [];
+          return actionable.filter(requirement => {
+            const receipt = hasRelevantBlockerEvidence(requirement, state);
+            return Boolean(receipt && (exhaustedRequirements.has(requirement.id)
+              || (terminalFailures && failures.every(Boolean))
+              || consecutiveFailures >= maxConsecutiveFailures));
+          }).map(requirement => requirement.id);
         },
         getToolActionCount: () => actionCount,
         onDiagnostics: async agentDiagnostics => {

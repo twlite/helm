@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { helmApi, parseError } from './api';
+import { helmApi, parseError, parseGuestRuntimeIdentity } from './api';
 import { Conversation, type ConversationNotice, type ConversationSendMode } from './components/Conversation';
 import { DesktopPanel } from './components/DesktopPanel';
 import { MemoryDialog } from './components/MemoryDialog';
@@ -112,6 +112,7 @@ function mergeVmStatus(payload: unknown, previous: VmStatus | null): VmStatus | 
     state,
     helperAvailable: typeof source.helperAvailable === 'boolean' ? source.helperAvailable : previous?.helperAvailable ?? false,
     guestConnected: typeof source.guestConnected === 'boolean' ? source.guestConnected : previous?.guestConnected ?? false,
+    guestIdentity: parseGuestRuntimeIdentity(source.guestIdentity) ?? previous?.guestIdentity,
     uncleanShutdownDetected: typeof source.uncleanShutdownDetected === 'boolean'
       ? source.uncleanShutdownDetected
       : previous?.uncleanShutdownDetected,

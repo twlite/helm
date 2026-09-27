@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { GuestRpcError } from "./errors";
 
 export interface SandboxOptions {
@@ -47,6 +48,7 @@ export interface FileStatResult {
   type: "file" | "directory" | "other" | "missing";
   size: number;
   modifiedAt?: string;
+  sha256?: string;
 }
 
 function pathIsWithin(root: string, candidate: string): boolean {
@@ -223,19 +225,26 @@ export class GuestSandbox {
     }
   }
 
-  async stat(inputPath: string): Promise<FileStatResult> {
+  async stat(inputPath: string, includeSha256 = false): Promise<FileStatResult> {
     const target = await this.lexicalPath(inputPath);
     await this.assertExistingParentInside(target);
     try {
       await this.assertExistingTargetInside(target);
       const metadata = await stat(target);
       const kind = classifyMode(metadata);
+      let sha256: string | undefined;
+      if (includeSha256 && kind === "file") {
+        const hash = createHash("sha256");
+        for await (const chunk of createReadStream(target)) hash.update(chunk);
+        sha256 = hash.digest("hex");
+      }
       return {
         path: target,
         exists: true,
         type: kind === "file" ? "file" : kind === "directory" ? "directory" : "other",
         size: metadata.size,
         modifiedAt: metadata.mtime.toISOString(),
+        ...(sha256 ? { sha256 } : {}),
       };
     } catch (error) {
       if (error instanceof GuestRpcError && error.code === "FILE_NOT_FOUND") {

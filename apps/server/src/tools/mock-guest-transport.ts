@@ -10,8 +10,14 @@ import type {
   GuestMethod,
   WindowInfo,
 } from '@helm/shared';
-import { buildDuckDuckGoSearchUrl, rankBrowserContentBlocks, type IndexedBrowserRegion } from '@helm/shared';
-import { guestMethodSchemas } from '@helm/shared';
+import {
+  buildDuckDuckGoSearchUrl,
+  GUEST_PROTOCOL_VERSION,
+  guestMethodSchemas,
+  guestProtocolContractJson,
+  rankBrowserContentBlocks,
+  type IndexedBrowserRegion,
+} from '@helm/shared';
 import type {
   GuestMethodParams,
   GuestMethodResult,
@@ -590,9 +596,14 @@ export class MockGuestTransport implements GuestTransport {
     switch (method) {
       case 'guest.handshake':
         return {
-          guestVersion: 'mock-1',
-          capabilities: Object.keys(guestMethodSchemas) as GuestMethod[],
-        } as unknown as GuestMethodResult[M];
+          runtime: 'helm-guest',
+          protocolVersion: GUEST_PROTOCOL_VERSION,
+          buildId: createHash('sha256').update('helm-mock-guest').digest('hex'),
+          protocolContractSha256: createHash('sha256').update(guestProtocolContractJson()).digest('hex'),
+          bundleSha256: createHash('sha256').update('helm-mock-guest-bundle').digest('hex'),
+          serverId: (params as GuestMethodParams['guest.handshake']).serverId,
+          methods: Object.keys(guestMethodSchemas),
+        } as GuestMethodResult[M];
       case 'fs.read': {
         const path = normalizeGuestPath((params as GuestMethodParams['fs.read']).path);
         const content = this.files.get(path);
@@ -675,6 +686,9 @@ export class MockGuestTransport implements GuestTransport {
             exists: true,
             type: 'file',
             size: content.length,
+            ...((params as GuestMethodParams['fs.stat']).includeSha256
+              ? { sha256: createHash('sha256').update(content, 'utf8').digest('hex') }
+              : {}),
           } as GuestMethodResult[M];
         }
         if (this.directories.has(path)) {

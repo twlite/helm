@@ -21,7 +21,7 @@ import type {
 
 import type { GuestTransport } from '../tools/guest-transport';
 import { CriterionVerifierRegistry } from '../tools/criterion-verifier';
-import { isSearchEngineUrl } from './browser-research';
+import { isSearchEngineUrl, isSearchResultsUrl } from './browser-research';
 import type { VerificationProvider } from './types';
 
 function json(value: unknown): string {
@@ -596,9 +596,14 @@ function successfulCurrentRunAction(
       || typeof data.query !== 'string'
       || typeof data.requestedUrl !== 'string'
       || typeof data.url !== 'string'
+      || !isSearchResultsUrl(data.url)
+      || (typeof receipt.effect?.urlAfter === 'string' && !browserUrlsMatch(data.url, receipt.effect.urlAfter))
       || !browserUrlsMatch(data.requestedUrl, buildDuckDuckGoSearchUrl(String(data.query)))
       || !Array.isArray(data.results)
-      || data.results.some(item => recordValue(item)?.type !== 'search_result' || typeof recordValue(item)?.href !== 'string')
+      || data.results.length === 0
+      || data.results.some(item => recordValue(item)?.type !== 'search_result'
+        || typeof recordValue(item)?.href !== 'string'
+        || typeof recordValue(item)?.ref !== 'string')
     )) continue;
     if (expectedTool === 'browser.read') {
       if (requirement.id === 'browserResearch' && !browserResearchAction(state)) continue;
@@ -872,7 +877,10 @@ async function requirementCheck(
     }
     if (!target.path) return { passed: false, message: `Requirement ${requirement.id} has no concrete path.` };
     try {
-      const stat = await guest.request('fs.stat', { path: target.path });
+      const stat = await guest.request('fs.stat', {
+        path: target.path,
+        ...(target.mode === 'written-from-artifact' ? { includeSha256: true } : {}),
+      });
       if (!stat.exists) return { passed: false, message: `Path does not exist: ${target.path}.`, evidence: stat };
       if (target.mode === 'written' || target.mode === 'written-from-artifact' || target.mode === 'created') {
         const lineageArtifact = target.mode === 'written-from-artifact' && currentAction?.data
@@ -892,6 +900,19 @@ async function requirementCheck(
             message: `The current-run write to ${target.path} has no matching browser-content artifact lineage.`,
             evidence: { action: currentAction, stat },
           };
+        }
+        if (target.mode === 'written-from-artifact') {
+          const latestWrite = [...state.recentActions].reverse().find(action => action.tool === 'fs.write'
+            && action.result.ok
+            && normalizedRequirementPath(String(action.input.path ?? '')) === normalizedRequirementPath(target.path!));
+          if (!latestWrite || latestWrite.id !== currentAction?.action.id
+            || !lineageArtifact?.sha256 || stat.sha256 !== lineageArtifact.sha256) {
+            return {
+              passed: false,
+              message: `The current file bytes or latest write no longer match the selected browser artifact at ${target.path}.`,
+              evidence: { action: currentAction, artifact: lineageArtifact, stat },
+            };
+          }
         }
         const passed = target.mode === 'created'
           ? stat.type === 'directory'

@@ -1,10 +1,26 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { guestResponseSchema } from '@helm/shared';
-import type { GuestMethod, GuestRequest, ToolError, VmStatus } from '@helm/shared';
+import { randomUUID } from 'node:crypto';
+import { guestHandshakeResultSchema, guestMethodSchemas, guestResponseSchema } from '@helm/shared';
+import type {
+  GuestBuildManifest,
+  GuestHandshakeResult,
+  GuestMethod,
+  GuestRequest,
+  GuestRuntimeIdentityStatus,
+  JsonValue,
+  ToolError,
+  VmStatus,
+} from '@helm/shared';
 import type { HelmConfig } from '../config';
 import { EventHub } from '../events';
 import { logger } from '../logger';
 import { virtualizationHelperAvailable } from './helper';
+import {
+  isGuestIdentityFailure,
+  readVerifiedGuestBuild,
+  type VerifiedGuestBuild,
+  GuestBuildIdentityError,
+} from './guest-build-identity';
 import { asToolError, type GuestTransport } from './transport';
 
 interface HostResponse {
@@ -32,6 +48,7 @@ export interface VmStartOptions {
 export interface VmControllerDependencies {
   helperAvailable?: boolean;
   spawn?: typeof spawn;
+  guestSourceRoot?: string;
   guestRetryAttempts?: number;
   guestRetryDelayMs?: number;
   hostCommandTimeoutMs?: number;
@@ -42,6 +59,16 @@ const DESKTOP_SCREENSHOT_POLL_INTERVAL_MS = 1_000;
 const GUEST_RECONNECT_INITIAL_DELAY_MS = 1_500;
 const GUEST_RECONNECT_MAX_DELAY_MS = 10_000;
 const VM_RUNNING_DISK_MUTATION_MESSAGE = 'VM is running. Shut it down before modifying disk images.';
+const SERVER_ID = randomUUID();
+
+function methodNamesMatch(actual: string[], expected: string[]): boolean {
+  return actual.length === expected.length
+    && [...actual].sort().every((method, index) => method === expected[index]);
+}
+
+function jsonValue(value: unknown): JsonValue {
+  return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
 
 function normalizeVmState(value: unknown, fallback: VmStatus['state']): VmStatus['state'] {
   switch (value) {
@@ -78,6 +105,13 @@ function screenshotImage(value: unknown): string | undefined {
 
 function structuredVmError(error: unknown): ToolError {
   if (error instanceof VmControllerError) {
+    return {
+      code: error.code,
+      message: error.message,
+      ...(error.details === undefined ? {} : { details: error.details }),
+    };
+  }
+  if (error instanceof GuestBuildIdentityError) {
     return {
       code: error.code,
       message: error.message,
@@ -135,11 +169,12 @@ export class VmController {
       VmControllerDependencies,
       'guestRetryAttempts' | 'guestRetryDelayMs' | 'hostCommandTimeoutMs' | 'childTerminationTimeoutMs'
     >
-  > & Pick<VmControllerDependencies, 'spawn'>;
+    > & Pick<VmControllerDependencies, 'spawn' | 'guestSourceRoot'>;
   private currentStatus: VmStatus = {
     state: 'stopped',
     helperAvailable: false,
     guestConnected: false,
+    guestIdentity: { serverId: SERVER_ID, state: 'unverified' },
   };
 
   constructor(
@@ -152,6 +187,7 @@ export class VmController {
       ?? virtualizationHelperAvailable(config.vmHelperPath);
     this.dependencies = {
       spawn: dependencies.spawn,
+      guestSourceRoot: dependencies.guestSourceRoot,
       guestRetryAttempts: dependencies.guestRetryAttempts ?? 20,
       guestRetryDelayMs: dependencies.guestRetryDelayMs ?? 500,
       hostCommandTimeoutMs: dependencies.hostCommandTimeoutMs ?? 30_000,
@@ -225,7 +261,7 @@ export class VmController {
         || ['running', 'starting', 'stopping'].includes(this.currentStatus.state);
       const vmStillRunning = mayStillBeRunning && await this.nativeVmIsRunning(mayStillBeRunning);
       if (vmStillRunning) {
-        const readinessFailure = guestReadinessAttempted || normalized.code === 'GUEST_NOT_READY';
+      const readinessFailure = guestReadinessAttempted || normalized.code === 'GUEST_NOT_READY';
         const message = readinessFailure
           ? 'VM is running, but helm-guest is not ready: ' + normalized.message
           : 'VM is running, but native VM startup reported an error: ' + normalized.message;
@@ -238,7 +274,9 @@ export class VmController {
         this.setStatus({ state: 'running', guestConnected: false, message });
         this.scheduleGuestReconnect();
         throw new VmControllerError(
-          readinessFailure ? 'GUEST_NOT_READY' : 'VM_BOOT_ERROR',
+          isGuestIdentityFailure(error)
+            ? normalized.code
+            : readinessFailure ? 'GUEST_NOT_READY' : 'VM_BOOT_ERROR',
           message,
           normalized.details,
         );
@@ -327,7 +365,9 @@ export class VmController {
         this.setStatus({ state: 'running', guestConnected: false, message });
         this.scheduleGuestReconnect();
         throw new VmControllerError(
-          readinessFailure ? 'GUEST_NOT_READY' : 'VM_BOOT_ERROR',
+          isGuestIdentityFailure(error)
+            ? normalized.code
+            : readinessFailure ? 'GUEST_NOT_READY' : 'VM_BOOT_ERROR',
           message,
           normalized.details,
         );
@@ -373,7 +413,10 @@ export class VmController {
       }
     }
     await this.guestTransport?.close();
-    this.setStatus({ state: 'stopped', guestConnected: false, screenshot: undefined, message: undefined });
+    this.setStatus({
+      state: 'stopped', guestConnected: false, screenshot: undefined, message: undefined,
+      guestIdentity: { serverId: SERVER_ID, state: 'unverified' },
+    });
     this.events.publish('guest.disconnected', { connected: false });
     // Release the native VM object and its disk attachment. A stopped helper
     // is still an owner of the VM working image until it exits.
@@ -401,7 +444,10 @@ export class VmController {
       }
     }
     await this.guestTransport?.close();
-    this.setStatus({ state: 'stopped', guestConnected: false, screenshot: undefined, message: undefined });
+    this.setStatus({
+      state: 'stopped', guestConnected: false, screenshot: undefined, message: undefined,
+      guestIdentity: { serverId: SERVER_ID, state: 'unverified' },
+    });
     this.events.publish('guest.disconnected', { connected: false });
     await this.terminateChild();
   }
@@ -436,10 +482,14 @@ export class VmController {
       throw error;
     }
     await this.guestTransport?.close();
-    this.setStatus({ state: 'stopped', guestConnected: false, screenshot: undefined, message: undefined });
+    this.setStatus({
+      state: 'stopped', guestConnected: false, screenshot: undefined, message: undefined,
+      guestIdentity: { serverId: SERVER_ID, state: 'unverified' },
+    });
   }
 
   async status(): Promise<VmStatus> {
+    this.refreshVerifiedGuestIdentity();
     if (this.child && this.currentStatus.helperAvailable) {
       try {
         const response = await this.sendHostCommand('vm.status', {});
@@ -458,7 +508,12 @@ export class VmController {
         // The cached status retains the last known state when the helper is unavailable.
       }
     }
-    return { ...this.currentStatus };
+    return {
+      ...this.currentStatus,
+      ...(this.currentStatus.guestIdentity
+        ? { guestIdentity: structuredClone(this.currentStatus.guestIdentity) }
+        : {}),
+    };
   }
 
   async guestRequest<T>(
@@ -468,6 +523,7 @@ export class VmController {
     behavior: GuestRequestBehavior = {},
   ): Promise<T> {
     this.assertAccepting('use the guest');
+    if (method !== 'guest.handshake') this.assertGuestIdentityCurrent();
     const request: GuestRequest = { id: `guest_${Date.now()}_${Math.random().toString(36).slice(2)}`, method, params };
     if (this.child) {
       try {
@@ -592,6 +648,7 @@ export class VmController {
       state: this.currentStatus.state,
       helperAvailable: this.currentStatus.helperAvailable,
       guestConnected: this.currentStatus.guestConnected,
+      ...(this.currentStatus.guestIdentity ? { guestIdentity: jsonValue(this.currentStatus.guestIdentity) } : {}),
       ...(this.currentStatus.uncleanShutdownDetected === undefined
         ? {}
         : { uncleanShutdownDetected: this.currentStatus.uncleanShutdownDetected }),
@@ -637,6 +694,7 @@ export class VmController {
     if (this.closing
       || !this.child
       || this.currentStatus.state !== 'running'
+      || this.currentStatus.guestIdentity?.state === 'mismatch'
       || (this.currentStatus.guestConnected && !force)
       || this.guestReconnectTimer !== undefined
       || this.guestReconnectInFlight) {
@@ -768,12 +826,16 @@ export class VmController {
       const stateWasKnownStopped = this.currentStatus.state === 'stopped'
         || this.currentStatus.state === 'unavailable';
       if (expected || stateWasKnownStopped) {
-        this.setStatus({ state: 'stopped', guestConnected: false });
+        this.setStatus({
+          state: 'stopped', guestConnected: false,
+          guestIdentity: { serverId: SERVER_ID, state: 'unverified' },
+        });
       } else {
         this.setStatus({
           state: 'error',
           guestConnected: false,
           message: 'helm-vm-host exited unexpectedly; VM state is unknown.',
+          guestIdentity: { serverId: SERVER_ID, state: 'unverified' },
         });
       }
       for (const pending of this.pending.values()) {
@@ -891,24 +953,216 @@ export class VmController {
   }
 
   private async connectGuestWithRetry(): Promise<void> {
+    const expected = this.readExpectedGuestBuild();
     let lastError: unknown;
     for (let attempt = 0; attempt < this.dependencies.guestRetryAttempts; attempt += 1) {
+      let attemptedHandshake: GuestHandshakeResult | undefined;
       try {
-        if (this.child) {
-          await this.guestRequest('guest.handshake', {});
-        } else if (this.guestTransport) {
+        if (!this.child && this.guestTransport) {
           await this.guestTransport.connect();
-        } else {
+        } else if (!this.child) {
           throw new VmControllerError('GUEST_TRANSPORT_MISSING', 'No guest transport is configured');
         }
+        attemptedHandshake = await this.guestRequest<GuestHandshakeResult>(
+          'guest.handshake',
+          { serverId: SERVER_ID },
+          undefined,
+          { preserveConnectionOnError: true, publishScreenshot: false },
+        );
+        this.verifyGuestHandshake(attemptedHandshake, expected);
+        this.setStatus({
+          guestIdentity: this.guestIdentityStatus(expected.manifest, attemptedHandshake, 'verified', undefined, expected.sourceVerified),
+        });
         this.setStatus({ guestConnected: true });
         return;
       } catch (error) {
+        if (isGuestIdentityFailure(error)) {
+          this.setStatus({
+            guestConnected: false,
+            message: error.message,
+            guestIdentity: this.guestIdentityStatus(expected.manifest, attemptedHandshake, 'mismatch', error, expected.sourceVerified),
+          });
+          throw error;
+        }
         lastError = error;
         await new Promise(resolve => setTimeout(resolve, this.dependencies.guestRetryDelayMs));
       }
     }
     throw lastError instanceof Error ? lastError : new Error('Guest did not become ready');
+  }
+
+  private readExpectedGuestBuild(): VerifiedGuestBuild {
+    try {
+      const expected = readVerifiedGuestBuild(this.config.runtimeDir, this.dependencies.guestSourceRoot);
+      this.setStatus({
+        guestIdentity: this.guestIdentityStatus(expected.manifest, undefined, 'unverified', undefined, expected.sourceVerified),
+      });
+      return expected;
+    } catch (error) {
+      if (isGuestIdentityFailure(error)) {
+        this.setStatus({
+          guestConnected: false,
+          message: error.message,
+          guestIdentity: this.guestIdentityStatus(undefined, undefined, 'mismatch', error),
+        });
+        throw error;
+      }
+      throw error;
+    }
+  }
+
+  private verifyGuestHandshake(raw: unknown, expected: VerifiedGuestBuild): void {
+    const parsed = guestHandshakeResultSchema.safeParse(raw);
+    if (!parsed.success) {
+      throw new GuestBuildIdentityError(
+        'GUEST_HANDSHAKE_INVALID',
+        'The running guest returned an incomplete build identity handshake.',
+        { issues: parsed.error.issues },
+      );
+    }
+    const actual = parsed.data;
+    const manifest = expected.manifest;
+    const expectedMethods = Object.keys(guestMethodSchemas).sort();
+    const methodContractMatches = methodNamesMatch(actual.methods, expectedMethods);
+
+    const fields = {
+      serverId: { expected: SERVER_ID, actual: actual.serverId },
+      buildId: { expected: manifest.buildId, actual: actual.buildId },
+      protocolVersion: { expected: manifest.protocolVersion, actual: actual.protocolVersion },
+      protocolContractSha256: {
+        expected: manifest.protocolContractSha256,
+        actual: actual.protocolContractSha256,
+      },
+      bundleSha256: { expected: manifest.bundleSha256, actual: actual.bundleSha256 },
+      methods: { expected: expectedMethods, actual: [...actual.methods].sort() },
+    };
+    const mismatches = Object.fromEntries(
+      Object.entries(fields).filter(([field, values]) => {
+        if (field === 'methods') return !methodContractMatches;
+        return values.expected !== values.actual;
+      }),
+    );
+    if (Object.keys(mismatches).length > 0) {
+      const code = !methodContractMatches
+        ? 'GUEST_TOOL_CONTRACT_MISMATCH'
+        : actual.serverId !== SERVER_ID
+          ? 'GUEST_SERVER_ID_MISMATCH'
+          : actual.protocolVersion !== manifest.protocolVersion
+            ? 'GUEST_PROTOCOL_VERSION_MISMATCH'
+            : actual.protocolContractSha256 !== manifest.protocolContractSha256
+              ? 'GUEST_PROTOCOL_CONTRACT_MISMATCH'
+              : 'GUEST_BUILD_IDENTITY_MISMATCH';
+      throw new GuestBuildIdentityError(
+        code,
+        'The running guest identity does not match the runtime bundle selected by this server. Stop and restart the VM after rebuilding the guest.',
+        { mismatches, expectedBundlePath: expected.bundlePath },
+      );
+    }
+  }
+
+  private guestIdentityStatus(
+    manifest: GuestBuildManifest | undefined,
+    actual: GuestHandshakeResult | undefined,
+    state: GuestRuntimeIdentityStatus['state'],
+    error?: GuestBuildIdentityError,
+    sourceVerified?: boolean,
+  ): GuestRuntimeIdentityStatus {
+    return {
+      serverId: SERVER_ID,
+      state,
+      ...(sourceVerified === undefined ? {} : { sourceVerified }),
+      ...(manifest ? {
+        expectedBuildId: manifest.buildId,
+        expectedBundleSha256: manifest.bundleSha256,
+        expectedProtocolVersion: manifest.protocolVersion,
+        expectedProtocolContractSha256: manifest.protocolContractSha256,
+      } : {}),
+      ...(actual ? {
+        runningBuildId: actual.buildId,
+        runningBundleSha256: actual.bundleSha256,
+        runningProtocolVersion: actual.protocolVersion,
+        runningProtocolContractSha256: actual.protocolContractSha256,
+      } : {}),
+      ...(error ? {
+        error: {
+          code: error.code,
+          message: error.message,
+          ...(error.details === undefined ? {} : { details: error.details }),
+        },
+      } : {}),
+    };
+  }
+
+  private refreshVerifiedGuestIdentity(): void {
+    const current = this.currentStatus.guestIdentity;
+    if (current?.state !== 'verified') return;
+    if (!current.runningBuildId
+      || !current.runningBundleSha256
+      || current.runningProtocolVersion === undefined
+      || !current.runningProtocolContractSha256
+      || !current.expectedBuildId
+      || !current.expectedBundleSha256
+      || current.expectedProtocolVersion === undefined
+      || !current.expectedProtocolContractSha256
+      || current.serverId !== SERVER_ID
+      || current.expectedBuildId !== current.runningBuildId
+      || current.expectedBundleSha256 !== current.runningBundleSha256
+      || current.expectedProtocolVersion !== current.runningProtocolVersion
+      || current.expectedProtocolContractSha256 !== current.runningProtocolContractSha256) {
+      const error = new GuestBuildIdentityError(
+        'GUEST_IDENTITY_INCOMPLETE',
+        'The cached guest identity is incomplete or internally inconsistent. Reconnect to verify the guest again.',
+      );
+      this.setStatus({
+        guestConnected: false,
+        message: error.message,
+        guestIdentity: this.guestIdentityStatus(undefined, undefined, 'mismatch', error),
+      });
+      return;
+    }
+    try {
+      const expected = readVerifiedGuestBuild(this.config.runtimeDir, this.dependencies.guestSourceRoot);
+      if (expected.manifest.buildId === current.runningBuildId
+        && expected.manifest.bundleSha256 === current.runningBundleSha256
+        && expected.manifest.protocolContractSha256 === current.runningProtocolContractSha256) {
+        return;
+      }
+      const error = new GuestBuildIdentityError(
+        'GUEST_RUNNING_BUILD_STALE',
+        'The running guest does not match the current guest bundle on disk. Stop and restart the VM to load the new bundle.',
+        {
+          runningBuildId: current.runningBuildId,
+          expectedBuildId: expected.manifest.buildId,
+          runningBundleSha256: current.runningBundleSha256,
+          expectedBundleSha256: expected.manifest.bundleSha256,
+        },
+      );
+      this.setStatus({
+        guestConnected: false,
+        message: error.message,
+        guestIdentity: this.guestIdentityStatus(expected.manifest, undefined, 'mismatch', error, expected.sourceVerified),
+      });
+    } catch (error) {
+      if (!isGuestIdentityFailure(error)) return;
+      this.setStatus({
+        guestConnected: false,
+        message: error.message,
+        guestIdentity: this.guestIdentityStatus(undefined, undefined, 'mismatch', error),
+      });
+    }
+  }
+
+  private assertGuestIdentityCurrent(): void {
+    if (this.currentStatus.guestIdentity?.state === 'verified') this.refreshVerifiedGuestIdentity();
+    if (this.currentStatus.guestIdentity?.state !== 'verified') {
+      const identity = this.currentStatus.guestIdentity;
+      throw new VmControllerError(
+        identity?.error?.code ?? 'GUEST_IDENTITY_UNVERIFIED',
+        identity?.error?.message ?? 'The running guest identity has not been verified.',
+        identity?.error?.details,
+        false,
+      );
+    }
   }
 }
 

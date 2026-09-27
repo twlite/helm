@@ -459,9 +459,29 @@ export interface VmStatus {
   state: 'stopped' | 'starting' | 'running' | 'stopping' | 'error' | 'unavailable';
   helperAvailable: boolean;
   guestConnected: boolean;
+  guestIdentity?: GuestRuntimeIdentityStatus;
   uncleanShutdownDetected?: boolean;
   message?: string;
   screenshot?: string;
+}
+
+export interface GuestRuntimeIdentityStatus {
+  serverId: string;
+  state: 'unverified' | 'verified' | 'mismatch';
+  sourceVerified?: boolean;
+  expectedBuildId?: string;
+  runningBuildId?: string;
+  expectedBundleSha256?: string;
+  runningBundleSha256?: string;
+  expectedProtocolVersion?: number;
+  runningProtocolVersion?: number;
+  expectedProtocolContractSha256?: string;
+  runningProtocolContractSha256?: string;
+  error?: {
+    code: string;
+    message: string;
+    details?: unknown;
+  };
 }
 
 export interface HealthStatus {

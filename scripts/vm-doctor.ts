@@ -2,6 +2,7 @@ import { statSync } from 'node:fs';
 import { arch, platform } from 'node:process';
 import { loadConfig } from '../apps/server/src/config';
 import { virtualizationHelperAvailable } from '../apps/server/src/vm/helper';
+import { readVerifiedGuestBuild } from '../apps/server/src/vm/guest-build-identity';
 
 type CheckStatus = 'OK' | 'WARN' | 'WAIT' | 'MISS';
 
@@ -94,6 +95,27 @@ add(
   guestRuntimeState === 'valid' ? 'OK' : 'WARN',
   guestRuntimeState === 'valid' ? guestRuntimePath : `build with bun run guest:build: ${guestRuntimePath}`,
 );
+
+try {
+  const verified = readVerifiedGuestBuild(config.runtimeDir);
+  add(
+    'guest runtime identity',
+    'OK',
+    `build ${verified.manifest.buildId}; bundle SHA-256 ${verified.actualBundleSha256}; ${verified.sourceVerified ? 'workspace source verified' : 'source tree unavailable; manifest and protocol verified'}`,
+  );
+} catch (error) {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as { code: unknown }).code)
+    : 'GUEST_IDENTITY_INVALID';
+  const message = error instanceof Error ? error.message : String(error);
+  const isMissing = code === 'GUEST_BUILD_MANIFEST_MISSING' || code === 'GUEST_BUNDLE_MISSING';
+  add(
+    'guest runtime identity',
+    isMissing ? 'WARN' : 'MISS',
+    `${code}: ${message}`,
+    !isMissing,
+  );
+}
 
 for (const check of checks) {
   console.log(`${check.status.padEnd(5)} ${check.label}: ${check.detail}`);

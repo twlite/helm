@@ -10,7 +10,7 @@ import type {
 import { ToolRegistry, type ToolRegistryOptions } from './tool-registry';
 
 const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
-  'guest.handshake': 'Check the guest protocol and capabilities.',
+  'guest.handshake': 'Check the loaded guest build identity, protocol contract, server process ID, and capabilities.',
   'fs.read': 'Read a UTF-8 file inside the allowed guest filesystem root.',
   'fs.write': 'Write a UTF-8 file inside the allowed guest filesystem root. Use content for new text or sourceRef plus a format to serialize the complete stored browser artifact. A successful write is a current-run action even when the bytes are unchanged.',
   'fs.mkdir': 'Create a directory inside the allowed guest filesystem root.',

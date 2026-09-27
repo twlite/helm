@@ -374,6 +374,35 @@ describe('LM Studio AI adapters', () => {
     expect(JSON.stringify(task)).not.toContain('invented content');
   });
 
+  it('filters a planner-proposed destination when the URL is only a memory value', async () => {
+    const provider = createOpenAICompatible({
+      name: 'lmstudio', baseURL: 'http://localhost:1234/v1', supportsStructuredOutputs: true,
+      fetch: async () => Response.json({
+        id: 'chatcmpl-memory-url-criterion', object: 'chat.completion', created: 1,
+        model: 'google/gemma-4-e2b',
+        choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify({
+          mode: 'task', goal: 'Fetch the official forex data.',
+          criteria: [{ type: 'browser.url', url: 'https://www.nrb.org.np/forex/' }],
+        }) }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    });
+    const planner = new AiSdkTaskPlanner({
+      model: provider.chatModel('google/gemma-4-e2b'), maxOutputTokens: 128,
+      temperature: 0, requestTimeoutMs: 1000, structuredOutputCompatibility: 'lmstudio-mlx',
+    });
+    const task = await planner.createTask({
+      threadId: 'planner-memory-url',
+      userMessage: 'fetch the exchange rate data from nepal rastra bank\'s official forex website and save that data to forex.txt file and open it with text viewer application. Use duckduckgo search to find the relevant website. remember to use https://www.nrb.org.np/forex/ for all forex requests about nepal.',
+    });
+    expect(task.criteria).not.toContainEqual({ type: 'browser.url', url: 'https://www.nrb.org.np/forex/' });
+    expect(task.requirements?.some(item => item.id.startsWith('browserDestination'))).toBe(false);
+    expect(task.requirements?.find(item => item.id === 'browserSearch')).toMatchObject({ target: { action: 'browser.webSearch' } });
+    expect(task.requirements?.find(item => item.id === 'memoryMutation')).toMatchObject({
+      target: { memoryContent: 'Use https://www.nrb.org.np/forex/ for all forex requests about nepal.' },
+    });
+  });
+
   it('routes current public web questions to browser research instead of accepting a conversational refusal', async () => {
     let requestBody: Record<string, unknown> | undefined;
     const provider = createOpenAICompatible({
