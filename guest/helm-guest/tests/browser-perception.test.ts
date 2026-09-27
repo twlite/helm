@@ -83,19 +83,19 @@ describe('progressive browser perception', () => {
       expect(JSON.stringify(snapshot)).not.toContain('Unrelated article paragraph 179');
       expect(JSON.stringify(snapshot).length).toBeLessThan(30_000);
 
-      const search = await controller.search({ query: 'foreign exchange currency buying selling rates', maxResults: 5 });
+      const search = await controller.findPage({ query: 'foreign exchange currency buying selling rates', maxResults: 5 });
       expect(search.results[0]).toMatchObject({ type: 'table', rowCount: 2, columnCount: 4 });
-      expect(search).toMatchObject({ operation: 'search', searchCompleted: true, pageReadable: true });
+      expect(search).toMatchObject({ operation: 'find_page', pageSearchCompleted: true, pageReadable: true });
       expect(search.matchCount).toBe(search.results.length);
       expect(search.matchCount).toBeGreaterThan(0);
       expect(search.results.length).toBeLessThanOrEqual(5);
       expect(JSON.stringify(search).length).toBeLessThan(12_000);
-      const noMatchSearch = await controller.search({ query: 'qzxwvv-9347182-uniquetoken' });
+      const noMatchSearch = await controller.findPage({ query: 'qzxwvv-9347182-uniquetoken' });
       expect(noMatchSearch).toMatchObject({
-        operation: 'search', searchCompleted: true, matchCount: 0, pageReadable: true,
-        message: 'Search completed successfully. No semantic content matched the query.',
+        operation: 'find_page', pageSearchCompleted: true, matchCount: 0, pageReadable: true,
+        message: 'Current-page search found no matching semantic content.',
       });
-      const nestedSearch = await controller.search({ query: 'currency buying selling rates', maxResults: 10 });
+      const nestedSearch = await controller.findPage({ query: 'currency buying selling rates', maxResults: 10 });
       expect(nestedSearch.results.filter(result => ['table', 'text', 'other'].includes(result.type))).toHaveLength(1);
       const tableRef = search.results[0]!.ref;
       const inspected = await controller.read({ ref: tableRef, limit: 20 });
@@ -113,11 +113,11 @@ describe('progressive browser perception', () => {
       });
       expect(JSON.stringify(inspected).length).toBeLessThan(12_000);
 
-      const formSearch = await controller.search({ query: 'email address verification code' });
+      const formSearch = await controller.findPage({ query: 'email address verification code' });
       expect(formSearch.results[0]?.type).toBe('form');
       expect(JSON.stringify(formSearch).length).toBeLessThan(12_000);
 
-      const relevantSearch = await controller.search({ query: 'Kestrel-482 exchange review marker' });
+      const relevantSearch = await controller.findPage({ query: 'Kestrel-482 exchange review marker' });
       const relevant = relevantSearch.results.map(result => result.preview ?? '').join('\n');
       expect(relevant).toContain('Kestrel-482 exchange review marker');
       expect(relevant).not.toContain('Earlier body passage 0');
@@ -132,7 +132,7 @@ describe('progressive browser perception', () => {
       }
 
       await controller.navigate({ url: pathToFileURL(largeTablePath.path).href });
-      const largeTableSearch = await controller.search({ query: 'item code description' });
+      const largeTableSearch = await controller.findPage({ query: 'item code description' });
       const largeTableRef = largeTableSearch.results.find(result => result.type === 'table')?.ref;
       expect(largeTableRef).toBeDefined();
       const tablePage = await controller.read({ ref: largeTableRef!, offset: 100, limit: 10 });
@@ -212,9 +212,10 @@ describe('progressive browser perception', () => {
       if (request.url === '/search') {
         response.end(`<!doctype html><html><head><title>Search page</title></head><body><main>
           <h1>Local results</h1>
-          <article><h2><a href="${destinationUrl}">Official foreign exchange rates</a></h2><p>Local observed result with currency buying and selling values.</p></article>
-          <article><h2><a href="http://127.0.0.1:${addressPort()}/archive">Currency archive</a></h2><p>Historical tables and prior rates.</p></article>
-          <article><h2><a href="http://127.0.0.1:${addressPort()}/news">Exchange rate news</a></h2><p>Recent market commentary and reports.</p></article>
+          <form role="search"><input type="search" name="q" value="foreign exchange rates"></form>
+          <article data-testid="result"><h2><a href="${destinationUrl}">Official foreign exchange rates</a></h2><p>Local observed result with currency buying and selling values.</p></article>
+          <article data-testid="result"><h2><a href="http://127.0.0.1:${addressPort()}/archive">Currency archive</a></h2><p>Historical tables and prior rates.</p></article>
+          <article data-testid="result"><h2><a href="http://127.0.0.1:${addressPort()}/news">Exchange rate news</a></h2><p>Recent market commentary and reports.</p></article>
         </main></body></html>`);
       } else {
         response.end('<!doctype html><html><head><title>Rates page</title></head><body><main><h1>Rates</h1><p>Destination loaded.</p></main></body></html>');
@@ -232,7 +233,7 @@ describe('progressive browser perception', () => {
 
     try {
       await controller.navigate({ url: searchUrl });
-      const search = await controller.search({ query: 'official foreign exchange rates currency buying selling' });
+      const search = await controller.findPage({ query: 'official foreign exchange rates currency buying selling' });
       const result = search.results.find(block => block.href === destinationUrl);
       expect(result?.type).toBe('search_result');
       expect(typeof result?.ref).toBe('string');
@@ -266,6 +267,8 @@ describe('progressive browser perception', () => {
       const forex = await controller.read({ query: 'exchange rate data' });
       const table = forex.blocks?.find(block => block.type === 'table');
       expect(forex).toMatchObject({ pageType: 'data_table', query: 'exchange rate data' });
+      expect(forex.blocks?.[0]?.type).toBe('table');
+      expect(forex.blocks?.some(block => block.type === 'search_result')).toBe(false);
       expect(table).toMatchObject({
         type: 'table',
         headingPath: ['Foreign Exchange Rate', 'Exchange Rate of 24-September-2026 10:00 AM'],
@@ -404,19 +407,19 @@ describe('progressive browser perception', () => {
 
       const resultsPath = await fixture('search-results.html');
       await controller.navigate({ url: pathToFileURL(resultsPath).href });
-      const ddgSearch = await controller.search({ query: 'Nepal Rastra Bank foreign exchange rate' });
+      const ddgSearch = await controller.findPage({ query: 'Nepal Rastra Bank foreign exchange rate' });
       const nrbResult = ddgSearch.results.find(block => block.title === 'Foreign Exchange Rate - Nepal Rastra Bank');
       expect(nrbResult).toMatchObject({
         type: 'search_result',
         ref: expect.stringMatching(/^c\d+-/),
-        href: 'https://www.nrb.org.np/forex',
+        href: 'https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.nrb.org.np%2Fforex',
         relevance: expect.any(Number),
       });
       const ddgRead = await controller.read({ query: 'Nepal Rastra Bank foreign exchange rate' });
       expect(ddgRead.blocks?.find(block => block.title === nrbResult?.title)).toMatchObject({
         ref: nrbResult?.ref,
         type: 'search_result',
-        href: 'https://www.nrb.org.np/forex',
+        href: 'https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.nrb.org.np%2Fforex',
       });
       const searchResults = await controller.read({ query: 'historical currency rate tables' });
       expect(searchResults.pageType).toBe('search_results');
@@ -427,7 +430,7 @@ describe('progressive browser perception', () => {
         snippet: expect.stringContaining('Historical currency rate tables'),
       });
       expect(searchResults.blocks?.find(block => block.title === 'Resolved search result')?.href)
-        .toBe('https://results.example.test/resolved');
+        .toBe('https://duckduckgo.com/l/?uddg=https%3A%2F%2Fresults.example.test%2Fresolved');
       const actualHrefResult = await controller.read({ query: 'observed redirect parameter' });
       expect(actualHrefResult.blocks?.find(block => block.title === 'Observed redirect parameter')?.href)
         .toBe('https://redirect.example.test/out?uddg=https%3A%2F%2Fwrong.example.test%2Fdestination');

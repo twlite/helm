@@ -2,6 +2,8 @@ const BROWSER_URL_PROTOCOLS = new Set(['http:', 'https:', 'file:', 'about:']);
 const URL_SCHEME_PATTERN = /^[a-z][a-z\d+.-]*:/iu;
 const HOST_WITH_PORT_PATTERN = /^(?:localhost|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z\d](?:[a-z\d-]*\.)+[a-z\d-]+)):\d+(?:[/?#]|$)/iu;
 
+const DUCKDUCKGO_SEARCH_URL = 'https://duckduckgo.com/';
+
 function invalidUrl(message: string): never {
   throw new Error(message);
 }
@@ -61,4 +63,11 @@ export function browserUrlsMatch(actual: string | undefined, expected: string): 
   } catch {
     return false;
   }
+}
+
+/** Build the canonical DuckDuckGo page URL used by Helm's local browser. */
+export function buildDuckDuckGoSearchUrl(query: string): string {
+  const normalized = query.trim();
+  if (!normalized) throw new Error('Search query must not be empty.');
+  return `${DUCKDUCKGO_SEARCH_URL}?q=${encodeURIComponent(normalized)}`;
 }

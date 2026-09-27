@@ -10,7 +10,7 @@ import type {
   GuestMethod,
   WindowInfo,
 } from '@helm/shared';
-import { rankBrowserContentBlocks, type IndexedBrowserRegion } from '@helm/shared';
+import { buildDuckDuckGoSearchUrl, rankBrowserContentBlocks, type IndexedBrowserRegion } from '@helm/shared';
 import { guestMethodSchemas } from '@helm/shared';
 import type {
   GuestMethodParams,
@@ -263,13 +263,8 @@ function mockContentBlocks(
       try {
         const target = new URL(link.href, browser.url);
         if (!['http:', 'https:'].includes(target.protocol)) return [];
-        const isDuckDuckGo = target.hostname === 'duckduckgo.com' || target.hostname.endsWith('.duckduckgo.com');
-        const wrapped = isDuckDuckGo
-          ? target.searchParams.get('uddg') ?? target.searchParams.get('url')
-          : undefined;
-        const destination = wrapped ? new URL(wrapped) : target;
-        if (!['http:', 'https:'].includes(destination.protocol)) return [];
-        return [{ text: link.text, href: destination.href }];
+        if (!['http:', 'https:'].includes(target.protocol)) return [];
+        return [{ text: link.text, href: target.href }];
       } catch {
         return [];
       }
@@ -863,8 +858,14 @@ export class MockGuestTransport implements GuestTransport {
           truncated: summaries.length < selected.length || blocks.length > summaries.length,
         } as GuestMethodResult[M];
       }
-      case 'browser.search': {
-        const input = params as GuestMethodParams['browser.search'];
+      case 'browser.findPage': {
+        const input = params as GuestMethodParams['browser.findPage'];
+        if (!this.browser.loaded || !this.browser.url || this.browser.url === 'about:blank') {
+          throw new GuestTransportError(
+            'BROWSER_NOT_READY',
+            'browser.findPage searches the current page only. Use browser.webSearch for DuckDuckGo web discovery.',
+          );
+        }
         const blocks = mockContentBlocks(this.browser, this.contentReferences, this.contentSessionId);
         const ranked = rankBrowserContentBlocks({ query: input.query, blocks, maxResults: input.maxResults });
         const blocksByRef = new Map(blocks.map(block => [block.ref, block]));
@@ -875,8 +876,8 @@ export class MockGuestTransport implements GuestTransport {
         });
         const pageReadable = blocks.some(block => Boolean(block.text?.trim() || block.rows?.length || block.items?.length || block.title?.trim() || block.snippet?.trim() || block.links?.length));
         return {
-          operation: 'search',
-          searchCompleted: true,
+          operation: 'find_page',
+          pageSearchCompleted: true,
           url: this.browser.url ?? 'about:blank',
           title: this.browser.title ?? '',
           revision: this.browser.revision,
@@ -885,8 +886,49 @@ export class MockGuestTransport implements GuestTransport {
           matchCount: results.length,
           pageReadable,
           message: results.length > 0
-            ? `Search completed successfully. Found ${results.length} matching semantic block${results.length === 1 ? '' : 's'}.`
-            : 'Search completed successfully. No semantic content matched the query.',
+            ? `Current-page search found ${results.length} matching semantic block${results.length === 1 ? '' : 's'}.`
+            : 'Current-page search found no matching semantic content.',
+          results,
+        } as GuestMethodResult[M];
+      }
+      case 'browser.webSearch': {
+        const input = params as GuestMethodParams['browser.webSearch'];
+        const requestedUrl = buildDuckDuckGoSearchUrl(input.query);
+        const navigation = this.navigateMock(requestedUrl);
+        const blocks = mockContentBlocks(this.browser, this.contentReferences, this.contentSessionId);
+        const searchResults = blocks.filter(block => block.type === 'search_result');
+        const ranked = rankBrowserContentBlocks({
+          query: input.query,
+          blocks: searchResults,
+          maxResults: input.maxResults ?? 10,
+        });
+        const blocksByRef = new Map(searchResults.map(block => [block.ref, block]));
+        const results = ranked.results.flatMap(match => {
+          const block = blocksByRef.get(match.ref);
+          return block?.type === 'search_result' && block.title && block.href
+            ? [{ ...mockContentSummary(block, 520, match.relevance), type: 'search_result' as const, title: block.title, href: block.href }]
+            : [];
+        });
+        if (results.length === 0) {
+          throw new GuestTransportError(
+            'WEB_SEARCH_RESULTS_UNAVAILABLE',
+            'DuckDuckGo did not expose any result links on the loaded page. Inspect the browser page or try another query.',
+          );
+        }
+        const pageReadable = searchResults.length > 0;
+        return {
+          operation: 'web_search',
+          searchEngine: 'duckduckgo',
+          searchCompleted: true,
+          requestedUrl,
+          url: navigation.url,
+          title: navigation.title,
+          revision: navigation.revision,
+          query: input.query,
+          semanticBlockCount: blocks.length,
+          matchCount: results.length,
+          pageReadable,
+          message: `DuckDuckGo returned ${results.length} observed result${results.length === 1 ? '' : 's'}.`,
           results,
         } as GuestMethodResult[M];
       }

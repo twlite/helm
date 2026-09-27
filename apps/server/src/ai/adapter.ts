@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type {
   AgentDecision,
   AgentTurnContext,
+  BrowserContentFormat,
   CompletionCriterion,
   Fact,
   JsonValue,
@@ -43,6 +44,8 @@ import {
   browserResearchCriterion,
   browserResearchStartUrl,
   browserResearchTask,
+  explicitBrowserAssetUrls,
+  explicitBrowserNavigationUrls,
   isAbsoluteBrowserNavigationUrl,
   isUnsupportedSearchEngineUrl,
   isBrowserResearchRequest,
@@ -110,7 +113,7 @@ export class AiSdkDecisionProvider implements DecisionProviderBoundary {
         'Do not claim success. Helm executes the action and verifies the result separately.',
         'If the task has no completion criteria, this is a conversational request: return complete immediately and do not call a tool.',
         'Request completion only when every explicit task criterion is already satisfied.',
-        'Use browser.read({ query }) to locate relevant semantic blocks; browser.search ranks the same blocks and exposes observed hrefs. Use browser.read({ ref, offset, limit }) only to inspect more of a selected block, including table rows.',
+        'Use browser.read({ query }) to locate relevant semantic blocks; browser.findPage ranks content on the current page only, while browser.webSearch performs DuckDuckGo web discovery. Use browser.read({ ref, offset, limit }) to inspect more of a selected block, including table rows.',
         'When saving extracted page content, select the relevant block ref and call fs.write with sourceRef and a suitable text, markdown, json, or csv format. Helm transfers the complete stored block; do not copy a preview or reconstruct extracted data in the content argument. Use content for model-authored summaries or other new text.',
         'For an unnamed destination, search DuckDuckGo first and prefer the named organization\'s official result. Never invent a hostname or route. Open a selected search or page link with browser.open({ ref }) instead of reconstructing its URL. Use an exact user URL or exact verified-memory URL directly; if a verified-memory URL fails or unexpectedly redirects, return to DuckDuckGo.',
         'If page content is needed for a file summary, obtain non-empty browser.read content first. Do not save a read error or placeholder as the requested artifact. If a page read fails, recover with another query or a relevant ref; otherwise report the blocker.',
@@ -427,6 +430,16 @@ function fileNameFromPath(input: string): string {
   return input.split(/[\\/]/u).at(-1) ?? input;
 }
 
+function formatForPath(path: string): BrowserContentFormat {
+  switch (path.split('.').at(-1)?.toLocaleLowerCase()) {
+    case 'csv': return 'csv';
+    case 'json': return 'json';
+    case 'md':
+    case 'markdown': return 'markdown';
+    default: return 'text';
+  }
+}
+
 function inferredReferencedFileName(input: TaskPlannerInput): string | undefined {
   const direct = fileNameFromText(input.userMessage);
   if (direct) return direct;
@@ -515,109 +528,14 @@ function toJsonValue(value: unknown): JsonValue {
   return String(value);
 }
 
-function explicitUrls(request: string): string[] {
-  const explicitMatches = [...request.matchAll(/https?:\/\/[^\s"'<>]+/giu)];
-  const urls = explicitMatches.map(match => match[0].replace(/[),.;!?]+$/u, ''));
-  const hostCandidates = [...request.matchAll(/\b(?:[a-z0-9-]+\.)+[a-z]{2,}(?:[/?#][^\s"'<>]*)?/giu)]
-    .filter(match => {
-      const matchStart = match.index ?? -1;
-      return !explicitMatches.some(explicit => {
-        const explicitStart = explicit.index ?? -1;
-        return explicitStart >= 0
-          && matchStart >= explicitStart
-          && matchStart < explicitStart + explicit[0].length;
-      });
-    })
-    .map(match => match[0].replace(/[),.;!?]+$/u, ''))
-    // A scheme-qualified URL is explicit even when it points at a document
-    // or image. A bare file-like token is retained only when its local
-    // wording explicitly asks for navigation; otherwise it is an
-    // output/reference value, not a browser requirement.
-    .filter(candidate => !BARE_FILE_REFERENCE_PATTERN.test(candidate) || bareCandidateIsExplicitlyNavigated(request, candidate));
-  const hosts = hostCandidates.map(value => `https://${value}`);
-  return [...new Set([...urls, ...hosts])];
-}
-
-function bareCandidateIsExplicitlyNavigated(request: string, candidate: string): boolean {
-  const context = urlSentenceContext(request, candidate);
-  const contextUrl = candidate.toLocaleLowerCase();
-  const contextUrlIndex = context.toLocaleLowerCase().indexOf(contextUrl);
-  const contextBeforeUrl = contextUrlIndex >= 0 ? context.slice(0, contextUrlIndex) : context;
-  const navigationClause = contextBeforeUrl.split(/\b(?:and|but|then|using|use)\b/iu).at(-1) ?? contextBeforeUrl;
-  return EXPLICIT_NAVIGATION_PATTERN.test(navigationClause) && !FILE_REFERENCE_INTENT_PATTERN.test(context);
-}
-
-type ExplicitUrlRole = 'navigation' | 'asset' | 'reference';
-
-type ExplicitUrlReference = {
-  url: string;
-  role: ExplicitUrlRole;
-};
-
-const STATIC_ASSET_URL_PATTERN = /\.(?:png|jpe?g|gif|webp|svg|ico|avif|bmp|tiff?)(?:[?#].*)?$/iu;
-const ASSET_REFERENCE_PATTERN = /\b(?:image|picture|photo|avatar|profile\s+(?:picture|image|photo)|logo|icon|thumbnail|background|cover|src|href)\b/iu;
-const EXPLICIT_NAVIGATION_PATTERN = /\b(?:go\s+to|navigate(?:\s+to)?|visit|open|browse|read|inspect|research|look\s+(?:it\s+)?up|find(?:\s+out)?|extract|download)\b/iu;
 const MEMORY_VALUE_PATTERN = /\b(?:remember|memory|memories)\b/iu;
 
-function urlSentenceContext(request: string, url: string): string {
-  const normalizedRequest = request.toLocaleLowerCase();
-  const normalizedUrl = url.toLocaleLowerCase().replace(/^https?:\/\//u, '');
-  const start = normalizedRequest.indexOf(normalizedUrl);
-  if (start < 0) return request;
-  const sentenceStart = Math.max(
-    request.lastIndexOf('.', start),
-    request.lastIndexOf('!', start),
-    request.lastIndexOf('?', start),
-    request.lastIndexOf('\n', start),
-  );
-  const sentenceEndCandidates = [
-    request.indexOf('.', start + normalizedUrl.length),
-    request.indexOf('!', start + normalizedUrl.length),
-    request.indexOf('?', start + normalizedUrl.length),
-    request.indexOf('\n', start + normalizedUrl.length),
-  ].filter(index => index >= 0);
-  const sentenceEnd = sentenceEndCandidates.length > 0
-    ? Math.min(...sentenceEndCandidates)
-    : request.length;
-  return request.slice(sentenceStart + 1, sentenceEnd);
-}
-
-function explicitUrlReferences(request: string): ExplicitUrlReference[] {
-  return explicitUrls(request).map(url => {
-    const context = urlSentenceContext(request, url);
-    const assetLanguage = ASSET_REFERENCE_PATTERN.test(context);
-    const contextUrl = url.toLocaleLowerCase().replace(/^https?:\/\//u, '');
-    const contextUrlIndex = context.toLocaleLowerCase().indexOf(contextUrl);
-    const contextBeforeUrl = contextUrlIndex >= 0 ? context.slice(0, contextUrlIndex) : context;
-    // A sentence can contain both a research source and an asset, for example
-    // "go to profile.example and use https://cdn.example/avatar.png". Scope
-    // navigation wording to the clause immediately owning this URL so the
-    // earlier "go to" does not turn the later image into another destination.
-    const navigationClause = contextBeforeUrl.split(/\b(?:and|but|then|using|use|as)\b/iu).at(-1) ?? contextBeforeUrl;
-    const explicitNavigation = EXPLICIT_NAVIGATION_PATTERN.test(navigationClause);
-    const memoryReference = MEMORY_VALUE_PATTERN.test(contextBeforeUrl)
-      && !/\b(?:go\s+to|navigate|visit|open|browse|research|inspect|read)\b/iu.test(contextBeforeUrl);
-    const role: ExplicitUrlRole = memoryReference
-      ? 'reference'
-      : assetLanguage && !explicitNavigation
-        ? 'asset'
-      : STATIC_ASSET_URL_PATTERN.test(url) && !explicitNavigation
-        ? 'asset'
-        : 'navigation';
-    return { url, role };
-  });
-}
-
 function browserSourceUrls(request: string): string[] {
-  return explicitUrlReferences(request)
-    .filter(reference => reference.role === 'navigation')
-    .map(reference => reference.url);
+  return explicitBrowserNavigationUrls(request);
 }
 
 function userAssetUrls(request: string): string[] {
-  return explicitUrlReferences(request)
-    .filter(reference => reference.role === 'asset')
-    .map(reference => reference.url);
+  return explicitBrowserAssetUrls(request);
 }
 
 function userAssetUrlForRequest(request: string, candidate: string): string | undefined {
@@ -666,6 +584,23 @@ function memoryMutationTool(request: string): 'memory.remember' | 'memory.update
   return undefined;
 }
 
+function explicitMemoryInstruction(request: string): { memoryContent: string; memoryKind: 'instruction' } | undefined {
+  const match = /\b(?:remember(?:\s+to|\s+that)?|memorize|store\s+in\s+memory)\s*:?\s+([^\n]+)/iu.exec(request);
+  if (!match?.[1]) return undefined;
+  const source = match[1].trim();
+  const boundary = source.search(/[!?]|\.(?=\s|$)/u);
+  const directive = (boundary >= 0 ? source.slice(0, boundary) : source)
+    .trim()
+    .replace(/^["'`]+|["'`]+$/gu, '');
+  if (!directive) return undefined;
+  const content = `${directive[0]!.toLocaleUpperCase()}${directive.slice(1).replace(/[.!?]+$/u, '')}.`;
+  return { memoryContent: content, memoryKind: 'instruction' };
+}
+
+function explicitlyRequiresDuckDuckGo(request: string): boolean {
+  return /\bduckduckgo\b[^.!?\n]{0,48}\bsearch\b|\bsearch\b[^.!?\n]{0,48}\bduckduckgo\b/iu.test(request);
+}
+
 function criterionWasExplicit(request: string, criterion: CompletionCriterion): boolean {
   const normalizedRequest = request.toLocaleLowerCase().replace(/[-_]+/gu, ' ');
   const includesPhrase = (value: string): boolean => normalizedRequest.includes(value.toLocaleLowerCase().replace(/[-_]+/gu, ' '));
@@ -702,6 +637,10 @@ function compiledRequirements(
   const repository = explicitRepository(request);
   const pageContentSave = savesPageContent(request);
   const memoryAction = memoryMutationTool(request);
+  const memoryInstruction = memoryAction === 'memory.remember'
+    ? explicitMemoryInstruction(request)
+    : undefined;
+  const requiresDuckDuckGo = explicitlyRequiresDuckDuckGo(request);
   const launchedApplication = explicitlyLaunchedApplication(request);
   const explicitNavigationAction = /\b(?:go\s+to|navigate(?:\s+to)?|visit|open|browse)\b/iu.test(request);
   for (const [index, url] of browserSourceUrls(request).entries()) {
@@ -715,6 +654,16 @@ function compiledRequirements(
         url: browserResearchStartUrl(url),
         ...(explicitNavigationAction ? { freshness: 'current-run', action: 'browser.navigate' as const } : {}),
       },
+    });
+  }
+  if (requiresDuckDuckGo) {
+    add({
+      id: 'browserSearch',
+      description: 'Perform the explicitly requested DuckDuckGo web search during this run.',
+      type: 'browser',
+      mandatory: true,
+      status: 'pending',
+      target: { action: 'browser.webSearch', freshness: 'current-run' },
     });
   }
   const asksRelease = /\b(?:latest|current|newest|stable)\b[^.\n]{0,80}\b(?:release|version|tag)\b|\b(?:release|version)\b[^.\n]{0,80}\b(?:latest|current|newest|stable)\b/iu.test(request);
@@ -735,6 +684,7 @@ function compiledRequirements(
       mandatory: true,
       status: 'pending',
       target: { factId: 'pageContent', freshness: 'current-run', action: 'browser.read' },
+      ...(requiresDuckDuckGo ? { dependsOn: ['browserSearch'] } : {}),
     });
   }
   if (memoryAction) {
@@ -744,7 +694,11 @@ function compiledRequirements(
       type: 'semantic',
       mandatory: true,
       status: 'pending',
-      target: { action: memoryAction, freshness: 'current-run' },
+      target: {
+        action: memoryAction,
+        freshness: 'current-run',
+        ...(memoryInstruction ?? {}),
+      },
     });
   }
   if (launchedApplication) {
@@ -827,6 +781,7 @@ function compiledRequirements(
         mode,
         freshness: 'current-run',
         action: 'fs.write',
+        ...(mode === 'written-from-artifact' ? { format: formatForPath(filePath) } : {}),
         ...(outputFactIds.length > 0 ? { factIds: outputFactIds } : {}),
       },
     });
@@ -965,7 +920,7 @@ export class AiSdkTaskPlanner implements TaskCompiler {
           'Use mode conversation with an empty criteria array for normal questions, identity questions, explanations, greetings, and other requests that do not require changing or inspecting the computer.',
           'Use mode task for browser, desktop, filesystem, or application work.',
           'Questions that require current or publicly available web information are tasks, not conversation. This includes today/latest/live facts, exchange rates, prices, weather, news, schedules, and facts attributed to a named organization.',
-          'For web research, use an exact user URL or exact verified-memory URL when available. Otherwise search DuckDuckGo, prefer an official result for a named organization, and open the observed result with browser.open({ ref }); never invent or retype a hostname or route. browser.search and browser.read rank the same semantic blocks. Use browser.read({ query }) to find relevant blocks and browser.read({ ref, offset, limit }) only to inspect more of a selected block.',
+          'For web research, follow an explicit current-run search-engine instruction first, even when a URL also appears as a remembered reference. Otherwise use an exact user URL or exact verified-memory URL when available. If discovery is needed, use browser.webSearch for DuckDuckGo, prefer an official result for a named organization, and open the observed result with browser.open({ ref }); never invent or retype a hostname or route. browser.findPage and browser.read find content on the current page; neither performs web discovery. Use browser.read({ query }) to find relevant blocks and browser.read({ ref, offset, limit }) to inspect more of a selected block.',
           'When saving extracted page content, pass the selected ref to fs.write as sourceRef with a suitable text, markdown, json, or csv format. Do not manually copy or reconstruct the complete extracted block in content; use content for model-authored summaries or new text.',
           'When a requested page summary is saved to a file, successful non-empty browser.read content is a prerequisite to fs.write. A read failure must leave the task recovering or blocked; do not write the error or a placeholder as the requested summary.',
           'A URL supplied as an image, profile picture, avatar, logo, icon, thumbnail, background, src, href, or other asset/reference value is not a research destination. Preserve it as a user-provided value and embed it directly where requested; do not navigate to it unless the user explicitly asks to open it.',
@@ -1220,7 +1175,7 @@ export class AiSdkWorker implements WorkerProvider {
               'browser.navigate requires an absolute http(s), file, or about URL. Output filenames belong to filesystem or desktop tools; never turn a filename into a URL.',
               'Do not navigate to a user-provided asset/reference URL merely because it contains http. Use that URL directly in the requested output.',
               'After an action, use its actual result and the next observation. A model hypothesis is not an observed fact.',
-              'Read page content with browser.read({ query }) using concise task terms to retrieve ranked semantic blocks; browser.search ranks those same blocks and exposes observed hrefs. Use browser.read({ ref, offset, limit }) only to inspect a selected block. Use browser.snapshot when interactive elements matter.',
+              'Read page content with browser.read({ query }) using concise task terms to retrieve ranked semantic blocks; browser.findPage is page-local search, while browser.webSearch performs DuckDuckGo web discovery and returns observed result refs. Use browser.read({ ref, offset, limit }) to inspect a selected block. Use browser.snapshot when interactive elements matter.',
               'When saving extracted page content, pass the relevant ref to fs.write as sourceRef with an appropriate format instead of copying or reconstructing the full content. Use content for a model-authored summary or other new text. Ensure browser.read succeeded before saving page-derived content; on failure, recover with another query or a relevant ref.',
               'Never invent a website hostname or route. If no exact destination URL was supplied and memory does not contain an exact verified URL, search DuckDuckGo and open an official, relevant observed result with browser.open({ ref }). Use a remembered source name only to guide the query. If a verified-memory URL fails or unexpectedly redirects, search DuckDuckGo.',
               'An existing output file or already-open window cannot satisfy an explicit write or open action for this run. Use fs.write with sourceRef for extracted content, then app.openFile after the write succeeds.',

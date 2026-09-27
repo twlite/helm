@@ -51,6 +51,12 @@ export interface RequirementTarget {
   url?: string;
   factIds?: string[];
   content?: string;
+  /** Exact compiler-owned payload for an explicit user memory instruction. */
+  memoryContent?: string;
+  memoryKind?: Memory['kind'];
+  memoryKey?: string;
+  /** Serialization selected from an explicit output extension, when applicable. */
+  format?: BrowserContentFormat;
   mode?: 'exists' | 'non-empty' | 'contains-facts' | 'contains-text' | 'downloaded' | 'matches-fact'
     | 'written' | 'written-from-artifact' | 'created' | 'open' | 'opened';
   freshness?: 'current-run';
@@ -494,7 +500,8 @@ export type GuestMethod =
   | 'browser.getState'
   | 'browser.snapshot'
   | 'browser.read'
-  | 'browser.search'
+  | 'browser.findPage'
+  | 'browser.webSearch'
   | 'browser.open'
   | 'browser.inspectRegion'
   | 'browser.download'
@@ -583,9 +590,9 @@ export interface BrowserSearchResult extends BrowserPageRegion {
   snippet?: string;
 }
 
-export interface BrowserSearchPageResult {
-  operation: 'search';
-  searchCompleted: true;
+export interface BrowserPageSearchResult {
+  operation: 'find_page';
+  pageSearchCompleted: true;
   url: string;
   title: string;
   revision: number;
@@ -595,6 +602,31 @@ export interface BrowserSearchPageResult {
   pageReadable: boolean;
   message: string;
   results: BrowserContentSummary[];
+}
+
+export interface BrowserWebSearchResultItem extends BrowserContentSummary {
+  type: 'search_result';
+  title: string;
+  href: string;
+}
+
+export interface BrowserWebSearchResult {
+  operation: 'web_search';
+  searchEngine: 'duckduckgo';
+  searchCompleted: true;
+  /** Exact DuckDuckGo search URL opened by the local browser. */
+  requestedUrl: string;
+  /** The final observed URL after browser navigation and redirects. */
+  url: string;
+  title: string;
+  revision: number;
+  query: string;
+  semanticBlockCount: number;
+  matchCount: number;
+  pageReadable: boolean;
+  message: string;
+  /** Only extracted result records with an observed href and current-page ref. */
+  results: BrowserWebSearchResultItem[];
 }
 
 export interface BrowserOpenResult {

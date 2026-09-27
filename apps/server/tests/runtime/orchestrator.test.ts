@@ -135,6 +135,7 @@ describe('orchestrated agent loop', () => {
     const userMessage = "Fetch the exchange rate data from Nepal Rastra Bank's official forex website, save that data to forex.txt, and open it with the text viewer application.";
     const searchUrl = browserResearchSearchUrl(deriveBrowserReadQuery(userMessage));
     const resultUrl = 'https://www.nrb.org.np/forex';
+    const observedHref = `https://duckduckgo.com/l/?uddg=${encodeURIComponent(resultUrl)}`;
     const rows = [
       ['USD', 'USD', '1', '152.28', '153.05', '153.65'],
       ['Euro', 'EUR', '1', '173.65', '173.65', '175.36'],
@@ -166,8 +167,9 @@ describe('orchestrated agent loop', () => {
     };
     const guest = new MockGuestTransport({
       initialFiles: { 'forex.txt': 'OLD DATA' },
+      redirects: { [observedHref]: resultUrl },
       pages: {
-        [searchUrl]: `<html><body><main><h1>Search results</h1></main><article><h2><a href="https://duckduckgo.com/l/?uddg=${encodeURIComponent(resultUrl)}">Foreign Exchange Rate - Nepal Rastra Bank</a></h2><p>Official foreign exchange rates with currency buying and selling values.</p></article></body></html>`,
+        [searchUrl]: `<html><body><main><h1>Search results</h1></main><article class="result"><h2><a href="${observedHref}">Foreign Exchange Rate - Nepal Rastra Bank</a></h2><p>Official foreign exchange rates with currency buying and selling values.</p></article></body></html>`,
         [resultUrl]: `<html><head><title>Nepal Rastra Bank Foreign Exchange Rates</title></head><body><main><h1>Foreign Exchange Rate</h1><h2>Exchange Rate of 24-September-2026</h2>${tableHtml}</main></body></html>`,
       },
     });
@@ -199,19 +201,22 @@ describe('orchestrated agent loop', () => {
     const worker = new FunctionalWorker([
       async context => {
         const navigate = await executeAction(context, 'browser.navigate', { url: searchUrl }, 'search-navigation');
-        const search = await executeAction(context, 'browser.search', { query: 'Nepal Rastra Bank official foreign exchange rate' }, 'search');
+        const search = await executeAction(context, 'browser.findPage', { query: 'Nepal Rastra Bank official foreign exchange rate' }, 'search');
         const searchData = search.result.data as { results?: Array<{ type: string; ref: string; href?: string }> };
-        const official = searchData.results?.find(item => item.type === 'search_result' && item.href === resultUrl);
+        const official = searchData.results?.find(item => item.type === 'search_result' && item.href === observedHref);
         if (!official) throw new Error('DuckDuckGo search did not return the observed official href.');
         const invented = await executeAction(context, 'browser.navigate', { url: 'https://www.nrb.org.np' }, 'invented-host');
         const opened = await executeAction(context, 'browser.open', { ref: official.ref }, 'open-result-ref');
         const read = await executeAction(context, 'browser.read', { query: 'exchange rate currency buying selling' }, 'read-rates');
         const readData = read.result.data as { sections?: Array<{ text: string }>; blocks?: Array<{ type: string; ref: string }> };
+        const table = readData.blocks?.find(block => block.type === 'table');
+        if (!table) throw new Error('The exchange table was not surfaced as a content ref.');
+        const selected = await executeAction(context, 'browser.read', { ref: table.ref }, 'select-table');
         const receiptId = ((read.result.evidence as { receipt?: { id?: string } } | undefined)?.receipt?.id) ?? 'missing-receipt';
         const pageContent = readData.sections?.[0]?.text.split('\n')[0] ?? 'Foreign Exchange Rate';
         return {
           status: 'completed', worker: 'browser', objectiveId: context.objective.id,
-          actions: [navigate, search, invented, opened, read],
+          actions: [navigate, search, invented, opened, read, selected],
           facts: [fact('pageContent', pageContent, receiptId)], evidence: [], artifacts: [], blockers: [], environmentChanged: true,
         };
       },
@@ -240,7 +245,6 @@ describe('orchestrated agent loop', () => {
       { type: 'objective', objective: fileObjective },
       { type: 'objective', objective: openObjective },
     ], worker, { maxSteps: 3 }).run({ threadId: task.threadId, userMessage, task });
-
     expect(result.status).toBe('completed');
     expect(result.finalVerification?.complete).toBe(true);
     expect(guest.getFile('forex.txt')).toContain('Saudi Riyal | SAR | 1 | 40.40 | 40.55 | 40.70');
@@ -602,7 +606,7 @@ describe('orchestrated agent loop', () => {
     const worker = new FunctionalWorker([
       async context => {
         const search = await executeAction(context, 'browser.navigate', { url: repositoryUrl }, 'search');
-        const results = await executeAction(context, 'browser.search', { query: 'oven-sh bun repository' }, 'search-results');
+        const results = await executeAction(context, 'browser.findPage', { query: 'oven-sh bun repository' }, 'search-results');
         const repositoryTarget = observedOpenTarget(results.result.data, repositoryUrl);
         if (!repositoryTarget) throw new Error('Search results did not provide an observed repository ref.');
         const repository = await executeAction(context, 'browser.open', repositoryTarget, 'repository');

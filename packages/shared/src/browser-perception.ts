@@ -309,12 +309,13 @@ export interface BrowserContentMatch {
   relevance: number;
 }
 
-/** Rank the canonical semantic content blocks used by browser.read and browser.search. */
+/** Rank the canonical semantic content blocks used by browser.read and browser.findPage. */
 export function rankBrowserContentBlocks(input: {
   query: string;
   blocks: readonly BrowserContentBlock[];
   maxResults?: number;
 }): { indexedBlockCount: number; results: BrowserContentMatch[] } {
+  const maxResults = clamp(Math.trunc(input.maxResults ?? 5), 1, 20);
   const regions = input.blocks.map((block, domOrder): IndexedBrowserRegion => ({
     ref: block.ref,
     kind: block.type === "table" ? "table"
@@ -351,11 +352,50 @@ export function rankBrowserContentBlocks(input: {
   const ranked = rankPageRegions({
     query: input.query,
     regions,
-    ...(input.maxResults === undefined ? {} : { maxResults: input.maxResults }),
+    // Keep enough candidates to promote a clearly relevant structured block
+    // even when long prose or result snippets dominate the lexical ranking.
+    maxResults: Math.max(20, maxResults),
   });
+
+  const query = [...new Set(queryTerms(input.query))];
+  const blockByRef = new Map(input.blocks.map(block => [block.ref, block]));
+  const structuralTableRelevance = (block: BrowserContentBlock): number | undefined => {
+    if (block.type !== "table" || query.length === 0) return undefined;
+    const structuralTerms = new Set(usefulTokens([
+      block.caption,
+      block.heading,
+      ...(block.headingPath ?? []),
+      ...(block.columns ?? []),
+    ].filter(Boolean).join(" ")));
+    const matched = query.filter(token => structuralTerms.has(token)).length;
+    if (matched === 0) return undefined;
+    const coverage = matched / query.length;
+    // One matching term is useful for a short query. Longer requests should
+    // agree with a substantial part of the table's label or headers.
+    if (query.length > 2 && coverage < 0.4) return undefined;
+    return Number((0.76 + coverage * 0.22).toFixed(3));
+  };
+  const promoted = new Map(ranked.results.map(result => [result.ref, result.score]));
+  for (const block of input.blocks) {
+    const relevance = structuralTableRelevance(block);
+    if (relevance === undefined) continue;
+    promoted.set(block.ref, Math.max(promoted.get(block.ref) ?? 0, relevance));
+  }
+  const results = [...promoted.entries()]
+    .map(([ref, relevance]) => ({
+      ref,
+      relevance,
+      table: blockByRef.get(ref)?.type === "table",
+      order: input.blocks.findIndex(block => block.ref === ref),
+    }))
+    .sort((left, right) => right.relevance - left.relevance
+      || Number(right.table) - Number(left.table)
+      || left.order - right.order)
+    .slice(0, maxResults)
+    .map(({ ref, relevance }) => ({ ref, relevance }));
   return {
     indexedBlockCount: ranked.indexedRegionCount,
-    results: ranked.results.map(result => ({ ref: result.ref, relevance: result.score })),
+    results,
   };
 }
 

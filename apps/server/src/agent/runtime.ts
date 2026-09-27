@@ -50,6 +50,7 @@ import {
   taskRequirementSummary,
   requirementsForTask,
   requiredActionForRequirement,
+  selectedBrowserArtifact,
   verifyTaskState,
 } from './task-state';
 import type {
@@ -200,8 +201,8 @@ function prepareBrowserNavigation(
   }
   if (!parsed || !['http:', 'https:'].includes(parsed.protocol)) return { input: toolInput };
 
-  const normalizedSearchUrl = browserResearchStartUrl(parsed.href);
-  if (isUnsupportedSearchEngineUrl(parsed.href) || normalizedSearchUrl !== parsed.href) {
+  if (isUnsupportedSearchEngineUrl(parsed.href)) {
+    const normalizedSearchUrl = browserResearchStartUrl(parsed.href);
     policy.attempted = true;
     policy.forceDuckDuckGo = false;
     return { input: { ...toolInput, url: normalizedSearchUrl }, provenance: 'duckduckgo-search', requestedUrl };
@@ -265,6 +266,7 @@ function rememberObservedBrowserUrls(
 ): void {
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return;
   const record = data as Record<string, unknown>;
+  if (tool === 'browser.webSearch' && record.searchCompleted === true) policy.attempted = true;
   const add = (
     value: unknown,
     provenance: NavigationProvenance,
@@ -304,11 +306,13 @@ function rememberObservedBrowserUrls(
       }
     }
   }
-  if (tool === 'browser.search' && Array.isArray(record.results)) {
+  if ((tool === 'browser.webSearch' || tool === 'browser.findPage') && Array.isArray(record.results)) {
     for (const item of record.results) {
       if (typeof item !== 'object' || item === null) continue;
       const block = item as Record<string, unknown>;
-      const provenance: NavigationProvenance = block.type === 'search_result' ? 'search-result' : 'page-link';
+      const provenance: NavigationProvenance = tool === 'browser.webSearch' || block.type === 'search_result'
+        ? 'search-result'
+        : 'page-link';
       add(block.href, provenance, typeof block.ref === 'string' ? { ref: block.ref } : undefined);
       if (Array.isArray(block.links)) {
         for (const [linkIndex, link] of block.links.entries()) {
@@ -589,6 +593,119 @@ function unsatisfiedActionPrerequisite(
       },
     },
   };
+}
+
+function requiredDuckDuckGoSearchFailure(
+  state: ReturnType<typeof createTaskState>,
+  tool: string,
+): ToolResult | undefined {
+  if (!tool.startsWith('browser.') || tool === 'browser.webSearch') return undefined;
+  const requirement = requirementsForTask(state.task).find(candidate => (
+    candidate.mandatory
+    && candidate.target?.freshness === 'current-run'
+    && candidate.target.action === 'browser.webSearch'
+    && !state.completedRequirementIds.includes(candidate.id)
+  ));
+  if (!requirement) return undefined;
+  return {
+    ok: false,
+    error: {
+      code: 'TASK_PREREQUISITE_NOT_SATISFIED',
+      message: `Cannot use ${tool} until the explicitly requested DuckDuckGo web search is complete.`,
+      details: { requirement: requirement.id, requiredAction: 'browser.webSearch' },
+    },
+  };
+}
+
+function artifactWriteFailure(
+  state: ReturnType<typeof createTaskState>,
+  tool: string,
+  input: Record<string, unknown>,
+): ToolResult | undefined {
+  if (tool !== 'fs.write') return undefined;
+  const requirement = requirementsForTask(state.task).find(candidate => (
+    candidate.id === 'outputFile'
+    && candidate.mandatory
+    && candidate.target?.mode === 'written-from-artifact'
+    && candidate.target.action === 'fs.write'
+    && !state.completedRequirementIds.includes(candidate.id)
+    && typeof candidate.target.path === 'string'
+    && typeof input.path === 'string'
+    && normalizedTaskPath(candidate.target.path) === normalizedTaskPath(input.path)
+  ));
+  if (!requirement) return undefined;
+  const selected = selectedBrowserArtifact(state);
+  if (input.content !== undefined || typeof input.sourceRef !== 'string'
+    || !selected || input.sourceRef !== selected.ref) {
+    return {
+      ok: false,
+      error: {
+        code: 'SOURCE_REF_REQUIRED',
+        message: `Write ${requirement.target!.path} from the selected browser content ref using sourceRef; model-copied content cannot satisfy this artifact requirement.`,
+        details: { requirement: requirement.id },
+      },
+    };
+  }
+  return undefined;
+}
+
+function actionableToolsForState(
+  state: ReturnType<typeof createTaskState>,
+  availableTools: readonly string[],
+): string[] {
+  const requirements = requirementsForTask(state.task);
+  const completed = new Set(state.completedRequirementIds);
+  const pendingDuckDuckGo = requirements.find(requirement => requirement.mandatory
+    && requirement.target?.action === 'browser.webSearch'
+    && requirement.target.freshness === 'current-run'
+    && !completed.has(requirement.id)
+    && (requirement.dependsOn ?? []).every(id => completed.has(id)));
+  if (pendingDuckDuckGo) return availableTools.includes('browser.webSearch') ? ['browser.webSearch'] : [];
+  const actionable = requirements.filter(requirement => requirement.mandatory
+    && !completed.has(requirement.id)
+    && (requirement.dependsOn ?? []).every(id => completed.has(id)));
+  const explicitSearchCompleted = requirements.some(requirement => requirement.target?.action === 'browser.webSearch'
+    && requirement.target.freshness === 'current-run'
+    && completed.has(requirement.id));
+  const names = new Set<string>();
+  const all = new Set(availableTools);
+  const addMatching = (predicate: (name: string) => boolean): void => {
+    for (const name of all) if (predicate(name)) names.add(name);
+  };
+  for (const requirement of actionable) {
+    const exactAction = requiredActionForRequirement(requirement);
+    if (requirement.target?.action === 'browser.webSearch') {
+      if (all.has('browser.webSearch')) names.add('browser.webSearch');
+      continue;
+    }
+    if (requirement.id === 'browserResearch' || requirement.target?.factId === 'pageContent') {
+      addMatching(name => name.startsWith('browser.') && !(explicitSearchCompleted && name === 'browser.webSearch'));
+      continue;
+    }
+    if (exactAction) {
+      if (all.has(exactAction)) names.add(exactAction);
+      continue;
+    }
+    switch (requirement.type) {
+      case 'browser':
+      case 'fact':
+        addMatching(name => name.startsWith('browser.'));
+        break;
+      case 'filesystem':
+        addMatching(name => name.startsWith('fs.'));
+        break;
+      case 'artifact':
+        addMatching(name => name.startsWith('browser.') || name.startsWith('fs.'));
+        break;
+      case 'desktop':
+        addMatching(name => name.startsWith('app.') || name.startsWith('desktop.'));
+        break;
+      case 'semantic':
+        addMatching(() => true);
+        break;
+    }
+  }
+  return [...names].sort();
 }
 
 function hasRelevantBlockerEvidence(
@@ -1270,7 +1387,9 @@ export class AgentRuntime {
       } else if (conversationalTask) {
         result = { ok: false, error: { code: 'TOOLS_NOT_REQUIRED', message: 'The compiled task is conversational and has no computer-use requirements. Answer the user directly.' } };
       } else {
-        const prerequisiteFailure = unsatisfiedActionPrerequisite(state, toolName, preparedInput);
+        const prerequisiteFailure = artifactWriteFailure(state, toolName, preparedInput)
+          ?? requiredDuckDuckGoSearchFailure(state, toolName)
+          ?? unsatisfiedActionPrerequisite(state, toolName, preparedInput);
         if (prerequisiteFailure) {
           result = prerequisiteFailure;
         } else {
@@ -1283,6 +1402,10 @@ export class AgentRuntime {
           } else {
             executionInput = clone(navigation.input);
             toolWasInvoked = true;
+            await this.emit('run.progress', {
+              threadId: run.threadId,
+              summary: `Running ${toolName}.`,
+            }, runId);
             result = await this.tools.execute(toolName, executionInput, {
               signal: cancellation.signal,
               runId,
@@ -1374,6 +1497,12 @@ export class AgentRuntime {
         verification,
       });
       await this.emit('run.verification', verification, runId);
+      if (toolWasInvoked && result.ok) {
+        await this.emit('run.progress', {
+          threadId: run.threadId,
+          summary: `Completed ${toolName}.`,
+        }, runId);
+      }
       const executedAction: AgentDecision = {
         ...action,
         input: clone(executionInput ?? preparedInput),
@@ -1389,8 +1518,72 @@ export class AgentRuntime {
       return compactResult;
     };
 
+    const advanceDeterministicRequirements = async (): Promise<void> => {
+      // The compiler has already captured these exact user-requested values.
+      // Persisting them is a mechanical side effect; the verifier still checks
+      // the complete mutation result against the compiled payload.
+      const memoryRequirement = requirementsForTask(state.task).find(requirement => (
+        requirement.id === 'memoryMutation'
+        && requirement.mandatory
+        && requirement.target?.action === 'memory.remember'
+        && typeof requirement.target.memoryContent === 'string'
+        && typeof requirement.target.memoryKind === 'string'
+        && !state.completedRequirementIds.includes(requirement.id)
+        && (requirement.dependsOn ?? []).every(id => state.completedRequirementIds.includes(id))
+      ));
+      if (memoryRequirement && this.tools.has('memory.remember')) {
+        const result = await executeToolNow('memory.remember', {
+          content: memoryRequirement.target!.memoryContent!,
+          kind: memoryRequirement.target!.memoryKind!,
+          source: 'user',
+        });
+        if (!result.ok) return;
+      }
+
+      const outputRequirement = requirementsForTask(state.task).find(requirement => (
+        requirement.id === 'outputFile'
+        && requirement.mandatory
+        && requirement.target?.action === 'fs.write'
+        && requirement.target.mode === 'written-from-artifact'
+        && typeof requirement.target.path === 'string'
+        && !state.completedRequirementIds.includes(requirement.id)
+        && (requirement.dependsOn ?? []).every(id => state.completedRequirementIds.includes(id))
+      ));
+      if (outputRequirement && this.tools.has('fs.write')) {
+        const selectedArtifact = selectedBrowserArtifact(state);
+        if (selectedArtifact) {
+          const writeResult = await executeToolNow('fs.write', {
+            path: outputRequirement.target!.path!,
+            sourceRef: selectedArtifact.ref,
+            format: outputRequirement.target!.format ?? 'text',
+          });
+          if (!writeResult.ok) return;
+        }
+      }
+
+      const openRequirement = requirementsForTask(state.task).find(requirement => (
+        requirement.id === 'openFile'
+        && requirement.mandatory
+        && requirement.target?.action === 'app.openFile'
+        && requirement.target.mode === 'opened'
+        && typeof requirement.target.path === 'string'
+        && !state.completedRequirementIds.includes(requirement.id)
+        && (requirement.dependsOn ?? []).every(id => state.completedRequirementIds.includes(id))
+      ));
+      if (openRequirement && this.tools.has('app.openFile')) {
+        await executeToolNow('app.openFile', {
+          path: openRequirement.target!.path!,
+          ...(openRequirement.target!.application ? { application: openRequirement.target!.application } : {}),
+        });
+      }
+    };
+
     const executeTool = (toolName: string, toolInput: Record<string, unknown>): Promise<ToolResult> => {
-      const queued = actionQueue.then(() => executeToolNow(toolName, toolInput));
+      const queued = actionQueue.then(async () => {
+        const result = await executeToolNow(toolName, toolInput);
+        if (result.ok) await advanceDeterministicRequirements();
+        return result;
+      });
       actionQueue = queued.then(() => undefined, () => undefined);
       return queued;
     };
@@ -1535,6 +1728,8 @@ export class AgentRuntime {
       state = updateCompletedRequirements(state, finalVerification);
       await persistState();
 
+      await advanceDeterministicRequirements();
+
       const agentResult = await this.actingAgent!.execute({
         userMessage: input.userMessage,
         task: clone(state.task),
@@ -1545,6 +1740,23 @@ export class AgentRuntime {
         verifyCompletion,
         reportBlocked,
         getRequirementSummary: () => taskRequirementSummary(state),
+        getActionableTools: () => actionableToolsForState(state, this.tools.names()),
+        getBlockableRequirementIds: () => {
+          const completed = new Set(state.completedRequirementIds);
+          const actionable = requirementsForTask(state.task).filter(requirement => requirement.mandatory
+            && !completed.has(requirement.id)
+            && (requirement.dependsOn ?? []).every(id => completed.has(id)));
+          const failures = actionable.map(requirement => hasRelevantBlockerEvidence(requirement, state));
+          const terminalCodes = new Set(['DISK_FULL', 'ENOSPC', 'EACCES', 'EPERM', 'PERMISSION_DENIED']);
+          const terminalFailures = failures.every(receipt => receipt?.error?.code && terminalCodes.has(receipt.error.code));
+          // A transient failed action cannot end the run while a retry or an
+          // independent requirement still has an executable path. Exhausted
+          // action failure budgets and explicit resource failures are terminal.
+          return actionable.length > 0 && failures.every(Boolean)
+            && (terminalFailures || consecutiveFailures >= maxConsecutiveFailures)
+            ? actionable.map(requirement => requirement.id)
+            : [];
+        },
         getToolActionCount: () => actionCount,
         onDiagnostics: async agentDiagnostics => {
           Object.assign(diagnostics, agentDiagnostics, { toolActions: actionCount });

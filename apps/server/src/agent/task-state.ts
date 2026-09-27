@@ -1,4 +1,4 @@
-import { browserUrlsMatch } from '@helm/shared';
+import { browserUrlsMatch, buildDuckDuckGoSearchUrl } from '@helm/shared';
 import type {
   Artifact,
   Blocker,
@@ -21,6 +21,7 @@ import type {
 
 import type { GuestTransport } from '../tools/guest-transport';
 import { CriterionVerifierRegistry } from '../tools/criterion-verifier';
+import { isSearchEngineUrl } from './browser-research';
 import type { VerificationProvider } from './types';
 
 function json(value: unknown): string {
@@ -387,7 +388,11 @@ function actualEvidenceFromResult(action: WorkerAction, now: () => number): Evid
 }
 
 function normalizedRequirementPath(value: string): string {
-  return value.replace(/\\/gu, '/').replace(/^(?:\.\/)+/u, '').replace(/\/$/u, '');
+  return value.replace(/\\/gu, '/')
+    .replace(/^\/home\/helm\/workspace\//u, '')
+    .replace(/^~\/(?:workspace\/)?/u, '')
+    .replace(/^(?:\.\/)+/u, '')
+    .replace(/\/$/u, '');
 }
 
 function actionReceipt(action: WorkerAction): WorkerAction['receipt'] | undefined {
@@ -415,18 +420,138 @@ function observedSemanticContentRef(
   sourceRef: string,
   sourceRevision: number,
   sourceUrl: string,
+  sourceType?: string,
 ): boolean {
   const writeIndex = state.recentActions.lastIndexOf(writeAction);
   if (writeIndex < 0) return false;
   return state.recentActions.slice(0, writeIndex).some(action => {
-    if ((action.tool !== 'browser.read' && action.tool !== 'browser.search') || !action.result.ok) return false;
+    if (!['browser.read', 'browser.findPage'].includes(action.tool) || !action.result.ok) return false;
     const receipt = actionReceipt(action);
     if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
     const data = recordValue(action.result.data);
     if (data?.url !== sourceUrl || data.revision !== sourceRevision) return false;
     const collection = action.tool === 'browser.read' ? data.blocks : data.results;
-    return Array.isArray(collection) && collection.some(item => recordValue(item)?.ref === sourceRef);
+    if (!Array.isArray(collection)) return false;
+    const block = collection.map(recordValue).find(item => item?.ref === sourceRef);
+    return Boolean(block && isSubstantiveBrowserContentBlock(block)
+      && (sourceType === undefined || block.type === sourceType));
   });
+}
+
+export function isSubstantiveBrowserContentBlock(block: Record<string, unknown>): boolean {
+  if (block.boilerplate === true) return false;
+  switch (block.type) {
+    case 'table':
+      return Array.isArray(block.columns) && block.columns.length > 0
+        && (Array.isArray(block.rows) && block.rows.length > 0 || Number(block.rowCount) > 0);
+    case 'list':
+      return Array.isArray(block.items) && block.items.length > 0 || Number(block.rowCount) > 0;
+    case 'definition':
+      return Array.isArray(block.definitions) && block.definitions.length > 0
+        || typeof block.preview === 'string' && block.preview.trim().length > 0;
+    case 'form':
+      return Array.isArray(block.fields) && block.fields.length > 0;
+    case 'text':
+    case 'code':
+    case 'other':
+      return (typeof block.preview === 'string' && block.preview.trim().length > 0)
+        || (typeof block.text === 'string' && block.text.trim().length > 0);
+    default:
+      return false;
+  }
+}
+
+function previouslyObservedBrowserContentRef(
+  state: TaskState,
+  selectedAction: WorkerAction,
+  ref: string,
+  url: string,
+  revision: number,
+): boolean {
+  const selectedIndex = state.recentActions.lastIndexOf(selectedAction);
+  if (selectedIndex < 0) return false;
+  return state.recentActions.slice(0, selectedIndex).some(action => {
+    if (!['browser.read', 'browser.findPage', 'browser.webSearch'].includes(action.tool) || !action.result.ok) return false;
+    const receipt = actionReceipt(action);
+    if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
+    const data = recordValue(action.result.data);
+    if (data?.url !== url || data.revision !== revision) return false;
+    const collection = action.tool === 'browser.read' ? data.blocks : data.results;
+    return Array.isArray(collection) && collection.some(item => {
+      const block = recordValue(item);
+      return block?.ref === ref && isSubstantiveBrowserContentBlock(block);
+    });
+  });
+}
+
+function browserResearchAction(state: TaskState): WorkerAction | undefined {
+  const discoveryRequired = requirementsForTask(state.task).some(requirement => (
+    requirement.target?.action === 'browser.webSearch'
+  ));
+  const artifactSelectionRequired = requirementsForTask(state.task).some(requirement => (
+    requirement.id === 'outputFile' && requirement.target?.mode === 'written-from-artifact'
+  ));
+  return [...state.recentActions].reverse().find(action => {
+    if (action.tool !== 'browser.read' || !action.result.ok) return false;
+    const receipt = actionReceipt(action);
+    if (!receipt || receipt.ok !== true || receipt.tool !== 'browser.read') return false;
+    const data = recordValue(action.result.data);
+    if (data?.operation !== 'read' || data.readable !== true || !Array.isArray(data.blocks)) return false;
+    if (discoveryRequired && isSearchEngineUrl(typeof data.url === 'string' ? data.url : undefined)) return false;
+    if (artifactSelectionRequired) {
+      const ref = typeof action.input.ref === 'string' ? action.input.ref : undefined;
+      if (!ref || typeof data.url !== 'string' || typeof data.revision !== 'number') return false;
+      const selected = data.blocks.map(recordValue).find(block => block?.ref === ref);
+      if (!selected || !isSubstantiveBrowserContentBlock(selected)) return false;
+      return previouslyObservedBrowserContentRef(state, action, ref, data.url, data.revision);
+    }
+    return data.blocks.some(block => {
+      const value = recordValue(block);
+      return value !== undefined && isSubstantiveBrowserContentBlock(value);
+    });
+  });
+}
+
+/** The model-selected current page block that can be transferred losslessly. */
+export function selectedBrowserArtifact(state: TaskState): {
+  ref: string;
+  url: string;
+  revision: number;
+  type: string;
+} | undefined {
+  for (const action of [...state.recentActions].reverse()) {
+    if (action.tool !== 'browser.read' || !action.result.ok || typeof action.input.ref !== 'string') continue;
+    const data = recordValue(action.result.data);
+    if (data?.operation !== 'read' || data.readable !== true
+      || typeof data.url !== 'string' || typeof data.revision !== 'number' || !Array.isArray(data.blocks)) continue;
+    const block = data.blocks.map(recordValue).find(item => item?.ref === action.input.ref);
+    if (!block || !isSubstantiveBrowserContentBlock(block)
+      || typeof block.type !== 'string'
+      || !previouslyObservedBrowserContentRef(state, action, action.input.ref, data.url, data.revision)) continue;
+    return { ref: action.input.ref, url: data.url, revision: data.revision, type: block.type };
+  }
+  return undefined;
+}
+
+function normalizedMemoryContent(value: string): string {
+  return value.trim().replace(/\s+/gu, ' ').toLocaleLowerCase();
+}
+
+function memoryMutationMatches(
+  requirement: TaskRequirement,
+  action: WorkerAction,
+  data: Record<string, unknown> | undefined,
+): boolean {
+  const target = requirement.target;
+  if (!target?.memoryContent) return true;
+  const memory = recordValue(data?.memory);
+  if (!memory || typeof memory.content !== 'string' || memory.kind !== target.memoryKind) return false;
+  if (normalizedMemoryContent(memory.content) !== normalizedMemoryContent(target.memoryContent)) return false;
+  if (memory.source !== 'user' || typeof action.input.content !== 'string'
+    || normalizedMemoryContent(action.input.content) !== normalizedMemoryContent(target.memoryContent)) return false;
+  if (target.memoryKey && (memory.key !== target.memoryKey || action.input.key !== target.memoryKey)) return false;
+  return action.input.kind === target.memoryKind
+    && (action.input.source === undefined || action.input.source === 'user');
 }
 
 function successfulCurrentRunAction(
@@ -461,14 +586,24 @@ function successfulCurrentRunAction(
       receipt.effect?.writePerformed !== true
       || typeof data?.sha256 !== 'string'
     )) continue;
+    if (expectedTool === 'fs.write' && typeof receipt.effect?.sha256 === 'string'
+      && receipt.effect.sha256 !== data?.sha256) continue;
+    if (expectedTool === 'memory.remember' && !memoryMutationMatches(requirement, action, data)) continue;
+    if (expectedTool === 'browser.webSearch' && (
+      data?.operation !== 'web_search'
+      || data.searchEngine !== 'duckduckgo'
+      || data.searchCompleted !== true
+      || typeof data.query !== 'string'
+      || typeof data.requestedUrl !== 'string'
+      || typeof data.url !== 'string'
+      || !browserUrlsMatch(data.requestedUrl, buildDuckDuckGoSearchUrl(String(data.query)))
+      || !Array.isArray(data.results)
+      || data.results.some(item => recordValue(item)?.type !== 'search_result' || typeof recordValue(item)?.href !== 'string')
+    )) continue;
     if (expectedTool === 'browser.read') {
-      const sections = Array.isArray(data?.sections) ? data.sections : [];
-      const hasSectionText = sections.some(section => {
-        const value = recordValue(section);
-        return typeof value?.text === 'string' && value.text.trim().length > 0;
-      });
-      const blocks = Array.isArray(data?.blocks) ? data.blocks : [];
-      if (data?.operation !== 'read' || data.readable !== true || (!hasSectionText && blocks.length === 0)) continue;
+      if (requirement.id === 'browserResearch' && !browserResearchAction(state)) continue;
+      const blocks = Array.isArray(data?.blocks) ? data.blocks.map(recordValue).filter((value): value is Record<string, unknown> => Boolean(value)) : [];
+      if (data?.operation !== 'read' || data.readable !== true || !blocks.some(isSubstantiveBrowserContentBlock)) continue;
     }
     if (target.url) {
       const observedUrl = typeof data?.url === 'string' ? data.url : receipt.effect?.urlAfter;
@@ -487,9 +622,15 @@ function successfulCurrentRunAction(
       typeof data.sourceType !== 'string'
       || typeof data.sourceRevision !== 'number'
       || typeof data.sourceUrl !== 'string'
-      || !observedSemanticContentRef(state, action, data.sourceRef, data.sourceRevision, data.sourceUrl)
+      || !observedSemanticContentRef(state, action, data.sourceRef, data.sourceRevision, data.sourceUrl, data.sourceType)
     )) continue;
-    if (target.mode === 'written-from-artifact' && typeof data?.sourceRef !== 'string') continue;
+    if (target.mode === 'written-from-artifact' && (
+      typeof data?.sourceRef !== 'string'
+      || typeof data.sourceType !== 'string'
+      || action.input.sourceRef !== data.sourceRef
+      || action.input.content !== undefined
+      || target.format !== undefined && data.format !== target.format
+    )) continue;
     return { action, receipt, ...(data ? { data } : {}) };
   }
   return undefined;
@@ -647,16 +788,26 @@ async function requirementCheck(
   verifier?: CriterionVerifierRegistry | VerificationProvider,
   lastToolResult?: ToolResult,
 ): Promise<{ passed: boolean; message: string; evidence?: unknown }> {
+  if (requirement.id === 'browserResearch') {
+    const action = browserResearchAction(state);
+    return action
+      ? { passed: true, message: 'A current-run read exposed substantive page content.', evidence: action }
+      : { passed: false, message: 'No current-run browser read has exposed substantive page content yet.' };
+  }
   if (requirement.criterion) {
+    const researchAction = requirement.criterion.type === 'custom'
+      && requirement.criterion.id === 'browser.research'
+      ? browserResearchAction(state)
+      : undefined;
     if (
       requirement.criterion.type === 'custom'
       && requirement.criterion.id === 'browser.research'
-      && supportedFact(state, 'pageContent')
+      && researchAction
     ) {
       return {
         passed: true,
-        message: 'Readable web page content is present in observed evidence.',
-        evidence: supportedFact(state, 'pageContent'),
+        message: 'A current-run read exposed substantive page content.',
+        evidence: researchAction,
       };
     }
     if (
@@ -728,7 +879,12 @@ async function requirementCheck(
           ? state.artifacts.find(artifact => artifact.type === 'file'
             && artifact.writeReceiptId === currentAction.receipt.id
             && artifact.sourceRef === currentAction.data?.sourceRef
-            && artifact.sourceRevision === currentAction.data?.sourceRevision)
+            && artifact.sourceRevision === currentAction.data?.sourceRevision
+            && artifact.sourceUrl === currentAction.data?.sourceUrl
+            && artifact.sourceType === currentAction.data?.sourceType
+            && artifact.sha256 === currentAction.data?.sha256
+            && artifact.path === currentAction.data?.path
+            && artifact.path === stat.path)
           : undefined;
         if (target.mode === 'written-from-artifact' && !lineageArtifact) {
           return {
@@ -788,6 +944,13 @@ async function requirementCheck(
     }
   }
   if (requirement.type === 'browser') {
+    if (target.freshness === 'current-run' && expectedAction === 'browser.webSearch' && currentAction) {
+      return {
+        passed: true,
+        message: 'The requested DuckDuckGo search returned observed results during this run.',
+        evidence: currentAction,
+      };
+    }
     if (target.freshness === 'current-run' && target.url && currentAction) {
       const finalUrl = typeof currentAction.data?.url === 'string'
         ? currentAction.data.url
@@ -842,16 +1005,20 @@ export async function verifyTaskState(
 ): Promise<VerificationResult> {
   const legacy = await criterionVerification(verifier, task, guest, observation, lastToolResult);
   const criteria = legacy.criteria.map(check => {
+    const researchAction = check.criterion.type === 'custom'
+      && check.criterion.id === 'browser.research'
+      ? browserResearchAction(state)
+      : undefined;
     if (
       check.criterion.type === 'custom'
       && check.criterion.id === 'browser.research'
-      && supportedFact(state, 'pageContent')
+      && researchAction
     ) {
       return {
         ...check,
         passed: true,
-        message: 'Readable web page content is present in observed evidence.',
-        evidence: supportedFact(state, 'pageContent'),
+        message: 'A current-run read exposed substantive page content.',
+        evidence: researchAction,
       };
     }
     if (

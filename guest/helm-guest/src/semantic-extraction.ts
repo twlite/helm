@@ -153,15 +153,11 @@ export function extractSemanticBrowserBlocks(
       try {
         const target = new URL(link.href);
         if (!["http:", "https:"].includes(target.protocol)) continue;
-        const isDuckDuckGo = target.hostname === "duckduckgo.com" || target.hostname.endsWith(".duckduckgo.com");
-        const wrapped = isDuckDuckGo
-          ? target.searchParams.get("uddg") ?? target.searchParams.get("url")
-          : null;
-        if (wrapped) {
-          const destination = new URL(wrapped);
-          if (["http:", "https:"].includes(destination.protocol)) href = destination.href;
-          else href = target.href;
-        } else href = target.href;
+        // Keep the resolved href Playwright observed on the anchor. In
+        // particular, DuckDuckGo redirect URLs are not silently replaced by
+        // their `uddg` payload; navigation must retain the source page's
+        // actual link provenance.
+        href = target.href;
       } catch {
         continue;
       }
@@ -180,9 +176,12 @@ export function extractSemanticBrowserBlocks(
     columnCount: number;
   } => {
     const isAria = !tagIs(table, "TABLE");
+    const nearestTable = (element: HTMLElement): HTMLElement | undefined => parentElements(element)
+      .find(parent => parent !== element && (parent.tagName === "TABLE"
+        || ["table", "grid", "treegrid"].includes(roleOf(parent) ?? "")));
     const rowElements = all.filter(candidate => {
       if (!visible(candidate)) return false;
-      if (isAria) return roleOf(candidate) === "row" && parentElements(candidate).includes(table);
+      if (isAria) return roleOf(candidate) === "row" && nearestTable(candidate) === table;
       return candidate.tagName === "TR" && candidate.closest("table") === table;
     });
     const cellsFor = (row: HTMLElement): HTMLElement[] => all.filter(candidate => {
@@ -248,11 +247,16 @@ export function extractSemanticBrowserBlocks(
       if (values.every(value => !value)) return [];
       return [Array.from({ length: columnCount }, (_, columnIndex) => values[columnIndex] ?? "")];
     });
-    const captionElement = table.querySelector("caption,[aria-label],[aria-labelledby]");
-    const caption = captionElement instanceof HTMLElement
-      ? textOf(captionElement).slice(0, 300)
-      : clean(table.getAttribute("aria-label") ?? "").slice(0, 300);
     return { columns, rows: dataRows, cellSpans: spans, rowCount: dataRows.length, columnCount };
+  };
+  const tableCaption = (table: HTMLElement): string => {
+    const labelledBy = clean((table.getAttribute("aria-labelledby") ?? "").split(/\s+/u)
+      .map(id => document.getElementById(id))
+      .filter((item): item is HTMLElement => item instanceof HTMLElement && visible(item))
+      .map(item => textOf(item)).join(" "));
+    const captionElement = Array.from(table.children).find(child => child instanceof HTMLElement && child.tagName === "CAPTION");
+    const caption = captionElement instanceof HTMLElement ? textOf(captionElement) : "";
+    return (labelledBy || clean(table.getAttribute("aria-label") ?? "") || caption).slice(0, 300);
   };
 
   // Page chrome is retained as a low-importance artifact, but its descendants
@@ -291,9 +295,7 @@ export function extractSemanticBrowserBlocks(
       seenTables.add(element);
       const data = tableRows(element);
       if (data.columnCount === 0 && data.rowCount === 0) continue;
-      const caption = element.querySelector("caption") instanceof HTMLElement
-        ? textOf(element.querySelector("caption") as HTMLElement).slice(0, 300)
-        : clean(element.getAttribute("aria-label") ?? "").slice(0, 300);
+      const caption = tableCaption(element);
       addElement(element, "table", 0.98, {
         ...(caption ? { caption } : {}),
         ...data,
@@ -402,26 +404,45 @@ export function extractSemanticBrowserBlocks(
     role: roleOf(candidate.element) ?? "region",
   });
 
-  // Search result records are constructed only from observed anchors and their
-  // visible result containers. The destination remains the page's href.
+  // Search result records are constructed only from observed anchors and
+  // credible result structures. Ordinary list navigation is never enough to
+  // turn a page into a search-results page.
   const parsedPageUrl = (() => {
     try { return new URL(options.pageUrl ?? location.href); } catch { return undefined; }
   })();
+  const isDuckDuckGoQuery = (parsedPageUrl?.hostname === "duckduckgo.com"
+    || parsedPageUrl?.hostname.endsWith(".duckduckgo.com") === true)
+    && Boolean((parsedPageUrl.searchParams.get("q") ?? parsedPageUrl.searchParams.get("query"))?.trim());
+  const hasSearchControl = all.some(element => {
+    if (roleOf(element) === "search") return true;
+    if (element.tagName === "INPUT") {
+      const input = element as HTMLInputElement;
+      return input.type === "search" || /^(?:q|query|search)$/iu.test(input.name);
+    }
+    if (element.tagName !== "FORM") return false;
+    return Boolean(element.querySelector("input[type='search'],input[name='q'],input[name='query'],input[name='search']"));
+  });
+  const hasResultMarker = (element: HTMLElement): boolean => {
+    const values = [
+      element.id,
+      typeof element.className === "string" ? element.className : "",
+      element.getAttribute("data-testid") ?? "",
+      element.getAttribute("data-test") ?? "",
+      element.getAttribute("role") ?? "",
+    ];
+    return values.some(value => /(?:^|[\s_-])(?:search[-_])?result(?:s)?(?:[\s_-]|$)/iu.test(value));
+  };
   const searchResultCandidates = new Map<string, { title: string; href: string; snippet: string; element: HTMLElement }>();
   for (const anchor of all) {
-    if (!(anchor instanceof HTMLAnchorElement) || !visible(anchor) || !anchor.href) continue;
-    const container = parentElements(anchor).find(parent => parent !== anchor && (
-      parent.tagName === "LI"
-      || roleOf(parent) === "listitem"
-      || /result/iu.test(`${parent.className ?? ""} ${parent.getAttribute("data-testid") ?? ""} ${parent.id}`)
-      || parent.tagName === "ARTICLE"
-    ));
+    if (!(anchor instanceof HTMLAnchorElement) || !visible(anchor) || !anchor.href || chromeFor(anchor)) continue;
+    let parsedHref: URL;
+    try { parsedHref = new URL(anchor.href); } catch { continue; }
+    if (!["http:", "https:"].includes(parsedHref.protocol)) continue;
+    const ancestors = parentElements(anchor).filter(parent => parent !== anchor);
+    const container = ancestors.find(hasResultMarker);
     if (!container) continue;
     const title = textOf(anchor).slice(0, 400);
     if (title.length < 4) continue;
-    const hrefs = linksOf(container, 12);
-    const found = hrefs.find(link => link.text === title || link.href === anchor.href);
-    if (!found) continue;
     let snippet = Array.from(container.querySelectorAll("p,[class*='snippet' i],[data-testid*='snippet' i]"))
       .filter(item => item instanceof HTMLElement && visible(item))
       .map(item => textOf(item as HTMLElement))
@@ -429,13 +450,11 @@ export function extractSemanticBrowserBlocks(
       .join(" ")
       .slice(0, 800);
     if (!snippet) snippet = textOf(container).replace(title, " ").slice(0, 800);
-    searchResultCandidates.set(found.href, { title, href: found.href, snippet, element: container });
+    searchResultCandidates.set(parsedHref.href, { title, href: parsedHref.href, snippet, element: container });
   }
-  const searchLikeUrl = parsedPageUrl?.hostname === "duckduckgo.com"
-    && (parsedPageUrl.searchParams.has("q") || parsedPageUrl.searchParams.has("query"));
-  const isSearchPage = searchLikeUrl
+  const isSearchPage = isDuckDuckGoQuery
     ? searchResultCandidates.size > 0
-    : searchResultCandidates.size >= 3;
+    : hasSearchControl && searchResultCandidates.size >= 3;
   if (isSearchPage) {
     for (const result of searchResultCandidates.values()) {
       addElement(result.element, "search_result", 0.96, {
@@ -449,7 +468,6 @@ export function extractSemanticBrowserBlocks(
   }
 
   const tableBlocks = blocks.filter(block => block.type === "table");
-  const tableRowsCount = tableBlocks.reduce((sum, block) => sum + (block.rowCount ?? 0), 0);
   const formCount = blocks.filter(block => block.type === "form").length;
   const codeCount = blocks.filter(block => block.type === "code").length;
   const proseBlocks = blocks.filter(block => block.type === "text" && !block.boilerplate);
@@ -458,7 +476,7 @@ export function extractSemanticBrowserBlocks(
     && element.getAttribute("itemprop") === "articleBody");
   let pageType: BrowserPageType;
   if (isSearchPage) pageType = "search_results";
-  else if (tableBlocks.length > 0 && tableRowsCount >= 2) pageType = "data_table";
+  else if (tableBlocks.some(block => (block.rowCount ?? 0) > 0 && (block.columnCount ?? 0) > 1)) pageType = "data_table";
   else if (formCount > 0 && proseChars < 1_200) pageType = "form";
   else if (codeCount > 0 && proseChars > 0) pageType = "documentation";
   else if (articleLike || proseChars >= 700) pageType = "article";

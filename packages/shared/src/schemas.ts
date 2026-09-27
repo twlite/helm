@@ -62,7 +62,11 @@ export const guestMethodSchemas = {
     offset: z.number().int().min(0).max(1_000_000).optional(),
     limit: z.number().int().min(1).max(100).optional(),
   }).strict(),
-  'browser.search': z.object({
+  'browser.findPage': z.object({
+    query: z.string().trim().min(1).max(1_000),
+    maxResults: z.number().int().min(1).max(20).optional(),
+  }),
+  'browser.webSearch': z.object({
     query: z.string().trim().min(1).max(1_000),
     maxResults: z.number().int().min(1).max(20).optional(),
   }),

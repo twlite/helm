@@ -50,12 +50,14 @@ const memoryForgetSchema = z.object({
   key: z.string().trim().min(1).max(200).optional(),
 }).strict().refine(value => Boolean(value.id) !== Boolean(value.key), 'Provide exactly one of id or key.');
 
-function compactMemory(memory: Memory): Record<string, unknown> {
+function compactMemory(memory: Memory, options: { preserveContent?: boolean } = {}): Record<string, unknown> {
   return {
     id: memory.id,
     ...(memory.key ? { key: memory.key } : {}),
     kind: memory.kind,
-    content: memory.content.length <= 2_000 ? memory.content : `${memory.content.slice(0, 1_997).trimEnd()}...`,
+    content: options.preserveContent || memory.content.length <= 2_000
+      ? memory.content
+      : `${memory.content.slice(0, 1_997).trimEnd()}...`,
     importance: memory.importance,
     ...(memory.source ? { source: memory.source } : {}),
     ...(memory.sourceUrl ? { sourceUrl: memory.sourceUrl } : {}),
@@ -113,7 +115,7 @@ export function registerMemoryTools(registry: ToolRegistry, memory: MemoryServic
     description: 'Search durable memories with the same hybrid FTS and vector ranking used for automatic recall.',
     inputSchema: memorySearchSchema,
     execute: async ({ query, limit }: z.infer<typeof memorySearchSchema>) => ({
-      results: (await memory.search(query, limit)).map(compactMemory),
+      results: (await memory.search(query, limit)).map(item => compactMemory(item)),
     }),
   });
   registry.register({
@@ -129,7 +131,10 @@ export function registerMemoryTools(registry: ToolRegistry, memory: MemoryServic
       });
       return {
         action: result.action,
-        memory: compactMemory(result.memory),
+        // Mutation receipts are also the verifier's proof of what was
+        // persisted. Return the complete bounded (4,000 character) value so
+        // an explicit memory requirement can compare the exact payload.
+        memory: compactMemory(result.memory, { preserveContent: true }),
       };
     },
   });
@@ -167,7 +172,7 @@ export function registerMemoryTools(registry: ToolRegistry, memory: MemoryServic
         } : {}),
       });
       if (!updated) return failure('MEMORY_NOT_FOUND', 'The memory disappeared before it could be updated.');
-      return { action: 'updated', memory: compactMemory(updated) };
+      return { action: 'updated', memory: compactMemory(updated, { preserveContent: true }) };
     },
   });
   registry.register({

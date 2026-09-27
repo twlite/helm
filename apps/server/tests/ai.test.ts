@@ -421,11 +421,12 @@ describe('LM Studio AI adapters', () => {
       threadId: 'thread-research',
       userMessage,
     })).resolves.toMatchObject({
-      goal: expect.stringContaining("Use Helm's browser"),
-      criteria: [{
+      goal: expect.stringContaining("Use Helm's local browser"),
+      criteria: expect.arrayContaining([{
         type: 'custom',
         id: BROWSER_RESEARCH_CRITERION_ID,
-      }],
+        description: expect.any(String),
+      }]),
     });
     expect(JSON.stringify(requestBody)).toContain('current or publicly available web information are tasks, not conversation');
     expect(JSON.stringify(requestBody)).toContain('browser.read');
@@ -896,6 +897,45 @@ describe('LM Studio AI adapters', () => {
     expect(dataTask.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
       dependsOn: ['browserResearch'],
       target: { path: 'forex.txt', mode: 'written-from-artifact', freshness: 'current-run', action: 'fs.write' },
+    });
+
+    const exactPrompt = 'fetch the exchange rate data from nepal rastra bank\'s official forex website and save that data to forex.txt file and open it with text viewer application. Use duckduckgo search to find the relevant website. remember to use https://www.nrb.org.np/forex/ for all forex requests about nepal.';
+    const exactTask = await planner.createTask({ threadId: 'exact-forex-thread', userMessage: exactPrompt });
+    const exactRequirements = exactTask.requirements ?? [];
+    expect(exactRequirements.map(requirement => requirement.id)).not.toContain('browserDestination1');
+    expect(exactRequirements.find(requirement => requirement.id === 'browserSearch')).toMatchObject({
+      target: { action: 'browser.webSearch', freshness: 'current-run' },
+    });
+    expect(exactRequirements.find(requirement => requirement.id === 'browserResearch')).toMatchObject({
+      dependsOn: ['browserSearch'],
+      target: { action: 'browser.read', factId: 'pageContent', freshness: 'current-run' },
+    });
+    expect(exactRequirements.find(requirement => requirement.id === 'outputFile')).toMatchObject({
+      dependsOn: ['browserResearch'],
+      target: { path: 'forex.txt', mode: 'written-from-artifact', format: 'text', action: 'fs.write' },
+    });
+    expect(exactRequirements.find(requirement => requirement.id === 'openFile')).toMatchObject({
+      dependsOn: ['outputFile'],
+      target: { path: 'forex.txt', mode: 'opened', application: 'text-editor', action: 'app.openFile' },
+    });
+    expect(exactRequirements.find(requirement => requirement.id === 'memoryMutation')).toMatchObject({
+      target: {
+        action: 'memory.remember',
+        freshness: 'current-run',
+        memoryKind: 'instruction',
+        memoryContent: 'Use https://www.nrb.org.np/forex/ for all forex requests about nepal.',
+      },
+    });
+    const rememberedFactTask = await planner.createTask({
+      threadId: 'remember-that-thread',
+      userMessage: 'Remember that all Nepal forex requests should use https://www.nrb.org.np/forex/.',
+    });
+    expect(rememberedFactTask.requirements?.find(requirement => requirement.id === 'memoryMutation')).toMatchObject({
+      target: {
+        action: 'memory.remember',
+        memoryKind: 'instruction',
+        memoryContent: 'All Nepal forex requests should use https://www.nrb.org.np/forex/.',
+      },
     });
 
     const followUp = await planner.createTask({

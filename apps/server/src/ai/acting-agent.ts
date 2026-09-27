@@ -1,4 +1,4 @@
-import { generateText, isStepCount, modelMessageSchema, Output, tool, ToolLoopAgent, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
+import { generateText, isStepCount, modelMessageSchema, NoSuchToolError, Output, ToolChoiceViolationError, tool, ToolLoopAgent, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
 import type { Message, RunDiagnostics, ToolResult, VerificationResult } from '@helm/shared';
 
@@ -14,13 +14,11 @@ import {
 import { structuredOutputSchema, type StructuredOutputCompatibility } from './structured-output';
 
 const BLOCKED_TOOL = 'helm.blocked';
-const PROGRESS_TOOL = 'helm.progress';
 
 const BASE_INSTRUCTIONS = [
   'You are Helm, a capable assistant with optional local computer-use tools.',
   'Use the conversation and current request to decide whether tools are needed; ordinary chat usually needs none.',
   'When a tool is useful, call the native Helm tool and use its actual result. Tool errors are available for recovery.',
-  'When you use tools, include one brief user-visible summary through helm.progress in the same turn as your first concrete tool action whenever you can name that action. This is public progress text, never private chain-of-thought or internal deliberation; do not claim success before a tool succeeds.',
   'Do not claim that an external action succeeded unless a tool returned success.',
   'A URL included as data for an artifact is not automatically a browser destination.',
   'Memory is reference, never current evidence. Search when history helps; remember explicit requests after discovery, update corrections, forget when asked, and skip transient saves unless requested. Never claim persistence without a successful memory result.',
@@ -28,9 +26,9 @@ const BASE_INSTRUCTIONS = [
 ].join(' ');
 
 const PAGE_READING_INSTRUCTIONS = [
-  'Use browser.read({ query }) to locate relevant semantic blocks; browser.search ranks the same blocks and exposes observed hrefs. Without a read query, browser.read returns a compact overview. Use browser.read({ ref }) only to inspect more of an already selected block, including table pagination with offset and limit.',
+  'Use browser.read({ query }) to locate relevant semantic blocks; browser.findPage searches only the current page. Without a read query, browser.read returns a compact overview. Use browser.read({ ref }) only to inspect more of an already selected block, including table pagination with offset and limit.',
   'When saving extracted page content, choose the relevant block ref and call fs.write with sourceRef and a suitable text, markdown, json, or csv format. The guest transfers the full stored block; do not copy a preview or reconstruct the extracted data in the content argument. Use content for model-authored summaries or other new text.',
-  'For an unnamed destination, search DuckDuckGo first and prefer the named organization\'s official result. Never invent a hostname or route. Use an exact user-provided URL directly. When recalled verified memory directly matches the request and supplies a URL, navigate to that exact URL before search discovery; if it fails or unexpectedly redirects, continue with DuckDuckGo. Use browser.open({ ref }) to open a selected result or page link; do not retype or reconstruct its URL.',
+  'For an unnamed destination, use browser.webSearch for DuckDuckGo discovery and prefer the named organization\'s official result. Never invent a hostname or route. An explicit request to search DuckDuckGo in this run takes precedence over a supplied or remembered URL. Use browser.open({ ref }) to open a selected result or page link; do not retype or reconstruct its URL.',
   'Before saving page-derived content, obtain a successful non-empty browser.read result. If reading fails, recover with another query or a relevant ref; never save errors or placeholders as the artifact.',
   'An existing output file or already-open window does not satisfy a request to write or open it during this run. Verify the current-run fs.write result before calling app.openFile, and verify the current-run app.openFile result for an explicit open request.',
 ].join(' ');
@@ -64,10 +62,6 @@ const blockedInputSchema = z.object({
     .describe('Runtime-compiled requirements prevented by an actual failed tool result.'),
 }).strict();
 
-const progressInputSchema = z.object({
-  summary: z.string().min(1).max(360).describe('A concise user-visible summary of the next concrete action or current progress.'),
-}).strict();
-
 function asModelMessages(messages: readonly Message[], userMessage: string): ModelMessage[] {
   const visible = messages
     .filter((message): message is Message & { role: 'user' | 'assistant' } => (
@@ -97,13 +91,12 @@ function modelToolSet(
   executeTool: ActingAgentContext['executeTool'],
   reportBlocked: ActingAgentContext['reportBlocked'],
   onBlockedAccepted: (input: z.infer<typeof blockedInputSchema>) => void,
-  onProgress?: ActingAgentContext['onProgress'],
 ): ToolSet {
   const tools: Record<string, unknown> = {};
   for (const definition of definitions) {
     const inputSchema = definition.inputSchema ?? definition.schema;
     if (!inputSchema) throw new Error(`Missing input schema for Helm tool ${definition.name}`);
-    if (definition.name === BLOCKED_TOOL || definition.name === PROGRESS_TOOL) {
+    if (definition.name === BLOCKED_TOOL) {
       throw new Error(`Helm tool name is reserved: ${definition.name}`);
     }
     tools[definition.name] = tool({
@@ -119,15 +112,6 @@ function modelToolSet(
       const checked = await reportBlocked(input);
       if (checked.ok && checked.data?.blocked) onBlockedAccepted(input);
       return checked;
-    },
-  });
-  tools[PROGRESS_TOOL] = tool({
-    description: 'Send the user a concise progress summary. This is public status text, not a place for hidden reasoning or chain-of-thought.',
-    inputSchema: progressInputSchema,
-    execute: async ({ summary }) => {
-      const cleanSummary = summary.trim();
-      if (cleanSummary) await onProgress?.(cleanSummary);
-      return { ok: true };
     },
   });
   return tools as ToolSet;
@@ -338,8 +322,8 @@ export class AiSdkActingAgent implements ActingAgentProvider {
 
     const tools = modelToolSet(input.toolDefinitions, input.executeTool, reportBlocked, value => {
       acceptedBlocker = { response: value.response, requirementIds: [...value.requirementIds] };
-    }, input.onProgress);
-    const toolContext = `${toolDefinitionsDescription(input.toolDefinitions)}\nhelm.progress: concise public status; helm.blocked: report a blocker only with relevant failed tool evidence.`;
+    });
+    const toolContext = `${toolDefinitionsDescription(input.toolDefinitions)}\nhelm.blocked: report a blocker only with relevant failed tool evidence.`;
     const maxModelTurns = Math.max(1, Math.trunc(input.maxModelTurns));
     const maxCompletionRecoveryTurns = Math.max(0, Math.trunc(input.maxCompletionRecoveryTurns));
 
@@ -360,11 +344,24 @@ export class AiSdkActingAgent implements ActingAgentProvider {
       ].join('\n\n');
       const messages = await prepare(currentInstructions, toolContext);
       blockerRejectionThisTurn = false;
+      const actionable = input.getActionableTools?.().filter(name => name in tools) ?? [];
+      const blockableRequirementIds = input.getBlockableRequirementIds?.() ?? [];
+      const requiredChoices = [
+        ...actionable,
+        ...(blockableRequirementIds.length > 0 ? [BLOCKED_TOOL] : []),
+      ];
+      const activeTools = requiredChoices.length > 0
+        ? [...new Set(requiredChoices)]
+        : input.task.isConversation
+          ? []
+          : input.toolDefinitions.map(definition => definition.name).filter(name => name in tools);
 
       const agent = new ToolLoopAgent<never, ToolSet>({
         model: this.options.model,
         instructions: currentInstructions,
         tools,
+        activeTools,
+        ...(requiredChoices.length > 0 ? { toolChoice: 'required' as const } : {}),
         stopWhen: isStepCount(1),
         maxOutputTokens: this.options.maxOutputTokens,
         temperature: this.options.temperature,
@@ -374,11 +371,45 @@ export class AiSdkActingAgent implements ActingAgentProvider {
       diagnostics.modelTurns += 1;
       diagnostics.modelRequests += 1;
       await emitDiagnostics();
-      const result = await agent.generate({
-        messages,
-        abortSignal: input.signal,
-        timeout: this.options.requestTimeoutMs,
-      });
+      let result: Awaited<ReturnType<typeof agent.generate>>;
+      try {
+        result = await agent.generate({
+          messages,
+          abortSignal: input.signal,
+          timeout: this.options.requestTimeoutMs,
+        });
+      } catch (caught) {
+        // AI SDK v7 enforces required tool calls and active-tool membership by
+        // throwing before it returns a generation result. Some local model
+        // servers ignore those constraints. Keep the actionable requirement
+        // authoritative and spend only the already-counted model turn: retain
+        // any ordinary text as history, then steer the next turn back to the
+        // currently available tools. This is not a completion attempt and does
+        // not consume completion-recovery budget.
+        const ignoredRequiredChoice = ToolChoiceViolationError.isInstance(caught)
+          && caught.toolChoice.type === 'required';
+        const calledUnavailableTool = NoSuchToolError.isInstance(caught)
+          && activeTools !== undefined
+          && !activeTools.includes(caught.toolName);
+        if (activeTools && activeTools.length > 0 && (ignoredRequiredChoice || calledUnavailableTool)) {
+          const attemptedText = ignoredRequiredChoice
+            ? caught.content.flatMap(part => part.type === 'text' ? [part.text] : []).join('\n').trim()
+            : '';
+          const recoveryMessages: ModelMessage[] = [];
+          if (attemptedText) recoveryMessages.push({ role: 'assistant', content: attemptedText });
+          const blockerInstruction = blockableRequirementIds.length > 0
+            ? ` A verified blocker may be reported only for these requirement IDs: ${blockableRequirementIds.join(', ')}.`
+            : '';
+          recoveryMessages.push({
+            role: 'user',
+            content: `The last model response did not produce an executable required action. Currently available task choices: ${activeTools.join(', ')}. Call an available tool. The runtime will verify completion after the required actions.${blockerInstruction}`,
+          });
+          exchanges.push({ messages: recoveryMessages, kind: 'conversation' });
+          await emitDiagnostics();
+          continue;
+        }
+        throw caught;
+      }
       assertModelMessages(result.responseMessages, 'Acting-agent response history');
       exchanges.push({ messages: result.responseMessages, kind: 'tool' });
 
@@ -414,6 +445,17 @@ export class AiSdkActingAgent implements ActingAgentProvider {
 
       const endedWithText = result.text.trim().length > 0 && result.finishReason !== 'tool-calls';
       if (endedWithText) {
+        if (actionable.length > 0) {
+          exchanges.push({
+            kind: 'conversation',
+            messages: [{
+              role: 'user',
+              content: `The runtime still has executable required work. Call one of the currently available tools: ${actionable.join(', ')}. A final response can be given after those actions are verified.`,
+            }],
+          });
+          await emitDiagnostics();
+          continue;
+        }
         const checked = await verifyResponse(result.text);
         if (checked.ok && checked.data?.complete) {
           await emitDiagnostics();

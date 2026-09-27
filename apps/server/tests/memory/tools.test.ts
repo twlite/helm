@@ -93,6 +93,38 @@ describe('native memory tools', () => {
     }
   });
 
+  it('returns the complete persisted user payload from a memory mutation', async () => {
+    const persistence = testDatabase();
+    try {
+      const memory = new MemoryService(persistence.sqlite);
+      const tools = new ToolRegistry();
+      registerMemoryTools(tools, memory);
+      const content = `Use the canonical project instruction: ${'specific-value '.repeat(170)}`.trim();
+
+      const saved = await tools.execute('memory.remember', {
+        content,
+        kind: 'instruction',
+        key: 'project:canonical-instruction',
+      });
+
+      expect(saved).toMatchObject({
+        ok: true,
+        data: {
+          action: 'remembered',
+          memory: {
+            content,
+            kind: 'instruction',
+            key: 'project:canonical-instruction',
+            source: 'user',
+          },
+        },
+      });
+      expect(memory.getByKey('project:canonical-instruction')?.content).toBe(content);
+    } finally {
+      persistence.close();
+    }
+  });
+
   it('returns schema errors and missing-memory failures as structured tool results', async () => {
     const persistence = testDatabase();
     try {

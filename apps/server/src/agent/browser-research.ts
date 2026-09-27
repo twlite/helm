@@ -1,3 +1,4 @@
+import { buildDuckDuckGoSearchUrl } from '@helm/shared';
 import type { CompletionCriterion } from '@helm/shared';
 
 /** Internal criterion used when a web-research request has no single URL to verify. */
@@ -12,8 +13,9 @@ const DUCKDUCKGO_SEARCH_URL = 'https://duckduckgo.com';
 const SUPPORTED_BROWSER_PROTOCOLS = new Set(['http:', 'https:', 'file:', 'about:']);
 const BARE_FILE_REFERENCE_PATTERN = /\.(?:txt|md|markdown|json|csv|tsv|log|html?|css|js|jsx|mjs|cjs|ts|tsx|xml|ya?ml|toml|ini|conf|env|pdf|docx?|xlsx?|pptx?|zip|tar|gz)(?:[?#].*)?$/iu;
 const STATIC_IMAGE_URL_PATTERN = /\.(?:png|jpe?g|gif|webp|svg|ico|avif|bmp|tiff?)(?:[?#].*)?$/iu;
-const ASSET_CONTEXT_PATTERN = /\b(?:image|picture|photo|avatar|profile\s+(?:picture|image|photo)|logo|icon|thumbnail|background|cover|src|href)\b/iu;
 const EXPLICIT_NAVIGATION_PATTERN = /\b(?:go\s+to|navigate(?:\s+to)?|visit|open|browse|read|inspect|research|look\s+(?:it\s+)?up|find(?:\s+out)?|extract|download)\b/iu;
+const MEMORY_REFERENCE_PATTERN = /\b(?:remember|memorize|memory|memories|keep\s+in\s+mind)\b/giu;
+const ASSET_REFERENCE_PATTERN = /\b(?:image|picture|photo|avatar|profile\s+(?:picture|image|photo)|logo|icon|thumbnail|background|cover|src|href)\b/iu;
 
 /**
  * Detect requests that require public web research.
@@ -56,7 +58,7 @@ export function browserResearchTask(input: { threadId: string; userMessage: stri
   return {
     id: `ai-browser-research-${input.threadId}`,
     threadId: input.threadId,
-    goal: `Use Helm's browser to search with DuckDuckGo and read the relevant public web pages for this request, prioritizing any named source and relevant memory guidance. If the user did not supply an exact destination URL and memory does not contain an exact verified URL, search DuckDuckGo first; never infer a website hostname or route. Use semantic browser.search/read results and browser.open({ ref }) to follow the selected result's observed href without retyping it. An exact verified-memory URL may be opened directly, but if it fails or redirects unexpectedly, search DuckDuckGo again. DuckDuckGo is the only supported search engine. Do not repeat the same search navigation: ${request}`,
+    goal: `Use Helm's local browser to research this request and inspect the relevant public page. When this request explicitly says to use DuckDuckGo, perform browser.webSearch before any destination navigation, even if the same request includes a URL as a memory instruction. Otherwise, use an exact current-run destination or exact verified-memory URL when one is clearly requested; if there is no destination, search with DuckDuckGo. Never infer a hostname or route. Choose among observed browser.webSearch results using their title, snippet, hostname, and organization identity, then open the selected result with browser.open({ ref }). On a page, use browser.read({ query }) or browser.findPage to locate relevant semantic blocks and browser.read({ ref }) to inspect a selected block. DuckDuckGo is the only supported search engine. Do not repeat the same search: ${request}`,
     criteria: [browserResearchCriterion()],
   };
 }
@@ -90,26 +92,94 @@ export function explicitBrowserUrls(input: string): string[] {
   return [...new Set(candidates)];
 }
 
-/** Explicit URLs that the user supplied as destinations, excluding obvious asset values. */
-export function explicitBrowserNavigationUrls(input: string): string[] {
-  return explicitBrowserUrls(input).filter(url => {
-    const withoutScheme = url.replace(/^https?:\/\//iu, '');
-    const start = input.toLocaleLowerCase().indexOf(withoutScheme.toLocaleLowerCase());
-    const before = start >= 0 ? input.slice(Math.max(0, input.lastIndexOf('.', start) + 1), start) : '';
-    const end = start < 0 ? -1 : start + withoutScheme.length;
-    const terminators = end < 0 ? [] : ['.', '!', '?', '\n']
-      .map(marker => input.indexOf(marker, end))
-      .filter(index => index >= 0);
-    const after = end < 0
-      ? ''
-      : input.slice(end, terminators.length > 0 ? Math.min(...terminators) : input.length);
-    const context = `${before}${withoutScheme}${after}`;
-    const clauseBeforeUrl = before.split(/\b(?:and|but|then|using|use|as)\b/iu).at(-1) ?? before;
-    const explicitlyOpened = EXPLICIT_NAVIGATION_PATTERN.test(clauseBeforeUrl);
-    const hasAssetContext = ASSET_CONTEXT_PATTERN.test(context);
-    const imageAsset = STATIC_IMAGE_URL_PATTERN.test(url);
-    return explicitlyOpened || (!hasAssetContext && !imageAsset);
+export type ExplicitBrowserUrlRole = 'navigation' | 'asset' | 'reference';
+
+export interface ExplicitBrowserUrlReference {
+  url: string;
+  role: ExplicitBrowserUrlRole;
+}
+
+function urlSentenceContext(input: string, url: string): { text: string; urlStart: number } {
+  const normalizedInput = input.toLocaleLowerCase();
+  const normalizedUrl = url.toLocaleLowerCase().replace(/^https?:\/\//iu, '');
+  const start = normalizedInput.indexOf(normalizedUrl)
+    >= 0
+    ? normalizedInput.indexOf(normalizedUrl)
+    : normalizedUrl.endsWith('/') ? normalizedInput.indexOf(normalizedUrl.slice(0, -1)) : -1;
+  if (start < 0) return { text: input, urlStart: -1 };
+  const sentenceStart = Math.max(
+    input.lastIndexOf('.', start),
+    input.lastIndexOf('!', start),
+    input.lastIndexOf('?', start),
+    input.lastIndexOf('\n', start),
+  );
+  const matchedUrlLength = normalizedInput.startsWith(normalizedUrl, start)
+    ? normalizedUrl.length
+    : normalizedUrl.length - 1;
+  const sentenceEndCandidates = [
+    input.indexOf('.', start + matchedUrlLength),
+    input.indexOf('!', start + matchedUrlLength),
+    input.indexOf('?', start + matchedUrlLength),
+    input.indexOf('\n', start + matchedUrlLength),
+  ].filter(index => index >= 0);
+  const sentenceEnd = sentenceEndCandidates.length > 0
+    ? Math.min(...sentenceEndCandidates)
+    : input.length;
+  return {
+    text: input.slice(sentenceStart + 1, sentenceEnd),
+    urlStart: start - (sentenceStart + 1),
+  };
+}
+
+/**
+ * Classify explicit URL values once so task compilation and navigation policy
+ * agree about destinations, assets, and URLs stored as data in a memory
+ * instruction.
+ */
+export function explicitBrowserUrlReferences(input: string): ExplicitBrowserUrlReference[] {
+  return explicitBrowserUrls(input).map(url => {
+    const { text, urlStart } = urlSentenceContext(input, url);
+    const beforeUrl = urlStart >= 0 ? text.slice(0, urlStart) : text;
+    const matchedUrl = url.toLocaleLowerCase().replace(/^https?:\/\//iu, '');
+    const afterUrl = urlStart >= 0 ? text.slice(urlStart + Math.min(text.length - urlStart, matchedUrl.length)) : '';
+    const memoryDirective = [...beforeUrl.matchAll(MEMORY_REFERENCE_PATTERN)].at(-1);
+    const textAfterMemoryDirective = memoryDirective
+      ? beforeUrl.slice((memoryDirective.index ?? 0) + memoryDirective[0].length)
+      : '';
+    // A later explicit navigation verb makes the URL a destination even if
+    // the same sentence also asks Helm to remember it.
+    const rememberedValue = Boolean(memoryDirective)
+      && !EXPLICIT_NAVIGATION_PATTERN.test(textAfterMemoryDirective)
+      && !EXPLICIT_NAVIGATION_PATTERN.test(afterUrl);
+    const assetLanguage = ASSET_REFERENCE_PATTERN.test(text);
+    const explicitlyNavigated = EXPLICIT_NAVIGATION_PATTERN.test(beforeUrl)
+      || EXPLICIT_NAVIGATION_PATTERN.test(afterUrl);
+    const role: ExplicitBrowserUrlRole = rememberedValue
+      ? 'reference'
+      : (assetLanguage || STATIC_IMAGE_URL_PATTERN.test(url)) && !explicitlyNavigated
+        ? 'asset'
+        : 'navigation';
+    return { url, role };
   });
+}
+
+/** Explicit URLs that the user supplied as destinations, excluding assets and memory values. */
+export function explicitBrowserNavigationUrls(input: string): string[] {
+  return explicitBrowserUrlReferences(input)
+    .filter(reference => reference.role === 'navigation')
+    .map(reference => reference.url);
+}
+
+export function explicitBrowserAssetUrls(input: string): string[] {
+  return explicitBrowserUrlReferences(input)
+    .filter(reference => reference.role === 'asset')
+    .map(reference => reference.url);
+}
+
+export function explicitBrowserReferenceUrls(input: string): string[] {
+  return explicitBrowserUrlReferences(input)
+    .filter(reference => reference.role === 'reference')
+    .map(reference => reference.url);
 }
 
 export function browserResearchSearchUrl(query: string): string {
@@ -118,7 +188,7 @@ export function browserResearchSearchUrl(query: string): string {
 
 /** Use only a destination explicitly written by the user; otherwise start at DuckDuckGo. */
 export function browserResearchStartUrl(input: string): string {
-  const explicit = explicitBrowserUrls(input).find(value => /^https?:/iu.test(value));
+  const explicit = explicitBrowserNavigationUrls(input).find(value => /^https?:/iu.test(value));
   if (explicit) return normalizeUnsupportedSearchEngineUrl(explicit) ?? explicit;
   const nonHttp = input.match(/\b(?:file|about):(?:\/\/)?[^\s"'<>]+/iu)?.[0];
   if (nonHttp) return nonHttp;
@@ -179,7 +249,7 @@ function queryFromSearchUrl(url: URL): string | undefined {
 }
 
 function duckDuckGoSearchUrl(query: string): string {
-  return `${DUCKDUCKGO_SEARCH_URL}/?q=${encodeURIComponent(query.trim())}`;
+  return buildDuckDuckGoSearchUrl(query);
 }
 
 function normalizeUnsupportedSearchEngineUrl(value: string): string | undefined {

@@ -131,6 +131,10 @@ export interface ActingAgentContext {
     requirementIds: readonly string[];
   }): Promise<ToolResult<{ blocked: boolean }>>;
   getRequirementSummary(): string;
+  /** Names of tools that can advance the currently actionable requirement state. */
+  getActionableTools?: () => readonly string[];
+  /** Pending requirement IDs with concrete failure evidence that can justify a blocker report. */
+  getBlockableRequirementIds?: () => readonly string[];
   getToolActionCount?: () => number;
   onDiagnostics?: (diagnostics: RunDiagnostics) => Promise<void> | void;
   drainSteering?: () => Message[];

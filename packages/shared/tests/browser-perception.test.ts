@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { deriveBrowserReadQuery, extractRelevantPassages, rankPageRegions, sampleReadableText, type IndexedBrowserRegion } from '../src/browser-perception';
+import { deriveBrowserReadQuery, extractRelevantPassages, rankBrowserContentBlocks, rankPageRegions, sampleReadableText, type IndexedBrowserRegion } from '../src/browser-perception';
 
 describe('shared browser perception helpers', () => {
   it('keeps queryless samples within even very small requested character limits', () => {
@@ -63,6 +63,50 @@ describe('shared browser perception helpers', () => {
     });
 
     expect(result.results.map(region => region.ref)).toEqual(['r1-2', 'r1-1']);
+  });
+
+  it('surfaces a structurally relevant table ahead of matching navigation and result snippets', () => {
+    const result = rankBrowserContentBlocks({
+      query: 'exchange rate data',
+      maxResults: 1,
+      blocks: [
+        {
+          ref: 'c1-nav',
+          type: 'navigation',
+          text: 'Daily Exchange Rate Statistics Foreign Exchange Management Data & Reports',
+          links: [
+            { text: 'Daily Exchange Rate', href: '#daily' },
+            { text: 'Statistics', href: '#statistics' },
+            { text: 'Foreign Exchange Management', href: '#management' },
+            { text: 'Quarterly Interest Rate', href: '#quarterly' },
+            { text: 'Data & Reports', href: '#reports' },
+          ],
+          importance: 0.1,
+          boilerplate: true,
+        },
+        {
+          ref: 'c1-menu',
+          type: 'search_result',
+          title: 'Daily Exchange Rate',
+          href: 'https://bank.example.test/rates',
+          snippet: 'Data and foreign exchange information.',
+          importance: 0.96,
+        },
+        {
+          ref: 'c1-table',
+          type: 'table',
+          headingPath: ['Foreign Exchange Rate', 'Today'],
+          caption: 'Official foreign currency buying and selling rates',
+          columns: ['Currency', 'Code', 'Unit', 'Buying', 'Selling'],
+          rows: [['USD', 'USD', '1', '152.28', '153.65']],
+          rowCount: 1,
+          columnCount: 5,
+          importance: 0.98,
+        },
+      ],
+    });
+
+    expect(result.results).toEqual([{ ref: 'c1-table', relevance: expect.any(Number) }]);
   });
 
   it('uses form labels as a high-density match field', () => {

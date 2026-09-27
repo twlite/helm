@@ -21,7 +21,8 @@ const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'browser.getState': 'Read the visible browser URL, title, loading state, page count, and current DOM revision without reading page text.',
   'browser.snapshot': 'Return a bounded semantic outline of the current page and its visible interactive elements.',
   'browser.read': 'Read a compact semantic overview or retrieve locally ranked page blocks for a query. Results include typed blocks and current-page content refs; use a block ref with fs.write sourceRef to transfer complete extracted content without copying it into tool arguments. Use offset and limit with a content ref to inspect more table rows or list items, and maxChars plus offset for prose chunks.',
-  'browser.search': 'Search the same locally extracted semantic blocks as browser.read. Results include typed content refs and exact observed hrefs; zero matches describe only this query.',
+  'browser.findPage': 'Find and rank content on the current page. This is page-local search and does not search the web; results include typed current-page refs.',
+  'browser.webSearch': 'Search the public web by opening a DuckDuckGo results page in Helm\'s local browser. Returns observed result records with exact hrefs and refs; open a selected result with browser.open({ ref }).',
   'browser.open': 'Open an observed destination directly from a current browser content ref. Use linkIndex for a block containing multiple links; the guest never accepts a model-created URL here.',
   'browser.inspectRegion': 'Inspect one current page region as bounded text, structured table rows, or local links. Large tables support offset and limit pagination.',
   'browser.download': 'Start and record a browser download from a semantic element or URL.',
@@ -73,7 +74,7 @@ async function boundarySnapshot(
 ): Promise<BoundarySnapshot> {
   const snapshot: BoundarySnapshot = {};
   if (method.startsWith('browser.') && ![
-    'browser.read', 'browser.snapshot', 'browser.search', 'browser.inspectRegion', 'browser.getState',
+    'browser.read', 'browser.snapshot', 'browser.findPage', 'browser.inspectRegion', 'browser.getState',
   ].includes(method)) {
     try {
       const state = await guest.request('browser.getState', {}, { signal });
@@ -129,13 +130,18 @@ function receiptEffect(
   if (before.browser || after.browser) {
     if (method === 'browser.navigate' && typeof input.url === 'string') {
       effect.requestedUrl = input.url;
+    } else if (method === 'browser.webSearch' && typeof dataRecord?.requestedUrl === 'string') {
+      effect.requestedUrl = dataRecord.requestedUrl;
     }
     const urlBefore = before.browser?.url;
     const urlAfter = after.browser?.url ?? (typeof dataRecord?.url === 'string' ? dataRecord.url : undefined);
     effect.urlBefore = urlBefore;
     effect.urlAfter = urlAfter;
-    if (method === 'browser.navigate' && typeof input.url === 'string' && urlAfter !== undefined) {
-      effect.redirected = !browserUrlsMatch(urlAfter, input.url);
+    if ((method === 'browser.navigate' && typeof input.url === 'string') || method === 'browser.webSearch') {
+      const requestedUrl = method === 'browser.webSearch' && typeof dataRecord?.requestedUrl === 'string'
+        ? dataRecord.requestedUrl
+        : typeof input.url === 'string' ? input.url : undefined;
+      if (requestedUrl && urlAfter !== undefined) effect.redirected = !browserUrlsMatch(urlAfter, requestedUrl);
     }
     effect.navigationOccurred = Boolean(urlBefore && urlAfter && urlBefore !== urlAfter);
     effect.newTabOpened = (after.browser?.pageCount ?? 1) > (before.browser?.pageCount ?? 1);

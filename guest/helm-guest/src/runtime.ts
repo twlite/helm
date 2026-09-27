@@ -173,9 +173,16 @@ export class GuestRuntime {
           ...(limit === undefined ? {} : { limit }),
         });
       }
-      case "browser.search": {
+      case "browser.findPage": {
         const maxResults = optionalInteger(params, "maxResults", { min: 1, max: 20 });
-        return this.browser.search({
+        return this.browser.findPage({
+          query: requiredString(params, "query", { maxLength: 1_000 }),
+          ...(maxResults === undefined ? {} : { maxResults }),
+        });
+      }
+      case "browser.webSearch": {
+        const maxResults = optionalInteger(params, "maxResults", { min: 1, max: 20 });
+        return this.browser.webSearch({
           query: requiredString(params, "query", { maxLength: 1_000 }),
           ...(maxResults === undefined ? {} : { maxResults }),
         });

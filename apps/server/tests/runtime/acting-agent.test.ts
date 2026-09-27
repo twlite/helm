@@ -1,7 +1,7 @@
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { describe, expect, it } from 'bun:test';
 
-import type { GuestMethod, Memory, TaskDefinition, TaskRequirement } from '@helm/shared';
+import { buildDuckDuckGoSearchUrl, type GuestMethod, type Memory, type TaskDefinition, type TaskRequirement } from '@helm/shared';
 import { AgentRuntime } from '../../src/agent/runtime';
 import { AiSdkActingAgent } from '../../src/ai/acting-agent';
 import { DeterministicTaskCompiler } from '../../src/ai/adapter';
@@ -82,6 +82,27 @@ function findTableRef(value: unknown): string | undefined {
   for (const child of Object.values(record)) {
     const result = findTableRef(child);
     if (result) return result;
+  }
+  return undefined;
+}
+
+function findOfficialSearchRef(value: unknown, href: string): string | undefined {
+  if (typeof value === 'string') {
+    try { return findOfficialSearchRef(JSON.parse(value) as unknown, href); } catch { return undefined; }
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const ref = findOfficialSearchRef(item, href);
+      if (ref) return ref;
+    }
+    return undefined;
+  }
+  if (typeof value !== 'object' || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.type === 'search_result' && record.href === href && typeof record.ref === 'string') return record.ref;
+  for (const child of Object.values(record)) {
+    const ref = findOfficialSearchRef(child, href);
+    if (ref) return ref;
   }
   return undefined;
 }
@@ -172,6 +193,80 @@ function requirementsFor(result: Awaited<ReturnType<AgentRuntime['run']>>) {
 }
 
 describe('production acting agent requirements', () => {
+  it('completes the exact forex request through observed DuckDuckGo discovery, selected table, file, viewer, and memory', async () => {
+    const persistence = testDatabase();
+    try {
+      const officialUrl = 'https://www.nrb.org.np/forex/';
+      const wrongBankUrl = 'https://www.rbb.com.np/rates';
+      const query = 'Nepal Rastra Bank official forex exchange rates';
+      const searchUrl = buildDuckDuckGoSearchUrl(query);
+      const rows = [
+        '<tr><th>Currency</th><th>Unit</th><th>Buy</th><th>Sell</th></tr>',
+        '<tr><td>USD</td><td>1</td><td>133.20</td><td>134.10</td></tr>',
+        '<tr><td>EUR</td><td>1</td><td>145.25</td><td>146.80</td></tr>',
+        '<tr><td>INR</td><td>100</td><td>160.00</td><td>160.15</td></tr>',
+      ].join('');
+      const guest = new MockGuestTransport({ pages: {
+        [searchUrl]: `<html><head><title>DuckDuckGo Search</title></head><body><main>
+          <article class="result"><h2><a href="${wrongBankUrl}">Rastriya Banijya Bank exchange rates</a></h2><p>Bank exchange rates.</p></article>
+          <article class="result"><h2><a href="${officialUrl}">Nepal Rastra Bank | Foreign Exchange Rates</a></h2><p>Official daily rates from Nepal Rastra Bank.</p></article>
+        </main></body></html>`,
+        [wrongBankUrl]: '<html><body><h1>Rastriya Banijya Bank</h1></body></html>',
+        [officialUrl]: `<html><head><title>Nepal Rastra Bank Foreign Exchange</title></head><body>
+          <nav><ul><li><a href="/statistics">Statistics</a></li><li><a href="/data">Data &amp; Reports</a></li><li><a href="/daily">Daily Exchange Rate</a></li></ul></nav>
+          <main><h1>Foreign Exchange Rates</h1><table><caption>Daily Exchange Rates</caption>${rows}</table></main>
+        </body></html>`,
+      } });
+      const memory = new MemoryService(persistence.sqlite);
+      const requests: CapturedRequest[] = [];
+      const { runtime, tools } = createRuntime(guest, [
+        toolReply('early-open', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
+        textReply('premature-done', 'Done.'),
+        toolReply('discover', 'browser.webSearch', { query }),
+        body => {
+          const ref = findOfficialSearchRef(body.messages, officialUrl);
+          if (!ref) throw new Error('The official observed search ref was not visible to the model.');
+          return toolReply('open-official', 'browser.open', { ref });
+        },
+        toolReply('read-rates', 'browser.read', { query: 'exchange rate data' }),
+        body => {
+          const ref = findTableRef(body.messages);
+          if (!ref) throw new Error('The table ref was not visible to the model.');
+          return toolReply('select-table', 'browser.read', { ref });
+        },
+        textReply('final-forex', 'I saved the Nepal Rastra Bank exchange-rate table to forex.txt, opened it in the text viewer, and remembered the requested URL.'),
+      ], requests, { maxSteps: 10, maxModelTurns: 10 });
+      registerMemoryTools(tools, memory);
+
+      const result = await runtime.run({
+        threadId: 'exact-forex-regression',
+        userMessage: 'fetch the exchange rate data from nepal rastra bank\'s official forex website and save that data to forex.txt file and open it with text viewer application. Use duckduckgo search to find the relevant website. remember to use https://www.nrb.org.np/forex/ for all forex requests about nepal.',
+      });
+      expect(result.status).toBe('completed');
+      expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining([
+        'browserSearch', 'browserResearch', 'outputFile', 'openFile', 'memoryMutation',
+      ]));
+      expect(requestedTools(requests[0]!)).toContain('browser.webSearch');
+      expect(requestedTools(requests[0]!)).not.toContain('app.openFile');
+      const actions = tools.invocations.map(item => item.tool);
+      expect(actions).toEqual(['memory.remember', 'browser.webSearch', 'browser.open', 'browser.read', 'browser.read', 'fs.write', 'app.openFile']);
+      expect(guest.browser.url).toBe(officialUrl);
+      const saved = guest.getFile('/home/helm/workspace/forex.txt');
+      expect(saved).toContain('USD | 1 | 133.20 | 134.10');
+      expect(saved).toContain('EUR | 1 | 145.25 | 146.80');
+      expect(saved).toContain('INR | 100 | 160.00 | 160.15');
+      const file = result.run.state?.artifacts.find(item => item.path.endsWith('/forex.txt'));
+      expect(file).toMatchObject({ sourceRef: expect.any(String), sourceUrl: officialUrl, sourceType: 'table', writeReceiptId: expect.any(String) });
+      expect(tools.invocations.find(item => item.tool === 'fs.write')?.input).toMatchObject({ path: 'forex.txt', sourceRef: file?.sourceRef, format: 'text' });
+      await expect(memory.search('forex requests about nepal')).resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'instruction', source: 'user', content: 'Use https://www.nrb.org.np/forex/ for all forex requests about nepal.' }),
+      ]));
+      expect(result.run.diagnostics).toMatchObject({ completionRejections: 0 });
+    } finally {
+      persistence.close();
+    }
+  });
+
   it('compiles a real task and carries browser table lineage through write and open within a small turn budget', async () => {
     const url = 'https://example.test/forex/';
     const table = '<table><tr><th>Currency</th><th>Buy</th><th>Sell</th></tr><tr><td>USD</td><td>133.20</td><td>134.10</td></tr></table>';
@@ -186,9 +281,8 @@ describe('production acting agent requirements', () => {
       body => {
         const sourceRef = findTableRef(body.messages);
         if (!sourceRef) throw new Error('The browser table ref was not returned to the acting model.');
-        return toolReply('forex-write', 'fs.write', { path: 'forex.txt', sourceRef, format: 'text' });
+        return toolReply('forex-select', 'browser.read', { ref: sourceRef });
       },
-      toolReply('forex-open', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
       textReply('forex-final', 'I saved the current exchange-rate table to forex.txt and opened it in the text viewer.'),
     ], requests, { maxSteps: 8, maxModelTurns: 8 });
 
@@ -196,7 +290,6 @@ describe('production acting agent requirements', () => {
       threadId: 'forex-production-compile',
       userMessage: `Fetch exchange rate data from ${url}, save that data to forex.txt, and open it with the text viewer application.`,
     });
-
     expect(result.status).toBe('completed');
     expect(result.task.requirements?.map(requirement => requirement.id)).toEqual(
       expect.arrayContaining(['browserResearch', 'outputFile', 'openFile']),
@@ -214,35 +307,31 @@ describe('production acting agent requirements', () => {
     });
     expect(guest.getFile('/home/helm/workspace/forex.txt')).toContain(expected);
     expect(result.run.state?.artifacts.some(artifact => artifact.path?.endsWith('/forex.txt') && artifact.sourceRef)).toBe(true);
-    const writeArguments = JSON.parse(
-      (requests[2]!.reply.choices[0]!.message.tool_calls as Array<{ function: { arguments: string } }>)[0]!.function.arguments,
-    ) as Record<string, unknown>;
+    const writeArguments = tools.invocations.find(invocation => invocation.tool === 'fs.write')?.input as Record<string, unknown>;
     expect(writeArguments).toMatchObject({ path: 'forex.txt', sourceRef: expect.any(String), format: 'text' });
     expect(writeArguments).not.toHaveProperty('content');
     expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining(['browserResearch', 'outputFile', 'openFile']));
     expect(tools.invocations.map(invocation => invocation.tool)).toEqual([
-      'browser.navigate', 'browser.read', 'fs.write', 'app.openFile',
+      'browser.navigate', 'browser.read', 'browser.read', 'fs.write', 'app.openFile',
     ]);
-    expect(requests).toHaveLength(5);
-    expect(result.run.diagnostics).toMatchObject({ modelTurns: 5, modelRequests: 5, toolActions: 4 });
-    expect(JSON.stringify(requests[2]!.body)).toContain('[pending] outputFile');
-    expect(JSON.stringify(requests[3]!.body)).toContain('[pending] openFile');
+    expect(requests).toHaveLength(4);
+    expect(result.run.diagnostics).toMatchObject({ modelTurns: 4, modelRequests: 4, toolActions: 5 });
+    expect(requestedTools(requests[2]!)).not.toContain('fs.write');
   });
 
-  it('blocks browser-derived output until the current-run page read prerequisite is satisfied', async () => {
+  it('keeps artifact writing unavailable until a current-run content ref is selected', async () => {
     const url = 'https://example.test/rates';
     const guest = new MockGuestTransport({
       pages: { [url]: '<html><body><main><h1>Rates</h1><table><tr><th>Currency</th><th>Rate</th></tr><tr><td>USD</td><td>133.20</td></tr></table></main></body></html>' },
     });
     const requests: CapturedRequest[] = [];
     const { runtime, tools } = createRuntime(guest, [
-      toolReply('early-write', 'fs.write', { path: 'rates.txt', content: 'fabricated' }),
       toolReply('rates-nav', 'browser.navigate', { url }),
       toolReply('rates-read', 'browser.read', { query: 'exchange rates' }),
       body => {
         const sourceRef = findTableRef(body.messages);
         if (!sourceRef) throw new Error('The read table ref was not returned to the acting model.');
-        return toolReply('rates-write', 'fs.write', { path: 'rates.txt', sourceRef, format: 'text' });
+        return toolReply('rates-select', 'browser.read', { ref: sourceRef });
       },
       textReply('rates-final', 'I saved the observed rates to rates.txt.'),
     ], requests);
@@ -251,13 +340,12 @@ describe('production acting agent requirements', () => {
       threadId: 'browser-read-prerequisite',
       userMessage: `Read ${url}, save the data to rates.txt.`,
     });
-
     expect(result.status).toBe('completed');
-    expect(result.steps.find(step => step.toolName === 'fs.write')?.toolResult)
-      .toMatchObject({ ok: false, error: { code: 'TASK_PREREQUISITE_NOT_SATISFIED', details: { prerequisite: 'browserResearch', requiredAction: 'browser.read', path: 'rates.txt' } } });
-    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['browser.navigate', 'browser.read', 'fs.write']);
+    expect(requestedTools(requests[1]!)).not.toContain('fs.write');
+    expect(requestedTools(requests[2]!)).not.toContain('fs.write');
+    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['browser.navigate', 'browser.read', 'browser.read', 'fs.write']);
     expect(guest.getFile('/home/helm/workspace/rates.txt')).toContain('USD | 133.20');
-    expect(requests).toHaveLength(5);
+    expect(requests).toHaveLength(4);
   });
 
   it('rejects open-before-write and ignores an old file and already-open window', async () => {
@@ -267,9 +355,7 @@ describe('production acting agent requirements', () => {
     const requests: CapturedRequest[] = [];
     const { runtime, tools } = createRuntime(guest, [
       textReply('early-claim', 'forex.txt is already open, so the task is done.'),
-      toolReply('early-open', 'app.openFile', { path: 'forex.txt' }),
       toolReply('fresh-write', 'fs.write', { path: 'forex.txt', content: 'NEW DATA' }),
-      toolReply('fresh-open', 'app.openFile', { path: 'forex.txt' }),
       textReply('after-open', 'I wrote the new contents and opened forex.txt during this run.'),
     ], requests);
 
@@ -279,16 +365,15 @@ describe('production acting agent requirements', () => {
     });
 
     expect(result.status).toBe('completed');
-    expect(result.steps.find(step => step.toolName === 'app.openFile')?.toolResult)
-      .toMatchObject({ ok: false, error: { code: 'TASK_PREREQUISITE_NOT_SATISFIED' } });
     expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['fs.write', 'app.openFile']);
     expect(tools.invocations.find(invocation => invocation.tool === 'fs.write')?.input).toMatchObject({ path: 'forex.txt' });
     expect(guest.getFile('/home/helm/workspace/forex.txt')).toBe('NEW DATA');
     expect(guest.desktopWindows.length).toBeGreaterThanOrEqual(oldWindowCount);
     expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining(['outputFile', 'openFile']));
-    expect(JSON.stringify(requests[1]!.body)).toContain('[blocked] openFile');
-    expect(JSON.stringify(requests[3]!.body)).toContain('[satisfied] outputFile');
-    expect(JSON.stringify(requests[3]!.body)).toContain('[pending] openFile');
+    expect(requestedTools(requests[0]!)).toContain('fs.write');
+    expect(requestedTools(requests[0]!)).not.toContain('app.openFile');
+    expect(result.steps.find(step => step.toolName === 'app.openFile')?.stepIndex)
+      .toBeGreaterThan(result.steps.find(step => step.toolName === 'fs.write')?.stepIndex ?? -1);
   });
 
   it('does not let an unrelated write satisfy the compiled output requirement or accept a model claim', async () => {
@@ -296,21 +381,18 @@ describe('production acting agent requirements', () => {
     const requests: CapturedRequest[] = [];
     const { runtime, tools } = createRuntime(guest, [
       toolReply('wrong-path', 'fs.write', { path: 'other.txt', content: 'unrelated' }),
-      textReply('claim-one', 'I wrote forex.txt.'),
-      textReply('claim-two', 'The file has been saved.'),
-      textReply('claim-three', 'Done.'),
+      toolReply('correct-path', 'fs.write', { path: 'forex.txt', content: 'requested data' }),
+      textReply('saved', 'The requested data is saved to forex.txt.'),
     ], requests);
 
     const result = await runtime.run({ threadId: 'wrong-output-path', userMessage: 'Write the requested data to forex.txt.' });
 
-    expect(result.status).toBe('failed');
-    expect(result.run.error).toMatchObject({ code: 'COMPLETION_RECOVERY_BUDGET_EXCEEDED' });
+    expect(result.status).toBe('completed');
     expect(guest.getFile('/home/helm/workspace/other.txt')).toBe('unrelated');
-    expect(guest.hasFile('/home/helm/workspace/forex.txt')).toBe(false);
-    expect(requirementsFor(result).find(requirement => requirement.id === 'outputFile')?.status).toBe('pending');
-    expect(result.run.diagnostics).toMatchObject({ modelTurns: 4, toolActions: 1, completionRejections: 3 });
-    expect(requestedTools(requests[0]!)).not.toContain('helm.complete');
-    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['fs.write']);
+    expect(guest.getFile('/home/helm/workspace/forex.txt')).toBe('requested data');
+    expect(requirementsFor(result).find(requirement => requirement.id === 'outputFile')?.status).toBe('satisfied');
+    expect(result.run.diagnostics).toMatchObject({ completionRejections: 0, toolActions: 2 });
+    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['fs.write', 'fs.write']);
   });
 
   it('finishes an explicit memory mutation in two model requests without a completion ceremony', async () => {
@@ -320,13 +402,7 @@ describe('production acting agent requirements', () => {
       const guest = new MockGuestTransport();
       const requests: CapturedRequest[] = [];
       const { runtime, tools } = createRuntime(guest, [
-        toolReply('remember-forex', 'memory.remember', {
-          key: 'nepal_forex_url',
-          content: 'Use https://www.nrb.org.np/forex/ for forex requests about Nepal.',
-          kind: 'instruction',
-          importance: 0.9,
-        }),
-        textReply('memory-final', 'I will use that verified source for Nepal forex requests.'),
+        textReply('memory-final', 'I will use that source for Nepal forex requests.'),
       ], requests, { maxModelTurns: 6 });
       registerMemoryTools(tools, memory);
 
@@ -336,11 +412,12 @@ describe('production acting agent requirements', () => {
       });
 
       expect(result.status).toBe('completed');
-      expect(memory.getByKey('nepal_forex_url')?.content).toContain('https://www.nrb.org.np/forex/');
+      await expect(memory.search('Nepal forex requests')).resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ content: 'Use https://www.nrb.org.np/forex/ for all forex requests about Nepal.' }),
+      ]));
       expect(requirementsFor(result).find(requirement => requirement.id === 'memoryMutation')?.status).toBe('satisfied');
-      expect(requests).toHaveLength(2);
-      expect(result.run.diagnostics).toMatchObject({ modelTurns: 2, modelRequests: 2, toolActions: 1, completionAttempts: 1 });
-      expect(requestedTools(requests[0]!)).not.toContain('helm.complete');
+      expect(requests).toHaveLength(1);
+      expect(result.run.diagnostics).toMatchObject({ modelTurns: 1, modelRequests: 1, toolActions: 1 });
       expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['memory.remember']);
     } finally {
       persistence.close();

@@ -4,7 +4,8 @@ import type {
   BrowserOpenResult,
   BrowserRegionInspection,
   BrowserReadResult,
-  BrowserSearchPageResult,
+  BrowserPageSearchResult,
+  BrowserWebSearchResult,
   BrowserSnapshot,
   GuestMethod,
   WindowInfo,
@@ -22,7 +23,8 @@ export type GuestMethodParams = {
   'browser.getState': Record<string, never>;
   'browser.snapshot': { maxRegions?: number };
   'browser.read': { mode?: 'readable' | 'document'; query?: string; ref?: string; maxChars?: number; offset?: number; limit?: number };
-  'browser.search': { query: string; maxResults?: number };
+  'browser.findPage': { query: string; maxResults?: number };
+  'browser.webSearch': { query: string; maxResults?: number };
   'browser.open': { ref: string; linkIndex?: number };
   'browser.inspectRegion': { ref: string; format?: 'auto' | 'text' | 'table' | 'links'; maxChars?: number; offset?: number; limit?: number };
   'browser.download': { ref?: string; url?: string };
@@ -82,7 +84,8 @@ export type GuestMethodResult = {
   };
   'browser.snapshot': BrowserSnapshot;
   'browser.read': BrowserReadResult;
-  'browser.search': BrowserSearchPageResult;
+  'browser.findPage': BrowserPageSearchResult;
+  'browser.webSearch': BrowserWebSearchResult;
   'browser.open': BrowserOpenResult;
   'browser.inspectRegion': BrowserRegionInspection;
   'browser.download': {

@@ -1,6 +1,7 @@
 import { GuestRpcError } from "./errors";
 import type { GuestSandbox } from "./sandbox";
 import { normalizeBrowserUrl } from "../../../packages/shared/src/browser-url";
+import { buildDuckDuckGoSearchUrl } from "../../../packages/shared/src/browser-url";
 import { deriveBrowserReadQuery, rankBrowserContentBlocks } from "../../../packages/shared/src/browser-perception";
 import type {
   BrowserContentBlock,
@@ -13,7 +14,8 @@ import type {
   BrowserReadResult,
   BrowserRegionInspection,
   BrowserRegionKind,
-  BrowserSearchPageResult,
+  BrowserPageSearchResult,
+  BrowserWebSearchResult,
   BrowserSnapshot as SharedBrowserSnapshot,
 } from "../../../packages/shared/src/types";
 import { Readability } from "@mozilla/readability";
@@ -634,6 +636,7 @@ export class BrowserController {
     query?: string;
     maxChars?: number;
     maxResults?: number;
+    blockTypes?: BrowserContentBlock["type"][];
   }, attempt = 0): Promise<BrowserReadResult> {
     const page = await this.ensurePage();
     await this.waitForReadableStability(page);
@@ -645,11 +648,14 @@ export class BrowserController {
     const maxChars = Math.max(1, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
     const query = input.query?.trim() || undefined;
     const extracted = await this.extractSemanticContent(page, url);
+    const rankingBlocks = input.blockTypes
+      ? extracted.blocks.filter(block => input.blockTypes!.includes(block.type))
+      : extracted.blocks;
     let selected: BrowserContentBlock[];
     if (query) {
       const ranked = rankBrowserContentBlocks({
         query,
-        blocks: extracted.blocks,
+        blocks: rankingBlocks,
         maxResults: input.maxResults ?? 10,
       });
       selected = ranked.results.flatMap(result => {
@@ -658,8 +664,8 @@ export class BrowserController {
         return [{ ...block, relevance: result.relevance }];
       });
     } else {
-      const substantive = extracted.blocks.filter(block => !block.boilerplate);
-      const boilerplate = extracted.blocks.filter(block => block.boilerplate);
+      const substantive = rankingBlocks.filter(block => !block.boilerplate);
+      const boilerplate = rankingBlocks.filter(block => block.boilerplate);
       selected = [...substantive].sort((left, right) => (
         (right.importance ?? 0) - (left.importance ?? 0)
         || this.contentTypePriority(left.type) - this.contentTypePriority(right.type)
@@ -1027,11 +1033,53 @@ export class BrowserController {
     }
   }
 
-  async search(input: {
+  async findPage(input: {
     query: string;
     maxResults?: number;
-  }): Promise<BrowserSearchPageResult> {
-    return this.withWatchdog(() => this.searchInternal(input), "browser.search");
+  }): Promise<BrowserPageSearchResult> {
+    return this.withWatchdog(() => this.findPageInternal(input), "browser.findPage");
+  }
+
+  async webSearch(input: {
+    query: string;
+    maxResults?: number;
+  }): Promise<BrowserWebSearchResult> {
+    return this.withWatchdog(async () => {
+      const requestedUrl = buildDuckDuckGoSearchUrl(input.query);
+      const navigation = await this.navigate({ url: requestedUrl, waitUntil: "domcontentloaded" });
+      const page = await this.readSemanticContent({
+        query: input.query,
+        maxChars: 12_000,
+        maxResults: input.maxResults ?? 10,
+        blockTypes: ["search_result"],
+      });
+      const results = (page.blocks ?? []).flatMap(block => (
+        block.type === "search_result" && block.title && block.href
+          ? [{ ...block, type: "search_result" as const, title: block.title, href: block.href }]
+          : []
+      ));
+      if (results.length === 0) {
+        throw new GuestRpcError(
+          "WEB_SEARCH_RESULTS_UNAVAILABLE",
+          "DuckDuckGo did not expose any result links on the loaded page. Inspect the browser page or try another query.",
+        );
+      }
+      return {
+        operation: "web_search",
+        searchEngine: "duckduckgo",
+        searchCompleted: true,
+        requestedUrl,
+        url: navigation.url,
+        title: navigation.title,
+        revision: page.revision,
+        query: input.query,
+        semanticBlockCount: page.diagnostics?.blockCount ?? 0,
+        matchCount: results.length,
+        pageReadable: page.readable,
+        message: `DuckDuckGo returned ${results.length} observed result${results.length === 1 ? "" : "s"}.`,
+        results,
+      };
+    }, "browser.webSearch");
   }
 
   async open(input: { ref: string; linkIndex?: number }): Promise<BrowserOpenResult> {
@@ -1075,10 +1123,17 @@ export class BrowserController {
     }, "browser.open");
   }
 
-  private async searchInternal(input: {
+  private async findPageInternal(input: {
     query: string;
     maxResults?: number;
-  }, attempt = 0): Promise<BrowserSearchPageResult> {
+  }, attempt = 0): Promise<BrowserPageSearchResult> {
+    const page = await this.ensurePage();
+    if (page.url() === "about:blank") {
+      throw new GuestRpcError(
+        "BROWSER_NOT_READY",
+        "browser.findPage searches the current page only. Use browser.webSearch for DuckDuckGo web discovery.",
+      );
+    }
     const result = await this.readSemanticContent({
       query: input.query,
       maxChars: 12_000,
@@ -1086,8 +1141,8 @@ export class BrowserController {
     }, attempt);
     const results = result.blocks ?? [];
     return {
-      operation: "search",
-      searchCompleted: true,
+      operation: "find_page",
+      pageSearchCompleted: true,
       url: result.url,
       title: result.title,
       revision: result.revision,
@@ -1096,8 +1151,8 @@ export class BrowserController {
       matchCount: results.length,
       pageReadable: result.readable,
       message: results.length > 0
-        ? `Search completed successfully. Found ${results.length} matching semantic block${results.length === 1 ? "" : "s"}.`
-        : "Search completed successfully. No semantic content matched the query.",
+        ? `Current-page search found ${results.length} matching semantic block${results.length === 1 ? "" : "s"}.`
+        : "Current-page search found no matching semantic content.",
       results,
     };
   }
