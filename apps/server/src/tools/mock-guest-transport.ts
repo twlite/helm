@@ -1373,6 +1373,13 @@ export class MockGuestTransport implements GuestTransport {
           pageType: document.pageType,
           documentRef: input.ref,
           sourceRefs: [...document.sourceRefs],
+          previewsAreComplete: false,
+          export: {
+            complete: !document.sourceTruncated,
+            sourceRef: input.ref,
+            recommendedTool: 'fs.writeFromRef',
+            ...(document.sourceTruncated ? { message: 'The extracted source is truncated; a raw export may be incomplete.' } : {}),
+          },
           sourceCapturedAt: document.capturedAt,
           sourceStructuredBlockCount: structured.length,
           sourceTableCount: document.blocks.filter(block => block.type === 'table').length,
@@ -1479,6 +1486,13 @@ export class MockGuestTransport implements GuestTransport {
         source: 'semantic',
         pageType: reference.pageType,
         sourceRefs: [reference.block.ref],
+        previewsAreComplete: false,
+        export: {
+          complete: !Boolean(full.truncated),
+          sourceRef: input.ref,
+          recommendedTool: 'fs.writeFromRef',
+          ...(full.truncated ? { message: 'The extracted source is truncated; a raw export may be incomplete.' } : {}),
+        },
         sourceCapturedAt: reference.capturedAt,
         sourceStructuredBlockCount: Number(mockStructured(reference.block)),
         sourceTableCount: Number(reference.block.type === 'table'),
@@ -1602,6 +1616,7 @@ export class MockGuestTransport implements GuestTransport {
     const documentRef = mode === 'document' && documentBlocks.length > 0
       ? this.registerMockDocumentReference(documentBlocks, pageType)
       : undefined;
+    const exportSourceRef = documentRef ?? (sourceBlocks.length === 1 ? sourceBlocks[0]!.ref : undefined);
     const documentRefs = new Set(documentBlocks.map(block => block.ref));
     const structuredBlocks = structured.slice(0, 20).map(block => this.mockStructuredSummary(block, selectedRefs.has(block.ref), documentRefs.has(block.ref)));
     const documentStructured = documentBlocks.filter(mockStructured);
@@ -1617,6 +1632,11 @@ export class MockGuestTransport implements GuestTransport {
       ...(input.query ? { query: input.query } : {}),
       ...(documentRef ? { documentRef } : {}),
       sourceRefs: sourceBlocks.map(block => block.ref),
+      previewsAreComplete: false,
+      export: {
+        complete: Boolean(exportSourceRef),
+        ...(exportSourceRef ? { sourceRef: exportSourceRef, recommendedTool: 'fs.writeFromRef' as const } : {}),
+      },
       ...(documentRef ? { sourceCapturedAt: this.documentReferences.get(documentRef)?.capturedAt } : { sourceCapturedAt: new Date().toISOString() }),
       sourceStructuredBlockCount: sourceBlocks.filter(mockStructured).length,
       sourceTableCount: sourceBlocks.filter(block => block.type === 'table').length,

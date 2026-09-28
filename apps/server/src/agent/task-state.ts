@@ -3,12 +3,14 @@ import type {
   Artifact,
   Blocker,
   CompletionCriterion,
+  CorrectiveArtifactHint,
   EnvironmentObservation,
   Evidence,
   Fact,
   FailedStrategy,
   JsonValue,
   ProgressState,
+  RejectedRequirementAction,
   TaskDefinition,
   TaskRequirement,
   TaskState,
@@ -434,6 +436,13 @@ export function requiredActionForRequirement(requirement: TaskRequirement): stri
   }
 }
 
+/** Translate canonical receipt operations into tools exposed to the acting model. */
+export function modelActionForRequirement(requirement: TaskRequirement): string | undefined {
+  const action = requiredActionForRequirement(requirement);
+  if (action !== 'fs.write') return action;
+  return requirement.target?.mode === 'written-from-artifact' ? 'fs.writeFromRef' : 'fs.writeText';
+}
+
 function browserVisitAction(state: TaskState, expectedUrl: string): WorkerAction | undefined {
   return [...verificationActions(state)].reverse().find(action => {
     if (!action.tool.startsWith('browser.') || !action.result.ok) return false;
@@ -608,6 +617,165 @@ function sourceUrlMatchesRequirement(state: TaskState, sourceUrl: string, reques
     const resolution = navigationResolutionFor(actions, requestedUrl);
     return Boolean(resolution && browserUrlsMatch(sourceUrl, resolution.finalUrl));
   });
+}
+
+function bestCorrectiveBrowserArtifact(
+  requirement: TaskRequirement,
+  state: TaskState,
+): CorrectiveArtifactHint | undefined {
+  const candidates: Array<{ hint: CorrectiveArtifactHint; document: boolean; index: number }> = [];
+  const actions = verificationActions(state);
+  for (let index = actions.length - 1; index >= 0; index -= 1) {
+    const action = actions[index]!;
+    if (action.tool !== 'browser.read' || !action.result.ok) continue;
+    const receipt = actionReceipt(action);
+    const data = recordValue(action.result.data);
+    if (!receipt || receipt.ok !== true || receipt.tool !== 'browser.read' || !data) continue;
+    const sourceUrl = typeof data.url === 'string' ? data.url : undefined;
+    const sourceRevision = typeof data.revision === 'number' ? data.revision : undefined;
+    const sourceCapturedAt = typeof data.sourceCapturedAt === 'string' ? data.sourceCapturedAt : undefined;
+    const diagnostics = recordValue(data.diagnostics);
+    const refs = Array.isArray(data.sourceRefs)
+      ? data.sourceRefs.filter((ref): ref is string => typeof ref === 'string')
+      : [];
+    if (!sourceUrl || sourceRevision === undefined || !sourceCapturedAt
+      || data.sourceTruncated !== false || diagnostics?.sourceTruncated === true
+      || !sourceUrlMatchesRequirement(state, sourceUrl, requirement.target?.sourceUrls)) continue;
+
+    const documentRef = typeof data.documentRef === 'string' ? data.documentRef : undefined;
+    const sourceType = documentRef ? 'document' : undefined;
+    const documentRefs = Array.isArray(diagnostics?.documentSourceRefs)
+      ? diagnostics.documentSourceRefs.map(recordValue).filter((ref): ref is Record<string, unknown> => Boolean(ref))
+      : [];
+    const documentBlockCount = diagnostics?.documentBlockCount;
+    const structuredCount = diagnostics?.documentStructuredBlockCount;
+    const tableCount = diagnostics?.documentTableCount;
+    const structurallyCompleteDocument = Boolean(documentRef && refs.length > 0
+      && recordValue(data.export)?.complete !== false
+      && documentBlockCount === refs.length
+      && documentRefs.length === refs.length
+      && documentRefs.every(ref => typeof ref.ref === 'string' && refs.includes(ref.ref))
+      && typeof structuredCount === 'number'
+      && typeof tableCount === 'number'
+      && data.sourceStructuredBlockCount === structuredCount
+      && data.sourceTableCount === tableCount);
+    if (structurallyCompleteDocument && documentRef && sourceType) {
+      candidates.push({
+        document: true,
+        index,
+        hint: {
+          sourceRef: documentRef,
+          sourceType,
+          sourceUrl,
+          sourceRevision,
+          sourceCapturedAt,
+          sourceStructuredBlockCount: structuredCount as number,
+          sourceTableCount: tableCount as number,
+          complete: true,
+        },
+      });
+      continue;
+    }
+
+    const exportedRef = recordValue(data.export)?.sourceRef;
+    const blockCandidates = Array.isArray(data.blocks)
+      ? data.blocks.map(recordValue).filter((block): block is Record<string, unknown> => Boolean(block))
+      : [];
+    const matchingBlocks = blockCandidates.filter(block => typeof block.ref === 'string'
+      && refs.includes(block.ref)
+      && isSubstantiveBrowserContentBlock(block)
+      && (typeof exportedRef !== 'string' || exportedRef === block.ref));
+    for (const block of matchingBlocks) {
+      const ref = String(block.ref);
+      const blockType = typeof block.type === 'string' ? block.type : 'content';
+      const structured = ['table', 'list', 'definition', 'form'].includes(blockType);
+      candidates.push({
+        document: false,
+        index,
+        hint: {
+          sourceRef: ref,
+          sourceType: blockType,
+          sourceUrl,
+          sourceRevision,
+          sourceCapturedAt,
+          sourceStructuredBlockCount: structured ? 1 : 0,
+          sourceTableCount: blockType === 'table' ? 1 : 0,
+          complete: true,
+        },
+      });
+    }
+  }
+  candidates.sort((left, right) => Number(right.document) - Number(left.document)
+    || right.hint.sourceStructuredBlockCount - left.hint.sourceStructuredBlockCount
+    || right.index - left.index);
+  return candidates[0]?.hint;
+}
+
+function findRejectedArtifactWrite(
+  requirement: TaskRequirement,
+  state: TaskState,
+): {
+  reasonCode: string;
+  message: string;
+  correctiveTool: string;
+  rejectedAction: RejectedRequirementAction;
+  correctiveArtifact?: CorrectiveArtifactHint;
+} | undefined {
+  const target = requirement.target;
+  if (target?.mode !== 'written-from-artifact' || !target.path) return undefined;
+  const expectedPath = target.path;
+  const candidate = [...verificationActions(state)].reverse().find(action => {
+    if (!WRITE_ACTION_TOOL_NAMES.has(action.tool) || !action.result.ok) return false;
+    const receipt = actionReceipt(action);
+    const receiptPath = receipt?.effect?.path;
+    return receipt?.ok === true && receipt.tool === 'fs.write'
+      && receipt.effect?.writePerformed === true
+      && typeof receiptPath === 'string'
+      && normalizedRequirementPath(receiptPath) === normalizedRequirementPath(expectedPath);
+  });
+  if (!candidate) return undefined;
+  const receipt = actionReceipt(candidate)!;
+  const data = recordValue(candidate.result.data);
+  const sourceRef = typeof data?.sourceRef === 'string' ? data.sourceRef : undefined;
+  const sourceUrl = typeof data?.sourceUrl === 'string' ? data.sourceUrl : undefined;
+  const correctiveArtifact = bestCorrectiveBrowserArtifact(requirement, state);
+  const rejectedAction: RejectedRequirementAction = {
+    tool: candidate.tool,
+    path: target.path,
+    ...(receipt.id ? { receiptId: receipt.id } : {}),
+    ...(sourceRef ? { sourceRef } : {}),
+    ...(sourceUrl ? { sourceUrl } : {}),
+  };
+
+  let reasonCode: string;
+  let reason: string;
+  if (candidate.tool === 'fs.writeText' || !sourceRef) {
+    reasonCode = 'BROWSER_PROVENANCE_REQUIRED';
+    reason = `${target.path} was written with ${candidate.tool}, but this request requires raw browser-derived data with verified source provenance. Browser previews are incomplete and cannot satisfy this raw export.`;
+  } else if (sourceUrl && !sourceUrlMatchesRequirement(state, sourceUrl, target.sourceUrls)) {
+    reasonCode = 'SOURCE_URL_MISMATCH';
+    reason = `${target.path} was written from ${sourceUrl}, which does not match the requested source${target.sourceUrls?.length === 1 ? ` ${target.sourceUrls[0]}` : ' URLs'}.`;
+  } else if (data?.sourceTruncated === true) {
+    reasonCode = 'BROWSER_ARTIFACT_INCOMPLETE';
+    reason = `The browser artifact used for ${target.path} is marked truncated, so Helm cannot verify a complete raw-data export.`;
+  } else {
+    reasonCode = 'BROWSER_ARTIFACT_NOT_VERIFIED';
+    reason = `The source ref used for ${target.path} does not have complete, verified current-run browser provenance.`;
+  }
+
+  const artifactMessage = correctiveArtifact
+    ? ` A complete current-run browser artifact is available as ${correctiveArtifact.sourceRef} from ${correctiveArtifact.sourceUrl}`
+      + (correctiveArtifact.sourceTableCount > 0 ? ` (${correctiveArtifact.sourceTableCount} ${correctiveArtifact.sourceTableCount === 1 ? 'table' : 'tables'})` : '')
+      + (correctiveArtifact.sourceStructuredBlockCount > 0 ? ` (${correctiveArtifact.sourceStructuredBlockCount} structured blocks)` : '')
+      + `; use ${modelActionForRequirement(requirement)} with that sourceRef to overwrite ${target.path}.`
+    : ` Use ${modelActionForRequirement(requirement)} with a complete durable ref from the requested source to overwrite ${target.path}.`;
+  return {
+    reasonCode,
+    message: `${reason}${artifactMessage}`,
+    correctiveTool: modelActionForRequirement(requirement) ?? 'fs.writeFromRef',
+    rejectedAction,
+    ...(correctiveArtifact ? { correctiveArtifact } : {}),
+  };
 }
 
 export function isSubstantiveBrowserContentBlock(block: Record<string, unknown>): boolean {
@@ -1049,7 +1217,15 @@ async function requirementCheck(
   observation: EnvironmentObservation,
   verifier?: CriterionVerifierRegistry | VerificationProvider,
   lastToolResult?: ToolResult,
-): Promise<{ passed: boolean; message: string; evidence?: unknown }> {
+): Promise<{
+  passed: boolean;
+  message: string;
+  evidence?: unknown;
+  reasonCode?: string;
+  correctiveTool?: string;
+  rejectedAction?: RejectedRequirementAction;
+  correctiveArtifact?: CorrectiveArtifactHint;
+}> {
   if (requirement.id === 'browserEvidence' || requirement.target?.factId === 'pageContent') {
     const action = browserEvidenceAction(state);
     return action
@@ -1131,6 +1307,19 @@ async function requirementCheck(
     ? successfulCurrentRunAction(requirement, state)
     : undefined;
   if (target.freshness === 'current-run' && expectedAction && !currentAction) {
+    const rejectedCandidate = expectedAction === 'fs.write'
+      ? findRejectedArtifactWrite(requirement, state)
+      : undefined;
+    if (rejectedCandidate) {
+      return {
+        passed: false,
+        ...rejectedCandidate,
+        evidence: {
+          rejectedAction: rejectedCandidate.rejectedAction,
+          ...(rejectedCandidate.correctiveArtifact ? { correctiveArtifact: rejectedCandidate.correctiveArtifact } : {}),
+        },
+      };
+    }
     return {
       passed: false,
       message: `A successful current-run ${expectedAction} action for ${target.path ?? requirement.id} has not been recorded.`,
@@ -1329,7 +1518,16 @@ export async function verifyTaskState(
     return check;
   });
   const requirements = requirementsForTask(task);
-  const checksById = new Map<string, { requirement: TaskRequirement; passed: boolean; message: string; evidence?: unknown }>();
+  const checksById = new Map<string, {
+    requirement: TaskRequirement;
+    passed: boolean;
+    message: string;
+    evidence?: unknown;
+    reasonCode?: string;
+    correctiveTool?: string;
+    rejectedAction?: RejectedRequirementAction;
+    correctiveArtifact?: CorrectiveArtifactHint;
+  }>();
   for (const requirement of requirementsInDependencyOrder(requirements)) {
     const unsatisfiedDependencies = (requirement.dependsOn ?? [])
       .filter(id => checksById.get(id)?.passed !== true);
@@ -1386,12 +1584,17 @@ export function taskRequirementSummary(state: TaskState): string {
         ? 'blocked'
         : 'pending';
     const target = requirement.target;
-    const targetSummary = target?.path
-      ? ` path=${target.path}${target.action ? ` action=${target.action}` : ''}${target.application ? ` application=${target.application}` : ''}`
-      : target?.url ? ` url=${target.url}`
-        : target?.factId ? ` fact=${target.factId}`
-          : target?.action ? ` action=${target.action}${target.application ? ` application=${target.application}` : ''}`
-            : target?.application ? ` application=${target.application}` : '';
+    const modelAction = modelActionForRequirement(requirement);
+    const fields = [
+      ...(target?.path ? [`path=${target.path}`] : []),
+      ...(target?.mode ? [`mode=${target.mode}`] : []),
+      ...(modelAction ? [`action=${modelAction}`] : []),
+      ...(target?.application ? [`application=${target.application}`] : []),
+      ...(target?.url ? [`url=${target.url}`] : []),
+      ...(target?.sourceUrls?.[0] ? [`sourceUrl=${target.sourceUrls[0]}`] : []),
+      ...(target?.factId ? [`fact=${target.factId}`] : []),
+    ];
+    const targetSummary = fields.length > 0 ? ` ${fields.join(' ')}` : '';
     const dependencies = status === 'blocked' ? ` dependsOn=${(requirement.dependsOn ?? []).filter(id => !state.completedRequirementIds.includes(id)).join(',')}` : '';
     return `- [${status}] ${requirement.id}${targetSummary}${dependencies}`;
   });

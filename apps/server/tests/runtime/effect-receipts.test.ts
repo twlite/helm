@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'bun:test';
 
 import type { ActionReceipt, CompletionCriterion, TaskDefinition, WorkerAction } from '@helm/shared';
-import { createTaskState, updateCompletedRequirements, verifyTaskState } from '../../src/agent/task-state';
+import { createTaskState, modelActionForRequirement, taskRequirementSummary, updateCompletedRequirements, verifyTaskState } from '../../src/agent/task-state';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
+import { createGuestToolRegistry } from '../../src/tools/guest-tools';
 import { MockGuestTransport } from '../../src/tools/mock-guest-transport';
 
 const url = 'https://fixture.example.test/rates';
@@ -170,7 +171,22 @@ describe('current-run effect receipts', () => {
       }, receipt('fs.write', { path: workspacePath, bytesWritten: 29, writePerformed: true })),
     ];
     const unrelated = await verifyTaskState(rawTask, unrelatedState, guest, observation, new CriterionVerifierRegistry(guest));
-    expect(unrelated.requirements?.find(check => check.requirement.id === 'outputFile')?.passed).toBe(false);
+    const rejected = unrelated.requirements?.find(check => check.requirement.id === 'outputFile');
+    expect(rejected).toMatchObject({
+      passed: false,
+      reasonCode: 'BROWSER_PROVENANCE_REQUIRED',
+      correctiveTool: 'fs.writeFromRef',
+      rejectedAction: { tool: 'fs.writeText', path: 'forex.txt' },
+      correctiveArtifact: {
+        sourceRef: documentRef,
+        sourceType: 'document',
+        sourceUrl: url,
+        sourceTableCount: 1,
+        complete: true,
+      },
+    });
+    expect(rejected?.message).toContain('fs.writeFromRef with that sourceRef to overwrite forex.txt');
+    expect(rejected?.evidence).toMatchObject({ rejectedAction: { tool: 'fs.writeText' } });
 
     const artifactState = createTaskState(rawTask);
     artifactState.recentActions = [
@@ -180,6 +196,47 @@ describe('current-run effect receipts', () => {
     ];
     const artifact = await verifyTaskState(rawTask, artifactState, guest, observation, new CriterionVerifierRegistry(guest));
     expect(artifact.requirements?.find(check => check.requirement.id === 'outputFile')?.passed).toBe(true);
+
+    const wrongSourceState = createTaskState(rawTask);
+    wrongSourceState.recentActions = [
+      action('browser.read', { mode: 'document' }, readData, receipt('browser.read', {})),
+      action('fs.writeFromRef', { path: 'forex.txt', sourceRef: documentRef, format: 'text' }, {
+        ...validWriteData, sourceUrl: 'https://unrelated.example.test/rates',
+      }, receipt('fs.write', { path: workspacePath, bytesWritten: 24, writePerformed: true })),
+    ];
+    const wrongSource = await verifyTaskState(rawTask, wrongSourceState, guest, observation, new CriterionVerifierRegistry(guest));
+    expect(wrongSource.requirements?.find(check => check.requirement.id === 'outputFile')).toMatchObject({
+      passed: false,
+      reasonCode: 'SOURCE_URL_MISMATCH',
+      correctiveTool: 'fs.writeFromRef',
+      rejectedAction: { tool: 'fs.writeFromRef', sourceUrl: 'https://unrelated.example.test/rates' },
+    });
+  });
+
+  it('shows model-visible write tools in requirement summaries and hides the internal receipt action', () => {
+    const baseTask = task();
+    const rawRequirement = {
+      ...baseTask.requirements![2]!,
+      target: { ...baseTask.requirements![2]!.target, mode: 'written-from-artifact' as const, action: 'fs.write' as const, sourceUrls: [url] },
+    };
+    const authoredRequirement = {
+      ...baseTask.requirements![2]!,
+      target: { ...baseTask.requirements![2]!.target, mode: 'written' as const, action: 'fs.write' as const },
+    };
+    expect(modelActionForRequirement(rawRequirement)).toBe('fs.writeFromRef');
+    expect(modelActionForRequirement(authoredRequirement)).toBe('fs.writeText');
+
+    const state = createTaskState({ ...baseTask, requirements: [rawRequirement] });
+    const summary = taskRequirementSummary(state);
+    expect(summary).toContain('mode=written-from-artifact');
+    expect(summary).toContain('action=fs.writeFromRef');
+    expect(summary).toContain(`sourceUrl=${url}`);
+    expect(summary).not.toContain('action=fs.write ');
+
+    const visibleNames = createGuestToolRegistry(new MockGuestTransport()).list().map(tool => tool.name);
+    expect(visibleNames).toContain('fs.writeFromRef');
+    expect(visibleNames).toContain('fs.writeText');
+    expect(visibleNames).not.toContain('fs.write');
   });
 
   it('does not let a pre-existing browser URL satisfy a requested visit without a navigation receipt', async () => {

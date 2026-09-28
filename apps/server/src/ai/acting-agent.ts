@@ -20,7 +20,7 @@ const BASE_INSTRUCTIONS = [
   'Do not claim that an external action succeeded unless a tool returned success.',
   'A URL included as data for an artifact is not automatically a browser destination.',
   'Prefer semantic browser tools for page reading because they are compact. browser.read query is natural-language content relevance text, never a CSS selector; use browser.query for DOM/CSS inspection. Check table counts and row counts, use blockTypes to select a structured block class such as table when appropriate, and use mode document when several relevant blocks should be exported together.',
-  'For raw page-derived data, pass a returned durable block ref or documentRef directly to fs.writeFromRef. Browser previews may be truncated; do not reconstruct raw data from a preview. For a summary or other transformation, use fs.writeText with your authored result.',
+  'For raw page-derived data: Use fs.writeFromRef with browser.read.export.sourceRef when export.complete is true. Previews are incomplete and must not be copied into a raw-data file. For a summary or other transformation, use fs.writeText with your authored result.',
   'Use app.launch only when the user asks to start an application without a file. Use app.openFile for an existing file; it checks the file and launches the selected application if needed.',
   'Finish with a normal concise assistant response only after the user\'s requested task is complete.',
 ].join(' ');
@@ -29,6 +29,19 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function normalizedCompletionSignature(value: string): string {
+  const normalized = value.normalize('NFKC').toLocaleLowerCase()
+    .replace(/[\p{P}\p{S}]+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  const words = normalized.split(' ').filter(Boolean);
+  if (words.length <= 12
+    && /\b(?:done|complete|completed|finished|all set|successfully|saved|wrote|written|opened|remembered)\b/u.test(normalized)) {
+    return '[completion claim]';
+  }
+  return normalized;
 }
 
 function parseDiagnosticInput(value: unknown): unknown {
@@ -483,7 +496,7 @@ export class AiSdkActingAgent implements ActingAgentProvider {
     let lastVerification: VerificationResult | undefined;
     let lastRejectedResponse: string | undefined;
     let completionRecoveryTurns = 0;
-    let lastRejectedCompletion: string | undefined;
+    let lastRejectedCompletion: { response: string; feedback: string; state: string } | undefined;
     let compactionCount = 0;
     const instructions = instructionsFor(input);
     const budget = contextBudget(this.options.contextBudget);
@@ -794,8 +807,6 @@ export class AiSdkActingAgent implements ActingAgentProvider {
       assertModelMessages(result.responseMessages, 'Acting-agent response history');
       exchanges.push({ messages: result.responseMessages, kind: 'tool' });
 
-      if (turnOutcome.toolCalls?.length) lastRejectedCompletion = undefined;
-
       if (acceptedResponse !== undefined && acceptedVerification !== undefined) {
         await emitDiagnostics();
         return {
@@ -828,8 +839,24 @@ export class AiSdkActingAgent implements ActingAgentProvider {
         lastRejectedResponse = result.text.trim();
         if (effectsAreVerified()) return finalize();
         const feedback = checked.error?.message ?? 'The runtime has not verified every requested effect.';
-        const rejectedCompletion = JSON.stringify([result.text.trim(), feedback]);
-        if (rejectedCompletion === lastRejectedCompletion) {
+        const rejectedCompletion = {
+          response: normalizedCompletionSignature(result.text),
+          feedback: feedback.normalize('NFKC').toLocaleLowerCase().replace(/\s+/gu, ' ').trim(),
+          state: JSON.stringify({
+            toolActions: input.getToolActionCount?.() ?? diagnostics.toolActions,
+            requirements: input.getRequirementSummary(),
+            verification: (input.getCurrentVerification?.() ?? checked.data ?? lastVerification)?.requirements?.map(check => ({
+              id: check.requirement.id,
+              passed: check.passed,
+              reasonCode: check.reasonCode,
+              message: check.message,
+            })),
+          }),
+        };
+        if (lastRejectedCompletion
+          && rejectedCompletion.response === lastRejectedCompletion.response
+          && rejectedCompletion.feedback === lastRejectedCompletion.feedback
+          && rejectedCompletion.state === lastRejectedCompletion.state) {
           await emitDiagnostics();
           throw new ActingAgentExecutionError(
             'REPEATED_UNVERIFIED_COMPLETION',
@@ -847,11 +874,21 @@ export class AiSdkActingAgent implements ActingAgentProvider {
           );
         }
         completionRecoveryTurns += 1;
+        const pendingRequirements = input.getRequirementSummary()
+          .split('\n')
+          .filter(line => /\[(?:pending|blocked)\]/u.test(line));
         exchanges.push({
           kind: 'conversation',
           messages: [{
             role: 'user',
-            content: `The task is not complete yet.\n\nMissing requested effects:\n${feedback}\n\nContinue using the available tools.`,
+            content: [
+              'The task is not complete yet.',
+              feedback,
+              ...(pendingRequirements.length > 0
+                ? [`Current pending effects and model-visible actions:\n${pendingRequirements.join('\n')}`]
+                : []),
+              'Continue using the available tools.',
+            ].join('\n\n'),
           }],
         });
       }

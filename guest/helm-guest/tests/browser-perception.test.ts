@@ -149,6 +149,10 @@ describe('progressive browser perception', () => {
       expect(read.returnedChars).toBeLessThanOrEqual(300);
       expect(read.truncated).toBe(true);
       expect(documentRef).toBeDefined();
+      expect(read).toMatchObject({
+        previewsAreComplete: false,
+        export: { complete: true, sourceRef: documentRef, recommendedTool: 'fs.writeFromRef' },
+      });
       expect(read.diagnostics).toMatchObject({
         documentTableCount: 2,
         documentStructuredBlockCount: 2,

@@ -420,6 +420,101 @@ describe('production acting-agent outcomes', () => {
     }
   });
 
+  it('recovers from a preview write by exposing the verified document ref and model-visible raw write tool', async () => {
+    const url = 'https://fixture.example.test/forex';
+    const fixture = await readFile(new URL('../../../../guest/helm-guest/tests/fixtures/forex-two-tables.html', import.meta.url), 'utf8');
+    const guest = new MockGuestTransport({ pages: { [url]: fixture } });
+    const persistence = testDatabase();
+    try {
+      const requests: CapturedRequest[] = [];
+      const memory = new MemoryService(persistence.sqlite);
+      let observedDocumentRef: string | undefined;
+      let recoveryText = '';
+      const { runtime, tools } = createRuntime(guest, [
+        toolReply('navigate', 'browser.navigate', { url }),
+        toolReply('read-document', 'browser.read', { mode: 'document', query: 'exchange rate data', maxChars: 300 }),
+        body => {
+          observedDocumentRef = findDocumentRef(body.messages);
+          if (!observedDocumentRef) throw new Error('The read did not expose its durable document ref.');
+          return toolReply('write-preview', 'fs.writeText', {
+            path: 'forex.txt',
+            content: 'Currency | Unit | Buy | Sell\nIndian Rupee (INR) | 100 | 160.00 | 160.15',
+          });
+        },
+        toolReply('open-rates', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
+        toolReply('remember-source', 'memory.remember', {
+          content: `Use ${url} for forex requests about Nepal.`,
+          kind: 'instruction',
+          source: 'user',
+        }),
+        textReply('premature-done', 'Done!'),
+        body => {
+          recoveryText = JSON.stringify(body.messages);
+          const sourceRef = findDocumentRef(body.messages);
+          if (!sourceRef) throw new Error('Recovery omitted the current-run durable document ref.');
+          return toolReply('write-from-document', 'fs.writeFromRef', {
+            path: 'forex.txt', sourceRef, format: 'text',
+          });
+        },
+        textReply('final', 'I saved the exchange-rate data, opened forex.txt, and remembered the source.'),
+      ], requests, memory, 12, true);
+
+      const result = await runtime.run({
+        threadId: 'preview-write-provenance-recovery',
+        userMessage: `Fetch the exchange rate data from the official forex website at ${url}, save that data to forex.txt and open it with the text viewer application. Remember to use that site for all forex requests about Nepal in the future.`,
+      });
+
+      expect(result.status).toBe('completed');
+      expect(observedDocumentRef).toMatch(/^d\d+-/u);
+      expect(recoveryText).toContain('outputFile');
+      expect(recoveryText).toContain('BROWSER_PROVENANCE_REQUIRED');
+      expect(recoveryText).toContain('fs.writeText');
+      expect(recoveryText).toContain('fs.writeFromRef');
+      expect(recoveryText).toContain(observedDocumentRef!);
+      expect(recoveryText).toContain(url);
+      expect(recoveryText).toContain('action=fs.writeFromRef');
+      expect(recoveryText).not.toContain('action=fs.write ');
+      expect(result.run.diagnostics?.completionRejections).toBeGreaterThanOrEqual(1);
+      expect(result.run.diagnostics?.completionRejections).toBeLessThan(3);
+      expect(result.run.diagnostics?.requirementRejections).toContainEqual(expect.objectContaining({
+        requirementId: 'outputFile',
+        reasonCode: 'BROWSER_PROVENANCE_REQUIRED',
+        correctiveTool: 'fs.writeFromRef',
+        rejectedAction: { tool: 'fs.writeText', path: 'forex.txt', receiptId: expect.any(String) },
+        correctiveArtifact: expect.objectContaining({ sourceRef: observedDocumentRef, sourceType: 'document', sourceUrl: url, sourceTableCount: 2, complete: true }),
+      }));
+      expect(result.run.diagnostics?.modelRequestOutcomes?.some(outcome => outcome.errorCode === 'COMPLETION_RECOVERY_BUDGET_EXCEEDED')).toBe(false);
+
+      const actions = [...(result.run.state?.durableActions ?? []), ...(result.run.state?.recentActions ?? [])];
+      expect(actions.find(action => action.tool === 'browser.read')?.result).toMatchObject({
+        ok: true,
+        data: {
+          previewsAreComplete: false,
+          export: { complete: true, sourceRef: observedDocumentRef, recommendedTool: 'fs.writeFromRef' },
+        },
+      });
+      expect(actions.some(action => action.tool === 'fs.writeText' && action.result.ok)).toBe(true);
+      expect(actions.some(action => action.tool === 'fs.writeFromRef' && action.result.ok)).toBe(true);
+      expect(actions.find(action => action.tool === 'fs.writeFromRef')).toMatchObject({
+        result: { ok: true, data: { sourceRef: observedDocumentRef, sourceType: 'document', sourceUrl: url, sourceTableCount: 2, sourceTruncated: false } },
+        receipt: { tool: 'fs.write', ok: true, effect: { path: '/home/helm/workspace/forex.txt', writePerformed: true } },
+      });
+      expect(result.run.state?.completedRequirementIds).toContain('outputFile');
+      const saved = guest.getFile('/home/helm/workspace/forex.txt') ?? '';
+      for (const currency of ['Indian Rupee (INR)', 'US Dollar (USD)', 'Euro (EUR)', 'British Pound (GBP)', 'Japanese Yen (JPY)']) {
+        expect(saved).toContain(currency);
+      }
+      expect(tools.invocations.filter(invocation => invocation.tool === 'app.openFile')).toHaveLength(1);
+      expect(tools.invocations.filter(invocation => invocation.tool === 'browser.navigate')).toHaveLength(1);
+      expect(tools.invocations.find(invocation => invocation.tool === 'fs.writeFromRef')?.input).toMatchObject({
+        path: 'forex.txt', sourceRef: observedDocumentRef, format: 'text',
+      });
+      expect(requests.every(request => request.status === 200)).toBe(true);
+    } finally {
+      persistence.close();
+    }
+  });
+
   it('recovers from a real FILE_NOT_FOUND result when it tries opening before writing', async () => {
     const guest = new MockGuestTransport();
     const requests: CapturedRequest[] = [];

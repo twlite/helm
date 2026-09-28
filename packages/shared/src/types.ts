@@ -364,8 +364,42 @@ export interface VerificationResult {
     passed: boolean;
     message: string;
     evidence?: unknown;
+    /** Stable machine-readable reason when a concrete candidate effect was rejected. */
+    reasonCode?: string;
+    /** Model-visible tool that can correct the rejected effect, when known. */
+    correctiveTool?: string;
+    rejectedAction?: RejectedRequirementAction;
+    correctiveArtifact?: CorrectiveArtifactHint;
   }>;
   summary: string;
+}
+
+export interface RejectedRequirementAction {
+  tool: string;
+  path?: string;
+  receiptId?: string;
+  sourceRef?: string;
+  sourceUrl?: string;
+}
+
+export interface CorrectiveArtifactHint {
+  sourceRef: string;
+  sourceType: string;
+  sourceUrl: string;
+  sourceRevision: number;
+  sourceCapturedAt: string;
+  sourceStructuredBlockCount: number;
+  sourceTableCount: number;
+  complete: boolean;
+}
+
+export interface RequirementRejectionDiagnostic {
+  requirementId: string;
+  reasonCode: string;
+  message: string;
+  correctiveTool?: string;
+  rejectedAction?: RejectedRequirementAction;
+  correctiveArtifact?: CorrectiveArtifactHint;
 }
 
 export interface AgentStep {
@@ -445,6 +479,8 @@ export interface RunDiagnostics {
   completionRejections: number;
   contextCompactions: number;
   lastUnsatisfiedRequirements: string[];
+  /** Bounded history of deterministic reasons verification rejected candidate effects. */
+  requirementRejections?: RequirementRejectionDiagnostic[];
   modelRequestOutcomes?: ModelRequestOutcome[];
 }
 
@@ -853,6 +889,15 @@ export interface BrowserReadResult {
   documentRef?: string;
   /** Full source block refs retained by documentRef, independent of preview limits. */
   sourceRefs?: string[];
+  /** Returned block summaries are bounded previews, never the complete raw source. */
+  previewsAreComplete?: false;
+  /** Durable ref to the complete selected artifact when extraction was not truncated. */
+  export?: {
+    complete: boolean;
+    sourceRef?: string;
+    recommendedTool?: 'fs.writeFromRef';
+    message?: string;
+  };
   sourceCapturedAt?: string;
   sourceStructuredBlockCount?: number;
   sourceTableCount?: number;

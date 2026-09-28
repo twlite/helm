@@ -1477,6 +1477,7 @@ export class BrowserController {
     const documentRef = documentBlocks.length > 0 && (mode === "document" || documentBlocks.length > 1)
       ? this.registerDocumentReference(documentBlocks, url, title, extracted.pageType, documentSourceTruncated)
       : undefined;
+    const exportSourceRef = documentRef ?? (documentBlocks.length === 1 ? documentBlocks[0]!.ref : undefined);
     const documentSnapshot = documentRef ? this.documentReferences.get(documentRef) : undefined;
     const documentRefSet = new Set(documentBlocks.map(block => block.ref));
     const structuredBlocks = extracted.blocks.filter(block => (
@@ -1507,6 +1508,12 @@ export class BrowserController {
       ...(query ? { query } : {}),
       ...(documentRef ? { documentRef } : {}),
       sourceRefs: documentBlocks.map(block => block.ref),
+      previewsAreComplete: false,
+      export: {
+        complete: Boolean(exportSourceRef && !documentSourceTruncated),
+        ...(exportSourceRef ? { sourceRef: exportSourceRef, recommendedTool: "fs.writeFromRef" as const } : {}),
+        ...(documentSourceTruncated ? { message: "The extracted source is truncated; a raw export may be incomplete." } : {}),
+      },
       ...(documentSnapshot ? { sourceCapturedAt: documentSnapshot.capturedAt } : { sourceCapturedAt: new Date().toISOString() }),
       sourceStructuredBlockCount: documentBlocks.filter(isStructuredContentBlock).length,
       sourceTableCount: documentBlocks.filter(block => block.type === "table").length,
@@ -1657,6 +1664,13 @@ export class BrowserController {
       source: "semantic",
       pageType: reference.pageType,
       sourceRefs: [reference.block.ref],
+      previewsAreComplete: false,
+      export: {
+        complete: !Boolean(reference.block.truncated),
+        sourceRef: input.ref,
+        recommendedTool: "fs.writeFromRef",
+        ...(reference.block.truncated ? { message: "The extracted source is truncated; a raw export may be incomplete." } : {}),
+      },
       sourceCapturedAt: reference.capturedAt,
       sourceStructuredBlockCount: isStructuredContentBlock(reference.block) ? 1 : 0,
       sourceTableCount: reference.block.type === "table" ? 1 : 0,
@@ -1737,6 +1751,13 @@ export class BrowserController {
       pageType: document.pageType,
       documentRef: input.ref,
       sourceRefs: [...document.sourceRefs],
+      previewsAreComplete: false,
+      export: {
+        complete: !document.sourceTruncated,
+        sourceRef: input.ref,
+        recommendedTool: "fs.writeFromRef",
+        ...(document.sourceTruncated ? { message: "The extracted source is truncated; a raw export may be incomplete." } : {}),
+      },
       sourceCapturedAt: document.capturedAt,
       sourceStructuredBlockCount: structuredBlocks.length,
       sourceTableCount: document.blocks.filter(block => block.type === "table").length,

@@ -446,12 +446,11 @@ describe('acting agent native tool loop', () => {
     expect(requests).toHaveLength(1);
   });
 
-  it('stops when the model repeats the same unverified completion after identical feedback', async () => {
+  it('stops on trivially reworded unverified completion after identical feedback', async () => {
     const requests: CapturedRequest[] = [];
-    const repeatedAnswer = 'I wrote notes.txt.';
     const provider = responseQueue([
-      textReply('first-answer', repeatedAnswer),
-      textReply('same-answer-again', repeatedAnswer),
+      textReply('first-answer', 'Done!'),
+      textReply('same-answer-again', 'All done.'),
     ], requests);
     const agent = new AiSdkActingAgent({
       model: provider.chatModel('acting-agent-repeated-completion-test-model'),
@@ -488,6 +487,7 @@ describe('acting agent native tool loop', () => {
     expect((caught as ActingAgentExecutionError).details.completionAttempts).toBe(2);
     expect((caught as ActingAgentExecutionError).details.completionRejections).toBe(2);
     expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.body.messages)).toContain('[pending] notes.txt');
   });
 
   it('keeps ordinary conversation on the same auto-choice path without calling tools', async () => {

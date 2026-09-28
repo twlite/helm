@@ -11,6 +11,7 @@ import type {
   Run,
   RunDiagnostics,
   RunStep,
+  RequirementRejectionDiagnostic,
   TaskDefinition,
   ToolError,
   ToolResult,
@@ -1321,6 +1322,7 @@ export class AgentRuntime {
       contextCompactions: 0,
       finalizationTurns: 0,
       lastUnsatisfiedRequirements: [],
+      requirementRejections: [],
       modelRequestOutcomes: [],
     };
     const run: Run = {
@@ -1356,6 +1358,31 @@ export class AgentRuntime {
         .split('\n')
         .filter(line => /\[(?:pending|blocked)\]/u.test(line))
         .map(line => line.trim());
+      const currentRejections = (finalVerification?.requirements ?? [])
+        .filter(check => !check.passed && check.reasonCode)
+        .map(check => ({
+          requirementId: check.requirement.id,
+          reasonCode: check.reasonCode!,
+          message: check.message,
+          ...(check.correctiveTool ? { correctiveTool: check.correctiveTool } : {}),
+          ...(check.rejectedAction ? { rejectedAction: check.rejectedAction } : {}),
+          ...(check.correctiveArtifact ? { correctiveArtifact: check.correctiveArtifact } : {}),
+        } satisfies RequirementRejectionDiagnostic));
+      const knownRejections = new Set((diagnostics.requirementRejections ?? []).map(rejection => JSON.stringify([
+        rejection.requirementId,
+        rejection.reasonCode,
+        rejection.rejectedAction?.receiptId,
+        rejection.correctiveArtifact?.sourceRef,
+      ])));
+      diagnostics.requirementRejections = [
+        ...(diagnostics.requirementRejections ?? []),
+        ...currentRejections.filter(rejection => !knownRejections.has(JSON.stringify([
+          rejection.requirementId,
+          rejection.reasonCode,
+          rejection.rejectedAction?.receiptId,
+          rejection.correctiveArtifact?.sourceRef,
+        ]))),
+      ].slice(-24);
       run.diagnostics = clone(diagnostics);
     };
     const persistState = async (): Promise<void> => {
@@ -1538,13 +1565,17 @@ export class AgentRuntime {
         .map(check => ({
           id: check.requirement.id,
           message: check.message,
+          ...(check.reasonCode ? { reasonCode: check.reasonCode } : {}),
+          ...(check.correctiveTool ? { correctiveTool: check.correctiveTool } : {}),
+          ...(check.rejectedAction ? { rejectedAction: check.rejectedAction } : {}),
+          ...(check.correctiveArtifact ? { correctiveArtifact: check.correctiveArtifact } : {}),
         }));
       const unsatisfiedCriteria = verification.criteria
         .filter(check => !check.passed)
         .map(check => ({ id: JSON.stringify(check.criterion), message: check.message }));
       const details = { requirements: unsatisfied, criteria: unsatisfiedCriteria };
       const summary = [
-        ...unsatisfied.map(item => item.id + ': ' + item.message),
+        ...unsatisfied.map(item => item.id + (item.reasonCode ? ` [${item.reasonCode}]` : '') + ': ' + item.message),
         ...unsatisfiedCriteria.map(item => item.id + ': ' + item.message),
       ];
       return {

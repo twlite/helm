@@ -20,7 +20,7 @@ const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'browser.navigate': 'Navigate the visible guest browser to a valid HTTP or HTTPS URL. User-provided URLs may be opened directly.',
   'browser.getState': 'Read the visible browser URL, title, loading state, page count, and current DOM revision without reading page text.',
   'browser.snapshot': 'Return a bounded semantic outline of the current page and its visible interactive elements.',
-  'browser.read': 'Read bounded structured semantic content from the current page. query is natural-language relevance text, not a CSS selector; use browser.query for DOM/CSS inspection. readable ranks compact model previews. document preserves substantive content in page order and returns an immutable documentRef for the complete relevant block collection; maxChars and maxBlocks limit previews, not that snapshot. Related nearby structured blocks with the same heading and column schema are included together. Navigation and other page chrome are excluded unless explicitly requested by blockTypes. Use fs.writeFromRef to save raw page data without copying a possibly truncated preview.',
+  'browser.read': 'Read bounded structured semantic content from the current page. query is natural-language relevance text, not a CSS selector; use browser.query for DOM/CSS inspection. readable ranks compact model previews. document preserves substantive content in page order and returns an immutable documentRef for the complete relevant block collection; maxChars and maxBlocks limit previews, not that snapshot. The result marks previewsAreComplete=false and provides export.sourceRef plus export.complete. Do not copy preview text into raw-data files; use export.sourceRef with fs.writeFromRef, and treat export.complete=false as an incomplete source.',
   'browser.query': 'Inspect a bounded set of current DOM elements by CSS selector, text, role, or name. Returns compact metadata and revision-bound element refs; observed links include navigation refs. Use it to inspect rendered rows or controls when semantic extraction is incomplete.',
   'browser.evaluate': 'Evaluate a JavaScript expression inside the current browser page and return JSON-serializable data (maximum 64 KB; bounded by the browser operation timeout). It runs only in page context and has no guest or host filesystem, process, environment, or host API access.',
   'browser.findPage': 'Find and rank content on the current page. This is page-local search and does not search the web; results include typed current-page refs.',
@@ -281,7 +281,7 @@ export function createGuestToolRegistry(
   });
   registerGuestTool(registry, guest, 'fs.write', {
     name: 'fs.writeFromRef',
-    description: 'Save raw browser-derived content from a durable block ref or documentRef returned by browser.read. Pass the ref directly; previews may be truncated and must not be reconstructed as complete data. Defaults to text; format may be text, markdown, json, or csv.',
+    description: 'Save raw browser-derived content from browser.read.export.sourceRef (or a returned durable block/document ref). Pass the ref directly; previews are never complete raw data and must not be reconstructed. Defaults to text; format may be text, markdown, json, or csv.',
     inputSchema: modelToolSchemas['fs.writeFromRef'],
     mapInput: value => value as GuestMethodParams['fs.write'],
     rpcTimeoutMs: GUEST_TOOL_DEADLINES_MS.filesystemWrite.guestRpc,

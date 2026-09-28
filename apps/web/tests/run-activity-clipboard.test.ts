@@ -121,6 +121,43 @@ describe('run activity clipboard formatter', () => {
     expect(text).toContain('"lastUnsatisfiedRequirements"');
   });
 
+  it('includes structured rejected-requirement recovery diagnostics', () => {
+    const text = formatRunActivityForClipboard(run({
+      diagnostics: {
+        modelTurns: 6,
+        finalizationTurns: 1,
+        modelRequests: 7,
+        toolActions: 6,
+        completionAttempts: 2,
+        completionRejections: 1,
+        contextCompactions: 0,
+        lastUnsatisfiedRequirements: [],
+        requirementRejections: [{
+          requirementId: 'outputFile',
+          reasonCode: 'BROWSER_PROVENANCE_REQUIRED',
+          message: 'forex.txt was written with fs.writeText; use fs.writeFromRef with the current document ref.',
+          correctiveTool: 'fs.writeFromRef',
+          rejectedAction: { tool: 'fs.writeText', path: 'forex.txt', receiptId: 'receipt-write-text' },
+          correctiveArtifact: {
+            sourceRef: 'd1-12345678-1',
+            sourceType: 'document',
+            sourceUrl: 'https://example.test/rates',
+            sourceRevision: 1,
+            sourceCapturedAt: '2026-09-28T07:41:42.000Z',
+            sourceStructuredBlockCount: 2,
+            sourceTableCount: 2,
+            complete: true,
+          },
+        }],
+      },
+    }));
+
+    expect(text).toContain('requirementRejections');
+    expect(text).toContain('BROWSER_PROVENANCE_REQUIRED');
+    expect(text).toContain('fs.writeFromRef');
+    expect(text).toContain('d1-12345678-1');
+  });
+
   it('includes bounded provider rejection details in the copied log', () => {
     const text = formatRunActivityForClipboard(run({
       status: 'failed',
