@@ -660,13 +660,25 @@ export class RunStepRepository {
     return this.getById(id);
   }
 
+  private queryByRun(runId: string, limit?: number): RunStep[] {
+    const limitClause = limit === undefined ? '' : ' LIMIT ?';
+    const query =
+      'SELECT id, run_id AS runId, step_index AS stepIndex, phase, decision_json AS decisionJson, orchestrator_decision_json AS orchestratorDecisionJson, objective_json AS objectiveJson, worker, worker_result_json AS workerResultJson, progress_json AS progressJson, tool_name AS toolName, tool_input_json AS toolInputJson, tool_result_json AS toolResultJson, observation_json AS observationJson, verification_json AS verificationJson, created_at AS createdAt, completed_at AS completedAt FROM run_steps WHERE run_id = ? ORDER BY step_index ASC, created_at ASC, id ASC' + limitClause;
+    const statement = this.database.prepare(query);
+    const selected = limit === undefined ? statement.all(runId) : statement.all(runId, limit);
+    return selected.map(mapRunStep);
+  }
+
   listByRun(runId: string, limit?: number): RunStep[] {
-    const rows = this.database
-      .prepare(
-        'SELECT id, run_id AS runId, step_index AS stepIndex, phase, decision_json AS decisionJson, orchestrator_decision_json AS orchestratorDecisionJson, objective_json AS objectiveJson, worker, worker_result_json AS workerResultJson, progress_json AS progressJson, tool_name AS toolName, tool_input_json AS toolInputJson, tool_result_json AS toolResultJson, observation_json AS observationJson, verification_json AS verificationJson, created_at AS createdAt, completed_at AS completedAt FROM run_steps WHERE run_id = ? ORDER BY step_index ASC, created_at ASC, id ASC LIMIT ?',
-      )
-      .all(runId, normalizeLimit(limit));
-    return rows.map(mapRunStep);
+    return this.queryByRun(runId, normalizeLimit(limit));
+  }
+
+  /**
+   * Returns every persisted step without the default 100-row limit used by
+   * listByRun. Run-detail diagnostics require the complete ordered history.
+   */
+  listAllByRun(runId: string): RunStep[] {
+    return this.queryByRun(runId);
   }
 
   list(runId: string, limit?: number): RunStep[] {

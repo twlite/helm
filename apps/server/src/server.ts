@@ -681,7 +681,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       if (request.method === 'GET' && segments[0] === 'api' && segments[1] === 'runs' && segments.length === 3) {
         const run = database.runs.getById(segments[2]);
         if (!run) return notFound('Run not found.');
-        return jsonResponse({ run: { ...run, steps: database.runSteps.listByRun(run.id) } });
+        return jsonResponse({ run: { ...run, steps: database.runSteps.listAllByRun(run.id) } });
       }
       if (request.method === 'POST' && url.pathname === '/api/runs/scripted-demo') {
         const input = scriptedDemoInputSchema.parse(await parseBody(request));
@@ -691,7 +691,7 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
         const task = createScriptedDemoTask(selectedThread.id);
         const message = database.messages.create({ threadId: selectedThread.id, role: 'user', content: task.goal, metadata: { source: 'scripted-demo' } });
         const run = await runScriptedDemo(selectedThread.id, message.id);
-        return jsonResponse({ run: { ...run, steps: database.runSteps.listByRun(run.id) } }, 201);
+        return jsonResponse({ run: { ...run, steps: database.runSteps.listAllByRun(run.id) } }, 201);
       }
       if (request.method === 'POST' && url.pathname === '/api/runs/agent') {
         const input = agentRunInputSchema.parse(await parseBody(request));

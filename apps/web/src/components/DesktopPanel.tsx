@@ -1,6 +1,8 @@
 import { useState } from 'react';
-import type { LiveActivity, RunDetails, VmAction, VmStatus } from '../types';
+import { helmApi } from '../api';
+import type { LiveActivity, RunActivityEventHistory, RunDetails, VmAction, VmStatus } from '../types';
 import { humanize } from '../format';
+import { formatRunActivityForClipboard } from '../run-activity-clipboard';
 import { Icon } from './Icon';
 import { DesktopViewer } from './DesktopViewer';
 import { RunActivityFeed } from './RunActivityFeed';
@@ -13,6 +15,7 @@ type DesktopPanelProps = {
   vmAction: VmAction | null;
   onVmAction: (action: VmAction) => Promise<void>;
   run: RunDetails | null;
+  getActivityEventHistory: (runId: string) => RunActivityEventHistory | undefined;
   liveActivity?: LiveActivity;
   onCancelRun: (runId: string) => Promise<void>;
   onRetryRun: (runId?: string) => Promise<void>;
@@ -38,14 +41,63 @@ export function DesktopPanel({
   vmAction,
   onVmAction,
   run,
+  getActivityEventHistory,
   liveActivity,
   onCancelRun,
   onRetryRun,
   isRetryingRun,
 }: DesktopPanelProps) {
   const [viewerOpen, setViewerOpen] = useState(false);
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copying' | 'copied' | 'warning' | 'failed'>('idle');
+  const [copyRunId, setCopyRunId] = useState<string>();
+  const [copyError, setCopyError] = useState<string>();
+  const visibleCopyStatus = copyRunId === run?.id ? copyStatus : 'idle';
+  const visibleCopyError = copyRunId === run?.id ? copyError : undefined;
   const state = vm?.state ?? 'unavailable';
   const status = statusClasses(state);
+
+  async function copyActivityLog() {
+    if (!run || copyStatus === 'copying') return;
+    setCopyRunId(run.id);
+    setCopyStatus('copying');
+    setCopyError(undefined);
+
+    let activityRun = run;
+    let historySource: 'server' | 'local' = 'server';
+    let historyRefreshWarning: string | undefined;
+    try {
+      activityRun = await helmApi.getRun(run.id);
+    } catch (error) {
+      historySource = 'local';
+      historyRefreshWarning = error instanceof Error ? error.message : String(error);
+    }
+
+    const matchingEventHistory = getActivityEventHistory(activityRun.id);
+    const text = formatRunActivityForClipboard(activityRun, {
+      historySource,
+      historyRefreshWarning,
+      runtimeEvents: matchingEventHistory,
+    });
+
+    try {
+      if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) {
+        throw new Error('Clipboard access is unavailable in this browser context.');
+      }
+      await navigator.clipboard.writeText(text);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setCopyError(message);
+      setCopyStatus('failed');
+      return;
+    }
+
+    setCopyStatus(historySource === 'local'
+      || !matchingEventHistory?.startedObserved
+      || matchingEventHistory.truncated
+      || matchingEventHistory.connectionInterrupted
+      ? 'warning'
+      : 'copied');
+  }
 
   return (
     <>
@@ -154,8 +206,30 @@ export function DesktopPanel({
                 <h3 className="text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--text-secondary)]">Activity</h3>
               </div>
               {run ? (
-                <span className="text-[10px] text-[#606975]">Live</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[10px] text-[#606975]">Live</span>
+                  <Button
+                    aria-label="Copy activity log"
+                    className="h-6 gap-1 px-1.5 text-[10px]"
+                    disabled={copyStatus === 'copying'}
+                    onClick={() => void copyActivityLog()}
+                    size="sm"
+                    title={visibleCopyError ?? (visibleCopyStatus === 'warning' ? 'Copied with a history warning; see the warning in the copied log.' : undefined)}
+                    variant="ghost"
+                  >
+                    <Icon name={visibleCopyStatus === 'copied' ? 'check' : visibleCopyStatus === 'failed' ? 'x' : 'copy'} size={12} />
+                    {visibleCopyStatus === 'copying' ? 'Copying…'
+                      : visibleCopyStatus === 'copied' ? 'Copied'
+                        : visibleCopyStatus === 'warning' ? 'Copied · warning'
+                          : visibleCopyStatus === 'failed' ? 'Copy failed' : 'Copy log'}
+                  </Button>
+                </div>
               ) : null}
+              <span aria-live="polite" className="sr-only" role={visibleCopyStatus === 'failed' ? 'alert' : 'status'}>
+                {visibleCopyStatus === 'failed' ? `Failed to copy activity log. ${visibleCopyError ?? ''}`
+                  : visibleCopyStatus === 'copied' ? 'Copied activity log.'
+                    : visibleCopyStatus === 'warning' ? 'Copied activity log with a history warning.' : ''}
+              </span>
             </div>
             <ScrollArea className="min-h-0 flex-1">
               <div className="px-3 pb-4 pt-1">

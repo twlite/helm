@@ -88,6 +88,31 @@ describe('typed repositories', () => {
     }
   });
 
+  it('can load every run step when building a complete activity history', () => {
+    const persistence = testDatabase();
+    try {
+      const thread = persistence.threads.create({ title: 'Long activity history' });
+      const run = persistence.runs.create({ id: 'long-history-run', threadId: thread.id, goal: 'Keep all steps', criteria: [] });
+      for (let index = 0; index < 105; index += 1) {
+        persistence.runSteps.create({
+          id: `long-history-step-${index}`,
+          runId: run.id,
+          stepIndex: index,
+          phase: 'observe',
+          createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+        });
+      }
+
+      expect(persistence.runSteps.listByRun(run.id)).toHaveLength(100);
+      expect(persistence.runSteps.listAllByRun(run.id)).toHaveLength(105);
+      expect(persistence.runSteps.listAllByRun(run.id).map(step => step.stepIndex)).toEqual(
+        Array.from({ length: 105 }, (_, index) => index),
+      );
+    } finally {
+      persistence.close();
+    }
+  });
+
   it('enforces explicit run state transitions and records terminal timestamps', () => {
     const persistence = testDatabase();
     try {

@@ -107,6 +107,27 @@ describe('Helm HTTP API', () => {
       expect(demo.run.status).toBe('completed');
       expect(demo.run.sourceMessageId).toBeString();
       expect(demo.run.steps.some(step => step.phase === 'verify')).toBe(true);
+
+      const longRun = application.database.runs.create({
+        id: 'long-activity-run',
+        threadId,
+        goal: 'Return the complete run history.',
+        criteria: [],
+      });
+      for (let index = 0; index < 105; index += 1) {
+        application.database.runSteps.create({
+          id: `long-activity-step-${index}`,
+          runId: longRun.id,
+          stepIndex: index,
+          phase: 'observe',
+          createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+        });
+      }
+      const completeRun = await readJson<{ run: { steps: Array<{ stepIndex: number }> } }>(
+        await application.handle(new Request(`http://helm.test/api/runs/${longRun.id}`)),
+      );
+      expect(completeRun.run.steps).toHaveLength(105);
+      expect(completeRun.run.steps.at(-1)?.stepIndex).toBe(104);
     } finally {
       await application.close();
       rmSync(dataDir, { recursive: true, force: true });

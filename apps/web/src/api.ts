@@ -266,6 +266,9 @@ function parseRun(value: unknown): RunDetails | null {
     ...(isRecord(value.state)
       ? { state: value.state as unknown as RunDetails['state'] }
       : {}),
+    ...(isRecord(value.diagnostics)
+      ? { diagnostics: value.diagnostics as unknown as RunDetails['diagnostics'] }
+      : {}),
     error: parseToolError(value.error),
     createdAt: asString(value.createdAt ?? value.created_at),
     startedAt: asOptionalString(value.startedAt ?? value.started_at),

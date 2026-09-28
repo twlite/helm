@@ -18,6 +18,7 @@ import type {
   Memory,
   MemoryKind,
   Message,
+  RunActivityEventHistory,
   RunDetails,
   StreamingAssistantMessage,
   Thread,
@@ -96,6 +97,37 @@ function mergeChatProgress(current: ChatProgress | null, run: RunDetails): ChatP
     summaries: current.summaries,
     toolCalls: [...toolCalls.values()].sort((left, right) => left.stepIndex - right.stepIndex),
   };
+}
+
+const MAX_ACTIVITY_EVENTS_PER_RUN = 1_000;
+const MAX_ACTIVITY_RUN_HISTORIES = 20;
+
+function appendRunActivityEvent(
+  current: Record<string, RunActivityEventHistory>,
+  event: HelmEvent,
+): Record<string, RunActivityEventHistory> {
+  if (!event.runId || !event.type.startsWith('run.')) return current;
+  const previous = current[event.runId] ?? {
+    runId: event.runId,
+    events: [],
+    startedObserved: false,
+    truncated: false,
+  };
+  const events = [...previous.events, event];
+  const next: Record<string, RunActivityEventHistory> = {
+    ...current,
+    [event.runId]: {
+      runId: event.runId,
+      events: events.slice(-MAX_ACTIVITY_EVENTS_PER_RUN),
+      startedObserved: previous.startedObserved || event.type === 'run.started',
+      truncated: previous.truncated || events.length > MAX_ACTIVITY_EVENTS_PER_RUN,
+    },
+  };
+  const runIds = Object.keys(next);
+  if (runIds.length > MAX_ACTIVITY_RUN_HISTORIES) {
+    for (const runId of runIds.slice(0, runIds.length - MAX_ACTIVITY_RUN_HISTORIES)) delete next[runId];
+  }
+  return next;
 }
 
 function mergeVmStatus(payload: unknown, previous: VmStatus | null): VmStatus | null {
@@ -245,6 +277,7 @@ function App() {
   const [isRetryingRun, setIsRetryingRun] = useState(false);
   const [regeneratingTitleThreadId, setRegeneratingTitleThreadId] = useState<string | null>(null);
   const [run, setRun] = useState<RunDetails | null>(null);
+  const runActivityHistoryRef = useRef<Record<string, RunActivityEventHistory>>({});
   const [liveActivity, setLiveActivity] = useState<LiveActivity | null>(null);
   const [chatProgress, setChatProgress] = useState<ChatProgress | null>(null);
   const [streamingAssistant, setStreamingAssistant] = useState<StreamingAssistantMessage | null>(null);
@@ -299,7 +332,12 @@ function App() {
     }
   }, [showError]);
 
+  const getRunActivityHistory = useCallback((runId: string) => runActivityHistoryRef.current[runId], []);
+
   const handleEvent = useCallback((event: HelmEvent) => {
+    if (event.runId && event.type.startsWith('run.')) {
+      runActivityHistoryRef.current = appendRunActivityEvent(runActivityHistoryRef.current, event);
+    }
     if (event.type === 'vm.status') {
       setVm((current) => mergeVmStatus(event.payload, current));
       setHealth((current) => {
@@ -447,6 +485,17 @@ function App() {
   }, [refreshRun]);
 
   const socket = useHelmWebSocket(handleEvent);
+
+  useEffect(() => {
+    if (socket.state === 'connected' || !run || !['pending', 'running'].includes(run.status)) return;
+    const history = runActivityHistoryRef.current[run.id];
+    if (history && !history.connectionInterrupted) {
+      runActivityHistoryRef.current = {
+        ...runActivityHistoryRef.current,
+        [run.id]: { ...history, connectionInterrupted: true },
+      };
+    }
+  }, [run?.id, run?.status, socket.state]);
 
   useEffect(() => {
     if (socket.connectionVersion === 0) return;
@@ -932,6 +981,7 @@ function App() {
           thread={selectedThread}
         />
         <DesktopPanel
+          getActivityEventHistory={getRunActivityHistory}
           isRetryingRun={isRetryingRun}
           liveActivity={liveActivity ?? undefined}
           onCancelRun={handleCancelRun}

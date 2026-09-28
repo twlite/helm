@@ -76,6 +76,14 @@ export type HelmEvent = {
   payload: unknown;
 };
 
+export type RunActivityEventHistory = {
+  runId: string;
+  events: HelmEvent[];
+  startedObserved: boolean;
+  truncated: boolean;
+  connectionInterrupted?: boolean;
+};
+
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'offline';
 
 export type AsyncState = 'idle' | 'loading' | 'saving' | 'error';
