@@ -126,15 +126,7 @@ export interface ActingAgentContext {
   verifyCompletion(input: {
     response: string;
   }): Promise<ToolResult<VerificationResult>>;
-  reportBlocked(input: {
-    response: string;
-    requirementIds: readonly string[];
-  }): Promise<ToolResult<{ blocked: boolean }>>;
   getRequirementSummary(): string;
-  /** Names of tools that can advance the currently actionable requirement state. */
-  getActionableTools?: () => readonly string[];
-  /** Pending requirement IDs with concrete failure evidence that can justify a blocker report. */
-  getBlockableRequirementIds?: () => readonly string[];
   getToolActionCount?: () => number;
   onDiagnostics?: (diagnostics: RunDiagnostics) => Promise<void> | void;
   drainSteering?: () => Message[];
@@ -147,7 +139,6 @@ export interface ActingAgentContext {
   maxModelTurns: number;
   maxCompletionRecoveryTurns: number;
   maxRepeatedAction: number;
-  maxConsecutiveFailures: number;
   signal?: AbortSignal;
 }
 
@@ -155,10 +146,6 @@ export interface ActingAgentResult {
   response: string;
   verification: VerificationResult;
   diagnostics: RunDiagnostics;
-  blocked?: {
-    response: string;
-    requirementIds: string[];
-  };
 }
 
 /** One coherent model conversation with native, runtime-validated Helm tools. */

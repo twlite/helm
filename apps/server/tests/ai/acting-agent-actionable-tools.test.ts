@@ -2,9 +2,9 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { describe, expect, it } from 'bun:test';
 import { z } from 'zod';
 
-import type { TaskDefinition, TaskRequirement, VerificationResult } from '@helm/shared';
-import { AiSdkActingAgent } from '../../src/ai/acting-agent';
-import type { ToolDefinition } from '../../src/tools/tool-registry';
+import type { TaskDefinition, VerificationResult } from '@helm/shared';
+import { ActingAgentExecutionError, AiSdkActingAgent } from '../../src/ai/acting-agent';
+import type { ToolDefinition } from '../../src/tools/registry';
 
 type ChatReply = {
   id: string;
@@ -32,6 +32,17 @@ function textReply(id: string, content: string): ChatReply {
   };
 }
 
+function emptyReply(id: string): ChatReply {
+  return {
+    id,
+    object: 'chat.completion',
+    created: 1,
+    model: 'acting-agent-test-model',
+    choices: [{ index: 0, message: { role: 'assistant', content: null }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 1, completion_tokens: 0, total_tokens: 1 },
+  };
+}
+
 function toolReply(id: string, name: string, args: unknown): ChatReply {
   return {
     id,
@@ -55,6 +66,21 @@ function toolReply(id: string, name: string, args: unknown): ChatReply {
   };
 }
 
+function responseQueue(replies: ChatReply[], requests: CapturedRequest[]) {
+  return createOpenAICompatible({
+    name: 'acting-agent-tool-loop-test',
+    baseURL: 'http://localhost:1234/v1',
+    fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const body = JSON.parse(await request.text()) as Record<string, unknown>;
+      const reply = replies.shift();
+      if (!reply) throw new Error('No scripted model response remains.');
+      requests.push({ body, reply });
+      return Response.json(reply);
+    },
+  });
+}
+
 function requestedTools(request: CapturedRequest): string[] {
   const tools = request.body.tools;
   if (!Array.isArray(tools)) return [];
@@ -67,161 +93,280 @@ function requestedTools(request: CapturedRequest): string[] {
   });
 }
 
-function requirement(id: string, action: string, dependsOn: string[] = []): TaskRequirement {
-  return {
-    id,
-    description: `Complete ${id}`,
-    type: action.startsWith('app.') ? 'desktop' : 'filesystem',
-    mandatory: true,
-    target: { action, freshness: 'current-run', mode: action === 'fs.write' ? 'written' : 'opened' },
-    ...(dependsOn.length > 0 ? { dependsOn } : {}),
-  };
-}
-
-describe('acting agent actionable tool control', () => {
-  it('recovers from premature text under required tool choice and exposes dependent tools only after their prerequisite succeeds', async () => {
+describe('acting agent native tool loop', () => {
+  it('offers the full tool set and recovers from a real open-before-write error', async () => {
+    const requests: CapturedRequest[] = [];
+    const provider = responseQueue([
+      toolReply('open-first', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
+      toolReply('write', 'fs.write', { path: 'forex.txt', content: 'USD 133.20' }),
+      toolReply('open-again', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
+      textReply('done', 'I wrote forex.txt and opened it in the text editor.'),
+    ], requests);
+    const definitions: ToolDefinition[] = [
+      { name: 'browser.navigate', description: 'Navigate to a URL.', inputSchema: z.object({ url: z.string() }), execute: async () => ({ ok: true }) },
+      { name: 'browser.webSearch', description: 'Search the web.', inputSchema: z.object({ query: z.string() }), execute: async () => ({ ok: true }) },
+      { name: 'browser.read', description: 'Read semantic page content.', inputSchema: z.object({ query: z.string().optional() }), execute: async () => ({ ok: true }) },
+      { name: 'browser.query', description: 'Query the current DOM.', inputSchema: z.object({ selector: z.string().optional(), text: z.string().optional() }), execute: async () => ({ ok: true }) },
+      { name: 'browser.evaluate', description: 'Evaluate in page context.', inputSchema: z.object({ expression: z.string() }), execute: async () => ({ ok: true }) },
+      { name: 'fs.write', description: 'Write content to a sandbox file.', inputSchema: z.object({ path: z.string(), content: z.string() }), execute: async () => ({ ok: true }) },
+      { name: 'app.openFile', description: 'Open an existing file; returns FILE_NOT_FOUND when missing.', inputSchema: z.object({ path: z.string(), application: z.string() }), execute: async () => ({ ok: true }) },
+    ];
     let written = false;
     let opened = false;
-    let verificationCalls = 0;
-    const requests: CapturedRequest[] = [];
-    const replies = [
-      // The provider also tries an action that is blocked by the dependency
-      // graph. `activeTools` omits it, so it cannot reach the runtime.
-      toolReply('early-open', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
-      // Local model servers can ignore tool_choice=required. The SDK surfaces
-      // this as ToolChoiceViolationError before agent.generate returns.
-      textReply('premature-done', 'Done.'),
-      toolReply('write', 'fs.write', { path: 'forex.txt', content: 'Observed data' }),
-      toolReply('open', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
-      textReply('final', 'The file was written and opened.'),
-    ];
-    const provider = createOpenAICompatible({
-      name: 'acting-agent-actionable-test',
-      baseURL: 'http://localhost:1234/v1',
-      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
-        const request = input instanceof Request ? input : new Request(input, init);
-        const body = JSON.parse(await request.text()) as Record<string, unknown>;
-        const reply = replies.shift();
-        if (!reply) throw new Error('No scripted model response remains.');
-        requests.push({ body, reply });
-        return Response.json(reply);
-      },
-    });
-    const definitions: ToolDefinition[] = [
-      {
-        name: 'fs.write',
-        description: 'Write a file.',
-        inputSchema: z.object({ path: z.string(), content: z.string() }).strict(),
-        execute: async () => ({ ok: true }),
-      },
-      {
-        name: 'app.openFile',
-        description: 'Open a file in an application.',
-        inputSchema: z.object({ path: z.string(), application: z.string() }).strict(),
-        execute: async () => ({ ok: true }),
-      },
-    ];
-    const requirements = [
-      requirement('outputFile', 'fs.write'),
-      requirement('openFile', 'app.openFile', ['outputFile']),
-    ];
     const agent = new AiSdkActingAgent({
-      model: provider.chatModel('acting-agent-actionable-test-model'),
+      model: provider.chatModel('acting-agent-tool-loop-test-model'),
       maxOutputTokens: 1_000,
       temperature: 0,
       requestTimeoutMs: 1_000,
     });
-
     const result = await agent.execute({
-      userMessage: 'Write the observed data to forex.txt and open it in the text editor.',
+      userMessage: 'Write the exchange data to forex.txt and open it in the text editor.',
       task: {
-        id: 'actionable-tools',
-        threadId: 'actionable-tools',
-        goal: 'Write the observed data to forex.txt and open it in the text editor.',
-        originalRequest: 'Write the observed data to forex.txt and open it in the text editor.',
+        id: 'open-before-write',
+        threadId: 'open-before-write',
+        goal: 'Write the exchange data to forex.txt and open it in the text editor.',
+        originalRequest: 'Write the exchange data to forex.txt and open it in the text editor.',
         criteria: [],
-        requirements,
+        requirements: [],
       } satisfies TaskDefinition,
       conversation: [],
       memories: [],
       toolDefinitions: definitions,
       executeTool: async (name, input) => {
+        if (name === 'app.openFile' && !written) {
+          return { ok: false, error: { code: 'FILE_NOT_FOUND', message: 'File does not exist: forex.txt' } };
+        }
         if (name === 'fs.write') {
-          expect(opened).toBe(false);
           written = true;
           return { ok: true, data: { path: input.path } };
         }
         if (name === 'app.openFile') {
-          // This assertion exercises the ordering invariant at the tool boundary.
-          expect(written).toBe(true);
           opened = true;
-          return { ok: true, data: { path: input.path } };
+          return { ok: true, data: { path: input.path, application: input.application } };
         }
-        return { ok: false, error: { code: 'UNEXPECTED_TOOL', message: name } };
+        return { ok: true };
       },
       verifyCompletion: async () => {
-        verificationCalls += 1;
         const verification: VerificationResult = {
           complete: written && opened,
           criteria: [],
           requirements: [],
-          summary: written && opened ? 'All required actions completed.' : 'Required actions remain.',
+          summary: written && opened ? 'The requested file was written and opened.' : 'The requested effects are pending.',
         };
         return { ok: verification.complete, data: verification };
       },
-      reportBlocked: async () => ({ ok: false, error: { code: 'NO_FAILURE', message: 'No tool failure was recorded.' } }),
-      getRequirementSummary: () => [
-        `${written ? '[satisfied]' : '[pending]'} outputFile action=fs.write`,
-        `${opened ? '[satisfied]' : written ? '[pending]' : '[blocked]'} openFile action=app.openFile dependsOn=outputFile`,
-      ].join('\n'),
-      getActionableTools: () => opened ? [] : written ? ['app.openFile'] : ['fs.write'],
-      getToolActionCount: () => Number(written) + Number(opened),
-      maxToolActions: 4,
+      getRequirementSummary: () => `${written ? '[satisfied]' : '[pending]'} write; ${opened ? '[satisfied]' : '[pending]'} open`,
+      maxToolActions: 8,
       maxModelTurns: 5,
-      // A premature text proposal must not consume completion recovery turns.
       maxCompletionRecoveryTurns: 0,
       maxRepeatedAction: 2,
-      maxConsecutiveFailures: 2,
     });
 
-    expect(result.response).toBe('The file was written and opened.');
+    expect(result.response).toBe('I wrote forex.txt and opened it in the text editor.');
     expect(result.verification.complete).toBe(true);
     expect(written).toBe(true);
     expect(opened).toBe(true);
-    expect(verificationCalls).toBe(1);
-    expect(requests).toHaveLength(5);
-    expect(requests.slice(0, 4).map(request => request.body.tool_choice)).toEqual(['required', 'required', 'required', 'required']);
-    expect(requestedTools(requests[0]!)).toEqual(['fs.write']);
-    expect(requestedTools(requests[1]!)).toEqual(['fs.write']);
-    expect(requestedTools(requests[2]!)).toEqual(['fs.write']);
-    expect(requestedTools(requests[3]!)).toEqual(['app.openFile']);
-    expect(requestedTools(requests[0]!)).not.toContain('app.openFile');
-    expect(requestedTools(requests[1]!)).not.toContain('app.openFile');
-    expect(requestedTools(requests[2]!)).not.toContain('app.openFile');
-    expect(result.diagnostics).toMatchObject({
-      modelTurns: 5,
-      modelRequests: 5,
-      toolActions: 2,
-      completionAttempts: 1,
-      completionRejections: 0,
-    });
-    expect(JSON.stringify(requests[2]!.body.messages)).toContain('Done.');
-    expect(JSON.stringify(requests[2]!.body.messages)).toContain('Currently available task choices: fs.write');
+    expect(requests).toHaveLength(4);
+    expect(requests.map(request => request.body.tool_choice)).toEqual(['auto', 'auto', 'auto', 'auto']);
+    const fullToolSet = requestedTools(requests[0]!);
+    expect(fullToolSet).toEqual(expect.arrayContaining([
+      'browser.navigate', 'browser.webSearch', 'browser.read', 'browser.query', 'browser.evaluate', 'fs.write', 'app.openFile',
+    ]));
+    expect(requests.slice(1).every(request => requestedTools(request).sort().join('|') === [...fullToolSet].sort().join('|'))).toBe(true);
+    expect(JSON.stringify(requests[1]!.body.messages)).toContain('FILE_NOT_FOUND');
+    expect(result.diagnostics.modelTurns).toBe(4);
+    expect(result.diagnostics.modelRequestOutcomes?.map(outcome => outcome.outcome)).toEqual([
+      'tool-call', 'tool-call', 'tool-call', 'assistant-text',
+    ]);
+    expect(result.diagnostics.modelRequestOutcomes?.map(outcome => outcome.providerCalls)).toEqual([1, 1, 1, 1]);
+    expect(result.diagnostics.modelRequestOutcomes?.at(-1)?.completion).toBe('accepted');
+    expect(result.diagnostics.modelRequestOutcomes?.[0]?.toolCalls).toEqual([
+      { tool: 'app.openFile', outcome: 'failed', errorCode: 'FILE_NOT_FOUND' },
+    ]);
   });
 
-  it('keeps ordinary conversation free of required tool choice', async () => {
+  it('records schema rejection separately while continuing the same useful tool conversation', async () => {
     const requests: CapturedRequest[] = [];
-    const provider = createOpenAICompatible({
-      name: 'acting-agent-conversation-test',
-      baseURL: 'http://localhost:1234/v1',
-      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
-        const request = input instanceof Request ? input : new Request(input, init);
-        const body = JSON.parse(await request.text()) as Record<string, unknown>;
-        const reply = textReply('hello', 'Hello!');
-        requests.push({ body, reply });
-        return Response.json(reply);
-      },
+    const provider = responseQueue([
+      toolReply('invalid-open-input', 'app.openFile', { path: 'notes.txt' }),
+      toolReply('write-notes', 'fs.write', { path: 'notes.txt', content: 'Notes from the page.' }),
+      textReply('done', 'I wrote the notes to notes.txt.'),
+    ], requests);
+    let written = false;
+    let toolActions = 0;
+    const agent = new AiSdkActingAgent({
+      model: provider.chatModel('acting-agent-schema-diagnostic-test-model'),
+      maxOutputTokens: 1_000,
+      temperature: 0,
+      requestTimeoutMs: 1_000,
     });
+    const result = await agent.execute({
+      userMessage: 'Write notes.txt.',
+      task: { id: 'schema-diagnostic', threadId: 'schema-diagnostic', goal: 'Write notes.txt.', criteria: [], requirements: [] },
+      conversation: [],
+      memories: [],
+      toolDefinitions: [
+        { name: 'app.openFile', description: 'Open an existing file.', inputSchema: z.object({ path: z.string(), application: z.string() }), execute: async () => ({ ok: true }) },
+        { name: 'fs.write', description: 'Write UTF-8 file content.', inputSchema: z.object({ path: z.string(), content: z.string() }), execute: async () => { written = true; return { ok: true }; } },
+      ],
+      executeTool: async name => {
+        toolActions += 1;
+        if (name === 'fs.write') {
+          written = true;
+          return { ok: true };
+        }
+        return { ok: false, error: { code: 'UNEXPECTED_EXECUTION', message: 'Invalid tool input should not execute.' } };
+      },
+      getToolActionCount: () => toolActions,
+      verifyCompletion: async () => ({
+        ok: written,
+        data: { complete: written, criteria: [], requirements: [], summary: written ? 'Written.' : 'Pending.' },
+      }),
+      getRequirementSummary: () => written ? '[satisfied] notes.txt' : '[pending] notes.txt',
+      maxToolActions: 4,
+      maxModelTurns: 5,
+      maxCompletionRecoveryTurns: 0,
+      maxRepeatedAction: 2,
+    });
+
+    expect(result.response).toBe('I wrote the notes to notes.txt.');
+    expect(result.diagnostics.modelTurns).toBe(3);
+    expect(result.diagnostics.toolActions).toBe(1);
+    expect(result.diagnostics.modelRequestOutcomes?.[0]?.toolCalls).toEqual([
+      { tool: 'app.openFile', outcome: 'schema-validation-failed' },
+    ]);
+    expect(requests).toHaveLength(3);
+  });
+
+  it('records an unknown tool call rejected before execution', async () => {
+    const requests: CapturedRequest[] = [];
+    const provider = responseQueue([toolReply('unknown-tool', 'browser.notRegistered', {})], requests);
+    const agent = new AiSdkActingAgent({
+      model: provider.chatModel('acting-agent-unknown-tool-test-model'),
+      maxOutputTokens: 1_000,
+      temperature: 0,
+      requestTimeoutMs: 1_000,
+    });
+    let diagnostics: Record<string, unknown> | undefined;
+    let executed = false;
+    try {
+      await agent.execute({
+        userMessage: 'Inspect the page.',
+        task: { id: 'unknown-tool', threadId: 'unknown-tool', goal: 'Inspect the page.', criteria: [], requirements: [] },
+        conversation: [],
+        memories: [],
+        toolDefinitions: [{
+          name: 'fs.write', description: 'Write a file.', inputSchema: z.object({ path: z.string(), content: z.string() }),
+          execute: async () => ({ ok: true }),
+        }],
+        executeTool: async () => { executed = true; return { ok: true }; },
+        verifyCompletion: async () => ({ ok: true, data: { complete: true, criteria: [], requirements: [], summary: 'Complete.' } }),
+        getRequirementSummary: () => '',
+        onDiagnostics: value => { diagnostics = value as unknown as Record<string, unknown>; },
+        maxToolActions: 4,
+        maxModelTurns: 2,
+        maxCompletionRecoveryTurns: 0,
+        maxRepeatedAction: 2,
+      });
+    } catch {
+      // The unknown tool is an actual model output error; inspect the recorded per-request diagnostic.
+    }
+
+    expect(executed).toBe(false);
+    const outcomes = diagnostics?.modelRequestOutcomes as Array<Record<string, unknown>> | undefined;
+    expect(outcomes?.[0]).toMatchObject({
+      request: 1,
+      outcome: 'tool-call',
+      toolCalls: [{ tool: 'browser.notRegistered', outcome: 'rejected-before-execution', errorCode: 'UNKNOWN_TOOL' }],
+    });
+    expect(outcomes?.[1]).toMatchObject({ request: 2, outcome: 'provider-error', errorName: 'Error' });
+    expect(requests).toHaveLength(1);
+  });
+
+  it('stops after one empty provider response instead of silently spending the remaining turn budget', async () => {
+    const requests: CapturedRequest[] = [];
+    const provider = responseQueue([emptyReply('empty')], requests);
+    const agent = new AiSdkActingAgent({
+      model: provider.chatModel('acting-agent-empty-output-test-model'),
+      maxOutputTokens: 1_000,
+      temperature: 0,
+      requestTimeoutMs: 1_000,
+    });
+    let caught: unknown;
+    try {
+      await agent.execute({
+        userMessage: 'Write notes.txt.',
+        task: { id: 'empty-output', threadId: 'empty-output', goal: 'Write notes.txt.', criteria: [], requirements: [] },
+        conversation: [],
+        memories: [],
+        toolDefinitions: [],
+        executeTool: async () => ({ ok: true }),
+        verifyCompletion: async () => ({ ok: true, data: { complete: true, criteria: [], requirements: [], summary: 'Complete.' } }),
+        getRequirementSummary: () => '[pending] notes.txt',
+        maxToolActions: 4,
+        maxModelTurns: 10,
+        maxCompletionRecoveryTurns: 0,
+        maxRepeatedAction: 2,
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(ActingAgentExecutionError);
+    expect((caught as ActingAgentExecutionError).code).toBe('NO_ACTIONABLE_OUTPUT');
+    expect((caught as ActingAgentExecutionError).details.modelRequestOutcomes).toMatchObject([
+      { request: 1, outcome: 'no-actionable-output', providerCalls: 1, providerRetries: 0 },
+    ]);
+    expect(requests).toHaveLength(1);
+  });
+
+  it('stops when the model repeats the same unverified completion after identical feedback', async () => {
+    const requests: CapturedRequest[] = [];
+    const repeatedAnswer = 'I wrote notes.txt.';
+    const provider = responseQueue([
+      textReply('first-answer', repeatedAnswer),
+      textReply('same-answer-again', repeatedAnswer),
+    ], requests);
+    const agent = new AiSdkActingAgent({
+      model: provider.chatModel('acting-agent-repeated-completion-test-model'),
+      maxOutputTokens: 1_000,
+      temperature: 0,
+      requestTimeoutMs: 1_000,
+    });
+    let caught: unknown;
+    try {
+      await agent.execute({
+        userMessage: 'Write notes.txt.',
+        task: { id: 'repeated-completion', threadId: 'repeated-completion', goal: 'Write notes.txt.', criteria: [], requirements: [] },
+        conversation: [],
+        memories: [],
+        toolDefinitions: [],
+        executeTool: async () => ({ ok: true }),
+        verifyCompletion: async () => ({
+          ok: false,
+          error: { code: 'UNSATISFIED_TASK_REQUIREMENTS', message: 'Missing requested effects:\n- notes.txt has not been written.' },
+        }),
+        getRequirementSummary: () => '[pending] notes.txt',
+        maxToolActions: 4,
+        maxModelTurns: 10,
+        maxCompletionRecoveryTurns: 3,
+        maxRepeatedAction: 2,
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(ActingAgentExecutionError);
+    expect((caught as ActingAgentExecutionError).code).toBe('REPEATED_UNVERIFIED_COMPLETION');
+    expect((caught as ActingAgentExecutionError).details.modelTurns).toBe(2);
+    expect((caught as ActingAgentExecutionError).details.completionAttempts).toBe(2);
+    expect((caught as ActingAgentExecutionError).details.completionRejections).toBe(2);
+    expect(requests).toHaveLength(2);
+  });
+
+  it('keeps ordinary conversation on the same auto-choice path without calling tools', async () => {
+    const requests: CapturedRequest[] = [];
+    const provider = responseQueue([textReply('hello', 'Hello!')], requests);
     const agent = new AiSdkActingAgent({
       model: provider.chatModel('acting-agent-conversation-test-model'),
       maxOutputTokens: 1_000,
@@ -237,76 +382,16 @@ describe('acting agent actionable tool control', () => {
       toolDefinitions: [],
       executeTool: async () => ({ ok: false, error: { code: 'UNEXPECTED_TOOL', message: 'No tool should run.' } }),
       verifyCompletion: async () => ({ ok: true, data: { complete: true, criteria: [], requirements: [], summary: 'Conversation complete.' } }),
-      reportBlocked: async () => ({ ok: false, error: { code: 'NO_FAILURE', message: 'No failure.' } }),
       getRequirementSummary: () => '',
-      getActionableTools: () => [],
       maxToolActions: 2,
       maxModelTurns: 2,
       maxCompletionRecoveryTurns: 1,
       maxRepeatedAction: 2,
-      maxConsecutiveFailures: 2,
     });
 
     expect(result.response).toBe('Hello!');
     expect(requests).toHaveLength(1);
     expect(requests[0]!.body.tool_choice).not.toBe('required');
     expect(requestedTools(requests[0]!)).toEqual([]);
-  });
-
-  it('offers blocker reporting only for a requirement with verified failure evidence', async () => {
-    const requests: CapturedRequest[] = [];
-    const provider = createOpenAICompatible({
-      name: 'acting-agent-blocker-test',
-      baseURL: 'http://localhost:1234/v1',
-      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
-        const request = input instanceof Request ? input : new Request(input, init);
-        const body = JSON.parse(await request.text()) as Record<string, unknown>;
-        const reply = toolReply('verified-blocker', 'helm.blocked', {
-          response: 'The required write action failed and cannot be recovered.',
-          requirementIds: ['outputFile'],
-        });
-        requests.push({ body, reply });
-        return Response.json(reply);
-      },
-    });
-    const agent = new AiSdkActingAgent({
-      model: provider.chatModel('acting-agent-blocker-test-model'),
-      maxOutputTokens: 1_000,
-      temperature: 0,
-      requestTimeoutMs: 1_000,
-    });
-
-    const result = await agent.execute({
-      userMessage: 'Write the requested data to forex.txt.',
-      task: {
-        id: 'verified-blocker',
-        threadId: 'verified-blocker',
-        goal: 'Write the requested data to forex.txt.',
-        criteria: [],
-        requirements: [requirement('outputFile', 'fs.write')],
-      },
-      conversation: [],
-      memories: [],
-      toolDefinitions: [],
-      executeTool: async () => ({ ok: false, error: { code: 'UNEXPECTED_TOOL', message: 'No tool is available.' } }),
-      verifyCompletion: async () => ({
-        ok: true,
-        data: { complete: false, criteria: [], requirements: [], summary: 'The output remains pending.' },
-      }),
-      reportBlocked: async () => ({ ok: true, data: { blocked: true } }),
-      getRequirementSummary: () => '[pending] outputFile action=fs.write',
-      getActionableTools: () => [],
-      getBlockableRequirementIds: () => ['outputFile'],
-      maxToolActions: 2,
-      maxModelTurns: 2,
-      maxCompletionRecoveryTurns: 0,
-      maxRepeatedAction: 2,
-      maxConsecutiveFailures: 2,
-    });
-
-    expect(result.blocked?.requirementIds).toEqual(['outputFile']);
-    expect(requests).toHaveLength(1);
-    expect(requests[0]!.body.tool_choice).toBe('required');
-    expect(requestedTools(requests[0]!)).toEqual(['helm.blocked']);
   });
 });

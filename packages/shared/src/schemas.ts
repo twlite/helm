@@ -78,6 +78,14 @@ export const guestMethodSchemas = {
   'browser.navigate': z.object({ url: z.string().min(1) }),
   'browser.getState': z.object({}),
   'browser.snapshot': z.object({ maxRegions: z.number().int().min(1).max(100).optional() }),
+  'browser.query': z.object({
+    selector: z.string().trim().min(1).max(1_000).optional(),
+    text: z.string().trim().min(1).max(1_000).optional(),
+    role: z.string().trim().min(1).max(100).optional(),
+    name: z.string().trim().min(1).max(1_000).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
+  }).refine(value => Boolean(value.selector || value.text || value.role || value.name), 'Provide at least one DOM query filter'),
+  'browser.evaluate': z.object({ expression: z.string().trim().min(1).max(12_000) }).strict(),
   'browser.read': z.object({
     mode: z.enum(['readable', 'document']).optional(),
     query: z.string().trim().min(1).max(1_000).optional(),

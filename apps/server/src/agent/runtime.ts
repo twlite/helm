@@ -98,6 +98,10 @@ function criterionKey(criterion: CompletionCriterion): string {
   return JSON.stringify(criterion);
 }
 
+/**
+ * Legacy requirements-first helpers, used only when no acting agent is configured.
+ * Production acting-agent runs bypass navigation policy and workflow guards.
+ */
 type NavigationProvenance = 'user' | 'search-result' | 'page-link' | 'verified-memory' | 'duckduckgo-search' | 'navigation-result';
 
 interface UrlCapability {
@@ -523,14 +527,19 @@ function withRuntimeReceipt(
   const data = result.data && typeof result.data === 'object' && !Array.isArray(result.data)
     ? result.data as Record<string, unknown>
     : undefined;
-  const path = typeof input.path === 'string' ? input.path : typeof data?.path === 'string' ? data.path : undefined;
+  const path = typeof data?.path === 'string' ? data.path : typeof input.path === 'string' ? input.path : undefined;
   const receipt: ActionReceipt = {
     id: `receipt-${crypto.randomUUID()}`,
     tool,
     ok: result.ok,
     effect: {
       ...(path ? { path } : {}),
+      ...(typeof data?.application === 'string'
+        ? { application: data.application }
+        : typeof input.application === 'string' ? { application: input.application } : {}),
       ...(typeof input.url === 'string' ? { requestedUrl: input.url } : {}),
+      ...(typeof data?.url === 'string' ? { urlAfter: data.url } : {}),
+      ...(typeof data?.size === 'number' ? { bytesWritten: data.size } : {}),
       ...(typeof data?.sha256 === 'string' ? { sha256: data.sha256 } : {}),
       ...(tool === 'fs.write' && result.ok && typeof data?.sha256 === 'string' ? { writePerformed: true } : {}),
       ...(tool === 'memory.remember' && result.ok ? { changed: data?.action !== 'already-present' } : {}),
@@ -549,6 +558,7 @@ function withRuntimeReceipt(
 
 function normalizedTaskPath(value: string): string {
   return value.replace(/\\/gu, '/').replace(/^(?:\.\/)+/u, '')
+    .replace(/^\/home\/helm\//u, '~/')
     .replace(/^\/home\/helm\/workspace\//u, '')
     .replace(/^~\/(?:workspace\/)?/u, '')
     .replace(/\/$/u, '');
@@ -745,42 +755,6 @@ function actionableToolsForState(
   return [...names].sort();
 }
 
-function hasRelevantBlockerEvidence(
-  requirement: TaskRequirement,
-  state: ReturnType<typeof createTaskState>,
-): ActionReceipt | undefined {
-  const ignoredErrors = new Set([
-    'TASK_PREREQUISITE_NOT_SATISFIED',
-    'UNOBSERVED_NAVIGATION_URL',
-    'OBSERVED_DESTINATION_REQUIRES_REF',
-    'INVALID_BROWSER_NAVIGATION',
-    'INVALID_BROWSER_URL',
-    'INVALID_BROWSER_PROTOCOL',
-    'VERIFIED_URL_RECOVERY_REQUIRED',
-    'STALE_CONTENT_REF',
-    'SEARCH_ALREADY_COMPLETED_USE_OBSERVED_RESULT',
-    'NAVIGATION_REF_REQUIRES_OPEN',
-  ]);
-  const expectedAction = requiredActionForRequirement(requirement);
-  for (const action of [...verificationActions(state)].reverse()) {
-    const receipt = embeddedReceipt(action.result) ?? action.receipt;
-    if (!receipt || receipt.ok !== false || ignoredErrors.has(receipt.error?.code ?? action.result.error?.code ?? '')) {
-      if (!(requirement.id === 'browserResearch' && action.tool === 'browser.read' && action.result.ok
-        && isRecord(action.result.data) && action.result.data.readable === false && receipt?.ok === true)) continue;
-    }
-    const isBrowserResearch = requirement.id === 'browserResearch' || requirement.target?.factId === 'pageContent';
-    if (isBrowserResearch && action.tool.startsWith('browser.')) return receipt;
-    if (action.tool !== expectedAction) continue;
-    if (requirement.target?.path && normalizedTaskPath(String(action.input.path ?? '')) !== normalizedTaskPath(requirement.target.path)) continue;
-    const actionApplication = action.tool === 'app.openFile' && action.input.application === undefined
-      ? 'text-editor'
-      : action.input.application;
-    if (requirement.target?.application && actionApplication !== requirement.target.application) continue;
-    return receipt;
-  }
-  return undefined;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -920,9 +894,12 @@ export class AgentRuntime {
     // thread or starting a second runtime against the same desktop.
     const conversation = [...(input.conversation ?? [])];
     const task = input.task ?? await this.createTask(input, memories);
+    if (this.actingAgent) return this.runWithActingAgent(input, task, memories, conversation);
+    // Navigation policy is confined to the legacy requirements-first paths.
     const navigationPolicy = createBrowserNavigationPolicy(input, memories);
-    if (this.actingAgent) return this.runWithActingAgent(input, task, memories, conversation, navigationPolicy);
     if (this.orchestrator && this.worker) {
+      // This guarded workflow belongs to the legacy orchestrator/worker path.
+      // Production server runs use the model-led acting-agent path above.
       return this.runOrchestrated(input, task, memories, conversation, navigationPolicy);
     }
     if (!this.decisionProvider) throw new Error('A decision provider is required for the legacy runtime path.');
@@ -1321,7 +1298,6 @@ export class AgentRuntime {
     task: TaskDefinition,
     memories: Memory[],
     conversation: Message[],
-    navigationPolicy: BrowserNavigationPolicy,
   ): Promise<AgentRuntimeResult> {
     const cancellation = new RunCancellation();
     const removeExternalAbort = this.attachExternalCancellation(cancellation, input.signal);
@@ -1338,6 +1314,7 @@ export class AgentRuntime {
       completionRejections: 0,
       contextCompactions: 0,
       lastUnsatisfiedRequirements: [],
+      modelRequestOutcomes: [],
     };
     const run: Run = {
       id: runId,
@@ -1356,20 +1333,11 @@ export class AgentRuntime {
     const observations: EnvironmentObservation[] = [];
     const previousResults: ToolResult[] = [];
     const noProgress = new Map<string, { result: string; count: number }>();
-    // Strategy attempts belong to the compiled requirement, not a literal
-    // tool argument. Query changes cannot reset a failed discovery strategy.
-    const strategyAttempts = new Map<string, { count: number; lastFailureClass: string }>();
-    const exhaustedRequirements = new Set<string>();
     const maxToolActions = this.budgetOptions?.maxSteps ?? DEFAULT_RUNTIME_BUDGETS.maxSteps;
     const maxRepeatedAction = this.budgetOptions?.maxRepeatedAction ?? DEFAULT_RUNTIME_BUDGETS.maxRepeatedAction;
-    const maxConsecutiveFailures = this.budgetOptions?.maxConsecutiveFailures ?? DEFAULT_RUNTIME_BUDGETS.maxConsecutiveFailures;
     const maxModelTurns = this.budgetOptions?.maxModelTurns ?? DEFAULT_RUNTIME_BUDGETS.maxModelTurns;
     const maxCompletionRecoveryTurns = this.budgetOptions?.maxCompletionRecoveryTurns ?? DEFAULT_RUNTIME_BUDGETS.maxCompletionRecoveryTurns;
-    const conversationalTask = task.isConversation === true
-      && task.criteria.length === 0
-      && (task.requirements?.length ?? 0) === 0;
     let actionCount = 0;
-    let consecutiveFailures = 0;
     let lastToolResult: ToolResult | undefined;
     let finalVerification: VerificationResult | undefined;
     let assistantResponse: string | undefined;
@@ -1407,7 +1375,7 @@ export class AgentRuntime {
     const executeToolNow = async (toolName: string, modelInput: Record<string, unknown>): Promise<ToolResult> => {
       cancellation.throwIfCancelled();
       const proposedInput = clone(modelInput);
-      const preparedInput = withDerivedBrowserReadQuery(toolName, clone(modelInput), task, input.userMessage);
+      const preparedInput = clone(modelInput);
       const stepIndex = actionCount;
       actionCount += 1;
       const action: AgentDecision = { type: 'action', tool: toolName, input: proposedInput };
@@ -1416,157 +1384,37 @@ export class AgentRuntime {
       await this.emit('run.step.started', { stepIndex, action }, runId);
 
       let result: ToolResult;
-      let navigation: PreparedNavigation | undefined;
-      let executionInput: Record<string, unknown> | undefined;
+      const executionInput = preparedInput;
       let toolWasInvoked = false;
-      let effectiveToolName = toolName;
       const receiptStartedAt = this.isoNow();
 
-      // Searching must not substitute for opening. While a successful search
-      // has unopened observed results, a further webSearch cannot execute
-      // another DuckDuckGo navigation. An exact URL match to an observed href
-      // is safely routed to browser.open with the stored ref; otherwise the
-      // proposal is rejected without side effects.
-      let searchGuardRejection: ToolResult | undefined;
-      let searchRewriteRef: string | undefined;
-      if (toolName === 'browser.webSearch' && hasUnopenedSearchResults(state)) {
-        const query = typeof preparedInput.query === 'string' ? preparedInput.query : '';
-        const matchingRef = query ? findObservedSearchRefForUrl(state, query) : undefined;
-        if (matchingRef) {
-          effectiveToolName = 'browser.open';
-          searchRewriteRef = matchingRef;
-        } else {
-          const unopened = unopenedSearchResults(state);
-          searchGuardRejection = {
-            ok: false,
-            error: {
-              code: 'SEARCH_ALREADY_COMPLETED_USE_OBSERVED_RESULT',
-              message: 'A DuckDuckGo search already returned observed results. Open one of the observed results with browser.open({ ref }) instead of searching again.',
-              details: {
-                availableResultRefs: unopened.map(item => item.ref),
-                hint: 'Open one of the observed results with browser.open({ ref }).',
-              },
-            },
-          };
-        }
-      }
-
-      if (searchGuardRejection) {
-        result = searchGuardRejection;
-      } else if (searchRewriteRef) {
-        executionInput = { ref: searchRewriteRef };
+      if (stepIndex >= maxToolActions) {
+        result = { ok: false, error: { code: 'ACTION_BUDGET_EXCEEDED', message: 'The run reached its ' + maxToolActions + '-action budget.' } };
+      } else if (previousNoProgress && previousNoProgress.count >= maxRepeatedAction) {
+        result = { ok: false, error: { code: 'REPEATED_ACTION', message: 'This exact action has repeated without a concrete state change. Try a different valid approach.' } };
+      } else {
         toolWasInvoked = true;
         await this.emit('run.progress', {
           threadId: run.threadId,
-          summary: `Running browser.open.`,
+          summary: `Running ${toolName}.`,
         }, runId);
-        result = await this.tools.execute(effectiveToolName, executionInput, {
+        result = await this.tools.execute(toolName, executionInput, {
           signal: cancellation.signal,
           runId,
           stepIndex,
           previousResults: clone(previousResults.slice(-12)),
           timeoutMs: this.budgetOptions?.toolTimeoutMs,
         });
-        if (effectiveToolName === 'browser.open') result = recordBrowserOpenOutcome(result);
-      } else if (stepIndex >= maxToolActions) {
-        result = { ok: false, error: { code: 'ACTION_BUDGET_EXCEEDED', message: 'The run reached its ' + maxToolActions + '-action budget.' } };
-      } else if (previousNoProgress && previousNoProgress.count >= maxRepeatedAction) {
-        result = { ok: false, error: { code: 'REPEATED_ACTION', message: 'This exact action has already repeated without a concrete state change. Choose another action or report the blocker.' } };
-      } else if (consecutiveFailures >= maxConsecutiveFailures) {
-        result = { ok: false, error: { code: 'TOOL_FAILURE_BUDGET_EXCEEDED', message: 'The run reached its ' + maxConsecutiveFailures + '-consecutive-failure bound.' } };
-      } else if (conversationalTask) {
-        result = { ok: false, error: { code: 'TOOLS_NOT_REQUIRED', message: 'The compiled task is conversational and has no computer-use requirements. Answer the user directly.' } };
-      } else {
-        const prerequisiteFailure = artifactWriteFailure(state, toolName, preparedInput)
-          ?? requiredDuckDuckGoSearchFailure(state, toolName)
-          ?? unsatisfiedActionPrerequisite(state, toolName, preparedInput);
-        if (prerequisiteFailure) {
-          result = prerequisiteFailure;
-        } else {
-          navigation = prepareBrowserNavigation(toolName, preparedInput, navigationPolicy);
-          const invalidNavigation = navigation.error
-            ?? invalidBrowserNavigationResult(toolName, navigation.input, true, task)
-            ?? browserNavigationGuard(toolName, navigation.input);
-          if (invalidNavigation) {
-            result = invalidNavigation;
-          } else {
-            executionInput = clone(navigation.input);
-            toolWasInvoked = true;
-            await this.emit('run.progress', {
-              threadId: run.threadId,
-              summary: `Running ${toolName}.`,
-            }, runId);
-            result = await this.tools.execute(toolName, executionInput, {
-              signal: cancellation.signal,
-              runId,
-              stepIndex,
-              previousResults: clone(previousResults.slice(-12)),
-              timeoutMs: this.budgetOptions?.toolTimeoutMs,
-            });
-            if (toolName === 'browser.webSearch' && result.ok) {
-              const data = isRecord(result.data) ? result.data : undefined;
-              const observedResults = Array.isArray(data?.results) ? data.results : [];
-              if (typeof data?.url !== 'string' || !isSearchResultsUrl(data.url)
-                || observedResults.length === 0 || observedResults.some(item => {
-                const record = isRecord(item) ? item : undefined;
-                return record?.type !== 'search_result'
-                  || typeof record.ref !== 'string' || typeof record.href !== 'string';
-              })) {
-                result = {
-                  ok: false,
-                  error: {
-                    code: 'WEB_SEARCH_PARSE_FAILED',
-                    message: 'The browser search returned no valid observed result refs.',
-                  },
-                };
-              }
-            }
-            if (toolName === 'browser.download') result = attachNavigationProvenance(result, navigation);
-            else if (toolName === 'browser.open') result = recordBrowserOpenOutcome(result);
-          }
-        }
+        if (toolName === 'browser.open') result = recordBrowserOpenOutcome(result);
       }
 
       if (toolWasInvoked) {
-        result = withRuntimeReceipt(effectiveToolName, executionInput ?? preparedInput, result, receiptStartedAt, this.now);
+        result = withRuntimeReceipt(toolName, executionInput, result, receiptStartedAt, this.now);
       }
-      if (effectiveToolName === 'browser.navigate' && navigation) {
-        result = recordNavigationOutcome(result, navigation, navigationPolicy);
-      }
-      rememberObservedBrowserUrls(effectiveToolName, result.data, navigationPolicy);
       const compactResult = compactAgentToolResult(result);
       lastToolResult = compactResult;
 
-      if (result.ok) consecutiveFailures = 0;
-      else consecutiveFailures += 1;
-
-      if (effectiveToolName === 'browser.webSearch' && !searchRewriteRef) {
-        const searchRequirement = requirementsForTask(state.task).find(requirement =>
-          requirement.mandatory && requirement.target?.action === 'browser.webSearch'
-          && !state.completedRequirementIds.includes(requirement.id));
-        if (searchRequirement) {
-          if (result.ok) {
-            strategyAttempts.delete(searchRequirement.id);
-            exhaustedRequirements.delete(searchRequirement.id);
-          } else {
-            const failureClass = result.error?.code ?? 'UNKNOWN_SEARCH_FAILURE';
-            const previous = strategyAttempts.get(searchRequirement.id)?.count ?? 0;
-            const count = previous + 1;
-            strategyAttempts.set(searchRequirement.id, { count, lastFailureClass: failureClass });
-            // The browser macro has already exhausted its local DDG variants
-            // for these outcomes. Other failures get one bounded retry, even
-            // when the model changes the query text.
-            if (['WEB_SEARCH_CHALLENGE', 'WEB_SEARCH_NO_RESULTS', 'WEB_SEARCH_PARSE_FAILED',
-              'WEB_SEARCH_NAVIGATION_FAILED',
-              'WEB_SEARCH_RESULTS_UNAVAILABLE', 'TOOL_FAILURE_BUDGET_EXCEEDED'].includes(failureClass)
-              || count >= 2) {
-              exhaustedRequirements.add(searchRequirement.id);
-            }
-          }
-        }
-      }
-
-      const resultFingerprint = fingerprintAction(effectiveToolName, executionInput ?? preparedInput, undefined, {
+      const resultFingerprint = fingerprintAction(toolName, executionInput, undefined, {
         ok: compactResult.ok,
         data: compactResult.data,
         error: compactResult.error,
@@ -1583,13 +1431,13 @@ export class AgentRuntime {
       }
       previousResults.push(compactResult);
 
-      const worker = effectiveToolName.startsWith('browser.') ? 'browser'
-        : effectiveToolName.startsWith('fs.') ? 'filesystem'
-          : effectiveToolName.startsWith('desktop.') || effectiveToolName.startsWith('app.') ? 'desktop' : 'system';
+      const worker = toolName.startsWith('browser.') ? 'browser'
+        : toolName.startsWith('fs.') ? 'filesystem'
+          : toolName.startsWith('desktop.') || toolName.startsWith('app.') ? 'desktop' : 'system';
       const workerAction = {
         id: this.idFactory('action'),
-        tool: effectiveToolName,
-        input: executionInput ?? preparedInput,
+        tool: toolName,
+        input: executionInput,
         result,
         ...(embeddedReceipt(result) ? { receipt: embeddedReceipt(result) } : {}),
       };
@@ -1617,10 +1465,10 @@ export class AgentRuntime {
         stepIndex,
         phase: 'act',
         decision: action,
-        toolName: effectiveToolName,
+        toolName,
         // toolInput is the input actually sent when tool execution began.
         // The model proposal remains available in decision.input.
-        ...(executionInput ? { toolInput: clone(executionInput) } : {}),
+        toolInput: clone(executionInput),
         toolResult: compactResult,
         observation: postObservation,
         verification,
@@ -1634,20 +1482,20 @@ export class AgentRuntime {
       if (toolWasInvoked && result.ok) {
         await this.emit('run.progress', {
           threadId: run.threadId,
-          summary: `Completed ${effectiveToolName}.`,
+          summary: `Completed ${toolName}.`,
         }, runId);
       }
       const executedAction: AgentDecision = {
         type: 'action',
-        tool: effectiveToolName,
-        input: clone(executionInput ?? preparedInput),
+        tool: toolName,
+        input: clone(executionInput),
       };
       await this.emit('run.step.completed', {
         stepIndex,
         action: executedAction,
         proposedTool: toolName,
         proposedInput,
-        effectiveTool: effectiveToolName,
+        effectiveTool: toolName,
         effectiveInput: executionInput,
         toolResult: compactResult,
         verification,
@@ -1655,71 +1503,9 @@ export class AgentRuntime {
       return compactResult;
     };
 
-    const advanceDeterministicRequirements = async (): Promise<void> => {
-      // The compiler has already captured these exact user-requested values.
-      // Persisting them is a mechanical side effect; the verifier still checks
-      // the complete mutation result against the compiled payload.
-      const memoryRequirement = requirementsForTask(state.task).find(requirement => (
-        requirement.id === 'memoryMutation'
-        && requirement.mandatory
-        && requirement.target?.action === 'memory.remember'
-        && typeof requirement.target.memoryContent === 'string'
-        && typeof requirement.target.memoryKind === 'string'
-        && !state.completedRequirementIds.includes(requirement.id)
-        && (requirement.dependsOn ?? []).every(id => state.completedRequirementIds.includes(id))
-      ));
-      if (memoryRequirement && this.tools.has('memory.remember')) {
-        const result = await executeToolNow('memory.remember', {
-          content: memoryRequirement.target!.memoryContent!,
-          kind: memoryRequirement.target!.memoryKind!,
-          source: 'user',
-        });
-        if (!result.ok) return;
-      }
-
-      const outputRequirement = requirementsForTask(state.task).find(requirement => (
-        requirement.id === 'outputFile'
-        && requirement.mandatory
-        && requirement.target?.action === 'fs.write'
-        && requirement.target.mode === 'written-from-artifact'
-        && typeof requirement.target.path === 'string'
-        && !state.completedRequirementIds.includes(requirement.id)
-        && (requirement.dependsOn ?? []).every(id => state.completedRequirementIds.includes(id))
-      ));
-      if (outputRequirement && this.tools.has('fs.write')) {
-        const selectedArtifact = selectedBrowserArtifact(state);
-        if (selectedArtifact) {
-          const writeResult = await executeToolNow('fs.write', {
-            path: outputRequirement.target!.path!,
-            sourceRef: selectedArtifact.ref,
-            format: outputRequirement.target!.format ?? 'text',
-          });
-          if (!writeResult.ok) return;
-        }
-      }
-
-      const openRequirement = requirementsForTask(state.task).find(requirement => (
-        requirement.id === 'openFile'
-        && requirement.mandatory
-        && requirement.target?.action === 'app.openFile'
-        && requirement.target.mode === 'opened'
-        && typeof requirement.target.path === 'string'
-        && !state.completedRequirementIds.includes(requirement.id)
-        && (requirement.dependsOn ?? []).every(id => state.completedRequirementIds.includes(id))
-      ));
-      if (openRequirement && this.tools.has('app.openFile')) {
-        await executeToolNow('app.openFile', {
-          path: openRequirement.target!.path!,
-          ...(openRequirement.target!.application ? { application: openRequirement.target!.application } : {}),
-        });
-      }
-    };
-
     const executeTool = (toolName: string, toolInput: Record<string, unknown>): Promise<ToolResult> => {
       const queued = actionQueue.then(async () => {
-        const result = await executeToolNow(toolName, toolInput);
-        if (result.ok) await advanceDeterministicRequirements();
-        return result;
+        return executeToolNow(toolName, toolInput);
       });
       actionQueue = queued.then(() => undefined, () => undefined);
       return queued;
@@ -1745,7 +1531,6 @@ export class AgentRuntime {
         .map(check => ({
           id: check.requirement.id,
           message: check.message,
-          dependsOn: check.requirement.dependsOn ?? [],
         }));
       const unsatisfiedCriteria = verification.criteria
         .filter(check => !check.passed)
@@ -1759,72 +1544,10 @@ export class AgentRuntime {
         ok: false,
         error: {
           code: 'UNSATISFIED_TASK_REQUIREMENTS',
-          message: 'Completion cannot be accepted yet:\n' + summary.map(item => '- ' + item).join('\n'),
+          message: 'Missing requested effects:\n' + summary.map(item => '- ' + item).join('\n'),
           details,
         },
       };
-    };
-
-    const reportBlocked = async (candidate: {
-      response: string;
-      requirementIds: readonly string[];
-    }): Promise<ToolResult<{ blocked: boolean }>> => {
-      await Promise.resolve();
-      await actionQueue;
-      const requestedIds = [...new Set(candidate.requirementIds)];
-      const requirements = requirementsForTask(state.task);
-      const evidence = new Map<string, ActionReceipt>();
-      for (const requirementId of requestedIds) {
-        const requirement = requirements.find(item => item.id === requirementId);
-        if (!requirement || !requirement.mandatory || state.completedRequirementIds.includes(requirementId)) {
-          return {
-            ok: false,
-            error: {
-              code: 'BLOCKER_NOT_VERIFIED',
-              message: 'Requirement ' + requirementId + ' is not a pending mandatory requirement.',
-            },
-          };
-        }
-        const receipt = hasRelevantBlockerEvidence(requirement, state);
-        if (!receipt) {
-          return {
-            ok: false,
-            error: {
-              code: 'BLOCKER_NOT_VERIFIED',
-              message: 'No relevant failed tool receipt supports a blocker for ' + requirementId + '. Continue recovery or choose a different pending requirement.',
-            },
-          };
-        }
-        evidence.set(requirementId, receipt);
-      }
-      state.blockers = [
-        ...state.blockers,
-        blocker(
-          'VERIFIED_REQUIREMENT_BLOCKER',
-          candidate.response.trim(),
-          requestedIds,
-          Object.fromEntries([...evidence].map(([requirementId, receipt]) => [requirementId, receipt.id])),
-        ),
-      ].slice(-12);
-      assistantResponse = candidate.response.trim();
-      await persistState();
-      await this.persistStep(steps, {
-        runId,
-        stepIndex: actionCount,
-        phase: 'blocked',
-        toolName: 'helm.blocked',
-        toolInput: { requirementIds: requestedIds },
-        toolResult: {
-          ok: true,
-          data: {
-            blocked: true,
-            requirements: requestedIds,
-            receiptIds: [...evidence.values()].map(receipt => receipt.id),
-          },
-        },
-        verification: finalVerification,
-      });
-      return { ok: true, data: { blocked: true } };
     };
 
     try {
@@ -1865,8 +1588,6 @@ export class AgentRuntime {
       state = updateCompletedRequirements(state, finalVerification);
       await persistState();
 
-      await advanceDeterministicRequirements();
-
       const agentResult = await this.actingAgent!.execute({
         userMessage: input.userMessage,
         task: clone(state.task),
@@ -1875,27 +1596,7 @@ export class AgentRuntime {
         toolDefinitions: this.tools.list(),
         executeTool,
         verifyCompletion,
-        reportBlocked,
         getRequirementSummary: () => taskRequirementSummary(state),
-        getActionableTools: () => actionableToolsForState(state, this.tools.names(), exhaustedRequirements),
-        getBlockableRequirementIds: () => {
-          const completed = new Set(state.completedRequirementIds);
-          const actionable = requirementsForTask(state.task).filter(requirement => requirement.mandatory
-            && !completed.has(requirement.id)
-            && (requirement.dependsOn ?? []).every(id => completed.has(id)));
-          const failures = actionable.map(requirement => hasRelevantBlockerEvidence(requirement, state));
-          const terminalCodes = new Set(['DISK_FULL', 'ENOSPC', 'EACCES', 'EPERM', 'PERMISSION_DENIED']);
-          const terminalFailures = failures.every(receipt => receipt?.error?.code && terminalCodes.has(receipt.error.code));
-          // A transient failed action cannot end the run while a retry or an
-          // independent requirement still has an executable path. Exhausted
-          // action failure budgets and explicit resource failures are terminal.
-          return actionable.filter(requirement => {
-            const receipt = hasRelevantBlockerEvidence(requirement, state);
-            return Boolean(receipt && (exhaustedRequirements.has(requirement.id)
-              || (terminalFailures && failures.every(Boolean))
-              || consecutiveFailures >= maxConsecutiveFailures));
-          }).map(requirement => requirement.id);
-        },
         getToolActionCount: () => actionCount,
         onDiagnostics: async agentDiagnostics => {
           Object.assign(diagnostics, agentDiagnostics, { toolActions: actionCount });
@@ -1928,40 +1629,24 @@ export class AgentRuntime {
         maxModelTurns,
         maxCompletionRecoveryTurns,
         maxRepeatedAction,
-        maxConsecutiveFailures,
         signal: cancellation.signal,
       });
       await actionQueue;
 
       Object.assign(diagnostics, agentResult.diagnostics, { toolActions: actionCount });
       run.diagnostics = clone(diagnostics);
-      if (agentResult.blocked) {
-        finalVerification = agentResult.verification;
-        assistantResponse = agentResult.blocked.response;
-        await this.persistStep(steps, {
-          runId,
-          stepIndex: actionCount,
-          phase: 'blocked',
-          verification: finalVerification,
-        });
-        await this.block(run, error('TASK_BLOCKED', assistantResponse, {
-          requirementIds: agentResult.blocked.requirementIds,
-          evidence: state.blockers.at(-1)?.details,
-        }));
-      } else {
-        if (!agentResult.verification.complete || !assistantResponse) {
-          throw new Error('The acting model returned without a verified completion.');
-        }
-        finalVerification = agentResult.verification;
-        assistantResponse = agentResult.response;
-        await this.persistStep(steps, {
-          runId,
-          stepIndex: actionCount,
-          phase: 'complete',
-          verification: finalVerification,
-        });
-        await this.complete(run, finalVerification);
+      if (!agentResult.verification.complete || !assistantResponse) {
+        throw new Error('The acting model returned without a verified completion.');
       }
+      finalVerification = agentResult.verification;
+      assistantResponse = agentResult.response;
+      await this.persistStep(steps, {
+        runId,
+        stepIndex: actionCount,
+        phase: 'complete',
+        verification: finalVerification,
+      });
+      await this.complete(run, finalVerification);
     } catch (caught) {
       await actionQueue;
       if (cancellation.cancelled || input.signal?.aborted) {
@@ -2015,6 +1700,7 @@ export class AgentRuntime {
    * share the legacy one-action decision loop: its model boundaries are
    * orchestrator -> bounded worker -> runtime observation -> verifier.
    */
+  /** Legacy requirements-first loop retained for scripted tests and demos. */
   private async runOrchestrated(
     input: RunTaskInput,
     task: TaskDefinition,

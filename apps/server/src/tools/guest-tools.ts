@@ -12,24 +12,26 @@ import { ToolRegistry, type ToolRegistryOptions } from './tool-registry';
 const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'guest.handshake': 'Check the loaded guest build identity, protocol contract, server process ID, and capabilities.',
   'fs.read': 'Read a UTF-8 file inside the allowed guest filesystem root.',
-  'fs.write': 'Write a UTF-8 file inside the allowed guest filesystem root. Use content for new text or sourceRef plus a format to serialize the complete stored browser artifact. A successful write is a current-run action even when the bytes are unchanged.',
+  'fs.write': 'Write model-authored UTF-8 content inside the guest filesystem root with content, or serialize an extracted browser content snapshot directly by passing its durable content ref as sourceRef and choosing a format. No additional browser.read of that ref is required.',
   'fs.mkdir': 'Create a directory inside the allowed guest filesystem root.',
   'fs.exists': 'Check whether a guest filesystem path exists.',
   'fs.list': 'List immediate entries inside an allowed guest directory.',
   'fs.stat': 'Inspect whether a guest filesystem path exists and its type.',
-  'browser.navigate': 'Navigate the visible guest browser to a URL.',
+  'browser.navigate': 'Navigate the visible guest browser to a valid HTTP or HTTPS URL. User-provided URLs may be opened directly.',
   'browser.getState': 'Read the visible browser URL, title, loading state, page count, and current DOM revision without reading page text.',
   'browser.snapshot': 'Return a bounded semantic outline of the current page and its visible interactive elements.',
-  'browser.read': 'Read a compact semantic overview or retrieve locally ranked page blocks for a query. Results include typed blocks and current-page content refs; use a block ref with fs.write sourceRef to transfer complete extracted content without copying it into tool arguments. Use offset and limit with a content ref to inspect more table rows or list items, and maxChars plus offset for prose chunks.',
+  'browser.read': 'Read structured semantic content currently rendered on the page. Results include durable content refs that may be passed directly to fs.write sourceRef; they preserve the extracted snapshot across page mutations and navigation. The rowCount reports rows extracted now; if a dynamic table appears incomplete, inspect the current page with browser.query or browser.evaluate. Use offset and limit with a content ref to inspect more extracted rows or list items.',
+  'browser.query': 'Inspect a bounded set of current DOM elements by CSS selector, text, role, or name. Returns compact metadata and revision-bound element refs; observed links include navigation refs. Use it to inspect rendered rows or controls when semantic extraction is incomplete.',
+  'browser.evaluate': 'Evaluate a JavaScript expression inside the current browser page and return JSON-serializable data (maximum 64 KB; bounded by the browser operation timeout). It runs only in page context and has no guest or host filesystem, process, environment, or host API access.',
   'browser.findPage': 'Find and rank content on the current page. This is page-local search and does not search the web; results include typed current-page refs.',
-  'browser.webSearch': 'Search the public web by opening a DuckDuckGo results page in Helm\'s local browser. Returns observed result records with exact hrefs and refs; open a selected result with browser.open({ ref }).',
-  'browser.open': 'Open an observed destination directly from a current browser content ref. Use linkIndex for a block containing multiple links; the guest never accepts a model-created URL here.',
+  'browser.webSearch': 'Search the public web with DuckDuckGo in Helm\'s local browser. Returns observed result records with exact hrefs and navigation refs. You may refine and search again when needed.',
+  'browser.open': 'Open a destination represented by an observed browser navigation or content ref. Use linkIndex for a block containing multiple links.',
   'browser.inspectRegion': 'Inspect one current page region as bounded text, structured table rows, or local links. Large tables support offset and limit pagination.',
   'browser.download': 'Start and record a browser download from a semantic element or URL.',
   'browser.click': 'Click a semantic browser element or desktop coordinate fallback.',
   'browser.type': 'Type into a semantic browser element.',
-  'app.launch': 'Launch one of the explicitly supported guest applications.',
-  'app.openFile': 'Open a guest file in an explicitly supported application.',
+  'app.launch': 'Launch an allowlisted guest application when the user explicitly asks to start the application without opening a file. For an existing file, use app.openFile.',
+  'app.openFile': 'Open an existing guest file in an allowlisted application. Checks that the path is a regular file before application side effects, launches the selected application if needed, and returns FILE_NOT_FOUND when the path does not exist.',
   'desktop.getState': 'Read guest windows and the focused window.',
   'desktop.listWindows': 'List guest windows.',
   'desktop.focusWindow': 'Focus a matching guest window.',
@@ -74,7 +76,7 @@ async function boundarySnapshot(
 ): Promise<BoundarySnapshot> {
   const snapshot: BoundarySnapshot = {};
   if (method.startsWith('browser.') && ![
-    'browser.read', 'browser.snapshot', 'browser.findPage', 'browser.inspectRegion', 'browser.getState',
+    'browser.read', 'browser.snapshot', 'browser.findPage', 'browser.inspectRegion', 'browser.getState', 'browser.query', 'browser.evaluate',
   ].includes(method)) {
     try {
       const state = await guest.request('browser.getState', {}, { signal });
@@ -159,9 +161,9 @@ function receiptEffect(
     }
   }
   if (before.filesystem || after.filesystem || method.startsWith('fs.')) {
-    const path = typeof input.path === 'string'
-      ? input.path
-      : typeof dataRecord?.path === 'string' ? dataRecord.path : undefined;
+    const path = typeof dataRecord?.path === 'string'
+      ? dataRecord.path
+      : typeof input.path === 'string' ? input.path : undefined;
     if (path) effect.path = path;
     effect.existsBefore = before.filesystem?.exists;
     effect.existsAfter = after.filesystem?.exists;
@@ -172,6 +174,16 @@ function receiptEffect(
     if (typeof dataRecord?.changed === 'boolean') effect.changed = dataRecord.changed;
     else effect.changed = effect.existsBefore !== effect.existsAfter;
     if (method === 'fs.write' && typeof dataRecord?.sha256 === 'string') effect.writePerformed = true;
+  }
+  if (method === 'app.openFile') {
+    const path = typeof dataRecord?.path === 'string'
+      ? dataRecord.path
+      : typeof input.path === 'string' ? input.path : undefined;
+    if (path) effect.path = path;
+    const application = typeof dataRecord?.application === 'string'
+      ? dataRecord.application
+      : typeof input.application === 'string' ? input.application : undefined;
+    if (application) effect.application = application;
   }
   if (before.desktop || after.desktop) effect.changed = JSON.stringify(before.desktop) !== JSON.stringify(after.desktop);
   return effect;

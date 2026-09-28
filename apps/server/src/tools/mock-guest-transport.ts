@@ -5,6 +5,7 @@ import type {
   BrowserContentBlock,
   BrowserContentFormat,
   BrowserContentSummary,
+  BrowserQueryResult,
   BrowserRegionKind,
   BrowserReadMode,
   GuestMethod,
@@ -32,6 +33,7 @@ export const DEMO_PAGE_PATH = '/home/helm/fixtures/demo.html';
 export const DEMO_PAGE_URL = `file://${DEMO_PAGE_PATH}`;
 export const DEMO_PAGE_TITLE = 'Helm deterministic demo';
 export const DEMO_PAGE_TEXT = 'Helm deterministic demo content.';
+const MAX_MOCK_BROWSER_QUERY_RESULT_BYTES = 64 * 1024;
 
 export const DEMO_PAGE_HTML = `<!doctype html>
 <html>
@@ -86,6 +88,17 @@ interface MockContentReference {
   block: BrowserContentBlock;
   revision: number;
   url: string;
+  title: string;
+  pageType: 'article' | 'data_table' | 'search_results' | 'documentation' | 'form' | 'application' | 'generic';
+}
+
+interface MockQueryCandidate {
+  tag: string;
+  role: string;
+  name: string;
+  text: string;
+  attributes: Record<string, string>;
+  href?: string;
 }
 
 interface MockNavigationReference {
@@ -152,6 +165,59 @@ function parseElements(html: string): MockBrowserElement[] {
     index += 1;
   }
   return elements;
+}
+
+function queryCandidates(html: string, selector: string): MockQueryCandidate[] {
+  const normalizedSelector = selector.trim();
+  const target = normalizedSelector.split(/\s+|>/u).filter(Boolean).at(-1) ?? '*';
+  const candidates: MockQueryCandidate[] = [];
+  const voidElements = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+  const tagPattern = /<([a-z][a-z0-9:-]*)\b([^>]*)>/giu;
+  for (const match of html.matchAll(tagPattern)) {
+    const tag = match[1]?.toLowerCase();
+    const attributesSource = match[2] ?? '';
+    if (!tag) continue;
+    const attributes: Record<string, string> = {};
+    for (const attribute of attributesSource.matchAll(/([a-z_:][\w:.-]*)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/giu)) {
+      const key = attribute[1]?.toLowerCase();
+      if (key) attributes[key] = decodeHtml(attribute[2] ?? attribute[3] ?? attribute[4] ?? '');
+    }
+    const index = match.index ?? 0;
+    const bodyStart = index + match[0].length;
+    const close = voidElements.has(tag)
+      ? -1
+      : html.toLowerCase().indexOf(`</${tag}`, bodyStart);
+    const bodyEnd = close < 0 ? bodyStart : close;
+    const body = html.slice(bodyStart, bodyEnd);
+    if (target !== '*' && target !== tag
+      && !(target.startsWith('#') && attributes.id === target.slice(1))
+      && !(target.startsWith('.') && (attributes.class ?? '').split(/\s+/u).includes(target.slice(1)))
+      && !(/^(?:\[[a-z_:][\w:.-]*(?:=["']?[^\]]+["']?)?\])$/iu.test(target)
+        && (() => {
+          const attributeMatch = target.match(/^\[([a-z_:][\w:.-]*)(?:=["']?([^\]]+?)["']?)?\]$/iu);
+          if (!attributeMatch?.[1]) return false;
+          const value = attributes[attributeMatch[1].toLowerCase()];
+          return value !== undefined && (attributeMatch[2] === undefined || value === attributeMatch[2]);
+        })())) continue;
+    const text = readableText(body).slice(0, 500);
+    const role = (attributes.role ?? (tag === 'a' && attributes.href ? 'link'
+      : tag === 'button' ? 'button'
+        : tag === 'table' ? 'table'
+          : tag === 'tr' ? 'row'
+            : tag === 'td' ? 'cell'
+              : tag === 'th' ? 'columnheader'
+                : tag === 'textarea' || tag === 'input' ? 'textbox' : 'generic')).toLowerCase();
+    const name = (attributes['aria-label'] ?? attributes.title ?? attributes.name ?? text).slice(0, 300);
+    const allowedAttributeNames = [
+      ...['id', 'class', 'href', 'role', 'aria-label', 'title', 'name', 'type'].filter(key => attributes[key] !== undefined),
+      ...Object.keys(attributes).filter(key => key.startsWith('data-')).slice(0, 8),
+    ];
+    const allowedAttributes = Object.fromEntries(allowedAttributeNames.map(key => [key, (attributes[key] ?? '').slice(0, 300)]));
+    const href = attributes.href && ['a', 'area'].includes(tag) ? attributes.href : undefined;
+    candidates.push({ tag, role, name, text, attributes: allowedAttributes, ...(href ? { href } : {}) });
+    if (candidates.length >= 2_000) break;
+  }
+  return candidates;
 }
 
 function mockRegionKind(tag: string): BrowserRegionKind {
@@ -389,7 +455,17 @@ function mockContentBlocks(
         block,
       });
     } else {
-      contentReferences.set(block.ref, { block, revision: browser.revision, url: browser.url ?? '' });
+      const snapshot = JSON.parse(JSON.stringify(block)) as BrowserContentBlock;
+      const pageType = blocks.some(candidate => candidate.type === 'search_result') ? 'search_results'
+        : blocks.some(candidate => candidate.type === 'table') ? 'data_table'
+          : blocks.some(candidate => candidate.type === 'form') ? 'form' : 'generic';
+      contentReferences.set(block.ref, {
+        block: snapshot,
+        revision: browser.revision,
+        url: browser.url ?? '',
+        title: browser.title ?? '',
+        pageType,
+      });
     }
   }
   return blocks;
@@ -539,7 +615,9 @@ export class MockGuestTransport implements GuestTransport {
   private readonly windows = new Map<string, WindowInfo>();
   private readonly contentReferences = new Map<string, MockContentReference>();
   private readonly navigationReferences = new Map<string, MockNavigationReference>();
+  private readonly queryElementReferences = new Map<string, MockBrowserElement>();
   private navigationIndex = 0;
+  private queryReferenceIndex = 0;
   private searchGeneration = 0;
   private contentSessionId = randomUUID().replace(/-/gu, '').slice(0, 8);
   private browser: MockBrowserState = {
@@ -591,11 +669,11 @@ export class MockGuestTransport implements GuestTransport {
     return [...this.windows.values()].map(window => ({ ...window }));
   }
 
-  /** Simulate an irrelevant DOM mutation that invalidates content refs but preserves navigation capabilities. */
+  /** Simulate an irrelevant DOM mutation that invalidates live DOM refs only. */
   simulateDomMutation(): void {
     if (!this.browser.loaded) return;
     this.browser.revision += 1;
-    this.contentReferences.clear();
+    this.queryElementReferences.clear();
     this.browser.regions = mockRegions(this.browser.html ?? '', this.browser.revision);
   }
 
@@ -608,7 +686,9 @@ export class MockGuestTransport implements GuestTransport {
     this.windows.clear();
     this.contentReferences.clear();
     this.navigationReferences.clear();
+    this.queryElementReferences.clear();
     this.navigationIndex = 0;
+    this.queryReferenceIndex = 0;
     this.searchGeneration = 0;
     this.contentSessionId = randomUUID().replace(/-/gu, '').slice(0, 8);
     this.browser = { loaded: false, text: '', elements: [], pageCount: 1, revision: 0, regions: [] };
@@ -675,8 +755,8 @@ export class MockGuestTransport implements GuestTransport {
         let sourceReference: MockContentReference | undefined;
         if (input.sourceRef) {
           sourceReference = this.contentReferences.get(input.sourceRef);
-          if (!sourceReference || sourceReference.revision !== this.browser.revision || sourceReference.url !== this.browser.url) {
-            throw new GuestTransportError('STALE_CONTENT_REF', `Browser content ref ${input.sourceRef} is unknown or stale. Read the current page again to obtain a fresh ref.`);
+          if (!sourceReference) {
+            throw new GuestTransportError('UNKNOWN_CONTENT_REF', `Browser content ref ${input.sourceRef} is unknown or expired.`);
           }
           content = mockSerializeContent(sourceReference.block, input.format ?? 'text');
         }
@@ -808,6 +888,79 @@ export class MockGuestTransport implements GuestTransport {
           })),
         } as GuestMethodResult[M];
       }
+      case 'browser.query': {
+        if (!this.browser.loaded || !this.browser.url || !this.browser.html) {
+          throw new GuestTransportError('BROWSER_NOT_READY', 'Navigate the browser before querying the page');
+        }
+        const input = params as GuestMethodParams['browser.query'];
+        const selector = input.selector?.trim() || 'body *';
+        const candidates = queryCandidates(this.browser.html, selector)
+          .filter(candidate => !input.text || candidate.text.toLocaleLowerCase().includes(input.text.toLocaleLowerCase()))
+          .filter(candidate => !input.role || candidate.role === input.role.toLocaleLowerCase())
+          .filter(candidate => !input.name || candidate.name.toLocaleLowerCase().includes(input.name.toLocaleLowerCase()));
+        const limit = Math.max(1, Math.min(100, input.limit ?? 20));
+        const selected = candidates.slice(0, limit);
+        const results: BrowserQueryResult['results'] = selected.map(candidate => {
+          const ref = `e${this.browser.revision}-q${++this.queryReferenceIndex}`;
+          this.queryElementReferences.set(ref, {
+            ref,
+            role: candidate.role,
+            name: candidate.name,
+            text: candidate.text,
+            enabled: true,
+            ...(candidate.href ? { href: candidate.href } : {}),
+          });
+          let navigationRef: string | undefined;
+          if (candidate.href) {
+            try {
+              const href = new URL(candidate.href, this.browser.url).toString();
+              if (['http:', 'https:'].includes(new URL(href).protocol)) {
+                navigationRef = `n-${this.contentSessionId}-${++this.navigationIndex}`;
+                this.navigationReferences.set(navigationRef, {
+                  href,
+                  sourceUrl: this.browser.url ?? '',
+                  sourceType: 'page_link',
+                  title: candidate.name || candidate.text,
+                  observedRevision: this.browser.revision,
+                });
+              }
+            } catch {
+              // A malformed href is returned as an attribute but is not a navigable ref.
+            }
+          }
+          return {
+            ref,
+            tag: candidate.tag,
+            role: candidate.role,
+            ...(candidate.name ? { name: candidate.name } : {}),
+            ...(candidate.text ? { text: candidate.text } : {}),
+            attributes: candidate.attributes,
+            ...(navigationRef ? { navigationRef } : {}),
+          };
+        });
+        let truncated = candidates.length > selected.length;
+        while (results.length > 0 && Buffer.byteLength(JSON.stringify({
+          url: this.browser.url,
+          title: this.browser.title ?? '',
+          revision: this.browser.revision,
+          results,
+          truncated,
+        }), 'utf8') > MAX_MOCK_BROWSER_QUERY_RESULT_BYTES) {
+          const removed = results.pop()!;
+          this.queryElementReferences.delete(removed.ref);
+          if (removed.navigationRef) this.navigationReferences.delete(removed.navigationRef);
+          truncated = true;
+        }
+        return {
+          url: this.browser.url,
+          title: this.browser.title ?? '',
+          revision: this.browser.revision,
+          results,
+          truncated,
+        } as GuestMethodResult[M];
+      }
+      case 'browser.evaluate':
+        throw new GuestTransportError('BROWSER_EVALUATE_UNAVAILABLE', 'The deterministic mock guest does not execute JavaScript outside a browser page context. Use browser.query or a real browser guest.');
       case 'browser.read': {
         if (!this.browser.loaded || !this.browser.url) {
           throw new GuestTransportError('BROWSER_NOT_READY', 'Navigate the browser before reading page content');
@@ -820,8 +973,8 @@ export class MockGuestTransport implements GuestTransport {
         }
         if (input.ref) {
           const reference = this.contentReferences.get(input.ref);
-          if (!reference || reference.revision !== this.browser.revision || reference.url !== this.browser.url) {
-            throw new GuestTransportError('STALE_CONTENT_REF', `Browser content ref ${input.ref} is unknown or stale.`);
+          if (!reference) {
+            throw new GuestTransportError('UNKNOWN_CONTENT_REF', `Browser content ref ${input.ref} is unknown or expired.`);
           }
           const full = reference.block;
           const offset = Math.max(0, input.offset ?? 0);
@@ -867,12 +1020,12 @@ export class MockGuestTransport implements GuestTransport {
           summary.truncated = Boolean(summary.truncated || hasMore);
           return {
             operation: 'read',
-            url: this.browser.url,
-            title: this.browser.title ?? '',
-            revision: this.browser.revision,
+            url: reference.url,
+            title: reference.title,
+            revision: reference.revision,
             mode,
             source: 'semantic',
-            pageType: full.type === 'table' ? 'data_table' : 'generic',
+            pageType: reference.pageType,
             blocks: [summary],
             diagnostics: { blockCount: 1, tableCount: full.type === 'table' ? 1 : 0, selectedRefs: [{ ref: input.ref }], extractors: [full.source?.extractor ?? 'dom'] },
             readable: Boolean(preview),
@@ -1038,8 +1191,8 @@ export class MockGuestTransport implements GuestTransport {
           } as GuestMethodResult[M];
         }
         const reference = this.contentReferences.get(input.ref);
-        if (!reference || reference.revision !== this.browser.revision || reference.url !== this.browser.url) {
-          throw new GuestTransportError('STALE_CONTENT_REF', `Browser content ref ${input.ref} is unknown or stale.`);
+        if (!reference) {
+          throw new GuestTransportError('UNKNOWN_CONTENT_REF', `Browser content ref ${input.ref} is unknown or expired.`);
         }
         const block = reference.block;
         const link = input.linkIndex === undefined ? undefined : block.links?.[input.linkIndex];
@@ -1116,12 +1269,7 @@ export class MockGuestTransport implements GuestTransport {
       }
       case 'browser.download': {
         const input = params as GuestMethodParams['browser.download'];
-        const elementRef = input.ref?.match(/^e(\d+)-([1-9]\d*)$/u);
-        const element = input.ref === undefined
-          ? undefined
-          : elementRef && Number(elementRef[1]) === this.browser.revision
-            ? this.browser.elements[Number(elementRef[2]) - 1]
-            : undefined;
+        const element = input.ref === undefined ? undefined : this.resolveElementReference(input.ref);
         if (input.ref !== undefined && element === undefined) {
           throw new GuestTransportError('STALE_ELEMENT_REF', `Browser element ref is no longer valid: ${input.ref}`);
         }
@@ -1151,25 +1299,23 @@ export class MockGuestTransport implements GuestTransport {
       }
       case 'browser.click': {
         const input = params as GuestMethodParams['browser.click'];
-        const elementRef = input.ref?.match(/^e(\d+)-([1-9]\d*)$/u);
-        if (input.ref && (!elementRef || Number(elementRef[1]) !== this.browser.revision || !this.browser.elements[Number(elementRef[2]) - 1])) {
+        if (input.ref && !this.resolveElementReference(input.ref)) {
           throw new GuestTransportError('STALE_ELEMENT_REF', `Browser element ref is no longer valid: ${input.ref}`);
         }
         this.browser.revision += 1;
-        this.contentReferences.clear();
+        this.queryElementReferences.clear();
         this.browser.regions = mockRegions(this.browser.html ?? '', this.browser.revision);
         return { ...input, clicked: true } as GuestMethodResult[M];
       }
       case 'browser.type': {
         const input = params as GuestMethodParams['browser.type'];
-        const elementRef = input.ref.match(/^e(\d+)-([1-9]\d*)$/u);
-        if (!elementRef || Number(elementRef[1]) !== this.browser.revision || !this.browser.elements[Number(elementRef[2]) - 1]) {
+        const element = this.resolveElementReference(input.ref);
+        if (!element) {
           throw new GuestTransportError('STALE_ELEMENT_REF', `Browser element ref is no longer valid: ${input.ref}`);
         }
-        const element = this.browser.elements[Number(elementRef[2]) - 1];
         if (element) element.value = input.text;
         this.browser.revision += 1;
-        this.contentReferences.clear();
+        this.queryElementReferences.clear();
         this.browser.regions = mockRegions(this.browser.html ?? '', this.browser.revision);
         return { ref: input.ref, text: input.text, typed: true } as GuestMethodResult[M];
       }
@@ -1226,6 +1372,17 @@ export class MockGuestTransport implements GuestTransport {
     }
   }
 
+  private resolveElementReference(ref: string): MockBrowserElement | undefined {
+    const queryRef = ref.match(/^e(\d+)-q([1-9]\d*)$/u);
+    if (queryRef) {
+      if (Number(queryRef[1]) !== this.browser.revision) return undefined;
+      return this.queryElementReferences.get(ref);
+    }
+    const elementRef = ref.match(/^e(\d+)-([1-9]\d*)$/u);
+    if (!elementRef || Number(elementRef[1]) !== this.browser.revision) return undefined;
+    return this.browser.elements[Number(elementRef[2]) - 1];
+  }
+
   private navigateMock(requestedUrl: string): GuestMethodResult['browser.navigate'] {
     const navigationFailure = this.navigationFailures[requestedUrl];
     if (navigationFailure) throw new GuestTransportError('BROWSER_NAVIGATION_FAILED', navigationFailure);
@@ -1241,7 +1398,7 @@ export class MockGuestTransport implements GuestTransport {
     const document = html ?? `<html><body>Mock page for ${url}</body></html>`;
     const title = pageTitle(document, 'Mock page');
     const revision = this.browser.revision + 1;
-    this.contentReferences.clear();
+    this.queryElementReferences.clear();
     this.browser = {
       url,
       title,

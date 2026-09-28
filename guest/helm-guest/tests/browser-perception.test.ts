@@ -13,6 +13,64 @@ import { GuestSandbox } from '../src/sandbox';
 import { extractAccessibleCandidate } from '../src/semantic-extraction';
 
 describe('progressive browser perception', () => {
+  it('provides bounded DOM query and page-context evaluation fallbacks', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-browser-inspection-'));
+    const sandbox = new GuestSandbox({ root, workspace: join(root, 'workspace') });
+    const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
+    const runtime = new GuestRuntime({ sandbox, browser: controller });
+    try {
+      const file = await sandbox.write('workspace/inspection.html', `<!doctype html><html><body>
+        <div id="rate-metadata" data-currency="USD" data-rate="133.20">Current market snapshot</div>
+        <table><tr><th>Currency</th><th>Buy</th></tr><tr><td>USD</td><td>133.20</td></tr></table>
+      </body></html>`);
+      await controller.navigate({ url: pathToFileURL(file.path).href });
+
+      const queried = await runtime.dispatch({
+        id: 'dom-query',
+        method: 'browser.query',
+        params: { selector: '[data-rate]' },
+      });
+      expect(queried).toMatchObject({
+        ok: true,
+        result: {
+          results: [expect.objectContaining({
+            tag: 'div',
+            attributes: { id: 'rate-metadata', 'data-currency': 'USD', 'data-rate': '133.20' },
+          })],
+        },
+      });
+
+      const evaluated = await runtime.dispatch({
+        id: 'page-evaluate',
+        method: 'browser.evaluate',
+        params: {
+          expression: `[...document.querySelectorAll('table tr')].map(row => [...row.cells].map(cell => cell.innerText.trim()))`,
+        },
+      });
+      expect(evaluated).toMatchObject({
+        ok: true,
+        result: { result: [['Currency', 'Buy'], ['USD', '133.20']] },
+      });
+
+      const hostApiProbe = await runtime.dispatch({
+        id: 'page-context-only',
+        method: 'browser.evaluate',
+        params: { expression: 'typeof process' },
+      });
+      expect(hostApiProbe).toMatchObject({ ok: true, result: { result: 'undefined' } });
+
+      const oversized = await runtime.dispatch({
+        id: 'bounded-evaluation',
+        method: 'browser.evaluate',
+        params: { expression: `'x'.repeat(100_000)` },
+      });
+      expect(oversized).toMatchObject({ ok: false, error: { code: 'BROWSER_EVALUATE_FAILED', message: expect.stringContaining('64 KB') } });
+    } finally {
+      await controller.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it('exposes a primary data table ref even when the query has no lexical overlap with its labels', async () => {
     const root = await mkdtemp(join(tmpdir(), 'helm-primary-table-'));
     const workspace = join(root, 'workspace');
@@ -32,7 +90,7 @@ describe('progressive browser perception', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
-  it('keeps snapshots bounded, finds late tables, extracts relevant passages, and rejects stale refs', async () => {
+  it('keeps snapshots bounded, finds late tables, extracts relevant passages, and rejects stale element refs', async () => {
     const root = await mkdtemp(join(tmpdir(), 'helm-browser-perception-'));
     const workspace = join(root, 'workspace');
     const sandbox = new GuestSandbox({ root, workspace });
@@ -146,7 +204,8 @@ describe('progressive browser perception', () => {
       await controller.click(updateRef!);
       const changed = await controller.getState();
       expect(changed.revision).toBeGreaterThan(snapshot.revision);
-      await expect(controller.read({ ref: tableRef })).rejects.toMatchObject({ code: 'STALE_CONTENT_REF' });
+      const tableSnapshot = await controller.read({ ref: tableRef });
+      expect(tableSnapshot.blocks?.[0]).toMatchObject({ type: 'table', columns: ['Currency', 'Unit', 'Buying', 'Selling'] });
       if (elementRef) {
         await expect(controller.click(elementRef)).rejects.toMatchObject({ code: 'STALE_ELEMENT_REF' });
       }
@@ -273,7 +332,7 @@ describe('progressive browser perception', () => {
     }
   }, 15_000);
 
-  it('ranks semantic browser blocks, exports complete content refs, and expires refs with page revisions', async () => {
+  it('ranks semantic blocks, exports complete content refs, and preserves snapshots across page revisions', async () => {
     const root = await mkdtemp(join(tmpdir(), 'helm-browser-content-'));
     const workspace = join(root, 'workspace');
     const sandbox = new GuestSandbox({ root, workspace });
@@ -320,7 +379,8 @@ describe('progressive browser perception', () => {
         importance: 0.1,
       });
       const repeated = await controller.read({ query: 'currency buying selling' });
-      expect(repeated.blocks?.[0]?.ref).toBe(table?.ref);
+      expect(repeated.blocks?.[0]).toMatchObject({ type: 'table', columns: table?.columns });
+      expect(repeated.blocks?.[0]?.ref).not.toBe(table?.ref);
       const fullTable = await controller.read({ ref: table!.ref, limit: 20 });
       expect(fullTable.blocks?.[0]?.rows).toEqual([
         ['USD', 'USD', '1', '152.28', '153.05', '153.65'],
@@ -345,6 +405,16 @@ describe('progressive browser perception', () => {
       ]);
 
       const previous = await sandbox.write('workspace/forex.txt', 'OLD DATA');
+      const internals = controller as unknown as { page: { locator: (selector: string) => { evaluateAll: (fn: (nodes: readonly unknown[]) => unknown) => Promise<unknown> } } };
+      await internals.page.locator('body').evaluateAll(nodes => {
+        const body = nodes[0] as HTMLElement;
+        body.dataset.unrelatedMutation = 'loaded';
+        const decoration = document.createElement('div');
+        decoration.textContent = 'Unrelated lazy page decoration';
+        body.appendChild(decoration);
+        return true;
+      });
+      await controller.getState();
       const write = await runtime.dispatch({
         id: 'forex-source-ref-write',
         method: 'fs.write',
@@ -461,15 +531,45 @@ describe('progressive browser perception', () => {
       const dynamicPath = await fixture('dynamic-table.html');
       await controller.navigate({ url: pathToFileURL(dynamicPath).href });
       const dynamic = await controller.read({ query: 'dynamic exchange rates buying selling' });
-      expect(dynamic.blocks?.[0]).toMatchObject({ type: 'table', columns: ['Currency', 'Buying', 'Selling'] });
-      expect(dynamic.blocks?.[0]?.rows).toEqual([['CHF', '170.10', '171.00']]);
+      expect(dynamic.blocks?.[0]).toMatchObject({
+        type: 'table',
+        columns: ['Currency', 'Buying', 'Selling'],
+        rowCount: 1,
+        rows: [['CHF', '170.10', '171.00']],
+      });
+
+      const evaluatedRows = await controller.evaluate({
+        expression: `new Promise(resolve => {
+          const started = Date.now();
+          const poll = () => {
+            const rows = [...document.querySelectorAll('#rates tbody tr')]
+              .map(row => [...row.cells].map(cell => cell.innerText.trim()));
+            if (rows.length >= 3 || Date.now() - started > 3_000) resolve(rows);
+            else setTimeout(poll, 50);
+          };
+          poll();
+        })`,
+      });
+      expect(evaluatedRows.result).toEqual([
+        ['CHF', '170.10', '171.00'],
+        ['USD', '132.10', '132.70'],
+        ['EUR', '143.20', '144.00'],
+      ]);
+      const queriedRows = await controller.query({ selector: '#rates tbody tr', limit: 10 });
+      expect(queriedRows.results.map(row => row.text)).toEqual([
+        'CHF 170.10 171.00',
+        'USD 132.10 132.70',
+        'EUR 143.20 144.00',
+      ]);
 
       const staleWrite = await runtime.dispatch({
         id: 'stale-source-ref-write',
         method: 'fs.write',
         params: { path: 'workspace/stale.txt', sourceRef: table!.ref, format: 'text' },
       });
-      expect(staleWrite).toMatchObject({ ok: false, error: { code: 'STALE_CONTENT_REF' } });
+      expect(staleWrite).toMatchObject({ ok: true, result: { sourceRef: table!.ref, sourceType: 'table' } });
+      const afterNavigation = await sandbox.read('workspace/stale.txt');
+      expect(afterNavigation.content).toContain('Indian Currency | INR | 100 | 160.00 | 160.00 | 160.15');
     } finally {
       await controller.close();
       await rm(root, { recursive: true, force: true });

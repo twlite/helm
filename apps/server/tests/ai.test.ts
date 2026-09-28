@@ -362,9 +362,9 @@ describe('LM Studio AI adapters', () => {
 
     expect(task.isConversation).toBe(false);
     expect(task.criteria).toEqual([]);
-    expect(task.requirements?.find(requirement => requirement.id === 'browserDestination1')).toMatchObject({
+    expect(task.requirements?.find(requirement => requirement.id === 'browserVisited1')).toMatchObject({
       type: 'browser',
-      target: { url: 'https://example.com/', freshness: 'current-run', action: 'browser.navigate' },
+      target: { url: 'https://example.com/', freshness: 'current-run' },
     });
     expect(task.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
       type: 'filesystem',
@@ -399,8 +399,9 @@ describe('LM Studio AI adapters', () => {
     expect(task.requirements?.some(item => item.id.startsWith('browserDestination'))).toBe(false);
     expect(task.requirements?.find(item => item.id === 'browserSearch')).toMatchObject({ target: { action: 'browser.webSearch' } });
     expect(task.requirements?.find(item => item.id === 'memoryMutation')).toMatchObject({
-      target: { memoryContent: 'Use https://www.nrb.org.np/forex/ for all forex requests about nepal.' },
+      target: { action: 'memory.remember', freshness: 'current-run' },
     });
+    expect(task.requirements?.find(item => item.id === 'memoryMutation')?.target).not.toHaveProperty('memoryContent');
   });
 
   it('routes current public web questions to browser research instead of accepting a conversational refusal', async () => {
@@ -542,7 +543,7 @@ describe('LM Studio AI adapters', () => {
     expect(JSON.stringify(requestBody)).toContain('browser.read({ query })');
   });
 
-  it('compiles the GitHub release workflow into executable research and Desktop requirements', async () => {
+  it('keeps current-information facts out of deterministic effect requirements', async () => {
     const provider = createOpenAICompatible({
       name: 'lmstudio',
       baseURL: 'http://localhost:1234/v1',
@@ -578,20 +579,17 @@ describe('LM Studio AI adapters', () => {
     const task = await planner.createTask({ threadId: 'bun-release-plan', userMessage });
     const requirements = task.requirements ?? [];
 
-    expect(requirements.find(requirement => requirement.id === 'browserResearch')).toMatchObject({ target: { factId: 'pageContent', action: 'browser.read', freshness: 'current-run' } });
-    expect(requirements.find(requirement => requirement.id === 'latestReleaseVersion')).toMatchObject({ target: { factId: 'latestReleaseVersion' } });
-    expect(requirements.find(requirement => requirement.id === 'releaseDate')).toMatchObject({ target: { factId: 'releaseDate' } });
-    expect(requirements.find(requirement => requirement.id === 'releaseUrl')).toMatchObject({ target: { factId: 'releaseUrl' } });
-    expect(requirements.find(requirement => requirement.id === 'outputDirectory')).toMatchObject({ target: { path: '~/Desktop/helm-demo', mode: 'created', freshness: 'current-run', action: 'fs.mkdir' } });
-    expect(requirements.find(requirement => requirement.id === 'outputFile')).toMatchObject({ target: { path: '~/Desktop/helm-demo/bun-release.md', mode: 'contains-facts', freshness: 'current-run', action: 'fs.write' } });
-    expect(requirements.find(requirement => requirement.id === 'outputFile')?.target?.factIds).toEqual(expect.arrayContaining([
-      'repositoryName', 'latestReleaseVersion', 'releaseDate', 'releaseUrl', 'currentDate',
-    ]));
-    expect(requirements.find(requirement => requirement.id === 'outputFile')?.target?.factIds).not.toContain('pageContent');
-    expect(browserResearchStartUrl(userMessage)).toBe(browserResearchSearchUrl(userMessage));
-    expect(requirements.findIndex(requirement => requirement.id === 'browserResearch')).toBeLessThan(
-      requirements.findIndex(requirement => requirement.id === 'latestReleaseVersion'),
-    );
+    expect(requirements.map(requirement => requirement.id)).not.toContain('browserResearch');
+    expect(requirements.map(requirement => requirement.id)).not.toContain('latestReleaseVersion');
+    expect(requirements.map(requirement => requirement.id)).not.toContain('releaseDate');
+    expect(requirements.map(requirement => requirement.id)).not.toContain('releaseUrl');
+    expect(requirements.find(requirement => requirement.id === 'outputDirectory')).toMatchObject({
+      target: { path: '~/Desktop/helm-demo', mode: 'created', freshness: 'current-run', action: 'fs.mkdir' },
+    });
+    expect(requirements.find(requirement => requirement.id === 'outputFile')).toMatchObject({
+      target: { path: '~/Desktop/helm-demo/bun-release.md', mode: 'written', freshness: 'current-run', action: 'fs.write' },
+    });
+    expect(requirements.find(requirement => requirement.id === 'outputFile')?.dependsOn).toBeUndefined();
   });
 
   it('keeps an explicitly supplied profile image URL as an asset instead of a browser destination', async () => {
@@ -904,17 +902,23 @@ describe('LM Studio AI adapters', () => {
     });
     const firstRequest = 'go to https://twlite.dev, summarize the page content, and save it in a twlite.txt file';
     const firstTask = await planner.createTask({ threadId: 'page-to-file-thread', userMessage: firstRequest });
-    expect(firstTask.requirements?.find(requirement => requirement.id === 'browserResearch')).toMatchObject({ target: { factId: 'pageContent', freshness: 'current-run', action: 'browser.read' } });
+    expect(firstTask.requirements?.find(requirement => requirement.id === 'browserEvidence')).toMatchObject({ target: { factId: 'pageContent', freshness: 'current-run' } });
     expect(firstTask.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
-      target: { path: 'twlite.txt', mode: 'written', freshness: 'current-run', action: 'fs.write' },
+      target: { path: 'twlite.txt', mode: 'non-empty', freshness: 'current-run', action: 'fs.write' },
     });
 
     const combinedTask = await planner.createTask({
       threadId: 'combined-page-to-file-thread',
       userMessage: 'go to https://twlite.dev and save the content in a twlite.md file and open it via text viewer app',
     });
+    expect(combinedTask.requirements?.find(requirement => requirement.id === 'browserEvidence')).toMatchObject({
+      target: { factId: 'pageContent', freshness: 'current-run' },
+    });
+    expect(combinedTask.requirements?.find(requirement => requirement.id === 'browserVisited1')).toMatchObject({
+      target: { url: 'https://twlite.dev/', freshness: 'current-run' },
+    });
     expect(combinedTask.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
-      target: { path: 'twlite.md', mode: 'written-from-artifact', freshness: 'current-run', action: 'fs.write' },
+      target: { path: 'twlite.md', mode: 'non-empty', freshness: 'current-run', action: 'fs.write' },
     });
     expect(combinedTask.requirements?.find(requirement => requirement.id === 'openFile')).toMatchObject({
       target: { path: 'twlite.md', content: 'twlite.md', mode: 'opened', freshness: 'current-run', action: 'app.openFile' },
@@ -922,37 +926,31 @@ describe('LM Studio AI adapters', () => {
 
     const dataRequest = "Fetch the exchange rate data from Nepal Rastra Bank's official forex website and save that data to forex.txt.";
     const dataTask = await planner.createTask({ threadId: 'forex-data-thread', userMessage: dataRequest });
-    expect(dataTask.requirements?.find(requirement => requirement.id === 'browserResearch')).toMatchObject({ target: { factId: 'pageContent', action: 'browser.read', freshness: 'current-run' } });
+    expect(dataTask.requirements?.find(requirement => requirement.id === 'browserEvidence')).toMatchObject({ target: { factId: 'pageContent', freshness: 'current-run' } });
     expect(dataTask.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
-      dependsOn: ['browserResearch'],
-      target: { path: 'forex.txt', mode: 'written-from-artifact', freshness: 'current-run', action: 'fs.write' },
+      target: { path: 'forex.txt', mode: 'non-empty', freshness: 'current-run', action: 'fs.write' },
     });
 
     const exactPrompt = 'fetch the exchange rate data from nepal rastra bank\'s official forex website and save that data to forex.txt file and open it with text viewer application. Use duckduckgo search to find the relevant website. remember to use https://www.nrb.org.np/forex/ for all forex requests about nepal.';
     const exactTask = await planner.createTask({ threadId: 'exact-forex-thread', userMessage: exactPrompt });
     const exactRequirements = exactTask.requirements ?? [];
-    expect(exactRequirements.map(requirement => requirement.id)).not.toContain('browserDestination1');
+    expect(exactRequirements.map(requirement => requirement.id)).not.toContain('browserVisited1');
     expect(exactRequirements.find(requirement => requirement.id === 'browserSearch')).toMatchObject({
       target: { action: 'browser.webSearch', freshness: 'current-run' },
     });
-    expect(exactRequirements.find(requirement => requirement.id === 'browserResearch')).toMatchObject({
-      dependsOn: ['browserSearch'],
-      target: { action: 'browser.read', factId: 'pageContent', freshness: 'current-run' },
+    expect(exactRequirements.find(requirement => requirement.id === 'browserEvidence')).toMatchObject({
+      target: { factId: 'pageContent', freshness: 'current-run' },
     });
     expect(exactRequirements.find(requirement => requirement.id === 'outputFile')).toMatchObject({
-      dependsOn: ['browserResearch'],
-      target: { path: 'forex.txt', mode: 'written-from-artifact', format: 'text', action: 'fs.write' },
+      target: { path: 'forex.txt', mode: 'non-empty', action: 'fs.write' },
     });
     expect(exactRequirements.find(requirement => requirement.id === 'openFile')).toMatchObject({
-      dependsOn: ['outputFile'],
       target: { path: 'forex.txt', mode: 'opened', application: 'text-editor', action: 'app.openFile' },
     });
     expect(exactRequirements.find(requirement => requirement.id === 'memoryMutation')).toMatchObject({
       target: {
         action: 'memory.remember',
         freshness: 'current-run',
-        memoryKind: 'instruction',
-        memoryContent: 'Use https://www.nrb.org.np/forex/ for all forex requests about nepal.',
       },
     });
     const rememberedFactTask = await planner.createTask({
@@ -962,8 +960,7 @@ describe('LM Studio AI adapters', () => {
     expect(rememberedFactTask.requirements?.find(requirement => requirement.id === 'memoryMutation')).toMatchObject({
       target: {
         action: 'memory.remember',
-        memoryKind: 'instruction',
-        memoryContent: 'All Nepal forex requests should use https://www.nrb.org.np/forex/.',
+        freshness: 'current-run',
       },
     });
 

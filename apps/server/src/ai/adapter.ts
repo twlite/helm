@@ -3,7 +3,6 @@ import { z } from 'zod';
 import type {
   AgentDecision,
   AgentTurnContext,
-  BrowserContentFormat,
   CompletionCriterion,
   Fact,
   JsonValue,
@@ -430,16 +429,6 @@ function fileNameFromPath(input: string): string {
   return input.split(/[\\/]/u).at(-1) ?? input;
 }
 
-function formatForPath(path: string): BrowserContentFormat {
-  switch (path.split('.').at(-1)?.toLocaleLowerCase()) {
-    case 'csv': return 'csv';
-    case 'json': return 'json';
-    case 'md':
-    case 'markdown': return 'markdown';
-    default: return 'text';
-  }
-}
-
 function inferredReferencedFileName(input: TaskPlannerInput): string | undefined {
   const direct = fileNameFromText(input.userMessage);
   if (direct) return direct;
@@ -458,11 +447,6 @@ function savesPageContent(request: string): boolean {
   // how the user describes the material being saved. Freshness for every file
   // output is compiled separately from the chosen content format.
   return mentionsWebContent && writesFile(request);
-}
-
-function savesRawPageContent(request: string): boolean {
-  if (/\b(?:summari[sz](?:e|ation)|explain|describe|analy[sz](?:e|is)|paraphrase|rewrite)\b/iu.test(request)) return false;
-  return /\b(?:save|write|copy|store)\b[^.!?\n]{0,100}\b(?:data|contents?|tables?|lists?)\b|\b(?:data|contents?|tables?|lists?)\b[^.!?\n]{0,100}\b(?:save|write|copy|store)\b/iu.test(request);
 }
 
 function writesFile(request: string): boolean {
@@ -584,19 +568,6 @@ function memoryMutationTool(request: string): 'memory.remember' | 'memory.update
   return undefined;
 }
 
-function explicitMemoryInstruction(request: string): { memoryContent: string; memoryKind: 'instruction' } | undefined {
-  const match = /\b(?:remember(?:\s+to|\s+that)?|memorize|store\s+in\s+memory)\s*:?\s+([^\n]+)/iu.exec(request);
-  if (!match?.[1]) return undefined;
-  const source = match[1].trim();
-  const boundary = source.search(/[!?]|\.(?=\s|$)/u);
-  const directive = (boundary >= 0 ? source.slice(0, boundary) : source)
-    .trim()
-    .replace(/^["'`]+|["'`]+$/gu, '');
-  if (!directive) return undefined;
-  const content = `${directive[0]!.toLocaleUpperCase()}${directive.slice(1).replace(/[.!?]+$/u, '')}.`;
-  return { memoryContent: content, memoryKind: 'instruction' };
-}
-
 function explicitlyRequiresDuckDuckGo(request: string): boolean {
   return /\bduckduckgo\b[^.!?\n]{0,48}\bsearch\b|\bsearch\b[^.!?\n]{0,48}\bduckduckgo\b/iu.test(request);
 }
@@ -631,60 +602,44 @@ function compiledRequirements(
   inferredFileName?: string,
 ): TaskRequirement[] {
   const requirements: TaskRequirement[] = [];
-  const add = (requirement: TaskRequirement): void => {
-    if (!requirements.some(existing => existing.id === requirement.id)) requirements.push(requirement);
-  };
-  const repository = explicitRepository(request);
-  const pageContentSave = savesPageContent(request);
+  const add = (requirement: TaskRequirement): void => { requirements.push(requirement); };
+  const urls = browserSourceUrls(request);
+  const browserContext = urls.length > 0 || /\b(?:page|website|webpage|web\s+page|site|browser|web)\b/iu.test(request);
+  const readsPageContent = browserContext
+    && /\b(?:read|extract|fetch|summari[sz]e|research|inspect|analy[sz]e|describe|compare)\b/iu.test(request);
+  const navigationRequested = /\b(?:go\s+to|navigate(?:\s+to)?|visit|open|browse)\b/iu.test(request)
+    || urls.length > 0 && readsPageContent;
+  const requiresBrowserEvidence = readsPageContent || savesPageContent(request);
   const memoryAction = memoryMutationTool(request);
-  const memoryInstruction = memoryAction === 'memory.remember'
-    ? explicitMemoryInstruction(request)
-    : undefined;
-  const requiresDuckDuckGo = explicitlyRequiresDuckDuckGo(request);
   const launchedApplication = explicitlyLaunchedApplication(request);
-  const explicitNavigationAction = /\b(?:go\s+to|navigate(?:\s+to)?|visit|open|browse)\b/iu.test(request);
-  for (const [index, url] of browserSourceUrls(request).entries()) {
+  for (const [index, url] of (navigationRequested ? urls : []).entries()) {
     add({
-      id: `browserDestination${index + 1}`,
-      description: 'Reach the URL explicitly supplied by the user.',
+      id: `browserVisited${index + 1}`,
+      description: `Visit the requested destination ${url} during this run.`,
       type: 'browser',
       mandatory: true,
       status: 'pending',
-      target: {
-        url: browserResearchStartUrl(url),
-        ...(explicitNavigationAction ? { freshness: 'current-run', action: 'browser.navigate' as const } : {}),
-      },
+      target: { url, freshness: 'current-run' },
     });
   }
-  if (requiresDuckDuckGo) {
+  if (explicitlyRequiresDuckDuckGo(request)) {
     add({
       id: 'browserSearch',
-      description: 'Perform the explicitly requested DuckDuckGo web search during this run.',
+      description: 'Perform the explicitly requested web search during this run.',
       type: 'browser',
       mandatory: true,
       status: 'pending',
       target: { action: 'browser.webSearch', freshness: 'current-run' },
     });
   }
-  const asksRelease = /\b(?:latest|current|newest|stable)\b[^.\n]{0,80}\b(?:release|version|tag)\b|\b(?:release|version)\b[^.\n]{0,80}\b(?:latest|current|newest|stable)\b/iu.test(request);
-  if (repository && /\b(?:repo(?:sitory)?|project|github|release|version)\b/iu.test(request)) {
-    add({ id: 'repositoryName', description: 'Know the repository name requested by the user.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'repositoryName' } });
-  }
-  if (
-    pageContentSave
-    || criteria.some(criterion => criterion.type === 'custom' && criterion.id === BROWSER_RESEARCH_CRITERION_ID)
-  ) {
-    // Page content is an actionable prerequisite for all browser-derived
-    // facts. Keep it ahead of those facts so a deterministic fallback starts
-    // research instead of treating the prerequisite as a terminal blocker.
+  if (requiresBrowserEvidence) {
     add({
-      id: 'browserResearch',
-      description: 'Collect readable evidence from the relevant public web page.',
-      type: 'fact',
+      id: 'browserEvidence',
+      description: 'Gather page evidence for the requested reading or transformation.',
+      type: 'browser',
       mandatory: true,
       status: 'pending',
-      target: { factId: 'pageContent', freshness: 'current-run', action: 'browser.read' },
-      ...(requiresDuckDuckGo ? { dependsOn: ['browserSearch'] } : {}),
+      target: { factId: 'pageContent', freshness: 'current-run' },
     });
   }
   if (memoryAction) {
@@ -697,7 +652,6 @@ function compiledRequirements(
       target: {
         action: memoryAction,
         freshness: 'current-run',
-        ...(memoryInstruction ?? {}),
       },
     });
   }
@@ -715,102 +669,62 @@ function compiledRequirements(
       },
     });
   }
-  if (asksRelease) {
-    add({ id: 'latestReleaseVersion', description: 'Determine the latest stable release version from an authoritative release page.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'latestReleaseVersion' } });
-    add({ id: 'releaseUrl', description: 'Capture the URL of the release page used for the observed version.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'releaseUrl' } });
-  }
-  if (/\b(?:release|version)\b[^.\n]{0,80}\bdate\b|\bdate\b[^.\n]{0,80}\b(?:release|version)\b/iu.test(request)) {
-    add({ id: 'releaseDate', description: 'Determine the release date from the authoritative release page.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'releaseDate' } });
-  }
-  if (/\b(?:today|current\s+date|today's\s+date|date\s+today)\b/iu.test(request)) {
-    add({ id: 'currentDate', description: 'Record the current date at runtime.', type: 'fact', mandatory: true, status: 'pending', target: { factId: 'currentDate' } });
-  }
   const paths = explicitPaths(request);
-  const inferredPaths = inferredDesktopOutputPaths(request);
-  const explicitFilePath = paths.find(path => /\.(?:txt|md|json|csv|log|html?)$/iu.test(path));
-  const explicitDirectoryPath = paths.find(path => !/\.[A-Za-z0-9]{1,8}$/u.test(path));
-  const filePath = explicitFilePath ?? inferredPaths.filePath ?? fileNameFromText(request) ?? inferredFileName;
-  const directoryPath = explicitDirectoryPath
-    ?? (explicitFilePath?.includes('/') ? explicitFilePath.slice(0, explicitFilePath.lastIndexOf('/')) : undefined)
-    ?? inferredPaths.directoryPath;
-  const factIds = requirements
-    .filter(requirement => requirement.type === 'fact' && requirement.id !== 'browserResearch')
-    .map(requirement => requirement.target?.factId ?? requirement.id);
-  // The page read is a prerequisite, but its full text is not the expected
-  // file content: the model may be asked to summarize or transform it.
-  const outputFactIds = factIds;
+  const desktopPaths = inferredDesktopOutputPaths(request);
+  const filePath = paths.find(path => /\.(?:txt|md|json|csv|log|html?)$/iu.test(path))
+    ?? desktopPaths.filePath
+    ?? fileNameFromText(request)
+    ?? inferredFileName;
   const downloadRequested = /\bdownload\b/iu.test(request);
   if (downloadRequested) {
     add({ id: 'downloadArtifact', description: 'Download the requested artifact and retain its recorded file.', type: 'artifact', mandatory: true, status: 'pending', target: { mode: 'downloaded' } });
   }
-  if (directoryPath && (!filePath || /\b(?:mkdir|folder|directory)\b/iu.test(request))) {
-    const actionRequested = createsDirectory(request);
-    add({
-      id: 'outputDirectory',
-      description: actionRequested ? 'Create the requested output directory during this run.' : 'Ensure the requested output directory exists.',
-      type: 'filesystem',
-      mandatory: true,
-      status: 'pending',
-      target: {
-        path: directoryPath,
-        mode: actionRequested ? 'created' : 'exists',
-        ...(actionRequested ? { freshness: 'current-run', action: 'fs.mkdir' } : {}),
-      },
-    });
-  }
-  if (filePath && writesFile(request)) {
-    // Every explicit file output is an action requirement. The model may write
-    // a raw content ref or a model-authored transformation; sourceRef lineage
-    // is retained whenever the selected write actually uses it.
-    const mode = pageContentSave && savesRawPageContent(request)
-      ? 'written-from-artifact'
-      : outputFactIds.length > 0 ? 'contains-facts' : 'written';
-    const dependsOn = [
-      ...(pageContentSave ? ['browserResearch'] : []),
-      ...(requirements.some(requirement => requirement.id === 'outputDirectory') ? ['outputDirectory'] : []),
-    ];
+  const writeRequested = /\b(?:save|write|create|put|copy|store)\b/iu.test(request);
+  if (filePath && writeRequested) {
     add({
       id: 'outputFile',
       description: 'Write the requested output file during this run.',
       type: 'filesystem',
       mandatory: true,
       status: 'pending',
-      ...(dependsOn.length > 0 ? { dependsOn } : {}),
       target: {
         path: filePath,
-        mode,
+        mode: requiresBrowserEvidence ? 'non-empty' : 'written',
         freshness: 'current-run',
         action: 'fs.write',
-        ...(mode === 'written-from-artifact' ? { format: formatForPath(filePath) } : {}),
-        ...(outputFactIds.length > 0 ? { factIds: outputFactIds } : {}),
       },
     });
   }
   const opensDownloadedArtifact = downloadRequested && /\b(?:open|view|show|display)\b/iu.test(request);
   if ((filePath && opensFileInViewer(request)) || opensDownloadedArtifact) {
-    const actionRequested = !asksToEnsureFileIsOpen(request);
-    const dependencies = [
-      ...(requirements.some(requirement => requirement.id === 'outputFile') ? ['outputFile'] : []),
-      ...(requirements.some(requirement => requirement.id === 'outputDirectory') ? ['outputDirectory'] : []),
-      ...(requirements.some(requirement => requirement.id === 'downloadArtifact') ? ['downloadArtifact'] : []),
-      ...(launchedApplication && requirements.some(requirement => requirement.id === 'applicationLaunch')
-        ? ['applicationLaunch']
-        : []),
-    ];
     add({
       id: 'openFile',
-      description: actionRequested ? 'Open the requested file during this run.' : 'Ensure the requested file is open in the text viewer.',
+      description: 'Open the requested file during this run.',
       type: 'desktop',
       mandatory: true,
       status: 'pending',
-      ...(actionRequested && dependencies.length > 0 ? { dependsOn: dependencies } : {}),
       target: {
         ...(filePath ? { path: filePath, content: fileNameFromPath(filePath) } : {}),
-        mode: actionRequested ? 'opened' : 'open',
+        mode: 'opened',
         ...(/\b(?:text\s+viewer|text\s+editor)\b/iu.test(request) ? { application: 'text-editor' } : {}),
-        ...(actionRequested ? { freshness: 'current-run', action: 'app.openFile' } : {}),
+        freshness: 'current-run',
+        action: 'app.openFile',
       },
     });
+  }
+  if (createsDirectory(request)) {
+    const directoryPath = paths.find(path => !/\.[A-Za-z0-9]{1,8}$/u.test(path))
+      ?? desktopPaths.directoryPath;
+    if (directoryPath) {
+      add({
+        id: 'outputDirectory',
+        description: 'Create the requested output directory during this run.',
+        type: 'filesystem',
+        mandatory: true,
+        status: 'pending',
+        target: { path: directoryPath, mode: 'created', freshness: 'current-run', action: 'fs.mkdir' },
+      });
+    }
   }
   for (const criterion of criteria.filter(candidate => candidate.type !== 'custom' && criterionWasExplicit(request, candidate))) {
     add({
@@ -834,9 +748,7 @@ function compileTask(
   const originalRequest = input.userMessage;
   const filteredCriteria = criteria
     .filter(criterion => criterionWasExplicit(originalRequest, criterion))
-    .map(criterion => criterion.type === 'browser.url'
-      ? { ...criterion, url: browserResearchStartUrl(criterion.url) }
-      : criterion);
+    .map(criterion => ({ ...criterion }));
   const userConstraints = [...new Set(
     originalRequest
       .split(/(?<=[.!?\n])\s+/u)
@@ -874,19 +786,18 @@ function compileTask(
 /** Compiles concrete action requirements without an additional model request. */
 export class DeterministicTaskCompiler implements TaskCompiler {
   async createTask(input: TaskPlannerInput): Promise<TaskDefinition> {
-    const browserResearch = isBrowserResearchRequest(input.userMessage);
-    const requiresComputer = browserResearch || requestRequiresComputer(input.userMessage);
-    const researchTask = browserResearch ? browserResearchTask(input) : undefined;
-    const goal = (researchTask?.goal ?? input.userMessage.trim()) || 'Respond to the user.';
+    const goal = input.userMessage.trim() || 'Respond to the user.';
+    const requirements = compiledRequirements(input.userMessage, [], inferredReferencedFileName(input));
     return compileTask(
       input,
       goal,
-      researchTask?.criteria ?? [],
-      requiresComputer ? 'task' : 'conversation',
+      [],
+      requirements.length > 0 ? 'task' : 'conversation',
     );
   }
 }
 
+/** Legacy model planner for older demos. Production uses the deterministic effect compiler. */
 export class AiSdkTaskPlanner implements TaskCompiler {
   constructor(public readonly options: AiSdkTaskPlannerOptions) {}
 

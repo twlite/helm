@@ -8,7 +8,7 @@ import { BrowserController } from '../src/browser';
 import { GuestSandbox } from '../src/sandbox';
 
 describe('search-result navigation capabilities', () => {
-  it('survives irrelevant DOM mutations while normal content refs become stale', async () => {
+  it('keeps observed navigation refs and extracted content snapshots across mutations and navigation', async () => {
     const root = await mkdtemp(join(tmpdir(), 'helm-search-nav-'));
     const sandbox = new GuestSandbox({ root, workspace: join(root, 'workspace') });
     const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
@@ -79,14 +79,19 @@ describe('search-result navigation capabilities', () => {
       // Force Helm's DOM revision observer to notice.
       await controller.getState();
 
-      // Navigation capability must survive; normal content ref must be stale.
+      // Both reference kinds survive a mutation, but they preserve different things:
+      // the navigation ref opens its observed destination and the content ref reads its snapshot.
       const opened = await controller.open({ ref: navRef });
       expect(opened.openedHref).toBe(navHref);
       expect(opened.url).toContain('/forex');
       expect(opened.sourceType).toBe('search_result');
 
-      // After navigation away, the old page content ref is stale.
-      await expect(controller.read({ ref: tableRef! })).rejects.toMatchObject({ code: 'STALE_CONTENT_REF' });
+      const snapshot = await controller.read({ ref: tableRef! });
+      expect(snapshot.url).toContain('/search');
+      expect(snapshot.blocks?.[0]).toMatchObject({
+        type: 'table',
+        rows: [['USD', '133.20']],
+      });
     } finally {
       await controller.close();
       await new Promise<void>(resolve => server.close(() => resolve()));

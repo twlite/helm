@@ -2,14 +2,22 @@
 <html lang="en">
   <head><meta charset="utf-8"><title>Dynamic rate panel</title></head>
   <body>
-    <nav>Home Deposit Transfer</nav>
-    <main><p id="status">Loading current rates…</p></main>
+    <nav>Home Rates Deposit Transfer</nav>
+    <main>
+      <h1>Dynamic exchange rates</h1>
+      <table id="rates">
+        <thead><tr><th>Currency</th><th>Buying</th><th>Selling</th></tr></thead>
+        <tbody><tr><td>CHF</td><td>170.10</td><td>171.00</td></tr></tbody>
+      </table>
+    </main>
     <script>
       setTimeout(() => {
-        document.querySelector('#status')?.remove();
-        const main = document.querySelector('main');
-        if (main) main.innerHTML = '<h1>Dynamic exchange rates</h1><table><thead><tr><th>Currency</th><th>Buying</th><th>Selling</th></tr></thead><tbody><tr><td>CHF</td><td>170.10</td><td>171.00</td></tr></tbody></table>';
-      }, 220);
+        const body = document.querySelector('#rates tbody');
+        if (body) body.insertAdjacentHTML('beforeend', `
+          <tr><td>USD</td><td>132.10</td><td>132.70</td></tr>
+          <tr><td>EUR</td><td>143.20</td><td>144.00</td></tr>
+        `);
+      }, 1_200);
     </script>
   </body>
 </html>

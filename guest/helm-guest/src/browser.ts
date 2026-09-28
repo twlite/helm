@@ -7,6 +7,7 @@ import type {
   BrowserContentBlock,
   BrowserContentFormat,
   BrowserContentSummary,
+  BrowserEvaluateResult,
   BrowserOpenResult,
   BrowserPageType,
   BrowserPageRegion,
@@ -17,6 +18,8 @@ import type {
   BrowserPageSearchResult,
   BrowserWebSearchResult,
   BrowserSnapshot as SharedBrowserSnapshot,
+  BrowserQueryResult,
+  JsonValue,
 } from "../../../packages/shared/src/types";
 import { Readability } from "@mozilla/readability";
 import { extractAccessibleCandidate, extractSemanticBrowserBlocks } from "./semantic-extraction";
@@ -54,6 +57,7 @@ interface PlaywrightPage {
   title(): Promise<string>;
   url(): string;
   locator(selector: string): PlaywrightLocator;
+  evaluate<T>(pageFunction: (arg: unknown) => T | Promise<T>, arg?: unknown): Promise<T>;
   frames(): PlaywrightFrame[];
   addScriptTag(options: { content: string }): Promise<PlaywrightElementHandle>;
   mouse: { click(x: number, y: number): Promise<void> };
@@ -411,6 +415,11 @@ const BROWSER_OPERATION_TIMEOUT_MS = 10_000;
 const DUCKDUCKGO_NAVIGATION_TIMEOUT_MS = 5_000;
 const DUCKDUCKGO_OPERATION_TIMEOUT_MS = 22_000;
 const BROWSER_CONTEXT_RESET_TIMEOUT_MS = 1_000;
+const MAX_CONTENT_REFERENCE_COUNT = 1_024;
+const MAX_CONTENT_REFERENCE_BYTES = 32 * 1024 * 1024;
+const MAX_CONTENT_REFERENCE_SIZE = 8 * 1024 * 1024;
+const MAX_BROWSER_EVALUATE_RESULT_BYTES = 64 * 1024;
+const MAX_BROWSER_QUERY_RESULT_BYTES = 64 * 1024;
 
 interface IndexedSemanticContent {
   blocks: BrowserContentBlock[];
@@ -424,6 +433,10 @@ interface SerializableContentReference {
   block: BrowserContentBlock;
   revision: number;
   url: string;
+  title: string;
+  pageType: BrowserPageType;
+  capturedAt: string;
+  size: number;
 }
 
 export interface NavigationReference {
@@ -439,6 +452,14 @@ export interface NavigationReference {
 
 function createContentSessionId(): string {
   return crypto.randomUUID().replace(/-/gu, '').slice(0, 8);
+}
+
+function freezeSnapshot<T>(value: T): T {
+  if (typeof value === 'object' && value !== null && !Object.isFrozen(value)) {
+    for (const child of Object.values(value as Record<string, unknown>)) freezeSnapshot(child);
+    Object.freeze(value);
+  }
+  return value;
 }
 
 class BrowserOperationTimeout extends Error {
@@ -617,8 +638,11 @@ export class BrowserController {
   private lastFrameMutationSignature: string | undefined;
   private lastNavigationHttpStatus: number | undefined;
   private webSearchReferenceIndex = 0;
+  private contentReferenceIndex = 0;
+  private queryElementReferenceIndex = 0;
   private references = new Map<string, BrowserReference>();
   private contentReferences = new Map<string, SerializableContentReference>();
+  private contentReferenceBytes = 0;
   private navigationReferences = new Map<string, NavigationReference>();
   private navigationIndex = 0;
   private searchGeneration = 0;
@@ -881,6 +905,206 @@ export class BrowserController {
     };
   }
 
+  async query(input: {
+    selector?: string;
+    text?: string;
+    role?: string;
+    name?: string;
+    limit?: number;
+  }): Promise<BrowserQueryResult> {
+    return this.withWatchdog(() => this.queryInternal(input), "browser.query");
+  }
+
+  private async queryInternal(input: {
+    selector?: string;
+    text?: string;
+    role?: string;
+    name?: string;
+    limit?: number;
+  }): Promise<BrowserQueryResult> {
+    const page = await this.ensurePage();
+    await this.refreshDomRevision(page);
+    const revision = this.referenceRevision;
+    const url = page.url();
+    const title = await this.readTitle(page);
+    const selector = input.selector?.trim() || "body *";
+    const limit = Math.max(1, Math.min(100, Math.trunc(input.limit ?? 20)));
+    type Match = {
+      index: number;
+      tag: string;
+      role: string;
+      name: string;
+      text: string;
+      attributes: Record<string, string>;
+      href?: string;
+    };
+    let inspected: { matches: Match[]; truncated: boolean };
+    const locator = page.locator(selector);
+    try {
+      inspected = await locator.evaluateAll((nodes, rawOptions) => {
+        const options = rawOptions as {
+          text?: string;
+          role?: string;
+          name?: string;
+          limit: number;
+        };
+        const normalize = (value: string): string => value.replace(/\s+/gu, " ").trim();
+        const inferRole = (element: Element): string => {
+          const explicit = element.getAttribute("role")?.trim();
+          if (explicit) return explicit.toLowerCase();
+          const tag = element.tagName.toLowerCase();
+          if (tag === "a" && element.hasAttribute("href")) return "link";
+          if (tag === "button") return "button";
+          if (tag === "textarea") return "textbox";
+          if (tag === "select") return "combobox";
+          if (tag === "table") return "table";
+          if (tag === "tr") return "row";
+          if (tag === "th") return "columnheader";
+          if (tag === "td") return "cell";
+          if (/^h[1-6]$/u.test(tag)) return "heading";
+          if (tag === "ul" || tag === "ol") return "list";
+          if (tag === "li") return "listitem";
+          if (tag === "form") return "form";
+          if (tag === "img") return "img";
+          if (tag === "input") {
+            const type = (element.getAttribute("type") || "text").toLowerCase();
+            if (type === "button" || type === "submit" || type === "reset") return "button";
+            if (type === "checkbox") return "checkbox";
+            if (type === "radio") return "radio";
+            return "textbox";
+          }
+          return "generic";
+        };
+        const lowerText = options.text?.toLocaleLowerCase();
+        const lowerRole = options.role?.toLocaleLowerCase();
+        const lowerName = options.name?.toLocaleLowerCase();
+        const matches: Match[] = [];
+        const scanLimit = Math.min(nodes.length, 10_000);
+        for (let index = 0; index < scanLimit; index += 1) {
+          const node = nodes[index];
+          if (!(node instanceof Element)) continue;
+          const tag = node.tagName.toLowerCase();
+          const role = inferRole(node);
+          const text = normalize(node instanceof HTMLElement ? node.innerText : node.textContent || "").slice(0, 500);
+          const name = normalize(
+            node.getAttribute("aria-label")
+            || node.getAttribute("title")
+            || (node instanceof HTMLInputElement ? node.value : "")
+            || text,
+          ).slice(0, 300);
+          if (lowerText && !text.toLocaleLowerCase().includes(lowerText)) continue;
+          if (lowerRole && role !== lowerRole) continue;
+          if (lowerName && !name.toLocaleLowerCase().includes(lowerName)) continue;
+          const attributes: Record<string, string> = {};
+          for (const attribute of ["id", "class", "href", "role", "aria-label", "title", "name", "type"]) {
+            const value = node.getAttribute(attribute);
+            if (value !== null) attributes[attribute] = value.slice(0, 300);
+          }
+          for (const attribute of Array.from(node.attributes).filter(item => item.name.startsWith("data-")).slice(0, 8)) {
+            attributes[attribute.name] = attribute.value.slice(0, 300);
+          }
+          const href = node instanceof HTMLAnchorElement ? node.href : undefined;
+          matches.push({
+            index,
+            tag,
+            role,
+            name,
+            text,
+            attributes,
+            ...(href ? { href } : {}),
+          });
+          if (matches.length >= options.limit) break;
+        }
+        return {
+          matches,
+          truncated: nodes.length > scanLimit || matches.length >= options.limit,
+        };
+      }, { text: input.text, role: input.role, name: input.name, limit });
+    } catch (error) {
+      throw new GuestRpcError(
+        "BROWSER_QUERY_FAILED",
+        error instanceof Error ? error.message.slice(0, 500) : "The DOM query failed.",
+      );
+    }
+
+    const results: BrowserQueryResult["results"] = inspected.matches.map(match => {
+      const ref = `e${revision}-q${++this.queryElementReferenceIndex}`;
+      this.references.set(ref, {
+        locator: locator.nth(match.index),
+        revision,
+        url,
+        kind: "element",
+      });
+      const navigationRef = match.href
+        ? this.registerNavigationReference({
+            href: match.href,
+            sourceUrl: url,
+            sourceType: "page_link",
+            title: match.name || match.text,
+          })
+        : undefined;
+      return {
+        ref,
+        tag: match.tag,
+        role: match.role,
+        ...(match.name ? { name: match.name } : {}),
+        ...(match.text ? { text: match.text } : {}),
+        attributes: match.attributes,
+        ...(navigationRef ? { navigationRef } : {}),
+      };
+    });
+    let truncated = inspected.truncated;
+    while (results.length > 0 && new TextEncoder().encode(JSON.stringify({ url, title, revision, results, truncated })).byteLength > MAX_BROWSER_QUERY_RESULT_BYTES) {
+      const removed = results.pop()!;
+      this.references.delete(removed.ref);
+      if (removed.navigationRef) this.navigationReferences.delete(removed.navigationRef);
+      truncated = true;
+    }
+    const stableRevision = await this.refreshDomRevision(page);
+    if (stableRevision !== revision || page.url() !== url) {
+      throw new GuestRpcError("BROWSER_DOM_UNSTABLE", "The page changed while its DOM was being queried.", { httpStatus: 409 });
+    }
+    return { url, title, revision, results, truncated };
+  }
+
+  async evaluate(input: { expression: string }): Promise<BrowserEvaluateResult> {
+    return this.withWatchdog(async () => {
+      const page = await this.ensurePage();
+      await this.refreshDomRevision(page);
+      let value: unknown;
+      try {
+        value = await page.evaluate(async rawOptions => {
+          const options = rawOptions as { expression: string; maxBytes: number };
+          const result = await (0, eval)(options.expression);
+          let serialized: string | undefined;
+          try {
+            serialized = JSON.stringify(result);
+          } catch {
+            throw new Error("The expression result is not JSON serializable.");
+          }
+          if (serialized === undefined) throw new Error("The expression result is not JSON serializable.");
+          if (new TextEncoder().encode(serialized).byteLength > options.maxBytes) {
+            throw new Error("The expression result exceeds the 64 KB response limit.");
+          }
+          return JSON.parse(serialized) as JsonValue;
+        }, { expression: input.expression, maxBytes: MAX_BROWSER_EVALUATE_RESULT_BYTES });
+      } catch (error) {
+        if (error instanceof GuestRpcError) throw error;
+        throw new GuestRpcError(
+          "BROWSER_EVALUATE_FAILED",
+          error instanceof Error ? error.message.slice(0, 500) : "The page expression failed.",
+        );
+      }
+      const revision = await this.refreshDomRevision(page);
+      return {
+        url: page.url(),
+        title: await this.readTitle(page),
+        revision,
+        result: value as JsonValue,
+      };
+    }, "browser.evaluate");
+  }
+
   async read(input: {
     mode?: BrowserReadMode;
     query?: string;
@@ -934,7 +1158,7 @@ export class BrowserController {
     const title = await this.readTitle(page);
     const maxChars = Math.max(1, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
     const query = input.query?.trim() || undefined;
-    const extracted = await this.extractSemanticContent(page, url);
+    const extracted = await this.extractSemanticContent(page, url, title);
     const rankingBlocks = input.blockTypes
       ? extracted.blocks.filter(block => input.blockTypes!.includes(block.type))
       : extracted.blocks;
@@ -1028,7 +1252,6 @@ export class BrowserController {
     offset?: number;
     limit?: number;
   }): Promise<BrowserReadResult> {
-    const page = await this.ensurePage();
     const reference = await this.resolveContentReference(input.ref);
     const maxChars = Math.max(1, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
     const offset = Math.max(0, Math.trunc(input.offset ?? 0));
@@ -1092,18 +1315,14 @@ export class BrowserController {
       summary.truncated = Boolean(summary.truncated || hasMore);
     }
     const preview = summary.preview ?? "";
-    const stableRevision = await this.refreshDomRevision(page);
-    if (stableRevision !== reference.revision || page.url() !== reference.url) {
-      throw new GuestRpcError("STALE_CONTENT_REF", `Browser content ref ${input.ref} is no longer available.`, { httpStatus: 409 });
-    }
     return {
       operation: "read",
       url: reference.url,
-      title: await this.readTitle(page),
+      title: reference.title,
       revision: reference.revision,
       mode: input.mode ?? "readable",
       source: "semantic",
-      pageType: full.type === "table" ? "data_table" : "generic",
+      pageType: reference.pageType,
       blocks: [summary],
       diagnostics: {
         blockCount: 1,
@@ -1143,11 +1362,35 @@ export class BrowserController {
   private registerContentReference(
     block: BrowserContentBlock,
     pageUrl: string,
-    referenceIndex: string,
+    pageTitle: string,
+    pageType: BrowserPageType,
   ): BrowserContentBlock {
-    const ref = `c${this.referenceRevision}-${this.contentSessionId}-${referenceIndex}`;
+    const ref = `c${this.referenceRevision}-${this.contentSessionId}-${++this.contentReferenceIndex}`;
     block.ref = ref;
-    this.contentReferences.set(ref, { block, revision: this.referenceRevision, url: pageUrl });
+    const snapshot = JSON.parse(JSON.stringify(block)) as BrowserContentBlock;
+    const size = new TextEncoder().encode(JSON.stringify(snapshot)).byteLength;
+    if (size > MAX_CONTENT_REFERENCE_SIZE) {
+      throw new GuestRpcError("CONTENT_REF_TOO_LARGE", `Extracted content exceeds the ${MAX_CONTENT_REFERENCE_SIZE} byte snapshot limit.`);
+    }
+    while (this.contentReferences.size >= MAX_CONTENT_REFERENCE_COUNT
+      || this.contentReferenceBytes + size > MAX_CONTENT_REFERENCE_BYTES) {
+      const oldestRef = this.contentReferences.keys().next().value as string | undefined;
+      if (oldestRef === undefined) break;
+      const oldest = this.contentReferences.get(oldestRef);
+      this.contentReferences.delete(oldestRef);
+      if (oldest) this.contentReferenceBytes = Math.max(0, this.contentReferenceBytes - oldest.size);
+    }
+    const capturedAt = new Date().toISOString();
+    this.contentReferences.set(ref, {
+      block: freezeSnapshot(snapshot),
+      revision: this.referenceRevision,
+      url: pageUrl,
+      title: pageTitle,
+      pageType,
+      capturedAt,
+      size,
+    });
+    this.contentReferenceBytes += size;
     return block;
   }
 
@@ -1183,7 +1426,12 @@ export class BrowserController {
     this.navigationReferences.clear();
   }
 
-  private async extractSemanticContent(page: PlaywrightPage, pageUrl: string): Promise<IndexedSemanticContent> {
+  private clearContentReferences(): void {
+    this.contentReferences.clear();
+    this.contentReferenceBytes = 0;
+  }
+
+  private async extractSemanticContent(page: PlaywrightPage, pageUrl: string, pageTitle: string): Promise<IndexedSemanticContent> {
     const frames = page.frames();
     const extracted: IndexedSemanticContent = {
       blocks: [],
@@ -1258,7 +1506,7 @@ export class BrowserController {
     });
     extracted.blocks = unique;
     extracted.extractors = [...new Set(extracted.extractors)];
-    extracted.blocks.forEach((block, index) => {
+    extracted.blocks.forEach(block => {
       if (block.type === "search_result" && typeof block.href === "string" && block.href.length > 0) {
         const ref = this.registerNavigationReference({
           href: block.href,
@@ -1272,7 +1520,7 @@ export class BrowserController {
         if (entry) entry.block = { ...block };
         return;
       }
-      this.registerContentReference(block, pageUrl, String(index + 1));
+      this.registerContentReference(block, pageUrl, pageTitle, extracted.pageType);
     });
     return extracted;
   }
@@ -1320,12 +1568,10 @@ export class BrowserController {
   }
 
   private async resolveContentReference(ref: string): Promise<SerializableContentReference> {
-    const page = await this.ensurePage();
-    await this.refreshDomRevision(page);
     const reference = this.contentReferences.get(ref);
-    if (!reference || reference.revision !== this.referenceRevision || reference.url !== page.url()) {
+    if (!reference) {
       this.contentReferences.delete(ref);
-      throw new GuestRpcError("STALE_CONTENT_REF", `Browser content ref ${ref} is unknown or stale. Read the current page again to obtain a fresh ref.`, { httpStatus: 409 });
+      throw new GuestRpcError("UNKNOWN_CONTENT_REF", `Browser content ref ${ref} is unknown or has expired. Read the page again to obtain a fresh ref.`, { httpStatus: 404 });
     }
     return reference;
   }
@@ -1977,6 +2223,7 @@ export class BrowserController {
     this.context = undefined;
     this.page = undefined;
     this.invalidateReferences();
+    this.clearContentReferences();
     this.clearAllNavigationReferences();
     if (context !== undefined) {
       await context.close().catch(() => undefined);
@@ -2049,7 +2296,6 @@ export class BrowserController {
   private invalidateReferences(): void {
     this.referenceRevision += 1;
     this.references.clear();
-    this.contentReferences.clear();
     // Navigation capabilities (observed search-result destinations) are
     // intentionally preserved across DOM revisions. They are immutable
     // evidence of a destination that was actually seen and must not disappear
@@ -2290,6 +2536,7 @@ export class BrowserController {
     this.context = undefined;
     this.page = undefined;
     this.invalidateReferences();
+    this.clearContentReferences();
     this.clearAllNavigationReferences();
     if (!context) return;
     const close = context.close().catch(() => undefined);

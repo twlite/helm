@@ -7,6 +7,8 @@ import type {
   BrowserPageSearchResult,
   BrowserWebSearchResult,
   BrowserSnapshot,
+  BrowserQueryResult,
+  BrowserEvaluateResult,
   GuestHandshakeResult,
   GuestMethod,
   WindowInfo,
@@ -23,6 +25,8 @@ export type GuestMethodParams = {
   'browser.navigate': { url: string };
   'browser.getState': Record<string, never>;
   'browser.snapshot': { maxRegions?: number };
+  'browser.query': { selector?: string; text?: string; role?: string; name?: string; limit?: number };
+  'browser.evaluate': { expression: string };
   'browser.read': { mode?: 'readable' | 'document'; query?: string; ref?: string; maxChars?: number; offset?: number; limit?: number };
   'browser.findPage': { query: string; maxResults?: number };
   'browser.webSearch': { query: string; maxResults?: number };
@@ -82,6 +86,8 @@ export type GuestMethodResult = {
     revision: number;
   };
   'browser.snapshot': BrowserSnapshot;
+  'browser.query': BrowserQueryResult;
+  'browser.evaluate': BrowserEvaluateResult;
   'browser.read': BrowserReadResult;
   'browser.findPage': BrowserPageSearchResult;
   'browser.webSearch': BrowserWebSearchResult;

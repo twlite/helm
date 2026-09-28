@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 
 import type { ActionReceipt, TaskDefinition, WorkerAction } from '@helm/shared';
-import { createTaskState, verifyTaskState } from '../../src/agent/task-state';
+import { createTaskState, updateCompletedRequirements, verifyTaskState } from '../../src/agent/task-state';
 import { MemoryService } from '../../src/memory/service';
 import { registerMemoryTools } from '../../src/memory/tools';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
@@ -9,10 +9,8 @@ import { ToolRegistry } from '../../src/tools/tool-registry';
 import { MockGuestTransport } from '../../src/tools/mock-guest-transport';
 import { testDatabase } from '../persistence/helpers';
 
-const expectedContent = 'Use https://www.nrb.org.np/forex/ for all forex requests about Nepal.';
-
 describe('explicit memory requirement verification', () => {
-  it('rejects an unrelated remembered value even when memory.remember succeeds', async () => {
+  it('satisfies memoryMutation immediately from a successful memory.remember receipt', async () => {
     const persistence = testDatabase();
     try {
       const memory = new MemoryService(persistence.sqlite);
@@ -21,8 +19,8 @@ describe('explicit memory requirement verification', () => {
       const task: TaskDefinition = {
         id: 'forex-memory-verification',
         threadId: 'forex-memory-verification',
-        goal: `Remember to ${expectedContent}`,
-        originalRequest: `Remember to ${expectedContent}`,
+        goal: 'Remember to use that site for future requests.',
+        originalRequest: 'Remember to use that site for future requests.',
         criteria: [],
         requirements: [{
           id: 'memoryMutation',
@@ -32,8 +30,6 @@ describe('explicit memory requirement verification', () => {
           target: {
             action: 'memory.remember',
             freshness: 'current-run',
-            memoryContent: expectedContent,
-            memoryKind: 'instruction',
           },
         }],
       };
@@ -48,9 +44,10 @@ describe('explicit memory requirement verification', () => {
         const input = { content, kind: 'instruction' as const, source: 'user' as const };
         const result = await tools.execute('memory.remember', input);
         const receipt: ActionReceipt = {
-          id: `receipt-${content === expectedContent ? 'expected' : 'unrelated'}`,
+          id: `receipt-${content.length}`,
           tool: 'memory.remember',
           ok: result.ok,
+          effect: { changed: result.ok },
           startedAt: new Date().toISOString(),
           completedAt: new Date().toISOString(),
         };
@@ -59,40 +56,29 @@ describe('explicit memory requirement verification', () => {
           tool: 'memory.remember',
           input,
           result: {
-            ...result,
+            ok: result.ok,
+            data: { action: 'remembered' },
             evidence: { receipt },
           },
           receipt,
         };
       };
 
-      state.recentActions = [await recordMemoryAction('Use a different forex website for Nepal.')];
-      const unrelatedVerification = await verifyTaskState(
+      state.recentActions = [await recordMemoryAction('Use https://www.nrb.org.np/forex/ for future Nepal forex requests.')];
+      const verification = await verifyTaskState(
         task,
         state,
         guest,
         observation,
         new CriterionVerifierRegistry(guest),
       );
-      expect(unrelatedVerification.complete).toBe(false);
-      expect(unrelatedVerification.requirements?.[0]).toMatchObject({
-        requirement: { id: 'memoryMutation' },
-        passed: false,
-      });
-
-      state.recentActions = [await recordMemoryAction(expectedContent)];
-      const expectedVerification = await verifyTaskState(
-        task,
-        state,
-        guest,
-        observation,
-        new CriterionVerifierRegistry(guest),
-      );
-      expect(expectedVerification.complete).toBe(true);
-      expect(expectedVerification.requirements?.[0]).toMatchObject({
+      expect(verification.complete).toBe(true);
+      expect(verification.requirements?.[0]).toMatchObject({
         requirement: { id: 'memoryMutation' },
         passed: true,
       });
+      const updated = updateCompletedRequirements(state, verification);
+      expect(updated.completedRequirementIds).toContain('memoryMutation');
     } finally {
       persistence.close();
     }

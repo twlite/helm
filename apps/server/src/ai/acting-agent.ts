@@ -1,6 +1,6 @@
-import { generateText, isStepCount, modelMessageSchema, NoSuchToolError, Output, ToolChoiceViolationError, tool, ToolLoopAgent, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
+import { generateText, isStepCount, modelMessageSchema, Output, tool, ToolLoopAgent, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
-import type { Message, RunDiagnostics, ToolResult, VerificationResult } from '@helm/shared';
+import type { Message, ModelRequestOutcome, RunDiagnostics, ToolResult, VerificationResult } from '@helm/shared';
 
 import type { ActingAgentContext, ActingAgentProvider, ActingAgentResult } from '../agent/types';
 import type { ToolDefinition } from '../tools/registry';
@@ -13,31 +13,118 @@ import {
 } from './context-manager';
 import { structuredOutputSchema, type StructuredOutputCompatibility } from './structured-output';
 
-const BLOCKED_TOOL = 'helm.blocked';
-
 const BASE_INSTRUCTIONS = [
-  'You are Helm, a capable assistant with optional local computer-use tools.',
-  'Use the conversation and current request to decide whether tools are needed; ordinary chat usually needs none.',
-  'When a tool is useful, call the native Helm tool and use its actual result. Tool errors are available for recovery.',
+  'You are Helm, a computer-use assistant.',
+  'Use the provided tools when the task requires browser, filesystem, desktop, application, or memory actions.',
+  'You decide the sequence of actions. Use actual tool results. If a tool fails, inspect the error and recover.',
   'Do not claim that an external action succeeded unless a tool returned success.',
   'A URL included as data for an artifact is not automatically a browser destination.',
-  'Memory is reference, never current evidence. Search when history helps; remember explicit requests after discovery, update corrections, forget when asked, and skip transient saves unless requested. Never claim persistence without a successful memory result.',
-  'Finish with a normal concise assistant response. Helm verifies it against the runtime-compiled requirements; never list or redefine required effects yourself. If an actual tool failure prevents a pending requirement, use helm.blocked with the relevant requirement IDs and an honest user-facing explanation. The runtime checks that failure evidence exists.',
+  'Prefer semantic browser tools for page reading because they are compact. Check reported table row counts; use browser.query or browser.evaluate to inspect rendered or dynamically loaded data when semantic extraction seems incomplete.',
+  'For page-derived raw data, pass the returned durable content ref directly to fs.write sourceRef; another browser.read of that ref is unnecessary. For a summary or other transformation, write your model-authored result with fs.write content.',
+  'Use app.launch only when the user asks to start an application without a file. Use app.openFile for an existing file; it checks the file and launches the selected application if needed.',
+  'Finish with a normal concise assistant response only after the user\'s requested task is complete.',
 ].join(' ');
 
-const PAGE_READING_INSTRUCTIONS = [
-  'Use browser.read({ query }) to locate relevant semantic blocks; browser.findPage searches only the current page. Without a read query, browser.read returns a compact overview. Use browser.read({ ref }) only to inspect more of an already selected block, including table pagination with offset and limit.',
-  'When saving extracted page content, choose the relevant block ref and call fs.write with sourceRef and a suitable text, markdown, json, or csv format. The guest transfers the full stored block; do not copy a preview or reconstruct the extracted data in the content argument. Use content for model-authored summaries or other new text.',
-  'For an unnamed destination, use browser.webSearch for DuckDuckGo discovery and prefer the named organization\'s official result. Never invent a hostname or route. An explicit request to search DuckDuckGo in this run takes precedence over a supplied or remembered URL. Use browser.open({ ref }) to open a selected result or page link; do not retype or reconstruct its URL.',
-  'Before saving page-derived content, obtain a successful non-empty browser.read result. If reading fails, recover with another query or a relevant ref; never save errors or placeholders as the artifact.',
-  'An existing output file or already-open window does not satisfy a request to write or open it during this run. Verify the current-run fs.write result before calling app.openFile, and verify the current-run app.openFile result for an explicit open request.',
-].join(' ');
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function errorDiagnostic(caught: unknown): Pick<ModelRequestOutcome, 'errorName' | 'errorCode'> {
+  const value = record(caught);
+  return {
+    ...(caught instanceof Error ? { errorName: caught.name } : typeof value?.name === 'string' ? { errorName: value.name } : {}),
+    ...(typeof value?.code === 'string' ? { errorCode: value.code } : {}),
+  };
+}
+
+function diagnosticToolCalls(
+  result: Awaited<ReturnType<ToolLoopAgent<never, ToolSet>['generate']>>,
+  availableTools: ReadonlySet<string>,
+): NonNullable<ModelRequestOutcome['toolCalls']> {
+  const calls: NonNullable<ModelRequestOutcome['toolCalls']> = [];
+  for (const step of result.steps) {
+    for (const call of step.toolCalls) {
+      const failedPart = step.content.find(part => part.type === 'tool-error' && part.toolCallId === call.toolCallId);
+      if (!availableTools.has(call.toolName)) {
+        calls.push({ tool: call.toolName, outcome: 'rejected-before-execution', errorCode: 'UNKNOWN_TOOL' });
+        continue;
+      }
+      if (call.dynamic === true && call.invalid === true) {
+        calls.push({ tool: call.toolName, outcome: 'schema-validation-failed' });
+        continue;
+      }
+      const toolResult = step.toolResults.find(item => item.toolCallId === call.toolCallId);
+      const output = record(toolResult?.output);
+      const error = record(output?.error);
+      const errorCode = typeof error?.code === 'string' ? error.code : undefined;
+      if (errorCode === 'INVALID_INPUT') {
+        calls.push({ tool: call.toolName, outcome: 'schema-validation-failed', errorCode });
+      } else if (errorCode === 'ACTION_BUDGET_EXCEEDED' || errorCode === 'REPEATED_ACTION' || errorCode === 'UNKNOWN_TOOL') {
+        calls.push({ tool: call.toolName, outcome: 'rejected-before-execution', errorCode });
+      } else if (output && typeof output.ok === 'boolean') {
+        calls.push({
+          tool: call.toolName,
+          outcome: output.ok ? 'succeeded' : 'failed',
+          ...(errorCode ? { errorCode } : {}),
+        });
+      } else if (failedPart) {
+        const failure = record(record(failedPart)?.error);
+        const name = typeof failure?.name === 'string' ? failure.name : '';
+        if (name.includes('NoSuchTool')) {
+          calls.push({ tool: call.toolName, outcome: 'rejected-before-execution', errorCode: 'UNKNOWN_TOOL' });
+        } else {
+          calls.push({
+            tool: call.toolName,
+            outcome: name.includes('InvalidToolInput') ? 'schema-validation-failed' : 'failed',
+            ...(typeof failure?.code === 'string' ? { errorCode: failure.code } : {}),
+          });
+        }
+      } else {
+        calls.push({ tool: call.toolName, outcome: 'no-result' });
+      }
+    }
+  }
+  return calls;
+}
+
+function actingTurnOutcome(
+  request: number,
+  result: Awaited<ReturnType<ToolLoopAgent<never, ToolSet>['generate']>>,
+  providerCalls: number,
+  availableTools: ReadonlySet<string>,
+): ModelRequestOutcome {
+  const toolCalls = diagnosticToolCalls(result, availableTools);
+  const hasText = result.text.trim().length > 0;
+  return {
+    request,
+    kind: 'acting-turn',
+    providerCalls,
+    providerRetries: Math.max(0, providerCalls - 1),
+    outcome: toolCalls.length > 0
+      ? hasText ? 'assistant-text-and-tool-call' : 'tool-call'
+      : hasText ? 'assistant-text' : 'no-actionable-output',
+    finishReason: result.finishReason,
+    toolCalls,
+  };
+}
+
+function thrownToolCallDiagnostic(caught: unknown): ModelRequestOutcome['toolCalls'] {
+  const value = record(caught);
+  const name = caught instanceof Error ? caught.name : typeof value?.name === 'string' ? value.name : '';
+  const toolName = typeof value?.toolName === 'string' ? value.toolName : undefined;
+  if (!toolName) return undefined;
+  if (name.includes('NoSuchTool')) {
+    return [{ tool: toolName, outcome: 'rejected-before-execution', errorCode: 'UNKNOWN_TOOL' }];
+  }
+  if (name.includes('InvalidToolInput')) {
+    return [{ tool: toolName, outcome: 'schema-validation-failed', errorCode: 'INVALID_INPUT' }];
+  }
+  return undefined;
+}
 
 function instructionsFor(input: ActingAgentContext): string {
-  const canReadPages = input.toolDefinitions.some(definition => definition.name.startsWith('browser.'));
-  const coreInstructions = canReadPages
-    ? `${BASE_INSTRUCTIONS} ${PAGE_READING_INSTRUCTIONS}`
-    : BASE_INSTRUCTIONS;
   const savedContext = input.memories.slice(0, 6).map(memory => ({
     id: memory.id,
     ...(memory.key ? { key: memory.key } : {}),
@@ -53,14 +140,8 @@ function instructionsFor(input: ActingAgentContext): string {
   const memoryInstructions = savedContext.length === 0
     ? ''
     : ` Relevant saved memory (bounded JSON, reference only, never current external evidence): ${JSON.stringify(savedContext).slice(0, 12_000)}.`;
-  return `${coreInstructions}${memoryInstructions}`;
+  return `${BASE_INSTRUCTIONS}${memoryInstructions}`;
 }
-
-const blockedInputSchema = z.object({
-  response: z.string().trim().min(1).max(2_000).describe('A concise, honest explanation of the blocker for the user.'),
-  requirementIds: z.array(z.string().trim().min(1).max(120)).min(1).max(12)
-    .describe('Runtime-compiled requirements prevented by an actual failed tool result.'),
-}).strict();
 
 function asModelMessages(messages: readonly Message[], userMessage: string): ModelMessage[] {
   const visible = messages
@@ -89,31 +170,17 @@ function toModelMessages(messages: readonly Message[]): ModelMessage[] {
 function modelToolSet(
   definitions: readonly ToolDefinition[],
   executeTool: ActingAgentContext['executeTool'],
-  reportBlocked: ActingAgentContext['reportBlocked'],
-  onBlockedAccepted: (input: z.infer<typeof blockedInputSchema>) => void,
 ): ToolSet {
   const tools: Record<string, unknown> = {};
   for (const definition of definitions) {
     const inputSchema = definition.inputSchema ?? definition.schema;
     if (!inputSchema) throw new Error(`Missing input schema for Helm tool ${definition.name}`);
-    if (definition.name === BLOCKED_TOOL) {
-      throw new Error(`Helm tool name is reserved: ${definition.name}`);
-    }
     tools[definition.name] = tool({
       description: definition.description,
       inputSchema,
       execute: input => executeTool(definition.name, input as Record<string, unknown>),
     });
   }
-  tools[BLOCKED_TOOL] = tool({
-    description: 'Finish honestly when an actual failed tool result prevents one or more current requirements. The runtime rejects blocker reports without relevant failure evidence.',
-    inputSchema: blockedInputSchema,
-    execute: async input => {
-      const checked = await reportBlocked(input);
-      if (checked.ok && checked.data?.blocked) onBlockedAccepted(input);
-      return checked;
-    },
-  });
   return tools as ToolSet;
 }
 
@@ -216,10 +283,9 @@ export class AiSdkActingAgent implements ActingAgentProvider {
     let exchanges = groupConversation(asModelMessages(input.conversation, input.userMessage), input.userMessage);
     let acceptedResponse: string | undefined;
     let acceptedVerification: ActingAgentResult['verification'] | undefined;
-    let acceptedBlocker: ActingAgentResult['blocked'] | undefined;
     let lastVerification: VerificationResult | undefined;
     let completionRecoveryTurns = 0;
-    let blockerRejectionThisTurn = false;
+    let lastRejectedCompletion: string | undefined;
     let compactionCount = 0;
     const instructions = instructionsFor(input);
     const budget = contextBudget(this.options.contextBudget);
@@ -231,6 +297,7 @@ export class AiSdkActingAgent implements ActingAgentProvider {
       completionRejections: 0,
       contextCompactions: 0,
       lastUnsatisfiedRequirements: [],
+      modelRequestOutcomes: [],
     };
 
     const refreshUnsatisfied = (): void => {
@@ -242,7 +309,14 @@ export class AiSdkActingAgent implements ActingAgentProvider {
     const emitDiagnostics = async (): Promise<void> => {
       refreshUnsatisfied();
       diagnostics.toolActions = input.getToolActionCount?.() ?? diagnostics.toolActions;
-      await input.onDiagnostics?.({ ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] });
+      await input.onDiagnostics?.({
+        ...diagnostics,
+        lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements],
+        modelRequestOutcomes: diagnostics.modelRequestOutcomes?.map(item => ({
+          ...item,
+          ...(item.toolCalls ? { toolCalls: item.toolCalls.map(call => ({ ...call })) } : {}),
+        })),
+      });
     };
 
     const prepare = async (currentInstructions: string, descriptions: string): Promise<ModelMessage[]> => {
@@ -257,27 +331,55 @@ export class AiSdkActingAgent implements ActingAgentProvider {
         summarize: async summaryInput => {
           diagnostics.modelRequests += 1;
           diagnostics.contextCompactions += 1;
+          const request = diagnostics.modelRequests;
+          let providerCalls = 0;
+          let providerReturned = false;
           await emitDiagnostics();
-          const summarized = await generateText({
-            model: this.options.model,
-            system: contextSummaryInstructions(),
-            prompt: contextSummaryPrompt(
-              summaryInput.currentRequest,
-              summaryInput.previousSummary,
-              summaryInput.messages,
-              summaryInput.evidenceCatalog,
-              summaryInput.environment,
-            ),
-            output: Output.object({
-              schema: structuredOutputSchema(contextSummarySchema, this.options.structuredOutputCompatibility),
-            }),
-            maxOutputTokens: Math.min(1_200, Math.max(256, this.options.maxOutputTokens)),
-            temperature: 0,
-            timeout: this.options.requestTimeoutMs,
-            maxRetries: 0,
-            abortSignal: summaryInput.signal,
-          });
-          return contextSummarySchema.parse(summarized.output);
+          try {
+            const summarized = await generateText({
+              model: this.options.model,
+              system: contextSummaryInstructions(),
+              prompt: contextSummaryPrompt(
+                summaryInput.currentRequest,
+                summaryInput.previousSummary,
+                summaryInput.messages,
+                summaryInput.evidenceCatalog,
+                summaryInput.environment,
+              ),
+              output: Output.object({
+                schema: structuredOutputSchema(contextSummarySchema, this.options.structuredOutputCompatibility),
+              }),
+              maxOutputTokens: Math.min(1_200, Math.max(256, this.options.maxOutputTokens)),
+              temperature: 0,
+              timeout: this.options.requestTimeoutMs,
+              maxRetries: 0,
+              abortSignal: summaryInput.signal,
+              onLanguageModelCallStart: () => { providerCalls += 1; },
+            });
+            providerReturned = true;
+            const output = contextSummarySchema.parse(summarized.output);
+            diagnostics.modelRequestOutcomes?.push({
+              request,
+              kind: 'context-compaction',
+              providerCalls,
+              providerRetries: Math.max(0, providerCalls - 1),
+              outcome: 'context-summary',
+              finishReason: summarized.finishReason,
+            });
+            await emitDiagnostics();
+            return output;
+          } catch (caught) {
+            diagnostics.modelRequestOutcomes?.push({
+              request,
+              kind: 'context-compaction',
+              providerCalls,
+              providerRetries: Math.max(0, providerCalls - 1),
+              outcome: providerReturned ? 'context-summary-error' : 'provider-error',
+              ...errorDiagnostic(caught),
+            });
+            await emitDiagnostics();
+            throw caught;
+          }
         },
       });
       exchanges = result.exchanges;
@@ -287,21 +389,6 @@ export class AiSdkActingAgent implements ActingAgentProvider {
       const messages = flattenExchanges(exchanges);
       assertModelMessages(messages, 'Prepared acting-agent context');
       return messages;
-    };
-
-    const reportBlocked = async (value: z.infer<typeof blockedInputSchema>): Promise<ToolResult<{ blocked: boolean }>> => {
-      const response = value.response.trim();
-      if (!response) return { ok: false, error: { code: 'EMPTY_RESPONSE', message: 'A non-empty blocker response is required.' } };
-      diagnostics.completionAttempts += 1;
-      const checked = await input.reportBlocked({ response, requirementIds: value.requirementIds });
-      if (checked.ok && checked.data?.blocked) {
-        acceptedBlocker = { response, requirementIds: [...value.requirementIds] };
-      } else {
-        diagnostics.completionRejections += 1;
-        blockerRejectionThisTurn = true;
-      }
-      await emitDiagnostics();
-      return checked;
     };
 
     const verifyResponse = async (responseValue: string): Promise<ToolResult<VerificationResult>> => {
@@ -316,14 +403,16 @@ export class AiSdkActingAgent implements ActingAgentProvider {
       } else {
         diagnostics.completionRejections += 1;
       }
+      const latestOutcome = diagnostics.modelRequestOutcomes?.at(-1);
+      if (latestOutcome?.kind === 'acting-turn' && latestOutcome.request === diagnostics.modelRequests) {
+        latestOutcome.completion = checked.ok && checked.data?.complete ? 'accepted' : 'rejected';
+      }
       await emitDiagnostics();
       return checked;
     };
 
-    const tools = modelToolSet(input.toolDefinitions, input.executeTool, reportBlocked, value => {
-      acceptedBlocker = { response: value.response, requirementIds: [...value.requirementIds] };
-    });
-    const toolContext = `${toolDefinitionsDescription(input.toolDefinitions)}\nhelm.blocked: report a blocker only with relevant failed tool evidence.`;
+    const tools = modelToolSet(input.toolDefinitions, input.executeTool);
+    const toolContext = toolDefinitionsDescription(input.toolDefinitions);
     const maxModelTurns = Math.max(1, Math.trunc(input.maxModelTurns));
     const maxCompletionRecoveryTurns = Math.max(0, Math.trunc(input.maxCompletionRecoveryTurns));
 
@@ -333,43 +422,25 @@ export class AiSdkActingAgent implements ActingAgentProvider {
       const steering = input.drainSteering?.() ?? [];
       if (steering.length > 0) exchanges.push({ messages: toModelMessages(steering), kind: 'conversation' });
 
-      const requirementSummary = input.getRequirementSummary().trim();
-      const currentInstructions = [
-        instructions,
-        `Task goal: ${input.task.goal}`,
-        requirementSummary
-          ? `Current runtime-verified requirements:\n${requirementSummary}`
-          : 'No external effects are required by the compiled task.',
-        'The runtime requirement state is authoritative. Continue acting while a mandatory requirement is pending; do not repeat it as a model-authored effect list.',
-      ].join('\n\n');
+      const currentInstructions = instructions;
       const messages = await prepare(currentInstructions, toolContext);
-      blockerRejectionThisTurn = false;
-      const actionable = input.getActionableTools?.().filter(name => name in tools) ?? [];
-      const blockableRequirementIds = input.getBlockableRequirementIds?.() ?? [];
-      const requiredChoices = [
-        ...actionable,
-        ...(blockableRequirementIds.length > 0 ? [BLOCKED_TOOL] : []),
-      ];
-      const activeTools = requiredChoices.length > 0
-        ? [...new Set(requiredChoices)]
-        : input.task.isConversation
-          ? []
-          : input.toolDefinitions.map(definition => definition.name).filter(name => name in tools);
+      let providerCalls = 0;
 
       const agent = new ToolLoopAgent<never, ToolSet>({
         model: this.options.model,
         instructions: currentInstructions,
         tools,
-        activeTools,
-        ...(requiredChoices.length > 0 ? { toolChoice: 'required' as const } : {}),
+        toolChoice: 'auto',
         stopWhen: isStepCount(1),
         maxOutputTokens: this.options.maxOutputTokens,
         temperature: this.options.temperature,
         timeout: this.options.requestTimeoutMs,
         maxRetries: 0,
+        onLanguageModelCallStart: () => { providerCalls += 1; },
       });
       diagnostics.modelTurns += 1;
       diagnostics.modelRequests += 1;
+      const request = diagnostics.modelRequests;
       await emitDiagnostics();
       let result: Awaited<ReturnType<typeof agent.generate>>;
       try {
@@ -379,61 +450,32 @@ export class AiSdkActingAgent implements ActingAgentProvider {
           timeout: this.options.requestTimeoutMs,
         });
       } catch (caught) {
-        // AI SDK v7 enforces required tool calls and active-tool membership by
-        // throwing before it returns a generation result. Some local model
-        // servers ignore those constraints. Keep the actionable requirement
-        // authoritative and spend only the already-counted model turn: retain
-        // any ordinary text as history, then steer the next turn back to the
-        // currently available tools. This is not a completion attempt and does
-        // not consume completion-recovery budget.
-        const ignoredRequiredChoice = ToolChoiceViolationError.isInstance(caught)
-          && caught.toolChoice.type === 'required';
-        const calledUnavailableTool = NoSuchToolError.isInstance(caught)
-          && activeTools !== undefined
-          && !activeTools.includes(caught.toolName);
-        if (activeTools && activeTools.length > 0 && (ignoredRequiredChoice || calledUnavailableTool)) {
-          const attemptedText = ignoredRequiredChoice
-            ? caught.content.flatMap(part => part.type === 'text' ? [part.text] : []).join('\n').trim()
-            : '';
-          const recoveryMessages: ModelMessage[] = [];
-          if (attemptedText) recoveryMessages.push({ role: 'assistant', content: attemptedText });
-          const blockerInstruction = blockableRequirementIds.length > 0
-            ? ` A verified blocker may be reported only for these requirement IDs: ${blockableRequirementIds.join(', ')}.`
-            : '';
-          recoveryMessages.push({
-            role: 'user',
-            content: `The last model response did not produce an executable required action. Currently available task choices: ${activeTools.join(', ')}. Call an available tool. The runtime will verify completion after the required actions.${blockerInstruction}`,
-          });
-          exchanges.push({ messages: recoveryMessages, kind: 'conversation' });
-          await emitDiagnostics();
-          continue;
-        }
+        const toolCalls = thrownToolCallDiagnostic(caught);
+        diagnostics.modelRequestOutcomes?.push({
+          request,
+          kind: 'acting-turn',
+          providerCalls,
+          providerRetries: Math.max(0, providerCalls - 1),
+          outcome: toolCalls ? 'tool-call' : 'provider-error',
+          ...(toolCalls ? { toolCalls } : {}),
+          ...errorDiagnostic(caught),
+        });
+        await emitDiagnostics();
         throw caught;
       }
+      const turnOutcome = actingTurnOutcome(
+        request,
+        result,
+        providerCalls,
+        new Set(input.toolDefinitions.map(definition => definition.name)),
+      );
+      diagnostics.modelRequestOutcomes?.push(turnOutcome);
+      await emitDiagnostics();
       assertModelMessages(result.responseMessages, 'Acting-agent response history');
       exchanges.push({ messages: result.responseMessages, kind: 'tool' });
 
-      if (blockerRejectionThisTurn) {
-        if (completionRecoveryTurns >= maxCompletionRecoveryTurns) {
-          await emitDiagnostics();
-          throw new ActingAgentExecutionError(
-            'COMPLETION_RECOVERY_BUDGET_EXCEEDED',
-            'The model repeatedly reported blockers without matching failed action evidence.',
-            { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
-          );
-        }
-        completionRecoveryTurns += 1;
-      }
+      if (turnOutcome.toolCalls?.length) lastRejectedCompletion = undefined;
 
-      if (acceptedBlocker) {
-        await emitDiagnostics();
-        return {
-          response: acceptedBlocker.response,
-          verification: lastVerification ?? { complete: false, criteria: [], requirements: [], summary: 'Run blocked by a verified tool failure.' },
-          diagnostics: { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
-          blocked: acceptedBlocker,
-        };
-      }
       if (acceptedResponse !== undefined && acceptedVerification !== undefined) {
         await emitDiagnostics();
         return {
@@ -443,19 +485,17 @@ export class AiSdkActingAgent implements ActingAgentProvider {
         };
       }
 
+      if (turnOutcome.outcome === 'no-actionable-output') {
+        await emitDiagnostics();
+        throw new ActingAgentExecutionError(
+          'NO_ACTIONABLE_OUTPUT',
+          'The acting model returned no assistant text or tool call. The runtime stopped instead of repeating the same request without new information.',
+          { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
+        );
+      }
+
       const endedWithText = result.text.trim().length > 0 && result.finishReason !== 'tool-calls';
       if (endedWithText) {
-        if (actionable.length > 0) {
-          exchanges.push({
-            kind: 'conversation',
-            messages: [{
-              role: 'user',
-              content: `The runtime still has executable required work. Call one of the currently available tools: ${actionable.join(', ')}. A final response can be given after those actions are verified.`,
-            }],
-          });
-          await emitDiagnostics();
-          continue;
-        }
         const checked = await verifyResponse(result.text);
         if (checked.ok && checked.data?.complete) {
           await emitDiagnostics();
@@ -465,21 +505,31 @@ export class AiSdkActingAgent implements ActingAgentProvider {
             diagnostics: { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
           };
         }
+        const feedback = checked.error?.message ?? 'The runtime has not verified every requested effect.';
+        const rejectedCompletion = JSON.stringify([result.text.trim(), feedback]);
+        if (rejectedCompletion === lastRejectedCompletion) {
+          await emitDiagnostics();
+          throw new ActingAgentExecutionError(
+            'REPEATED_UNVERIFIED_COMPLETION',
+            'The model repeated the same unverified response after receiving the same missing-effects feedback. The runtime stopped instead of spending another turn without new information.',
+            { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
+          );
+        }
+        lastRejectedCompletion = rejectedCompletion;
         if (completionRecoveryTurns >= maxCompletionRecoveryTurns) {
           await emitDiagnostics();
           throw new ActingAgentExecutionError(
             'COMPLETION_RECOVERY_BUDGET_EXCEEDED',
-            'The model repeatedly proposed a response while compiled requirements remained unsatisfied.',
+            'The model repeatedly proposed a response while requested effects remained unverified.',
             { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
           );
         }
         completionRecoveryTurns += 1;
-        const feedback = checked.error?.message ?? 'The runtime has not verified every mandatory task requirement.';
         exchanges.push({
           kind: 'conversation',
           messages: [{
             role: 'user',
-            content: `Completion cannot be accepted yet:\n${feedback}\n\nCurrent requirement state:\n${input.getRequirementSummary()}\nContinue the task with a useful tool action, or report a blocker through helm.blocked only when a relevant tool failure is recorded.`,
+            content: `The task is not complete yet.\n\nMissing requested effects:\n${feedback}\n\nContinue using the available tools.`,
           }],
         });
       }
@@ -489,7 +539,7 @@ export class AiSdkActingAgent implements ActingAgentProvider {
     await emitDiagnostics();
     throw new ActingAgentExecutionError(
       'MODEL_TURN_BUDGET_EXCEEDED',
-      `The acting model reached its ${maxModelTurns}-turn inference budget before all compiled requirements were verified.`,
+      `The acting model reached its ${maxModelTurns}-turn inference budget before all requested effects were verified.`,
       { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
     );
   }

@@ -56,8 +56,14 @@ export const GuestMethodContracts: Readonly<
   "browser.snapshot": {
     description: "Return a bounded page outline and visible interactive elements with semantic refs.",
   },
+  "browser.query": {
+    description: "Inspect a bounded set of current DOM elements by CSS selector, text, role, or name. Returns revision-bound element refs and observed link refs.",
+  },
+  "browser.evaluate": {
+    description: "Evaluate a JavaScript expression inside the current browser page and return bounded JSON data. It has no guest or host filesystem/process access.",
+  },
   "browser.read": {
-    description: "Read a compact semantic overview or locally ranked page content. Content refs remain internal to the current page revision and can be opened or exported through fs.write.",
+    description: "Read structured semantic content from the current page. Returns durable content refs that may be passed directly to fs.write sourceRef; refs preserve the extracted snapshot across page mutations and navigation.",
   },
   "browser.findPage": {
     description: "Find and rank content on the current page. This is page-local search and does not search the web.",

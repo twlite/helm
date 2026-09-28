@@ -165,6 +165,22 @@ export class GuestRuntime {
           const maxRegions = optionalInteger(params, "maxRegions", { min: 1, max: 100 });
           return maxRegions === undefined ? {} : { maxRegions };
         })());
+      case "browser.query": {
+        const selector = optionalString(params, "selector", { maxLength: 1_000 });
+        const text = optionalString(params, "text", { maxLength: 1_000 });
+        const role = optionalString(params, "role", { maxLength: 100 });
+        const name = optionalString(params, "name", { maxLength: 1_000 });
+        const limit = optionalInteger(params, "limit", { min: 1, max: 100 });
+        return this.browser.query({
+          ...(selector === undefined ? {} : { selector }),
+          ...(text === undefined ? {} : { text }),
+          ...(role === undefined ? {} : { role }),
+          ...(name === undefined ? {} : { name }),
+          ...(limit === undefined ? {} : { limit }),
+        });
+      }
+      case "browser.evaluate":
+        return this.browser.evaluate({ expression: requiredString(params, "expression", { maxLength: 12_000 }) });
       case "browser.read": {
         const mode = enumValue(params, "mode", ["readable", "document"] as const, "readable");
         const query = optionalString(params, "query", { maxLength: 1_000 });

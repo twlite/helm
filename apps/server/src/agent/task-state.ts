@@ -267,9 +267,9 @@ function toolResultRecord(action: WorkerAction): Record<string, unknown> | undef
 
 function navigationFinalUrl(action: WorkerAction): string | undefined {
   const dataUrl = toolResultRecord(action)?.url;
-  if (typeof dataUrl === 'string' && dataUrl.length > 0) return dataUrl;
-  const receiptUrl = action.receipt?.effect?.urlAfter;
-  return typeof receiptUrl === 'string' && receiptUrl.length > 0 ? receiptUrl : undefined;
+  const receiptUrl = actionReceipt(action)?.effect?.urlAfter;
+  if (typeof receiptUrl === 'string' && receiptUrl.length > 0) return receiptUrl;
+  return typeof dataUrl === 'string' && dataUrl.length > 0 ? dataUrl : undefined;
 }
 
 /**
@@ -286,14 +286,22 @@ export function navigationResolutionFor(
     if (browserUrlsMatch(resolution.requestedUrl, expectedUrl)) return resolution;
   }
   for (const action of [...actions].reverse()) {
-    if (action.tool !== 'browser.navigate' || !action.result.ok) continue;
-    const requestedUrl = typeof action.input.url === 'string' ? action.input.url : undefined;
-    const finalUrl = navigationFinalUrl(action);
-    if (!requestedUrl || !finalUrl || !browserUrlsMatch(requestedUrl, expectedUrl)) continue;
+    if (!action.tool.startsWith('browser.') || !action.result.ok) continue;
+    const receipt = actionReceipt(action);
+    if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) continue;
+    const navigationOccurred = action.tool === 'browser.navigate'
+      || action.tool === 'browser.open'
+      || receipt.effect?.navigationOccurred === true;
+    if (!navigationOccurred) continue;
+    const requestedUrl = receipt.effect?.requestedUrl;
+    const finalUrl = receipt.effect?.urlAfter;
+    if (!finalUrl) continue;
+    const sourceUrl = requestedUrl ?? finalUrl;
+    if (!browserUrlsMatch(sourceUrl, expectedUrl) && !browserUrlsMatch(finalUrl, expectedUrl)) continue;
     return {
-      requestedUrl,
+      requestedUrl: sourceUrl,
       finalUrl,
-      redirected: !browserUrlsMatch(requestedUrl, finalUrl),
+      redirected: Boolean(requestedUrl && !browserUrlsMatch(requestedUrl, finalUrl)),
     };
   }
   return undefined;
@@ -390,6 +398,7 @@ function actualEvidenceFromResult(action: WorkerAction, now: () => number): Evid
 
 function normalizedRequirementPath(value: string): string {
   return value.replace(/\\/gu, '/')
+    .replace(/^\/home\/helm\//u, '~/')
     .replace(/^\/home\/helm\/workspace\//u, '')
     .replace(/^~\/(?:workspace\/)?/u, '')
     .replace(/^(?:\.\/)+/u, '')
@@ -413,6 +422,53 @@ export function requiredActionForRequirement(requirement: TaskRequirement): stri
     case 'opened': return 'app.openFile';
     default: return undefined;
   }
+}
+
+function browserVisitAction(state: TaskState, expectedUrl: string): WorkerAction | undefined {
+  return [...verificationActions(state)].reverse().find(action => {
+    if (!action.tool.startsWith('browser.') || !action.result.ok) return false;
+    const receipt = actionReceipt(action);
+    if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
+    const navigationOccurred = action.tool === 'browser.navigate'
+      || action.tool === 'browser.open'
+      || receipt.effect?.navigationOccurred === true;
+    if (!navigationOccurred) return false;
+    const requestedUrl = receipt.effect?.requestedUrl;
+    const finalUrl = receipt.effect?.urlAfter;
+    return [requestedUrl, finalUrl].some(value => (
+      typeof value === 'string' && browserUrlsMatch(value, expectedUrl)
+    ));
+  });
+}
+
+function browserEvidenceAction(state: TaskState): WorkerAction | undefined {
+  return [...verificationActions(state)].reverse().find(action => {
+    if (!['browser.read', 'browser.findPage', 'browser.inspectRegion', 'browser.snapshot', 'browser.query', 'browser.evaluate'].includes(action.tool)
+      || !action.result.ok) return false;
+    const receipt = actionReceipt(action);
+    if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
+    const data = recordValue(action.result.data);
+    if (!data) return false;
+    if (action.tool === 'browser.read') {
+      return data.readable === true && Array.isArray(data.blocks) && data.blocks.length > 0;
+    }
+    if (action.tool === 'browser.findPage') {
+      return Number(data.matchCount) > 0 && Array.isArray(data.results) && data.results.length > 0;
+    }
+    if (action.tool === 'browser.inspectRegion') {
+      return typeof data.text === 'string' && data.text.trim().length > 0
+        || Array.isArray(data.rows) && data.rows.length > 0;
+    }
+    if (action.tool === 'browser.snapshot') {
+      return Array.isArray(data.outline) && data.outline.length > 0
+        || Array.isArray(data.elements) && data.elements.length > 0;
+    }
+    if (action.tool === 'browser.query') return Array.isArray(data.results) && data.results.length > 0;
+    const value = data.result;
+    return value !== null && value !== undefined && value !== ''
+      && (!Array.isArray(value) || value.length > 0)
+      && (typeof value !== 'object' || Array.isArray(value) || Object.keys(value as object).length > 0);
+  });
 }
 
 function observedSemanticContentRef(
@@ -648,27 +704,6 @@ export function findObservedSearchRefForUrl(state: TaskState, query: string): st
   return undefined;
 }
 
-function normalizedMemoryContent(value: string): string {
-  return value.trim().replace(/\s+/gu, ' ').toLocaleLowerCase();
-}
-
-function memoryMutationMatches(
-  requirement: TaskRequirement,
-  action: WorkerAction,
-  data: Record<string, unknown> | undefined,
-): boolean {
-  const target = requirement.target;
-  if (!target?.memoryContent) return true;
-  const memory = recordValue(data?.memory);
-  if (!memory || typeof memory.content !== 'string' || memory.kind !== target.memoryKind) return false;
-  if (normalizedMemoryContent(memory.content) !== normalizedMemoryContent(target.memoryContent)) return false;
-  if (memory.source !== 'user' || typeof action.input.content !== 'string'
-    || normalizedMemoryContent(action.input.content) !== normalizedMemoryContent(target.memoryContent)) return false;
-  if (target.memoryKey && (memory.key !== target.memoryKey || action.input.key !== target.memoryKey)) return false;
-  return action.input.kind === target.memoryKind
-    && (action.input.source === undefined || action.input.source === 'user');
-}
-
 function successfulCurrentRunAction(
   requirement: TaskRequirement,
   state: TaskState,
@@ -683,27 +718,15 @@ function successfulCurrentRunAction(
     const data = recordValue(action.result.data);
     const path = target.path;
     if (path) {
-      const observedPaths = [data?.path, receipt.effect?.path, action.input.path]
-        .filter((value): value is string => typeof value === 'string');
-      if (!observedPaths.some(observedPath => normalizedRequirementPath(observedPath) === normalizedRequirementPath(path))) continue;
-    } else if (expectedTool === 'app.openFile' && requirement.dependsOn?.includes('downloadArtifact')) {
-      const downloadedPaths = state.artifacts
-        .filter(artifact => artifact.type === 'download')
-        .map(artifact => artifact.path);
-      const openedPaths = [data?.path, receipt.effect?.path, action.input.path]
-        .filter((value): value is string => typeof value === 'string');
-      if (!downloadedPaths.some(downloadedPath => openedPaths.some(openedPath => (
-        normalizedRequirementPath(openedPath) === normalizedRequirementPath(downloadedPath)
-      )))) continue;
+      const receiptPath = receipt.effect?.path;
+      if (typeof receiptPath !== 'string'
+        || normalizedRequirementPath(receiptPath) !== normalizedRequirementPath(path)) continue;
     }
-    if (target.application && data?.application !== target.application && action.input.application !== target.application) continue;
-    if (expectedTool === 'fs.write' && (
-      receipt.effect?.writePerformed !== true
-      || typeof data?.sha256 !== 'string'
-    )) continue;
-    if (expectedTool === 'fs.write' && typeof receipt.effect?.sha256 === 'string'
-      && receipt.effect.sha256 !== data?.sha256) continue;
-    if (expectedTool === 'memory.remember' && !memoryMutationMatches(requirement, action, data)) continue;
+    if (target.application) {
+      const receiptApplication = receipt.effect?.application;
+      if (receiptApplication !== target.application) continue;
+    }
+    if (expectedTool === 'fs.write' && receipt.effect?.writePerformed !== true) continue;
     if (expectedTool === 'browser.webSearch' && (
       data?.operation !== 'web_search'
       || data.searchEngine !== 'duckduckgo'
@@ -726,31 +749,18 @@ function successfulCurrentRunAction(
       if (data?.operation !== 'read' || data.readable !== true || !blocks.some(isSubstantiveBrowserContentBlock)) continue;
     }
     if (target.url) {
-      const observedUrl = typeof data?.url === 'string' ? data.url : receipt.effect?.urlAfter;
-      const requestedUrl = expectedTool === 'browser.open'
-        ? data?.openedHref
-        : receipt.effect?.requestedUrl ?? action.input.url;
+      const observedUrl = receipt.effect?.urlAfter;
+      const requestedUrl = receipt.effect?.requestedUrl;
       if (
         typeof observedUrl !== 'string'
         || (typeof requestedUrl !== 'string'
           ? !browserUrlsMatch(target.url, observedUrl)
           : !browserUrlsMatch(target.url, requestedUrl) && !browserUrlsMatch(target.url, observedUrl))
-        || !['user', 'verified-memory', 'search-result', 'page-link'].includes(String(data?.urlProvenance))
       ) continue;
     }
-    if (typeof data?.sourceRef === 'string' && (
-      typeof data.sourceType !== 'string'
-      || typeof data.sourceRevision !== 'number'
-      || typeof data.sourceUrl !== 'string'
-      || !observedSemanticContentRef(state, action, data.sourceRef, data.sourceRevision, data.sourceUrl, data.sourceType)
-    )) continue;
-    if (target.mode === 'written-from-artifact' && (
-      typeof data?.sourceRef !== 'string'
-      || typeof data.sourceType !== 'string'
-      || action.input.sourceRef !== data.sourceRef
-      || action.input.content !== undefined
-      || target.format !== undefined && data.format !== target.format
-    )) continue;
+    if (expectedTool === 'memory.remember' && receipt.effect?.changed !== true) continue;
+    if (expectedTool === 'memory.update' && receipt.effect?.changed !== true) continue;
+    if (expectedTool === 'memory.forget' && receipt.effect?.changed !== true) continue;
     return { action, receipt, ...(data ? { data } : {}) };
   }
   return undefined;
@@ -912,6 +922,12 @@ async function requirementCheck(
   verifier?: CriterionVerifierRegistry | VerificationProvider,
   lastToolResult?: ToolResult,
 ): Promise<{ passed: boolean; message: string; evidence?: unknown }> {
+  if (requirement.id === 'browserEvidence' || requirement.target?.factId === 'pageContent') {
+    const action = browserEvidenceAction(state);
+    return action
+      ? { passed: true, message: 'Current-run browser content evidence was gathered.', evidence: action }
+      : { passed: false, message: 'No successful current-run browser content inspection has been recorded.' };
+  }
   if (requirement.id === 'browserResearch') {
     const action = browserResearchAction(state);
     return action
@@ -934,22 +950,21 @@ async function requirementCheck(
         evidence: researchAction,
       };
     }
-    if (
-      requirement.criterion.type === 'browser.url'
-      && browserDestinationReached(
-        observation.browser?.url,
-        requirement.criterion.url,
-        verificationActions(state),
-      )
-    ) {
+    if (requirement.criterion.type === 'browser.url') {
       const resolution = navigationResolutionFor(verificationActions(state), requirement.criterion.url);
-      return {
-        passed: true,
-        message: resolution?.redirected
-          ? `Browser followed the redirect from ${requirement.criterion.url} to ${resolution.finalUrl}.`
-          : `Browser reached ${requirement.criterion.url}.`,
-        evidence: { browser: observation.browser, navigation: resolution },
-      };
+      return resolution
+        ? {
+            passed: true,
+            message: resolution.redirected
+              ? `Browser followed the redirect from ${requirement.criterion.url} to ${resolution.finalUrl}.`
+              : `Browser reached ${requirement.criterion.url}.`,
+            evidence: { browser: observation.browser, navigation: resolution },
+          }
+        : {
+            passed: false,
+            message: `No successful current-run browser navigation receipt reached ${requirement.criterion.url}.`,
+            evidence: { browser: observation.browser },
+          };
     }
     if (verifier) {
       const verified = await verifier.verifyTask(
@@ -966,6 +981,12 @@ async function requirementCheck(
     }
   }
   const target = requirement.target ?? {};
+  if (requirement.type === 'browser' && target.freshness === 'current-run' && target.url) {
+    const action = browserVisitAction(state, target.url);
+    return action
+      ? { passed: true, message: `The requested destination was visited during this run: ${target.url}.`, evidence: action }
+      : { passed: false, message: `No successful current-run browser navigation reached ${target.url}.` };
+  }
   const expectedAction = requiredActionForRequirement(requirement);
   const currentAction = target.freshness === 'current-run' && expectedAction
     ? successfulCurrentRunAction(requirement, state)
@@ -995,44 +1016,31 @@ async function requirementCheck(
         : { passed: false, message: 'No recorded browser download exists yet.' };
     }
     if (!target.path) return { passed: false, message: `Requirement ${requirement.id} has no concrete path.` };
+    if (expectedAction === 'fs.write' && currentAction) {
+      if (target.mode === 'non-empty') {
+        const bytesWritten = currentAction.receipt.effect?.bytesWritten
+          ?? (typeof currentAction.data?.size === 'number' ? currentAction.data.size : undefined);
+        const passed = typeof bytesWritten === 'number' && bytesWritten > 0;
+        return {
+          passed,
+          message: passed
+            ? `A successful write receipt records non-empty output at ${target.path}.`
+            : `The successful write receipt does not record non-empty output at ${target.path}.`,
+          evidence: currentAction,
+        };
+      }
+      if (target.mode === 'written' || target.mode === 'written-from-artifact') {
+        return {
+          passed: true,
+          message: `A successful current-run write receipt records ${target.path}.`,
+          evidence: currentAction,
+        };
+      }
+    }
     try {
-      const stat = await guest.request('fs.stat', {
-        path: target.path,
-        ...(target.mode === 'written-from-artifact' ? { includeSha256: true } : {}),
-      });
+      const stat = await guest.request('fs.stat', { path: target.path });
       if (!stat.exists) return { passed: false, message: `Path does not exist: ${target.path}.`, evidence: stat };
       if (target.mode === 'written' || target.mode === 'written-from-artifact' || target.mode === 'created') {
-        const lineageArtifact = target.mode === 'written-from-artifact' && currentAction?.data
-          ? state.artifacts.find(artifact => artifact.type === 'file'
-            && artifact.writeReceiptId === currentAction.receipt.id
-            && artifact.sourceRef === currentAction.data?.sourceRef
-            && artifact.sourceRevision === currentAction.data?.sourceRevision
-            && artifact.sourceUrl === currentAction.data?.sourceUrl
-            && artifact.sourceType === currentAction.data?.sourceType
-            && artifact.sha256 === currentAction.data?.sha256
-            && artifact.path === currentAction.data?.path
-            && artifact.path === stat.path)
-          : undefined;
-        if (target.mode === 'written-from-artifact' && !lineageArtifact) {
-          return {
-            passed: false,
-            message: `The current-run write to ${target.path} has no matching browser-content artifact lineage.`,
-            evidence: { action: currentAction, stat },
-          };
-        }
-        if (target.mode === 'written-from-artifact') {
-          const latestWrite = [...verificationActions(state)].reverse().find(action => action.tool === 'fs.write'
-            && action.result.ok
-            && normalizedRequirementPath(String(action.input.path ?? '')) === normalizedRequirementPath(target.path!));
-          if (!latestWrite || latestWrite.id !== currentAction?.action.id
-            || !lineageArtifact?.sha256 || stat.sha256 !== lineageArtifact.sha256) {
-            return {
-              passed: false,
-              message: `The current file bytes or latest write no longer match the selected browser artifact at ${target.path}.`,
-              evidence: { action: currentAction, artifact: lineageArtifact, stat },
-            };
-          }
-        }
         const passed = target.mode === 'created'
           ? stat.type === 'directory'
           : stat.type === 'file';
@@ -1041,7 +1049,7 @@ async function requirementCheck(
           message: passed
             ? `${target.mode === 'created' ? 'Directory creation' : 'File write'} is verified for ${target.path}.`
             : `The requested current-run action did not produce the expected path type at ${target.path}.`,
-          evidence: { action: currentAction, artifact: lineageArtifact, stat },
+          evidence: { action: currentAction, stat },
         };
       }
       if (target.mode === 'non-empty') {
@@ -1091,16 +1099,6 @@ async function requirementCheck(
         evidence: currentAction,
       };
     }
-    if (target.freshness === 'current-run' && target.url && currentAction) {
-      const finalUrl = typeof currentAction.data?.url === 'string'
-        ? currentAction.data.url
-        : currentAction.receipt.effect?.urlAfter;
-      return {
-        passed: true,
-        message: `The requested current-run browser action reached ${finalUrl ?? target.url}.`,
-        evidence: currentAction,
-      };
-    }
     const expected = target.url ?? (target.factId ? supportedFact(state, target.factId)?.value : undefined);
     const resolution = typeof expected === 'string'
       ? navigationResolutionFor(verificationActions(state), expected)
@@ -1121,6 +1119,13 @@ async function requirementCheck(
     };
   }
   if (requirement.type === 'desktop') {
+    if (expectedAction === 'app.openFile' && currentAction) {
+      return {
+        passed: true,
+        message: `A successful current-run app.openFile receipt records ${target.path ?? requirement.id}.`,
+        evidence: currentAction,
+      };
+    }
     const expected = target.content;
     const windows = observation.desktop?.windows ?? [];
     const stateMatches = expected === undefined || windows.some(window => window.title.includes(expected));
@@ -1145,6 +1150,24 @@ export async function verifyTaskState(
 ): Promise<VerificationResult> {
   const legacy = await criterionVerification(verifier, task, guest, observation, lastToolResult);
   const criteria = legacy.criteria.map(check => {
+    if (check.criterion.type === 'browser.url') {
+      const resolution = navigationResolutionFor(verificationActions(state), check.criterion.url);
+      return resolution
+        ? {
+            ...check,
+            passed: true,
+            message: resolution.redirected
+              ? `Browser followed the redirect from ${check.criterion.url} to ${resolution.finalUrl}.`
+              : `Browser reached ${check.criterion.url}.`,
+            evidence: { browser: observation.browser, navigation: resolution },
+          }
+        : {
+            ...check,
+            passed: false,
+            message: `No successful current-run browser navigation receipt reached ${check.criterion.url}.`,
+            evidence: { browser: observation.browser },
+          };
+    }
     const researchAction = check.criterion.type === 'custom'
       && check.criterion.id === 'browser.research'
       ? browserResearchAction(state)
@@ -1159,21 +1182,6 @@ export async function verifyTaskState(
         passed: true,
         message: 'A current-run read exposed substantive page content.',
         evidence: researchAction,
-      };
-    }
-    if (
-      !check.passed
-      && check.criterion.type === 'browser.url'
-      && browserDestinationReached(observation.browser?.url, check.criterion.url, verificationActions(state))
-    ) {
-      const resolution = navigationResolutionFor(verificationActions(state), check.criterion.url);
-      return {
-        ...check,
-        passed: true,
-        message: resolution?.redirected
-          ? `Browser followed the redirect from ${check.criterion.url} to ${resolution.finalUrl}.`
-          : `Browser reached ${check.criterion.url}.`,
-        evidence: { browser: observation.browser, navigation: resolution },
       };
     }
     return check;

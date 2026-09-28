@@ -151,6 +151,7 @@ export interface ActionEffect {
   bytesWritten?: number;
   sha256?: string;
   writePerformed?: boolean;
+  application?: string;
   downloadStarted?: boolean;
   download?: DownloadRecord;
   changed?: boolean;
@@ -435,6 +436,31 @@ export interface RunDiagnostics {
   completionRejections: number;
   contextCompactions: number;
   lastUnsatisfiedRequirements: string[];
+  modelRequestOutcomes?: ModelRequestOutcome[];
+}
+
+export interface ModelRequestOutcome {
+  request: number;
+  kind: 'acting-turn' | 'context-compaction';
+  providerCalls: number;
+  providerRetries: number;
+  outcome:
+    | 'tool-call'
+    | 'assistant-text'
+    | 'assistant-text-and-tool-call'
+    | 'no-actionable-output'
+    | 'provider-error'
+    | 'context-summary-error'
+    | 'context-summary';
+  finishReason?: string;
+  errorName?: string;
+  errorCode?: string;
+  completion?: 'accepted' | 'rejected';
+  toolCalls?: Array<{
+    tool: string;
+    outcome: 'succeeded' | 'failed' | 'schema-validation-failed' | 'rejected-before-execution' | 'no-result';
+    errorCode?: string;
+  }>;
 }
 
 export interface RunStep {
@@ -521,6 +547,8 @@ export type GuestMethod =
   | 'browser.navigate'
   | 'browser.getState'
   | 'browser.snapshot'
+  | 'browser.query'
+  | 'browser.evaluate'
   | 'browser.read'
   | 'browser.findPage'
   | 'browser.webSearch'
@@ -605,6 +633,29 @@ export interface BrowserSnapshot {
     checked?: boolean;
     selected?: boolean;
   }>;
+}
+
+export interface BrowserQueryResult {
+  url: string;
+  title: string;
+  revision: number;
+  results: Array<{
+    ref: string;
+    tag: string;
+    role: string;
+    name?: string;
+    text?: string;
+    attributes: Record<string, string>;
+    navigationRef?: string;
+  }>;
+  truncated: boolean;
+}
+
+export interface BrowserEvaluateResult {
+  url: string;
+  title: string;
+  revision: number;
+  result: JsonValue;
 }
 
 export interface BrowserSearchResult extends BrowserPageRegion {

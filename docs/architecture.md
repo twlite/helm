@@ -1,15 +1,15 @@
 # Helm architecture
 
-Helm is a local computer-use assistant with a single acting model conversation
-and a guarded execution runtime.
+Helm is a local computer-use assistant. The production agent loop keeps the
+acting model in control of action sequencing and keeps execution safety in the
+runtime and individual tools.
 
 ```text
 browser UI -- REST + WebSocket --> Bun server
-                                   |- acting model + native Helm tools
-                                   |- deterministic task compiler + requirement state
+                                   |- acting model + all relevant Helm tools
+                                   |- end-effect compiler and verifier
                                    |- ToolRegistry -> validated guest RPC
-                                   |- action receipts + effect verification
-                                   |- repositories -> better-sqlite3
+                                   |- action receipts + run persistence
                                    `- VmController -> typed guest transport
                                                         | JSON Lines
                                                         v
@@ -21,13 +21,11 @@ browser UI -- REST + WebSocket --> Bun server
 ## Responsibilities
 
 - `packages/shared` owns protocol schemas and persisted conversation/run types.
-- `apps/server/src/ai/acting-agent.ts` owns the AI SDK tool-loop adapter. It
-  passes native function definitions to the configured LM Studio model,
-  budgets the retained conversation, and returns AI SDK tool results to the
-  same conversation.
-- `apps/server/src/agent/runtime.ts` owns cancellation, separate model/action
-  budgets, persistence, action-loop protection, current-run receipts,
-  dependency enforcement, and requirement verification.
+- `apps/server/src/ai/acting-agent.ts` sends native tool definitions to the
+  configured model, keeps one coherent conversation, and returns tool results
+  to that same conversation.
+- `apps/server/src/agent/runtime.ts` owns cancellation, tool and model budgets,
+  persistence, action-loop protection, receipts, and end-effect verification.
 - `apps/server/src/tools` owns Zod input validation, guest calls, and action
   receipt generation.
 - `apps/server/src/memory` owns persistent memory, its native acting-agent
@@ -38,154 +36,133 @@ browser UI -- REST + WebSocket --> Bun server
 - `apps/web` renders persisted and live messages, runs, and activity. It does
   not infer completion from UI state.
 
-Production AI turns compile each request into a `TaskDefinition` before the
-acting model runs. `DeterministicTaskCompiler` derives concrete effects,
-requested paths and URLs, current-run action semantics, and a small dependency
-graph without a planning-model request. It does not generate an action plan or
-artifact content. The complete original request and recent conversation still
-go to the acting model. Production does not use the model-backed planner,
-orchestrator, bounded worker, or a separate response-generation model.
-Scripted compatibility tests and the deterministic demo may still use legacy
-interfaces.
+Production compiles only concrete end effects that can be checked from
+receipts and environment state. It does not compile an action plan or a graph
+of browser/search/read/write/open prerequisites. The original request and
+recent conversation go to the acting model unchanged. The model chooses
+whether tools are needed, which registered tools to call, and in what order.
 
 ## Model and runtime boundary
 
-The model decides what the user means, whether tools are needed, which actions
-to take, how to recover, and what semantic content to create. It may return an
-ordinary answer without invoking a computer tool.
+Production acting turns use native function tools with `toolChoice: "auto"`.
+The runtime supplies the full registered tool set appropriate to the current
+computer-use runtime; it does not narrow that set based on pending
+requirements. A tool call goes through `ToolRegistry`, Zod validation, and the
+existing guest RPC or memory tool. Successful and failed results, including
+receipts, return to the same model context. A tool validates its real
+preconditions. For example, opening a missing file returns `FILE_NOT_FOUND`,
+and the model can respond to that result.
 
-When it calls a tool, the runtime validates the input with the registered
-schema and executes through the existing guest boundary. Actual results,
-including failures and action receipts, return to the same model conversation.
-The runtime does not replace model-generated HTML, documents, reports, or
-other artifacts with content of its own.
+The model owns semantic reasoning, action sequencing, recovery, and semantic
+artifact content. The runtime does not replace model-generated HTML,
+documents, reports, or other artifacts with content assembled from internal
+facts. When the model proposes a final response, the runtime verifies
+explicitly requested end effects such as a current-run write to a particular
+path, a file open in the requested application, a visit to an explicit
+destination, or a memory change. It does not verify the intermediate workflow
+or try to determine semantic correctness of a summary.
 
-Ordinary assistant text is a completion proposal. The runtime checks it using
-the compiled task and current-run `TaskState`: exact action receipts, matching
-paths and URLs, source refs, artifact lineage, and dependencies. Missing
-effects produce concise feedback in the same model conversation. The model
-cannot redefine required effects in its response. A `helm.blocked` report is
-accepted only when a relevant failed action receipt supports the pending
-requirement. This check does not decide what fields belong in an artifact or
-whether the response is semantically complete.
+Successful current-run receipts are the authority for concrete tool effects.
+A requested write needs a successful `fs.write` receipt for the normalized
+path, plus a positive byte count when non-empty output was requested. A
+requested open needs a successful `app.openFile` receipt for the normalized
+path and application; a failed `FILE_NOT_FOUND` result does not pass. An
+explicit destination needs the navigation receipt's requested and final URL,
+including a legitimate redirect. A memory mutation needs its successful
+operation receipt and mutation effect. Page-derived requests also need
+successful browser evidence. A failed effect produces concise missing-effect
+feedback in the same conversation, with the full tool set still available.
+VM isolation, sandboxing, tool schemas, receipts, activity events,
+persistence, cancellation, timeouts, action budgets, model-turn budgets,
+basic repeated-action detection, and context compaction remain in place.
 
-When a task saves page-derived content, its output-file requirement depends on
-a successful readable browser result. A zero-match search is query-local: it
-proves neither that the page is unreadable nor that its content was read.
-Explicit output actions are verified from a successful current-run write
-receipt for the requested path. Existing files cannot satisfy a new write
-action, while `sourceRef` writes preserve source URL, revision, and content
-lineage. Explicit file opens depend on their current-run write and require a
-matching `app.openFile` receipt even if the file or editor window existed
-before the run.
+The older model planner, orchestrator, and worker path remains available to
+legacy tests and demos. Production server runs use the model-led acting-agent
+path.
 
-## Persistence and limits
+## Browser perception and references
 
-`runs.task_json`, `state_json`, and `diagnostics_json` store the compiled
-requirements, current state, and execution counts. `run_steps` stores each
-validated tool invocation, its effective input, the model proposal, result,
-and verification. The activity UI shows effective navigation alongside the
-model-proposed destination. It also displays compact requirement and budget
-state. Live events can be reconciled with durable run status and steps after
-reconnecting.
-
-Tool calls, model steps, consecutive tool errors, repeated no-progress actions,
-timeouts, and cancellation are bounded. Guest tools retain filesystem
-sandboxing, browser automation, desktop operations, and receipt evidence.
-
-## Browser perception
-
-Normal environment observations include only browser URL, title, loading state,
-page count, and DOM revision. They do not request or attach a semantic page
-snapshot. The acting model can request progressive detail when it needs it:
+Normal environment observations include browser URL, title, loading state,
+page count, and DOM revision. The model requests page detail when useful:
 
 ```text
-browser.getState -> browser.snapshot -> browser.read / browser.search -> browser.inspectRegion
+browser.snapshot / browser.read / browser.findPage / browser.query / browser.evaluate
 ```
 
-`browser.snapshot` returns a bounded DOM outline and visible controls with
-legacy `r...` region refs for inspection and interaction. Information
-retrieval uses the semantic extractor: `browser.read` and `browser.search`
-extract and rank the same typed blocks for tables, headings, prose, lists,
-code, forms, navigation, search results, and other useful content. Search
-returns compact typed summaries, including observed hrefs, stable `c...`
-content refs, relevance, match count, and whether semantic content was
-extracted. Local ranking uses field boosts for headings, table headers, form
-labels, titles, snippets, and hrefs.
+`browser.read` and `browser.findPage` use structured semantic extraction for
+tables, headings, prose, lists, code, forms, navigation, search results, and
+other useful content. `browser.findPage` searches the current page only;
+`browser.webSearch` performs DuckDuckGo discovery. The model may refine a
+search by calling `browser.webSearch` again. It may directly navigate to a
+user-provided HTTP or HTTPS destination. Helm does not rewrite navigation
+into a search or prescribe a search/read/open order.
 
-Full extracted blocks live in a guest content registry. A `c...` ref can fetch
-a block or paginate table rows with `browser.read`; navigation or page
-mutations expire refs. `browser.open({ ref })` resolves a destination from a
-current block's observed href inside the guest, so the model does not retype
-URLs. DuckDuckGo redirect parameters are unwrapped locally. `fs.write` accepts
-either normal string content or a content `sourceRef` and serializes the
-selected full block locally as text, Markdown, JSON, or CSV. Tables preserve
-heading ancestry, complete rows, and row/column spans where available. The
-source-ref write result reports source URL, revision, and type with filesystem
-evidence.
+Browser refs have different lifetimes and contracts:
 
-`browser.inspectRegion` reads one selected region as bounded text, local links,
-or structured table columns and rows. Text inspection defaults to 8,000
-characters. Table inspection defaults to 50 rows and supports `offset` and
-`limit` pagination; it reports total and returned row counts and truncation.
-Search and inspection results are persisted in normal tool receipts and shown
-in the run activity feed.
+- **Element refs** identify live DOM elements for interactive operations such
+  as click and type. They are bound to the current DOM revision and can become
+  stale after page changes.
+- **Navigation refs** identify HTTP or HTTPS hrefs that Helm actually
+  observed. They survive unrelated DOM revisions and are resolved by
+  `browser.open`.
+- **Content refs** identify immutable normalized snapshots extracted from a
+  page. The guest retains each block with its source URL, title, source
+  revision, capture time, and serialized size in a bounded in-memory store.
+  Ordinary DOM mutations and later navigation do not invalidate these
+  snapshots. They expire through bounded-store eviction or a browser-session
+  reset, not through page revision checks.
 
-Region and interactive refs encode the current DOM revision. Navigation and
-observed DOM changes invalidate earlier refs; the guest rejects expired refs
-instead of acting on a control from an older page state. Reads settle on
-bounded DOM readiness and content stability, inspect accessible frames and
-open shadow roots, and combine semantic DOM, table/grid, optional local
-Readability, and ARIA fallback signals. Raw HTML and the complete DOM stay out
-of model context.
+`browser.read` returns compact summaries with content refs. The model may use a
+content ref directly in `fs.write({ sourceRef, format })`; another
+`browser.read({ ref })` is not needed just to select it. The model can use
+`browser.read({ ref, offset, limit })` for deeper inspection or pagination.
+`fs.write` serializes the stored snapshot locally as text, Markdown, JSON, or
+CSV, and it also accepts model-authored content.
 
-Navigation policy records whether a destination came from the user,
-verified-memory, a DuckDuckGo result, a page link, or a navigation result. A
-model-proposed URL without that provenance starts a DuckDuckGo search using
-the current request; the runtime does not turn site or organization names into
-guessed routes. Once a search result or page link has a semantic ref, opening
-it should use `browser.open({ ref })`. Exact relevant verified-memory URLs are
-allowed directly and are removed from the temporary capability if they fail
-or redirect unexpectedly.
+Semantic table row counts describe the rows extracted from the current page
+DOM, which may be only the rows rendered so far. The model can use bounded
+`browser.query` or page-context `browser.evaluate` to inspect additional
+rendered or dynamically loaded rows without receiving unlimited HTML.
 
-## Model context management
+When semantic extraction is insufficient, `browser.query` inspects a bounded
+set of DOM elements by CSS selector, text, role, or accessible name. It
+returns compact tag, role, text, and attribute data, along with live element
+refs and observed-link navigation refs. `browser.evaluate` runs a JavaScript
+expression only in the current page context. It has a bounded timeout and
+JSON response size, accepts JSON-serializable results, and receives no guest
+filesystem, process, environment, or host APIs. Neither tool returns unlimited
+HTML.
 
-The acting agent estimates input use from its instructions, registered tool
-definitions, and serialized retained messages. The current estimate is roughly
-one token per four characters plus 12% overhead; it is an estimate, not a
-provider tokenizer. The configured context window is in `config/models.json` or
-can be overridden with `HELM_LLM_CONTEXT_WINDOW_TOKENS`. The model config also
-sets compaction and critical-pressure ratios and how many recent exchanges to
-keep raw.
+## Receipts, persistence, and budgets
 
-Before context estimation, the context manager bounds tool results to 24,000
-characters, caps oversized strings and arrays, and preserves useful structure
-such as table columns, row counts, and truncation state. This is a final safety
-net after browser-specific retrieval limits.
+Each actual tool call records its input, result, timestamps, and receipt.
+Filesystem, browser, application, desktop, and memory effects remain visible
+to run-state verification and activity events. `runs.task_json`, `state_json`,
+and `diagnostics_json` retain compiled effects, run state, and execution
+counts. Per-model-request outcomes include whether the model returned text,
+called tools, proposed a rejected completion, failed tool validation, hit a
+pre-execution rejection, or returned no actionable output, along with provider
+call and retry counts. The acting loop stops on empty output instead of
+silently spending more turns with the same context. `run_steps` retains the
+model proposal, effective tool input, result, and verification. UI state is
+not completion evidence.
 
-At the configured pressure threshold, Helm first prunes duplicate browser
-observations and snapshots/search results from older DOM revisions. At higher
-pressure it keeps the current request, recent raw exchanges, and current
-operational state, then replaces older exchanges with a structured continuity
-summary. A structured model call is made only at that boundary, not after each
-tool result. The summary can retain findings and completed work only when they
-cite receipt IDs already present in tool evidence. Artifacts and the latest
-browser/desktop state are reconstructed from observed results. Summary text is
-never promoted to a receipt or trusted evidence, and stale DOM refs are removed
-from compacted context.
+Tool calls, model turns, repeated no-progress actions, operation timeouts, and
+cancellation are bounded. Run activity exposes progress and context usage
+without replacing actual tool results. Context compaction preserves the
+current user request, recent tool conversation, actual receipts and artifacts,
+and environment state. A generated context summary is working context, never
+new evidence. The acting agent's persistent memory tools remain part of the
+same native tool set.
 
-`run.context.usage` reports estimates to the activity UI. A completed
-compaction is persisted with its pressure reason, before/after estimates,
-pruning counts, kept raw exchanges, and preserved/removed state. This is
-run-local continuity. Persistent memory is retrieved separately as a hint for
-future runs and is not treated as proof that an external fact remains current.
+## Browser execution
 
-## Persistent memory
-
-Persistent memory has an independent lifecycle from message history and
-run-local context compaction. The acting agent can search, remember, update, and
-forget memories through validated host tools in the same native tool loop.
-Observed memories retain source URLs and successful action receipt IDs. Memory
-retrieval combines full-text and optional vector results; the detailed lifecycle,
-ranking, provenance, UI, and migration behavior is documented in
-[`memory.md`](./memory.md).
+The guest uses Playwright inside the isolated VM. Semantic extraction keeps
+page content compact, while `browser.query` and `browser.evaluate` provide
+bounded inspection fallbacks. Raw DOM element refs remain live, revision-bound
+handles. Navigation refs preserve exact observed hrefs. Content refs preserve
+copied extracted data independently of the live page. `app.openFile` checks
+the real sandbox filesystem before application side effects and returns
+`FILE_NOT_FOUND` when the file is missing. It starts the selected application
+with an existing file when needed. `app.launch` is for explicit application
+launches without a file, not a preparation step for `app.openFile`.
