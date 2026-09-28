@@ -1,6 +1,6 @@
 import { generateText, isStepCount, modelMessageSchema, Output, tool, ToolLoopAgent, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
-import type { Message, ModelRequestOutcome, RunDiagnostics, ToolResult, VerificationResult } from '@helm/shared';
+import type { JsonValue, Message, ModelRequestOutcome, RunDiagnostics, ToolResult, VerificationResult } from '@helm/shared';
 
 import type { ActingAgentContext, ActingAgentProvider, ActingAgentResult } from '../agent/types';
 import type { ToolDefinition } from '../tools/registry';
@@ -19,8 +19,8 @@ const BASE_INSTRUCTIONS = [
   'You decide the sequence of actions. Use actual tool results. If a tool fails, inspect the error and recover.',
   'Do not claim that an external action succeeded unless a tool returned success.',
   'A URL included as data for an artifact is not automatically a browser destination.',
-  'Prefer semantic browser tools for page reading because they are compact. Check reported table row counts; use browser.query or browser.evaluate to inspect rendered or dynamically loaded data when semantic extraction seems incomplete.',
-  'For page-derived raw data, pass the returned durable content ref directly to fs.write sourceRef; another browser.read of that ref is unnecessary. For a summary or other transformation, write your model-authored result with fs.write content.',
+  'Prefer semantic browser tools for page reading because they are compact. browser.read query is natural-language content relevance text, never a CSS selector; use browser.query for DOM/CSS inspection. Check table counts and row counts, use blockTypes to select a structured block class such as table when appropriate, and use mode document when several relevant blocks should be exported together.',
+  'For page-derived raw data, pass a returned durable block ref or documentRef directly to fs.write sourceRef; no additional browser.read is needed. For a summary or other transformation, write your model-authored result with fs.write content.',
   'Use app.launch only when the user asks to start an application without a file. Use app.openFile for an existing file; it checks the file and launches the selected application if needed.',
   'Finish with a normal concise assistant response only after the user\'s requested task is complete.',
 ].join(' ');
@@ -29,6 +29,92 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+function parseDiagnosticInput(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value) as unknown; } catch { return value; }
+}
+
+function boundedDiagnosticInput(
+  value: unknown,
+  key = '',
+  depth = 0,
+  budget = { nodes: 120, chars: 4_000 },
+): JsonValue | undefined {
+  if (budget.nodes <= 0) return '[additional input omitted]';
+  budget.nodes -= 1;
+  if (depth > 5) return '[nested input omitted]';
+  if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    if (/password|secret|cookie|authorization|api[_-]?key|credential|base64/iu.test(key)) return '[redacted]';
+    const limit = Math.min(budget.chars, /content|text|body|data/iu.test(key) ? 240 : 600);
+    budget.chars -= Math.min(value.length, limit);
+    return value.length > limit ? `${value.slice(0, limit)}… [${value.length} characters]` : value;
+  }
+  if (Array.isArray(value)) {
+    const output: JsonValue[] = [];
+    for (const item of value.slice(0, 16)) {
+      if (budget.nodes <= 0 || budget.chars <= 0) {
+        output.push('[additional input omitted]');
+        break;
+      }
+      output.push(boundedDiagnosticInput(item, key, depth + 1, budget) ?? null);
+    }
+    return output;
+  }
+  const source = record(value);
+  if (!source) return undefined;
+  const output: Record<string, JsonValue> = {};
+  for (const [childKey, child] of Object.entries(source).slice(0, 24)) {
+    if (budget.nodes <= 0 || budget.chars <= 0) {
+      output._omitted = true;
+      break;
+    }
+    const safe = boundedDiagnosticInput(child, childKey.slice(0, 80), depth + 1, budget);
+    if (safe !== undefined) output[childKey.slice(0, 80)] = safe;
+  }
+  if (Object.keys(source).length > 24) output._omittedKeys = Object.keys(source).length - 24;
+  return output;
+}
+
+function toolCallInput(call: unknown): JsonValue | undefined {
+  const value = record(call);
+  const raw = value?.input ?? value?.args ?? value?.rawInput;
+  return boundedDiagnosticInput(parseDiagnosticInput(raw));
+}
+
+function validationIssues(value: unknown): NonNullable<NonNullable<ModelRequestOutcome['toolCalls']>[number]['validationIssues']> | undefined {
+  const candidate = Array.isArray(value) ? value : record(value)?.issues;
+  if (!Array.isArray(candidate)) return undefined;
+  const issues = candidate.slice(0, 8).flatMap(item => {
+    const issue = record(item);
+    if (!issue) return [];
+    const path = Array.isArray(issue.path)
+      ? issue.path.slice(0, 8).filter((part): part is string | number => typeof part === 'string' || typeof part === 'number')
+      : [];
+    const code = typeof issue.code === 'string' ? issue.code.slice(0, 80) : 'invalid_input';
+    const message = typeof issue.message === 'string' ? issue.message.slice(0, 400) : 'Input did not match the tool schema.';
+    return [{ path, code, message }];
+  });
+  return issues.length > 0 ? issues : undefined;
+}
+
+function issuesFromFailure(value: unknown): NonNullable<NonNullable<ModelRequestOutcome['toolCalls']>[number]['validationIssues']> | undefined {
+  const pending: unknown[] = [value];
+  const visited = new Set<object>();
+  while (pending.length > 0 && visited.size < 6) {
+    const error = record(pending.shift());
+    if (!error || visited.has(error)) continue;
+    visited.add(error);
+    const issues = validationIssues(error.issues ?? error.validationIssues ?? error.details);
+    if (issues) return issues;
+    for (const key of ['cause', 'validationError']) {
+      const nested = error[key];
+      if (nested && typeof nested === 'object') pending.push(nested);
+    }
+  }
+  return undefined;
 }
 
 function errorDiagnostic(caught: unknown): Pick<ModelRequestOutcome, 'errorName' | 'errorCode'> {
@@ -52,7 +138,16 @@ function diagnosticToolCalls(
         continue;
       }
       if (call.dynamic === true && call.invalid === true) {
-        calls.push({ tool: call.toolName, outcome: 'schema-validation-failed' });
+        const failedPart = step.content.find(part => part.type === 'tool-error' && part.toolCallId === call.toolCallId);
+        const failure = record(call)?.error ?? record(record(failedPart)?.error);
+        const issues = issuesFromFailure(failure);
+        calls.push({
+          tool: call.toolName,
+          outcome: 'schema-validation-failed',
+          errorCode: 'INVALID_INPUT',
+          ...(toolCallInput(call) ? { input: toolCallInput(call) } : {}),
+          ...(issues ? { validationIssues: issues } : {}),
+        });
         continue;
       }
       const toolResult = step.toolResults.find(item => item.toolCallId === call.toolCallId);
@@ -60,7 +155,14 @@ function diagnosticToolCalls(
       const error = record(output?.error);
       const errorCode = typeof error?.code === 'string' ? error.code : undefined;
       if (errorCode === 'INVALID_INPUT') {
-        calls.push({ tool: call.toolName, outcome: 'schema-validation-failed', errorCode });
+        const issues = validationIssues(error?.details);
+        calls.push({
+          tool: call.toolName,
+          outcome: 'schema-validation-failed',
+          errorCode,
+          ...(toolCallInput(call) ? { input: toolCallInput(call) } : {}),
+          ...(issues ? { validationIssues: issues } : {}),
+        });
       } else if (errorCode === 'ACTION_BUDGET_EXCEEDED' || errorCode === 'REPEATED_ACTION' || errorCode === 'UNKNOWN_TOOL') {
         calls.push({ tool: call.toolName, outcome: 'rejected-before-execution', errorCode });
       } else if (output && typeof output.ok === 'boolean') {
@@ -79,6 +181,8 @@ function diagnosticToolCalls(
             tool: call.toolName,
             outcome: name.includes('InvalidToolInput') ? 'schema-validation-failed' : 'failed',
             ...(typeof failure?.code === 'string' ? { errorCode: failure.code } : {}),
+            ...(name.includes('InvalidToolInput') && toolCallInput(call) ? { input: toolCallInput(call) } : {}),
+            ...(name.includes('InvalidToolInput') && issuesFromFailure(failure) ? { validationIssues: issuesFromFailure(failure) } : {}),
           });
         }
       } else {
@@ -201,6 +305,8 @@ const DEFAULT_CONTEXT_BUDGET: ContextBudgetOptions = {
   contextCriticalRecentExchanges: 2,
 };
 
+const MAX_FINALIZATION_TURNS = 2;
+
 function flattenExchanges(exchanges: readonly ContextExchange[]): ModelMessage[] {
   return exchanges.flatMap(exchange => exchange.messages);
 }
@@ -284,6 +390,7 @@ export class AiSdkActingAgent implements ActingAgentProvider {
     let acceptedResponse: string | undefined;
     let acceptedVerification: ActingAgentResult['verification'] | undefined;
     let lastVerification: VerificationResult | undefined;
+    let lastRejectedResponse: string | undefined;
     let completionRecoveryTurns = 0;
     let lastRejectedCompletion: string | undefined;
     let compactionCount = 0;
@@ -296,6 +403,7 @@ export class AiSdkActingAgent implements ActingAgentProvider {
       completionAttempts: 0,
       completionRejections: 0,
       contextCompactions: 0,
+      finalizationTurns: 0,
       lastUnsatisfiedRequirements: [],
       modelRequestOutcomes: [],
     };
@@ -404,7 +512,8 @@ export class AiSdkActingAgent implements ActingAgentProvider {
         diagnostics.completionRejections += 1;
       }
       const latestOutcome = diagnostics.modelRequestOutcomes?.at(-1);
-      if (latestOutcome?.kind === 'acting-turn' && latestOutcome.request === diagnostics.modelRequests) {
+      if ((latestOutcome?.kind === 'acting-turn' || latestOutcome?.kind === 'finalization')
+        && latestOutcome.request === diagnostics.modelRequests) {
         latestOutcome.completion = checked.ok && checked.data?.complete ? 'accepted' : 'rejected';
       }
       await emitDiagnostics();
@@ -415,6 +524,120 @@ export class AiSdkActingAgent implements ActingAgentProvider {
     const toolContext = toolDefinitionsDescription(input.toolDefinitions);
     const maxModelTurns = Math.max(1, Math.trunc(input.maxModelTurns));
     const maxCompletionRecoveryTurns = Math.max(0, Math.trunc(input.maxCompletionRecoveryTurns));
+
+    const effectsAreVerified = (): boolean => {
+      const current = input.getCurrentVerification?.();
+      if (current) return current.complete;
+      const requirementSummary = input.getRequirementSummary();
+      if (requirementSummary.trim()) {
+        return !requirementSummary.split('\n').some(line => /\[(?:pending|blocked)\]/u.test(line));
+      }
+      return lastVerification?.complete ?? true;
+    };
+
+    const acceptedResult = (): ActingAgentResult => ({
+      response: acceptedResponse!,
+      verification: acceptedVerification!,
+      diagnostics: { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
+    });
+
+    const finalize = async (): Promise<ActingAgentResult> => {
+      if (effectsAreVerified() && lastRejectedResponse) {
+        const checked = await verifyResponse(lastRejectedResponse);
+        if (checked.ok && checked.data?.complete && acceptedResponse && acceptedVerification) return acceptedResult();
+      }
+      if (!effectsAreVerified()) {
+        throw new ActingAgentExecutionError(
+          'FINALIZATION_VERIFICATION_FAILED',
+          'Finalization was skipped because deterministic verification no longer reports the requested effects as complete.',
+          { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
+        );
+      }
+
+      exchanges.push({
+        kind: 'conversation',
+        messages: [{
+          role: 'user',
+          content: [
+            'The runtime has verified that the requested effects are complete.',
+            'Provide a concise, natural final response to the user. Do not call tools or suggest more actions.',
+            `Verification: ${JSON.stringify(input.getCurrentVerification?.() ?? lastVerification ?? { complete: true })}`,
+          ].join('\n'),
+        }],
+      });
+      const finalInstructions = `${instructions} All requested external effects have already been verified. This is a response-only finalization turn; do not claim anything beyond the conversation and verification evidence.`;
+
+      for (let finalizationIndex = 0; finalizationIndex < MAX_FINALIZATION_TURNS; finalizationIndex += 1) {
+        if (input.signal?.aborted) throw input.signal.reason ?? new Error('Agent run cancelled');
+        if (finalizationIndex > 0) {
+          exchanges.push({
+            kind: 'conversation',
+            messages: [{ role: 'user', content: 'Return a non-empty concise final response for the completed task.' }],
+          });
+        }
+        const messages = await prepare(finalInstructions, 'No tools are available during finalization.');
+        let providerCalls = 0;
+        diagnostics.finalizationTurns = (diagnostics.finalizationTurns ?? 0) + 1;
+        diagnostics.modelRequests += 1;
+        const request = diagnostics.modelRequests;
+        await emitDiagnostics();
+        try {
+          const result = await generateText({
+            model: this.options.model,
+            system: finalInstructions,
+            messages,
+            maxOutputTokens: this.options.maxOutputTokens,
+            temperature: this.options.temperature,
+            timeout: this.options.requestTimeoutMs,
+            maxRetries: 0,
+            abortSignal: input.signal,
+            onLanguageModelCallStart: () => { providerCalls += 1; },
+          });
+          diagnostics.modelRequestOutcomes?.push({
+            request,
+            kind: 'finalization',
+            providerCalls,
+            providerRetries: Math.max(0, providerCalls - 1),
+            outcome: result.text.trim() ? 'final-response' : 'finalization-error',
+            finishReason: result.finishReason,
+            ...(!result.text.trim() ? { errorCode: 'EMPTY_RESPONSE' } : {}),
+          });
+          if (result.response.messages.length > 0) {
+            exchanges.push({ messages: result.response.messages, kind: 'conversation' });
+          }
+          await emitDiagnostics();
+          const response = result.text.trim();
+          if (!response) continue;
+          const checked = await verifyResponse(response);
+          if (checked.ok && checked.data?.complete && acceptedResponse && acceptedVerification) return acceptedResult();
+          if (!effectsAreVerified()) {
+            throw new ActingAgentExecutionError(
+              'FINALIZATION_VERIFICATION_FAILED',
+              'The requested effects became incomplete while finalizing the response.',
+              { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
+            );
+          }
+        } catch (caught) {
+          if (caught instanceof ActingAgentExecutionError) throw caught;
+          diagnostics.modelRequestOutcomes?.push({
+            request,
+            kind: 'finalization',
+            providerCalls,
+            providerRetries: Math.max(0, providerCalls - 1),
+            outcome: 'finalization-error',
+            ...errorDiagnostic(caught),
+          });
+          await emitDiagnostics();
+        }
+      }
+
+      await emitDiagnostics();
+      throw new ActingAgentExecutionError(
+        'FINALIZATION_FAILED',
+        'The requested effects are verified, but the acting model did not produce a valid final response within the bounded finalization budget.',
+        { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
+      );
+    };
 
     while (diagnostics.modelTurns < maxModelTurns) {
       if (input.signal?.aborted) throw input.signal.reason ?? new Error('Agent run cancelled');
@@ -505,6 +728,8 @@ export class AiSdkActingAgent implements ActingAgentProvider {
             diagnostics: { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
           };
         }
+        lastRejectedResponse = result.text.trim();
+        if (effectsAreVerified()) return finalize();
         const feedback = checked.error?.message ?? 'The runtime has not verified every requested effect.';
         const rejectedCompletion = JSON.stringify([result.text.trim(), feedback]);
         if (rejectedCompletion === lastRejectedCompletion) {
@@ -533,13 +758,32 @@ export class AiSdkActingAgent implements ActingAgentProvider {
           }],
         });
       }
+
+      if (Boolean(turnOutcome.toolCalls?.length) && effectsAreVerified()) {
+        // Some providers return assistant text alongside the final tool call.
+        // Let the normal verifier accept that text before spending a separate
+        // response-only model request.
+        if (result.text.trim()) {
+          const checked = await verifyResponse(result.text);
+          if (checked.ok && checked.data?.complete && acceptedResponse && acceptedVerification) {
+            return acceptedResult();
+          }
+        }
+        await emitDiagnostics();
+        return finalize();
+      }
       await emitDiagnostics();
     }
 
+    if (effectsAreVerified()) return finalize();
+
     await emitDiagnostics();
+    const unsatisfied = diagnostics.lastUnsatisfiedRequirements.length > 0
+      ? 'before all requested effects were verified.'
+      : 'before deterministic verification was complete.';
     throw new ActingAgentExecutionError(
       'MODEL_TURN_BUDGET_EXCEEDED',
-      `The acting model reached its ${maxModelTurns}-turn inference budget before all requested effects were verified.`,
+      `The acting model reached its ${maxModelTurns}-turn action/recovery budget ${unsatisfied}`,
       { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
     );
   }

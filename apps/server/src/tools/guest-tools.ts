@@ -12,7 +12,7 @@ import { ToolRegistry, type ToolRegistryOptions } from './tool-registry';
 const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'guest.handshake': 'Check the loaded guest build identity, protocol contract, server process ID, and capabilities.',
   'fs.read': 'Read a UTF-8 file inside the allowed guest filesystem root.',
-  'fs.write': 'Write model-authored UTF-8 content inside the guest filesystem root with content, or serialize an extracted browser content snapshot directly by passing its durable content ref as sourceRef and choosing a format. No additional browser.read of that ref is required.',
+  'fs.write': 'Write UTF-8 text inside the guest filesystem root. Use {path, content} for model-authored text. Use {path, sourceRef, format?} to serialize a durable browser.read block ref or documentRef; format selects text, markdown, json, or csv and applies only to sourceRef. No extra browser.read is needed before writing a returned ref.',
   'fs.mkdir': 'Create a directory inside the allowed guest filesystem root.',
   'fs.exists': 'Check whether a guest filesystem path exists.',
   'fs.list': 'List immediate entries inside an allowed guest directory.',
@@ -20,7 +20,7 @@ const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'browser.navigate': 'Navigate the visible guest browser to a valid HTTP or HTTPS URL. User-provided URLs may be opened directly.',
   'browser.getState': 'Read the visible browser URL, title, loading state, page count, and current DOM revision without reading page text.',
   'browser.snapshot': 'Return a bounded semantic outline of the current page and its visible interactive elements.',
-  'browser.read': 'Read structured semantic content currently rendered on the page. Results include durable content refs that may be passed directly to fs.write sourceRef; they preserve the extracted snapshot across page mutations and navigation. The rowCount reports rows extracted now; if a dynamic table appears incomplete, inspect the current page with browser.query or browser.evaluate. Use offset and limit with a content ref to inspect more extracted rows or list items.',
+  'browser.read': 'Read bounded structured semantic content from the current page. query is natural-language content relevance text, not a CSS selector; use browser.query for DOM/CSS inspection. A query returns matching content and may return no blocks when nothing matches. Use mode readable for compact ranked blocks or mode document for a broader DOM-ordered selection; use blockTypes (for example table) to select a structured block class. Page reads accept maxBlocks/maxChars; ref reads accept offset/limit/maxChars for pagination. Results include durable block refs and, when multiple blocks are selected, a documentRef that fs.write can serialize losslessly with sourceRef.',
   'browser.query': 'Inspect a bounded set of current DOM elements by CSS selector, text, role, or name. Returns compact metadata and revision-bound element refs; observed links include navigation refs. Use it to inspect rendered rows or controls when semantic extraction is incomplete.',
   'browser.evaluate': 'Evaluate a JavaScript expression inside the current browser page and return JSON-serializable data (maximum 64 KB; bounded by the browser operation timeout). It runs only in page context and has no guest or host filesystem, process, environment, or host API access.',
   'browser.findPage': 'Find and rank content on the current page. This is page-local search and does not search the web; results include typed current-page refs.',

@@ -1,11 +1,11 @@
 import { GuestRpcError } from "./errors";
 import type { GuestSandbox } from "./sandbox";
-import { normalizeBrowserUrl } from "../../../packages/shared/src/browser-url";
-import { buildDuckDuckGoSearchUrl } from "../../../packages/shared/src/browser-url";
+import { browserUrlsMatch, buildDuckDuckGoSearchUrl, normalizeBrowserUrl } from "../../../packages/shared/src/browser-url";
 import { deriveBrowserReadQuery, rankBrowserContentBlocks } from "../../../packages/shared/src/browser-perception";
 import type {
   BrowserContentBlock,
   BrowserContentFormat,
+  BrowserContentSourceType,
   BrowserContentSummary,
   BrowserEvaluateResult,
   BrowserOpenResult,
@@ -13,6 +13,7 @@ import type {
   BrowserPageRegion,
   BrowserReadMode,
   BrowserReadResult,
+  BrowserStructuredBlockSummary,
   BrowserRegionInspection,
   BrowserRegionKind,
   BrowserPageSearchResult,
@@ -22,6 +23,7 @@ import type {
   JsonValue,
 } from "../../../packages/shared/src/types";
 import { Readability } from "@mozilla/readability";
+import { createHash } from "node:crypto";
 import { extractAccessibleCandidate, extractSemanticBrowserBlocks } from "./semantic-extraction";
 
 type WaitUntil = "commit" | "domcontentloaded" | "load" | "networkidle";
@@ -131,6 +133,7 @@ export interface BrowserState {
   loading: boolean;
   pageCount: number;
   revision: number;
+  navigationRecovery?: { originalError: string };
 }
 
 export type BrowserSnapshot = SharedBrowserSnapshot;
@@ -430,12 +433,26 @@ interface IndexedSemanticContent {
 }
 
 interface SerializableContentReference {
+  kind: "block";
   block: BrowserContentBlock;
   revision: number;
   url: string;
   title: string;
   pageType: BrowserPageType;
   capturedAt: string;
+  size: number;
+}
+
+interface SerializableDocumentReference {
+  kind: "document";
+  blocks: BrowserContentBlock[];
+  sourceRefs: string[];
+  revision: number;
+  url: string;
+  title: string;
+  pageType: BrowserPageType;
+  capturedAt: string;
+  sourceTruncated: boolean;
   size: number;
 }
 
@@ -580,8 +597,96 @@ function blockText(block: BrowserContentBlock): string {
   return block.text ?? "";
 }
 
+function semanticContentFingerprint(block: BrowserContentBlock): string {
+  const hash = createHash("sha256");
+  const add = (label: string, value: string, normalize = true): void => {
+    const stable = normalize ? value.replace(/\s+/gu, " ").trim() : value;
+    hash.update(`${label.length}:${label}:${stable.length}:`);
+    hash.update(stable);
+    hash.update(";");
+  };
+  const addStrings = (label: string, values: readonly string[] | undefined): void => {
+    hash.update(`${label}:${values?.length ?? 0};`);
+    for (const value of values ?? []) add(`${label}-item`, value);
+  };
+
+  add("type", block.type, false);
+  addStrings("heading-path", block.headingPath);
+  add("heading", block.heading ?? "");
+  switch (block.type) {
+    case "table":
+      add("caption", block.caption ?? "");
+      addStrings("columns", block.columns);
+      hash.update(`row-count:${block.rowCount ?? block.rows?.length ?? 0};column-count:${block.columnCount ?? block.columns?.length ?? 0};truncated:${block.truncated ?? false};`);
+      hash.update(`rows:${block.rows?.length ?? 0};`);
+      for (const row of block.rows ?? []) addStrings("row", row);
+      hash.update(`spans:${block.cellSpans?.length ?? 0};`);
+      for (const row of block.cellSpans ?? []) {
+        hash.update(`span-row:${row.length};`);
+        for (const span of row) hash.update(`${span.rowspan}x${span.colspan};`);
+      }
+      break;
+    case "list":
+      add("ordered", String(block.ordered ?? false), false);
+      hash.update(`row-count:${block.rowCount ?? block.items?.length ?? 0};truncated:${block.truncated ?? false};`);
+      addStrings("items", block.items);
+      break;
+    case "definition":
+      hash.update(`definition-count:${block.definitions?.length ?? 0};truncated:${block.truncated ?? false};`);
+      hash.update(`definitions:${block.definitions?.length ?? 0};`);
+      for (const definition of block.definitions ?? []) {
+        add("term", definition.term);
+        add("definition", definition.definition);
+      }
+      break;
+    case "form":
+      hash.update(`field-count:${block.fields?.length ?? 0};truncated:${block.truncated ?? false};`);
+      hash.update(`fields:${block.fields?.length ?? 0};`);
+      for (const field of block.fields ?? []) {
+        add("field-label", field.label);
+        add("field-type", field.type ?? "");
+        add("field-value", field.value ?? "");
+        add("field-required", String(field.required ?? false), false);
+      }
+      break;
+    case "search_result":
+      add("title", block.title ?? "");
+      add("href", block.href ?? "", false);
+      add("snippet", block.snippet ?? "");
+      break;
+    case "navigation":
+      add("role", block.role ?? "", false);
+      add("text", block.text ?? "");
+      hash.update(`links:${block.links?.length ?? 0};`);
+      for (const link of block.links ?? []) {
+        add("link-text", link.text);
+        add("link-href", link.href, false);
+      }
+      break;
+    case "heading":
+      add("text", block.text ?? "");
+      add("role", block.role ?? "", false);
+      break;
+    case "text":
+    case "other":
+      add("text", block.text ?? "");
+      add("title", block.title ?? "");
+      add("snippet", block.snippet ?? "");
+      add("language", block.language ?? "", false);
+      break;
+    case "code":
+      add("text", block.text ?? "", false);
+      add("title", block.title ?? "");
+      add("snippet", block.snippet ?? "");
+      add("language", block.language ?? "", false);
+      break;
+  }
+  return hash.digest("hex");
+}
+
 function serializeBrowserContentBlock(block: BrowserContentBlock, format: BrowserContentFormat): string {
   if (format === "json") return `${JSON.stringify({
+    ref: block.ref,
     type: block.type,
     heading: block.heading,
     headingPath: block.headingPath,
@@ -627,6 +732,39 @@ function serializeBrowserContentBlock(block: BrowserContentBlock, format: Browse
   return `${heading ? `${heading}\n\n` : ""}${blockText(block)}\n`;
 }
 
+function serializeBrowserDocumentReference(
+  document: SerializableDocumentReference,
+  format: BrowserContentFormat,
+): string {
+  if (format === "json") {
+    return `${JSON.stringify({
+      type: "document",
+      sourceUrl: document.url,
+      sourceTitle: document.title,
+      capturedAt: document.capturedAt,
+      sourceRevision: document.revision,
+      sourceRefs: document.sourceRefs,
+      sourceTruncated: document.sourceTruncated,
+      blocks: document.blocks.map(block => JSON.parse(serializeBrowserContentBlock(block, "json")) as unknown),
+    }, null, 2)}\n`;
+  }
+  if (format === "csv") {
+    const tables = document.blocks.filter(block => block.type === "table");
+    if (document.blocks.length !== 1 || tables.length !== 1) {
+      throw new GuestRpcError(
+        "UNSUPPORTED_CONTENT_FORMAT",
+        `CSV export requires a single table block with no other blocks; this snapshot contains ${document.blocks.length} blocks and ${tables.length} tables. Use text, markdown, or json for a composite document.`,
+        { httpStatus: 400 },
+      );
+    }
+    return serializeBrowserContentBlock(tables[0]!, "csv");
+  }
+  return document.blocks
+    .map(block => serializeBrowserContentBlock(block, format).trimEnd())
+    .filter(Boolean)
+    .join("\n\n") + "\n";
+}
+
 export class BrowserController {
   private readonly contentSessionId = createContentSessionId();
   private context: PlaywrightContext | undefined;
@@ -639,9 +777,13 @@ export class BrowserController {
   private lastNavigationHttpStatus: number | undefined;
   private webSearchReferenceIndex = 0;
   private contentReferenceIndex = 0;
+  private documentReferenceIndex = 0;
   private queryElementReferenceIndex = 0;
   private references = new Map<string, BrowserReference>();
   private contentReferences = new Map<string, SerializableContentReference>();
+  private documentReferences = new Map<string, SerializableDocumentReference>();
+  private contentReferenceOrder = new Map<string, number>();
+  private contentReferenceSequence = 0;
   private contentReferenceBytes = 0;
   private navigationReferences = new Map<string, NavigationReference>();
   private navigationIndex = 0;
@@ -672,6 +814,7 @@ export class BrowserController {
   }): Promise<BrowserState> {
     const url = safeUrl(input.url);
     const page = await this.ensurePage();
+    const urlBefore = page.url();
     const waitUntil = input.waitUntil ?? "domcontentloaded";
     const timeoutMs = input.timeoutMs ?? 30_000;
     this.invalidateReferences();
@@ -680,6 +823,8 @@ export class BrowserController {
     try {
       return await this.navigatePage(page, url, waitUntil, timeoutMs);
     } catch (error) {
+      const recovered = await this.reconcileNavigationFailure(page, url, urlBefore, error);
+      if (recovered) return recovered;
       // Chromium can be closed from the guest desktop while the controller
       // still holds the old Playwright page object. Recreate the persistent
       // context once so the next agent action can recover instead of
@@ -1109,9 +1254,11 @@ export class BrowserController {
     mode?: BrowserReadMode;
     query?: string;
     ref?: string;
+    maxBlocks?: number;
     maxChars?: number;
     offset?: number;
     limit?: number;
+    blockTypes?: BrowserContentBlock["type"][];
   } = {}): Promise<BrowserReadResult> {
     return this.withWatchdog(() => this.readInternal(input), "browser.read");
   }
@@ -1120,9 +1267,11 @@ export class BrowserController {
     mode?: BrowserReadMode;
     query?: string;
     ref?: string;
+    maxBlocks?: number;
     maxChars?: number;
     offset?: number;
     limit?: number;
+    blockTypes?: BrowserContentBlock["type"][];
   }): Promise<BrowserReadResult> {
     if (input.ref && this.navigationReferences.has(input.ref)) {
       throw new GuestRpcError(
@@ -1131,23 +1280,25 @@ export class BrowserController {
         { httpStatus: 400 },
       );
     }
-    if (input.ref) return this.readContentReference({
-      ref: input.ref,
-      ...(input.mode === undefined ? {} : { mode: input.mode }),
-      ...(input.maxChars === undefined ? {} : { maxChars: input.maxChars }),
-      ...(input.offset === undefined ? {} : { offset: input.offset }),
-      ...(input.limit === undefined ? {} : { limit: input.limit }),
-    });
-    return this.readSemanticContent({ ...input, primaryStructured: true });
+    if (input.ref) {
+      const refInput = {
+        ref: input.ref,
+        ...(input.maxChars === undefined ? {} : { maxChars: input.maxChars }),
+        ...(input.offset === undefined ? {} : { offset: input.offset }),
+        ...(input.limit === undefined ? {} : { limit: input.limit }),
+      };
+      if (this.documentReferences.has(input.ref)) return this.readDocumentReference(refInput);
+      return this.readContentReference(refInput);
+    }
+    return this.readSemanticContent(input);
   }
 
   private async readSemanticContent(input: {
     mode?: BrowserReadMode;
     query?: string;
+    maxBlocks?: number;
     maxChars?: number;
-    maxResults?: number;
     blockTypes?: BrowserContentBlock["type"][];
-    primaryStructured?: boolean;
   }, attempt = 0): Promise<BrowserReadResult> {
     const page = await this.ensurePage();
     await this.waitForReadableStability(page);
@@ -1157,6 +1308,8 @@ export class BrowserController {
     const url = page.url();
     const title = await this.readTitle(page);
     const maxChars = Math.max(1, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
+    const mode = input.mode ?? "readable";
+    const maxBlocks = Math.max(1, Math.min(20, Math.trunc(input.maxBlocks ?? (mode === "document" ? 20 : 7))));
     const query = input.query?.trim() || undefined;
     const extracted = await this.extractSemanticContent(page, url, title);
     const rankingBlocks = input.blockTypes
@@ -1167,39 +1320,40 @@ export class BrowserController {
       const ranked = rankBrowserContentBlocks({
         query,
         blocks: rankingBlocks,
-        maxResults: input.maxResults ?? 10,
+        maxResults: maxBlocks,
       });
       selected = ranked.results.flatMap(result => {
-        const block = this.contentReferences.get(result.ref)?.block
-          ?? this.navigationReferences.get(result.ref)?.block;
+        const block = this.contentBlockForRef(result.ref);
         if (!block) return [];
         return [{ ...block, relevance: result.relevance }];
       });
-      if (input.primaryStructured && extracted.pageType === 'data_table'
-        && !selected.some(block => block.type === 'table')) {
-        const primaryTable = rankingBlocks
-          .filter(block => block.type === 'table' && !block.boilerplate)
-          .sort((left, right) => (right.importance ?? 0) - (left.importance ?? 0))[0];
-        if (primaryTable) {
-          selected = [primaryTable, ...selected.filter(block => block.ref !== primaryTable.ref)]
-            .slice(0, Math.max(1, Math.min(20, Math.trunc(input.maxResults ?? 10))));
-        }
-      }
     } else {
       const substantive = rankingBlocks.filter(block => !block.boilerplate);
-      const boilerplate = rankingBlocks.filter(block => block.boilerplate);
-      selected = [...substantive].sort((left, right) => (
-        (right.importance ?? 0) - (left.importance ?? 0)
-        || this.contentTypePriority(left.type) - this.contentTypePriority(right.type)
-        || left.ref.localeCompare(right.ref)
-      )).slice(0, 7);
-      const chrome = boilerplate[0];
-      if (chrome) selected.push(chrome);
+      if (mode === "document") {
+        selected = substantive.slice(0, maxBlocks);
+      } else {
+        const boilerplate = rankingBlocks.filter(block => block.boilerplate);
+        selected = [...substantive].sort((left, right) => (
+          (right.importance ?? 0) - (left.importance ?? 0)
+          || this.contentTypePriority(left.type) - this.contentTypePriority(right.type)
+          || left.ref.localeCompare(right.ref)
+        )).slice(0, maxBlocks);
+        const chrome = boilerplate[0];
+        if (chrome) selected.push(chrome);
+      }
     }
+    if (mode === "document") {
+      const selectedByRef = new Map(selected.map(block => [block.ref, block]));
+      selected = extracted.blocks.flatMap(block => {
+        const selectedBlock = selectedByRef.get(block.ref);
+        return selectedBlock ? [selectedBlock] : [];
+      });
+    }
+    selected = selected.slice(0, maxBlocks);
 
     const summaries: BrowserContentSummary[] = [];
     let returnedChars = 0;
-    const previewChars = Math.max(160, Math.min(DEFAULT_BLOCK_PREVIEW_CHARS, Math.floor(maxChars / Math.max(1, Math.min(6, selected.length)))));
+    const previewChars = Math.max(120, Math.min(DEFAULT_BLOCK_PREVIEW_CHARS, Math.floor(maxChars / Math.max(1, Math.min(8, selected.length)))));
     for (const block of selected) {
       const summary = this.summarizeContentBlock(block, previewChars);
       const cost = JSON.stringify(summary).length;
@@ -1217,19 +1371,51 @@ export class BrowserController {
       if (attempt < 2) return this.readSemanticContent(input, attempt + 1);
       throw new GuestRpcError("BROWSER_DOM_UNSTABLE", "The page changed repeatedly while semantic content was being read.", { httpStatus: 409 });
     }
+    const selectedRefs = summaries.map(summary => summary.ref);
+    const selectedRefSet = new Set(selectedRefs);
+    // A composite snapshot represents a document. Preserve page order even
+    // when readable mode ranked its previews by relevance.
+    const documentBlocks = extracted.blocks.flatMap(block => (
+      selectedRefSet.has(block.ref) ? [this.contentBlockForRef(block.ref)].filter((item): item is BrowserContentBlock => Boolean(item)) : []
+    ));
+    const documentRef = documentBlocks.length > 1
+      ? this.registerDocumentReference(documentBlocks, url, title, extracted.pageType, extracted.sourceTruncated)
+      : undefined;
+    const structuredBlocks = extracted.blocks.filter(block => (
+      block.type === "table" || block.type === "list" || block.type === "definition" || block.type === "form"
+    ));
+    const structuredSummaries: BrowserStructuredBlockSummary[] = structuredBlocks.slice(0, 20).map(block => ({
+      ref: block.ref,
+      type: block.type as BrowserStructuredBlockSummary["type"],
+      ...(block.heading ? { heading: block.heading.slice(0, 160) } : {}),
+      ...(block.headingPath ? { headingPath: block.headingPath.slice(0, 8).map(heading => heading.slice(0, 160)) } : {}),
+      ...(block.caption ? { caption: block.caption.slice(0, 240) } : {}),
+      ...(block.rowCount === undefined ? {} : { rowCount: block.rowCount }),
+      ...(block.columnCount === undefined ? {} : { columnCount: block.columnCount }),
+      selected: selectedRefSet.has(block.ref),
+      previewOnly: true,
+    }));
     return {
       operation: "read",
       url,
       title,
       revision,
-      mode: input.mode ?? "readable",
+      mode,
       source: "semantic",
       pageType: extracted.pageType,
       ...(query ? { query } : {}),
+      ...(documentRef ? { documentRef } : {}),
       blocks: summaries,
       diagnostics: {
         blockCount: extracted.blocks.length,
         tableCount: extracted.blocks.filter(block => block.type === "table").length,
+        selectedBlockCount: summaries.length,
+        structuredBlockCount: structuredBlocks.length,
+        structuredBlocksTruncated: structuredBlocks.length > structuredSummaries.length,
+        structuredBlocks: structuredSummaries,
+        sourceTruncated: extracted.sourceTruncated,
+        summariesArePreviews: true,
+        ...(documentRef ? { documentRef } : {}),
         selectedRefs: summaries.map(summary => ({ ref: summary.ref, ...(summary.relevance === undefined ? {} : { relevance: summary.relevance }) })),
         extractors: extracted.extractors,
         inaccessibleFrames: extracted.inaccessibleFrames,
@@ -1247,7 +1433,6 @@ export class BrowserController {
 
   private async readContentReference(input: {
     ref: string;
-    mode?: BrowserReadMode;
     maxChars?: number;
     offset?: number;
     limit?: number;
@@ -1257,8 +1442,9 @@ export class BrowserController {
     const offset = Math.max(0, Math.trunc(input.offset ?? 0));
     const limit = Math.max(1, Math.min(100, Math.trunc(input.limit ?? 20)));
     const full = reference.block;
-    let block: BrowserContentBlock = full;
+    let block: BrowserContentBlock = { ...full };
     let hasMore = false;
+    let paged = false;
     if (full.type === "table") {
       const rows = full.rows ?? [];
       block = {
@@ -1267,6 +1453,7 @@ export class BrowserController {
         ...(full.cellSpans ? { cellSpans: full.cellSpans.slice(offset, offset + limit) } : {}),
       };
       hasMore = offset + (block.rows?.length ?? 0) < rows.length;
+      paged = true;
     } else if (full.type === "list") {
       const items = full.items ?? [];
       const selected: string[] = [];
@@ -1279,10 +1466,33 @@ export class BrowserController {
       }
       block = { ...full, items: selected };
       hasMore = offset + (block.items?.length ?? 0) < items.length;
-    } else if (["text", "code", "other"].includes(full.type) && full.text !== undefined) {
+      paged = true;
+    } else if (full.type === "definition") {
+      const definitions = full.definitions ?? [];
+      block = { ...full, definitions: definitions.slice(offset, offset + limit) };
+      hasMore = offset + (block.definitions?.length ?? 0) < definitions.length;
+      paged = true;
+    } else if (full.type === "form") {
+      const fields = full.fields ?? [];
+      block = { ...full, fields: fields.slice(offset, offset + limit) };
+      hasMore = offset + (block.fields?.length ?? 0) < fields.length;
+      paged = true;
+    } else if (full.type === "navigation") {
+      const links = full.links ?? [];
+      block = { ...full, links: links.slice(offset, offset + limit) };
+      hasMore = offset + (block.links?.length ?? 0) < links.length;
+      paged = true;
+    } else if (["text", "code", "other", "heading"].includes(full.type) && full.text !== undefined) {
       const text = full.text;
-      block = { ...full, text: text.slice(offset, offset + maxChars) };
+      block = { ...full, text: text.slice(offset, offset + Math.min(maxChars, input.limit ?? maxChars)) };
       hasMore = offset + (block.text?.length ?? 0) < text.length;
+      paged = true;
+    } else if (input.offset !== undefined || input.limit !== undefined) {
+      throw new GuestRpcError(
+        "UNSUPPORTED_CONTENT_PAGINATION",
+        `Content ref ${input.ref} is a ${full.type} block and does not support offset/limit pagination.`,
+        { httpStatus: 400 },
+      );
     }
     const summary = this.summarizeContentBlock(block, maxChars);
     if (block.type === "table") {
@@ -1301,32 +1511,61 @@ export class BrowserController {
         summary.nextOffset = offset + rows.length;
         hasMore = true;
       }
-      summary.truncated = Boolean(summary.truncated || hasMore);
     } else if (block.type === "list") {
       summary.items = block.items ?? [];
       summary.offset = offset;
       summary.returnedRowCount = summary.items.length;
       if (hasMore) summary.nextOffset = offset + summary.items.length;
-      summary.truncated = Boolean(summary.truncated || hasMore);
-    } else if (["text", "code", "other"].includes(block.type) && block.text !== undefined) {
+    } else if (block.type === "definition") {
+      summary.definitions = block.definitions ?? [];
+      summary.offset = offset;
+      summary.returnedRowCount = summary.definitions.length;
+      if (hasMore) summary.nextOffset = offset + summary.definitions.length;
+    } else if (block.type === "form") {
+      summary.fields = block.fields ?? [];
+      summary.offset = offset;
+      summary.returnedRowCount = summary.fields.length;
+      if (hasMore) summary.nextOffset = offset + summary.fields.length;
+    } else if (block.type === "navigation") {
+      summary.links = block.links ?? [];
+      summary.offset = offset;
+      summary.returnedRowCount = summary.links.length;
+      if (hasMore) summary.nextOffset = offset + summary.links.length;
+    } else if (["text", "code", "other", "heading"].includes(block.type) && block.text !== undefined) {
       summary.offset = offset;
       summary.returnedChars = block.text.length;
       if (hasMore) summary.nextOffset = offset + block.text.length;
-      summary.truncated = Boolean(summary.truncated || hasMore);
     }
+    if (paged) summary.truncated = Boolean(summary.truncated || hasMore);
     const preview = summary.preview ?? "";
     return {
       operation: "read",
       url: reference.url,
       title: reference.title,
       revision: reference.revision,
-      mode: input.mode ?? "readable",
+      mode: "readable",
       source: "semantic",
       pageType: reference.pageType,
       blocks: [summary],
       diagnostics: {
         blockCount: 1,
         tableCount: full.type === "table" ? 1 : 0,
+        selectedBlockCount: 1,
+        structuredBlockCount: ["table", "list", "definition", "form"].includes(full.type) ? 1 : 0,
+        structuredBlocksTruncated: false,
+        structuredBlocks: ["table", "list", "definition", "form"].includes(full.type) ? [{
+          ref: input.ref,
+          type: full.type as BrowserStructuredBlockSummary["type"],
+          ...(full.heading ? { heading: full.heading } : {}),
+          ...(full.headingPath ? { headingPath: full.headingPath } : {}),
+          ...(full.caption ? { caption: full.caption } : {}),
+          ...(full.rowCount === undefined ? {} : { rowCount: full.rowCount }),
+          ...(full.columnCount === undefined ? {} : { columnCount: full.columnCount }),
+          selected: true,
+          previewOnly: true,
+        }] : [],
+        sourceTruncated: Boolean(full.truncated),
+        summariesArePreviews: true,
         selectedRefs: [{ ref: input.ref }],
         extractors: full.source?.extractor ? [full.source.extractor] : ["dom"],
       },
@@ -1338,15 +1577,95 @@ export class BrowserController {
     };
   }
 
+  private async readDocumentReference(input: {
+    ref: string;
+    maxChars?: number;
+    offset?: number;
+    limit?: number;
+  }): Promise<BrowserReadResult> {
+    const document = await this.resolveDocumentReference(input.ref);
+    const maxChars = Math.max(1, Math.min(12_000, Math.trunc(input.maxChars ?? DEFAULT_READ_CHARS)));
+    const offset = Math.max(0, Math.trunc(input.offset ?? 0));
+    const limit = Math.max(1, Math.min(100, Math.trunc(input.limit ?? 20)));
+    const candidates = document.blocks.slice(offset, offset + limit);
+    const previewChars = Math.max(120, Math.min(DEFAULT_BLOCK_PREVIEW_CHARS, Math.floor(maxChars / Math.max(1, Math.min(8, candidates.length)))));
+    const blocks: BrowserContentSummary[] = [];
+    let returnedChars = 0;
+    for (const candidate of candidates) {
+      const summary = this.summarizeContentBlock(candidate, previewChars);
+      const cost = JSON.stringify(summary).length;
+      if (blocks.length > 0 && returnedChars + cost > maxChars) break;
+      blocks.push(summary);
+      returnedChars += cost;
+    }
+    const structuredBlocks = document.blocks.filter(block => ["table", "list", "definition", "form"].includes(block.type));
+    const structuredSummaries: BrowserStructuredBlockSummary[] = structuredBlocks.slice(0, 20).map(block => ({
+      ref: block.ref,
+      type: block.type as BrowserStructuredBlockSummary["type"],
+      ...(block.heading ? { heading: block.heading.slice(0, 160) } : {}),
+      ...(block.headingPath ? { headingPath: block.headingPath.slice(0, 8).map(heading => heading.slice(0, 160)) } : {}),
+      ...(block.caption ? { caption: block.caption.slice(0, 240) } : {}),
+      ...(block.rowCount === undefined ? {} : { rowCount: block.rowCount }),
+      ...(block.columnCount === undefined ? {} : { columnCount: block.columnCount }),
+      selected: true,
+      previewOnly: true,
+    }));
+    return {
+      operation: "read",
+      url: document.url,
+      title: document.title,
+      revision: document.revision,
+      mode: "document",
+      source: "semantic",
+      pageType: document.pageType,
+      documentRef: input.ref,
+      blocks,
+      diagnostics: {
+        blockCount: document.blocks.length,
+        tableCount: document.blocks.filter(block => block.type === "table").length,
+        selectedBlockCount: document.blocks.length,
+        structuredBlockCount: structuredBlocks.length,
+        structuredBlocksTruncated: structuredBlocks.length > structuredSummaries.length,
+        structuredBlocks: structuredSummaries,
+        sourceTruncated: document.sourceTruncated,
+        summariesArePreviews: true,
+        documentRef: input.ref,
+        selectedRefs: blocks.map(block => ({ ref: block.ref })),
+        extractors: [...new Set(document.blocks.map(block => block.source?.extractor ?? "dom"))],
+      },
+      readable: blocks.length > 0,
+      sections: blocks.map(block => ({ ...(block.heading ? { heading: block.heading } : {}), text: block.preview ?? "", ref: block.ref })),
+      totalChars: document.blocks.reduce((sum, block) => sum + this.contentBlockSize(block), 0),
+      returnedChars,
+      truncated: document.sourceTruncated || offset > 0 || blocks.length < candidates.length || offset + blocks.length < document.blocks.length,
+    };
+  }
+
   async serializeContentRef(ref: string, format: BrowserContentFormat = "text"): Promise<{
     content: string;
     sourceRef: string;
-    sourceType: BrowserContentBlock["type"];
+    sourceType: BrowserContentSourceType;
     sourceRevision: number;
     sourceUrl: string;
+    sourceCapturedAt: string;
+    sourceRefs?: string[];
     format: BrowserContentFormat;
   }> {
     return this.withWatchdog(async () => {
+      const document = this.documentReferences.get(ref);
+      if (document) {
+        this.touchContentSnapshot(ref);
+        return {
+          content: serializeBrowserDocumentReference(document, format),
+          sourceRef: ref,
+          sourceType: "document",
+          sourceRevision: document.revision,
+          sourceUrl: document.url,
+          sourceCapturedAt: document.capturedAt,
+          sourceRefs: [...document.sourceRefs],
+          format,
+        };
+      }
       const reference = await this.resolveContentReference(ref);
       return {
         content: serializeBrowserContentBlock(reference.block, format),
@@ -1354,6 +1673,8 @@ export class BrowserController {
         sourceType: reference.block.type,
         sourceRevision: reference.revision,
         sourceUrl: reference.url,
+        sourceCapturedAt: reference.capturedAt,
+        sourceRefs: [ref],
         format,
       };
     }, "browser.serializeContentRef");
@@ -1369,19 +1690,10 @@ export class BrowserController {
     block.ref = ref;
     const snapshot = JSON.parse(JSON.stringify(block)) as BrowserContentBlock;
     const size = new TextEncoder().encode(JSON.stringify(snapshot)).byteLength;
-    if (size > MAX_CONTENT_REFERENCE_SIZE) {
-      throw new GuestRpcError("CONTENT_REF_TOO_LARGE", `Extracted content exceeds the ${MAX_CONTENT_REFERENCE_SIZE} byte snapshot limit.`);
-    }
-    while (this.contentReferences.size >= MAX_CONTENT_REFERENCE_COUNT
-      || this.contentReferenceBytes + size > MAX_CONTENT_REFERENCE_BYTES) {
-      const oldestRef = this.contentReferences.keys().next().value as string | undefined;
-      if (oldestRef === undefined) break;
-      const oldest = this.contentReferences.get(oldestRef);
-      this.contentReferences.delete(oldestRef);
-      if (oldest) this.contentReferenceBytes = Math.max(0, this.contentReferenceBytes - oldest.size);
-    }
+    this.makeContentSnapshotCapacity(size);
     const capturedAt = new Date().toISOString();
     this.contentReferences.set(ref, {
+      kind: "block",
       block: freezeSnapshot(snapshot),
       revision: this.referenceRevision,
       url: pageUrl,
@@ -1390,8 +1702,70 @@ export class BrowserController {
       capturedAt,
       size,
     });
+    this.contentReferenceOrder.set(ref, ++this.contentReferenceSequence);
     this.contentReferenceBytes += size;
     return block;
+  }
+
+  private registerDocumentReference(
+    blocks: BrowserContentBlock[],
+    pageUrl: string,
+    pageTitle: string,
+    pageType: BrowserPageType,
+    sourceTruncated: boolean,
+  ): string {
+    const ref = `d${this.referenceRevision}-${this.contentSessionId}-${++this.documentReferenceIndex}`;
+    const sourceRefs = blocks.map(block => block.ref);
+    const snapshotBlocks = JSON.parse(JSON.stringify(blocks)) as BrowserContentBlock[];
+    const snapshot = {
+      kind: "document" as const,
+      blocks: snapshotBlocks,
+      sourceRefs,
+      revision: this.referenceRevision,
+      url: pageUrl,
+      title: pageTitle,
+      pageType,
+      capturedAt: new Date().toISOString(),
+      sourceTruncated,
+      size: 0,
+    };
+    const size = new TextEncoder().encode(JSON.stringify(snapshot)).byteLength;
+    if (size > MAX_CONTENT_REFERENCE_SIZE) {
+      throw new GuestRpcError("CONTENT_REF_TOO_LARGE", `Extracted document exceeds the ${MAX_CONTENT_REFERENCE_SIZE} byte snapshot limit.`);
+    }
+    this.makeContentSnapshotCapacity(size);
+    snapshot.size = size;
+    this.documentReferences.set(ref, freezeSnapshot(snapshot));
+    this.contentReferenceOrder.set(ref, ++this.contentReferenceSequence);
+    this.contentReferenceBytes += size;
+    return ref;
+  }
+
+  private makeContentSnapshotCapacity(size: number): void {
+    if (size > MAX_CONTENT_REFERENCE_SIZE) {
+      throw new GuestRpcError("CONTENT_REF_TOO_LARGE", `Extracted content exceeds the ${MAX_CONTENT_REFERENCE_SIZE} byte snapshot limit.`);
+    }
+    while (this.contentReferenceOrder.size >= MAX_CONTENT_REFERENCE_COUNT
+      || this.contentReferenceBytes + size > MAX_CONTENT_REFERENCE_BYTES) {
+      const oldestRef = this.contentReferenceOrder.keys().next().value as string | undefined;
+      if (oldestRef === undefined) break;
+      this.contentReferenceOrder.delete(oldestRef);
+      const oldestBlock = this.contentReferences.get(oldestRef);
+      const oldestDocument = this.documentReferences.get(oldestRef);
+      this.contentReferences.delete(oldestRef);
+      this.documentReferences.delete(oldestRef);
+      this.contentReferenceBytes = Math.max(0, this.contentReferenceBytes - (oldestBlock?.size ?? oldestDocument?.size ?? 0));
+    }
+  }
+
+  private touchContentSnapshot(ref: string): void {
+    if (!this.contentReferenceOrder.has(ref)) return;
+    this.contentReferenceOrder.delete(ref);
+    this.contentReferenceOrder.set(ref, ++this.contentReferenceSequence);
+  }
+
+  private contentBlockForRef(ref: string): BrowserContentBlock | undefined {
+    return this.contentReferences.get(ref)?.block ?? this.navigationReferences.get(ref)?.block;
   }
 
   private registerNavigationReference(input: {
@@ -1428,6 +1802,8 @@ export class BrowserController {
 
   private clearContentReferences(): void {
     this.contentReferences.clear();
+    this.documentReferences.clear();
+    this.contentReferenceOrder.clear();
     this.contentReferenceBytes = 0;
   }
 
@@ -1499,7 +1875,7 @@ export class BrowserController {
 
     const seen = new Set<string>();
     const unique = extracted.blocks.filter(block => {
-      const key = `${block.type}\u0000${block.headingPath?.join("/") ?? ""}\u0000${(block.text ?? block.title ?? "").replace(/\s+/gu, " ").trim().toLocaleLowerCase()}`;
+      const key = semanticContentFingerprint(block);
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -1573,6 +1949,16 @@ export class BrowserController {
       this.contentReferences.delete(ref);
       throw new GuestRpcError("UNKNOWN_CONTENT_REF", `Browser content ref ${ref} is unknown or has expired. Read the page again to obtain a fresh ref.`, { httpStatus: 404 });
     }
+    this.touchContentSnapshot(ref);
+    return reference;
+  }
+
+  private async resolveDocumentReference(ref: string): Promise<SerializableDocumentReference> {
+    const reference = this.documentReferences.get(ref);
+    if (!reference) {
+      throw new GuestRpcError("UNKNOWN_CONTENT_REF", `Browser document ref ${ref} is unknown or has expired. Read the page again to obtain a fresh document ref.`, { httpStatus: 404 });
+    }
+    this.touchContentSnapshot(ref);
     return reference;
   }
 
@@ -2529,6 +2915,41 @@ export class BrowserController {
     this.loading = false;
     await this.readTitle(page);
     return this.getState();
+  }
+
+  private async reconcileNavigationFailure(
+    page: PlaywrightPage,
+    requestedUrl: string,
+    urlBefore: string,
+    originalError: unknown,
+  ): Promise<BrowserState | undefined> {
+    // A small bounded pause gives Chromium time to commit a navigation that
+    // raced with a redirect or a transient ERR_EMPTY_RESPONSE/ERR_ABORTED.
+    await new Promise<void>(resolve => setTimeout(resolve, 120));
+    try {
+      const currentUrl = page.url();
+      if (!browserUrlsMatch(currentUrl, requestedUrl) || browserUrlsMatch(urlBefore, currentUrl)) return undefined;
+      const pageStatus = await page.locator("body").evaluateAll(nodes => {
+        const body = nodes[0];
+        if (!(body instanceof HTMLElement) || document.readyState === "loading") {
+          return { usable: false, documentUrl: location.href };
+        }
+        const usable = !document.querySelector("#main-frame-error, #errorPageContainer, .neterror")
+          && (body.innerText.trim().length > 0 || body.children.length > 0);
+        return { usable, documentUrl: location.href };
+      });
+      if (!pageStatus.usable || !browserUrlsMatch(pageStatus.documentUrl, currentUrl)) return undefined;
+      this.loading = false;
+      const state = await this.getStateInternal();
+      return {
+        ...state,
+        navigationRecovery: {
+          originalError: (originalError instanceof Error ? originalError.message : String(originalError)).slice(0, 500),
+        },
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   private async resetContext(): Promise<void> {

@@ -1,6 +1,7 @@
 import type {
   BrowserContentFormat,
   BrowserContentType,
+  BrowserContentSourceType,
   BrowserOpenResult,
   BrowserRegionInspection,
   BrowserReadResult,
@@ -27,7 +28,9 @@ export type GuestMethodParams = {
   'browser.snapshot': { maxRegions?: number };
   'browser.query': { selector?: string; text?: string; role?: string; name?: string; limit?: number };
   'browser.evaluate': { expression: string };
-  'browser.read': { mode?: 'readable' | 'document'; query?: string; ref?: string; maxChars?: number; offset?: number; limit?: number };
+  'browser.read':
+    | { mode?: 'readable' | 'document'; query?: string; maxBlocks?: number; maxChars?: number; blockTypes?: BrowserContentType[] }
+    | { ref: string; maxChars?: number; offset?: number; limit?: number };
   'browser.findPage': { query: string; maxResults?: number };
   'browser.webSearch': { query: string; maxResults?: number };
   'browser.open': { ref: string; linkIndex?: number };
@@ -60,9 +63,11 @@ export type GuestMethodResult = {
     beforeSha256?: string;
     changed?: boolean;
     sourceRef?: string;
-    sourceType?: BrowserContentType;
+    sourceType?: BrowserContentSourceType;
     sourceRevision?: number;
     sourceUrl?: string;
+    sourceCapturedAt?: string;
+    sourceRefs?: string[];
     format?: BrowserContentFormat;
   };
   'fs.mkdir': { path: string; existedBefore: boolean; changed?: boolean };
@@ -75,7 +80,14 @@ export type GuestMethodResult = {
     size: number;
     sha256?: string;
   };
-  'browser.navigate': { url: string; title: string; loading: boolean; pageCount: number; revision: number };
+  'browser.navigate': {
+    url: string;
+    title: string;
+    loading: boolean;
+    pageCount: number;
+    revision: number;
+    navigationRecovery?: { originalError: string };
+  };
   'browser.getState': {
     ready: boolean;
     visible: true;

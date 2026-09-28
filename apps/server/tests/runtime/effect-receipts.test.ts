@@ -156,6 +156,49 @@ describe('current-run effect receipts', () => {
     expect(withoutReceipt.complete).toBe(false);
     expect(withoutReceipt.criteria[0]?.passed).toBe(false);
 
+    state.recentActions = [action('browser.read', {}, {
+      operation: 'read', url, title: 'Rates', revision: 1, readable: true,
+      blocks: [{ ref: 'c1-12345678-1', type: 'text', text: 'Observed rate data.' }],
+    }, receipt('browser.read', {}))];
+    const readEvidence = await verifyTaskState(
+      currentTask, state, guest, observation, new CriterionVerifierRegistry(guest),
+    );
+    expect(readEvidence.complete).toBe(true);
+    expect(readEvidence.criteria[0]?.passed).toBe(true);
+
+    const unrelatedCurrentPage = await verifyTaskState(
+      currentTask,
+      state,
+      guest,
+      { ...observation, browser: { url: 'https://unrelated.example.test/' } },
+      new CriterionVerifierRegistry(guest),
+    );
+    expect(unrelatedCurrentPage.complete).toBe(false);
+    expect(unrelatedCurrentPage.criteria[0]?.passed).toBe(false);
+
+    const finalUrl = 'https://rates-cdn.example.test/current';
+    state.recentActions = [
+      action('browser.navigate', { url }, undefined, receipt('browser.navigate', {
+        requestedUrl: url,
+        urlBefore: 'about:blank',
+        urlAfter: finalUrl,
+        navigationOccurred: true,
+      }, false)),
+      action('browser.read', {}, {
+        operation: 'read', url: finalUrl, title: 'Rates', revision: 2, readable: true,
+        blocks: [{ ref: 'c2-12345678-1', type: 'text', text: 'Observed rate data.' }],
+      }, receipt('browser.read', {})),
+    ];
+    const redirectedReadEvidence = await verifyTaskState(
+      currentTask,
+      state,
+      guest,
+      { ...observation, browser: { url: finalUrl } },
+      new CriterionVerifierRegistry(guest),
+    );
+    expect(redirectedReadEvidence.complete).toBe(true);
+    expect(redirectedReadEvidence.criteria[0]?.passed).toBe(true);
+
     state.recentActions = [action('browser.navigate', { url }, { url }, receipt('browser.navigate', {
       requestedUrl: url,
       urlBefore: 'about:blank',

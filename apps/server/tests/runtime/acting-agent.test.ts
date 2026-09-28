@@ -1,6 +1,6 @@
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { describe, expect, it } from 'bun:test';
-import type { BrowserReadResult, GuestMethod } from '@helm/shared';
+import { readFile } from 'node:fs/promises';
 
 import { AgentRuntime } from '../../src/agent/runtime';
 import { AiSdkActingAgent } from '../../src/ai/acting-agent';
@@ -8,7 +8,6 @@ import { DeterministicTaskCompiler } from '../../src/ai/adapter';
 import { CriterionVerifierRegistry } from '../../src/tools/criterion-verifier';
 import { createGuestToolRegistry } from '../../src/tools/guest-tools';
 import { MockGuestTransport } from '../../src/tools/mock-guest-transport';
-import type { GuestMethodParams, GuestMethodResult, GuestRequestOptions } from '../../src/tools/guest-transport';
 import { MemoryService } from '../../src/memory/service';
 import { registerMemoryTools } from '../../src/memory/tools';
 import { testDatabase } from '../persistence/helpers';
@@ -84,6 +83,27 @@ function findTableRef(value: unknown): string | undefined {
   return undefined;
 }
 
+function findDocumentRef(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    try { return findDocumentRef(JSON.parse(value) as unknown); } catch { return undefined; }
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const ref = findDocumentRef(item);
+      if (ref) return ref;
+    }
+    return undefined;
+  }
+  if (typeof value !== 'object' || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.documentRef === 'string') return record.documentRef;
+  for (const child of Object.values(record)) {
+    const ref = findDocumentRef(child);
+    if (ref) return ref;
+  }
+  return undefined;
+}
+
 function findQueryAttribute(value: unknown, attribute: string): string | undefined {
   if (typeof value === 'string') {
     try { return findQueryAttribute(JSON.parse(value) as unknown, attribute); } catch { return undefined; }
@@ -109,64 +129,12 @@ function findQueryAttribute(value: unknown, attribute: string): string | undefin
   return undefined;
 }
 
-function findQueryRowTexts(value: unknown): string[] {
-  if (typeof value === 'string') {
-    try { return findQueryRowTexts(JSON.parse(value) as unknown); } catch { return []; }
-  }
-  if (Array.isArray(value)) return value.flatMap(findQueryRowTexts);
-  if (typeof value !== 'object' || value === null) return [];
-  const record = value as Record<string, unknown>;
-  if (record.tag === 'tr' && record.role === 'row' && typeof record.text === 'string') return [record.text];
-  return Object.values(record).flatMap(findQueryRowTexts);
-}
-
-function findReadTableSummary(value: unknown): Record<string, unknown> | undefined {
-  if (typeof value === 'string') {
-    try { return findReadTableSummary(JSON.parse(value) as unknown); } catch { return undefined; }
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const table = findReadTableSummary(item);
-      if (table) return table;
-    }
-    return undefined;
-  }
-  if (typeof value !== 'object' || value === null) return undefined;
-  const record = value as Record<string, unknown>;
-  if (record.type === 'table') return record;
-  for (const child of Object.values(record)) {
-    const table = findReadTableSummary(child);
-    if (table) return table;
-  }
-  return undefined;
-}
-
-class PartialSemanticReadGuest extends MockGuestTransport {
-  private returnedPartialTable = false;
-
-  override async request<M extends GuestMethod>(
-    method: M,
-    params: GuestMethodParams[M],
-    options: GuestRequestOptions = {},
-  ): Promise<GuestMethodResult[M]> {
-    const result = await super.request(method, params, options);
-    if (method !== 'browser.read' || this.returnedPartialTable) return result;
-    this.returnedPartialTable = true;
-    const read = result as BrowserReadResult;
-    return {
-      ...read,
-      blocks: read.blocks?.map(block => block.type === 'table'
-        ? { ...block, rows: block.rows?.slice(0, 1), rowCount: 1, truncated: true }
-        : block),
-    } as GuestMethodResult[M];
-  }
-}
-
 function createRuntime(
   guest: MockGuestTransport,
   replies: ScriptedReply[],
   requests: CapturedRequest[],
   memory?: MemoryService,
+  maxModelTurns = 12,
 ) {
   const provider = createOpenAICompatible({
     name: 'acting-agent-test',
@@ -197,7 +165,7 @@ function createRuntime(
     actingAgent,
     budgets: {
       maxSteps: 14,
-      maxModelTurns: 12,
+      maxModelTurns,
       maxCompletionRecoveryTurns: 2,
       maxRepeatedAction: 2,
       maxConsecutiveFailures: 3,
@@ -259,30 +227,25 @@ describe('production acting-agent outcomes', () => {
     expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining([
       'browserVisited1', 'browserEvidence', 'outputFile', 'openFile',
     ]));
-    expect(requests.at(-1)?.body.tool_choice).toBe('auto');
-    expect(JSON.stringify(requests[0]?.body)).toContain('another browser.read of that ref is unnecessary');
+    expect(result.run.diagnostics?.modelTurns).toBe(4);
+    expect(result.run.diagnostics?.finalizationTurns).toBe(1);
+    expect(requests.at(-1)?.body.tool_choice).toBeUndefined();
+    expect(result.run.diagnostics?.modelRequestOutcomes?.at(-1)?.kind).toBe('finalization');
+    expect(JSON.stringify(requests[0]?.body)).toContain('no additional browser.read is needed');
     expect(JSON.stringify(requests[0]?.body)).toContain('Use app.launch only when the user asks to start an application without a file');
     expect(JSON.stringify(requests[0]?.body)).toContain('Use app.openFile for an existing file');
-    expect(result.run.diagnostics?.modelTurns).toBe(5);
-    expect(result.run.diagnostics?.modelRequestOutcomes?.map(outcome => outcome.outcome)).toEqual([
-      'tool-call', 'tool-call', 'tool-call', 'tool-call', 'assistant-text',
+    expect(result.run.diagnostics?.modelRequestOutcomes?.map(outcome => outcome.kind)).toEqual([
+      'acting-turn', 'acting-turn', 'acting-turn', 'acting-turn', 'finalization',
     ]);
     expect(tools.invocations.some(invocation => invocation.tool === 'app.launch')).toBe(false);
   });
 
-  it('recovers from partial semantic table output with DOM inspection, remembers, writes, and opens inside the normal turn budget', async () => {
-    const url = 'https://fixture.example.test/dynamic-rates';
-    const guest = new PartialSemanticReadGuest({
-      pages: {
-        [url]: `<!doctype html><html><head><title>Current Rates</title></head><body><main>
-          <h1>Current exchange rates</h1>
-          <table id="rates"><thead><tr><th>Currency</th><th>Unit</th><th>Buy</th><th>Sell</th></tr></thead><tbody>
-            <tr><td>INR (Indian Rupee)</td><td>100</td><td>160.00</td><td>160.15</td></tr>
-            <tr><td>USD (U.S. Dollar)</td><td>1</td><td>153.01</td><td>153.61</td></tr>
-            <tr><td>EUR (European Euro)</td><td>1</td><td>174.30</td><td>174.98</td></tr>
-          </tbody></table>
-        </main></body></html>`,
-      },
+  it('exports both exchange tables after transient navigation failure and finalizes at the acting-turn boundary', async () => {
+    const url = 'https://fixture.example.test/forex';
+    const fixture = await readFile(new URL('../../../../guest/helm-guest/tests/fixtures/forex-two-tables.html', import.meta.url), 'utf8');
+    const guest = new MockGuestTransport({
+      pages: { [url]: fixture },
+      navigationFailuresAfterReach: { [url]: 'net::ERR_EMPTY_RESPONSE' },
     });
     const persistence = testDatabase();
     try {
@@ -290,28 +253,20 @@ describe('production acting-agent outcomes', () => {
       const memory = new MemoryService(persistence.sqlite);
       const { runtime, tools } = createRuntime(guest, [
         toolReply('navigate', 'browser.navigate', { url }),
-        toolReply('partial-read', 'browser.read', { mode: 'document' }),
+        toolReply('read-document', 'browser.read', { mode: 'document', blockTypes: ['table'] }),
         body => {
-          const table = findReadTableSummary(body.messages);
-          if (!table || table.rowCount !== 1) throw new Error('The initial semantic read was not partial.');
-          return toolReply('inspect-all-rows', 'browser.query', { selector: '#rates tbody tr', limit: 20 });
+          const documentRef = findDocumentRef(body.messages);
+          if (!documentRef) throw new Error('The complete multi-table read did not return a documentRef.');
+          return toolReply('write-complete-document', 'fs.write', { path: 'forex.txt', sourceRef: documentRef, format: 'text' });
         },
+        toolReply('open-rates', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
         toolReply('remember-source', 'memory.remember', {
-          content: `Use ${url} for all forex requests about Nepal.`,
+          content: `Use ${url} for forex requests about Nepal.`,
           kind: 'instruction',
           source: 'user',
         }),
-        body => {
-          const rows = findQueryRowTexts(body.messages).filter(row => !row.startsWith('Currency '));
-          if (rows.length !== 3) throw new Error(`Expected three inspected currency rows, received ${rows.length}.`);
-          return toolReply('write-all-rates', 'fs.write', {
-            path: 'forex.txt',
-            content: `Currency | Unit | Buy | Sell\n${rows.join('\n')}`,
-          });
-        },
-        toolReply('open-rates', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
-        textReply('done', 'I saved the exchange rates to forex.txt and opened it in the text viewer.'),
-      ], requests, memory);
+        textReply('done', 'I saved the exchange rates to forex.txt, opened it in the text viewer, and remembered the source.'),
+      ], requests, memory, 5);
 
       const result = await runtime.run({
         threadId: 'dynamic-table-full-effect-scenario',
@@ -319,10 +274,26 @@ describe('production acting-agent outcomes', () => {
       });
 
       expect(result.status).toBe('completed');
-      expect(guest.getFile('/home/helm/workspace/forex.txt')).toContain('INR (Indian Rupee) 100 160.00 160.15');
-      expect(guest.getFile('/home/helm/workspace/forex.txt')).toContain('USD (U.S. Dollar) 1 153.01 153.61');
-      expect(guest.getFile('/home/helm/workspace/forex.txt')).toContain('EUR (European Euro) 1 174.30 174.98');
-      const actions = result.run.state?.durableActions ?? [];
+      const saved = guest.getFile('/home/helm/workspace/forex.txt') ?? '';
+      for (const currency of ['Indian Rupee (INR)', 'US Dollar (USD)', 'Euro (EUR)', 'British Pound (GBP)', 'Japanese Yen (JPY)']) {
+        expect(saved).toContain(currency);
+      }
+      expect(saved.length).toBeGreaterThan(0);
+      const actions = [
+        ...(result.run.state?.durableActions ?? []),
+        ...(result.run.state?.recentActions ?? []),
+      ];
+      expect(actions.find(action => action.tool === 'browser.navigate')).toMatchObject({
+        result: { ok: false, error: { code: 'BROWSER_NAVIGATION_FAILED' } },
+      });
+      expect(actions.filter(action => action.tool === 'browser.navigate')).toHaveLength(1);
+      expect(actions.find(action => action.tool === 'browser.read')?.result).toMatchObject({
+        ok: true, data: { url, diagnostics: { tableCount: 2, selectedBlockCount: expect.any(Number) }, documentRef: expect.stringMatching(/^d\d+-/u) },
+      });
+      expect(actions.find(action => action.tool === 'fs.write')?.result).toMatchObject({
+        ok: true,
+        data: { sourceType: 'document', sourceRefs: expect.arrayContaining([expect.stringMatching(/^c\d+-/u), expect.stringMatching(/^c\d+-/u)]) },
+      });
       expect(actions.find(action => action.tool === 'memory.remember')).toMatchObject({
         result: { ok: true, data: { action: 'remembered' } },
         receipt: { tool: 'memory.remember', ok: true, effect: { changed: true } },
@@ -337,16 +308,22 @@ describe('production acting-agent outcomes', () => {
       expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining([
         'browserVisited1', 'browserEvidence', 'memoryMutation', 'outputFile', 'openFile',
       ]));
+      expect(result.run.diagnostics?.lastUnsatisfiedRequirements).toEqual([]);
       expect(tools.invocations.some(invocation => invocation.tool === 'app.launch')).toBe(false);
       expect(guest.desktopWindows).toContainEqual(expect.objectContaining({
         application: 'text-editor',
         title: expect.stringContaining('forex.txt'),
       }));
-      expect(result.run.diagnostics?.modelTurns).toBeLessThan(12);
-      expect(result.run.diagnostics?.modelTurns).toBe(7);
-      expect(result.run.diagnostics?.toolActions).toBe(6);
-      expect(result.run.diagnostics?.modelRequestOutcomes).toHaveLength(7);
-      expect(requests.at(-1)?.body.tool_choice).toBe('auto');
+      expect(result.run.diagnostics?.modelTurns).toBe(5);
+      expect(result.run.diagnostics?.finalizationTurns).toBe(1);
+      expect(result.run.diagnostics?.toolActions).toBe(5);
+      expect(result.run.diagnostics?.modelRequestOutcomes).toHaveLength(6);
+      expect(result.run.diagnostics?.modelRequestOutcomes?.map(outcome => outcome.kind)).toEqual([
+        'acting-turn', 'acting-turn', 'acting-turn', 'acting-turn', 'acting-turn', 'finalization',
+      ]);
+      expect(result.run.diagnostics?.modelRequestOutcomes?.some(outcome => outcome.errorCode === 'MODEL_TURN_BUDGET_EXCEEDED')).toBe(false);
+      expect(requests[4]?.body.tool_choice).toBe('auto');
+      expect(requests[5]?.body.tools).toBeUndefined();
     } finally {
       persistence.close();
     }

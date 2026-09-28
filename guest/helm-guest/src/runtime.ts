@@ -22,6 +22,7 @@ import {
   optionalFiniteNumber,
 } from "./protocol";
 import { GuestSandbox } from "./sandbox";
+import type { BrowserContentBlock } from "../../../packages/shared/src/types";
 
 export interface GuestRuntimeOptions {
   sandbox?: GuestSandbox;
@@ -123,6 +124,8 @@ export class GuestRuntime {
             sourceType: serialized.sourceType,
             sourceRevision: serialized.sourceRevision,
             sourceUrl: serialized.sourceUrl,
+            sourceCapturedAt: serialized.sourceCapturedAt,
+            ...(serialized.sourceRefs ? { sourceRefs: serialized.sourceRefs } : {}),
             format: serialized.format,
           };
         }
@@ -185,16 +188,22 @@ export class GuestRuntime {
         const mode = enumValue(params, "mode", ["readable", "document"] as const, "readable");
         const query = optionalString(params, "query", { maxLength: 1_000 });
         const ref = optionalString(params, "ref", { maxLength: 64 });
+        const maxBlocks = optionalInteger(params, "maxBlocks", { min: 1, max: 20 });
         const maxChars = optionalInteger(params, "maxChars", { min: 1, max: 12_000 });
         const offset = optionalInteger(params, "offset", { min: 0, max: 1_000_000 });
         const limit = optionalInteger(params, "limit", { min: 1, max: 100 });
+        const blockTypes = Array.isArray(params.blockTypes)
+          ? params.blockTypes.filter((value): value is BrowserContentBlock["type"] => typeof value === "string")
+          : undefined;
         return this.browser.read({
           mode,
           ...(query === undefined ? {} : { query }),
           ...(ref === undefined ? {} : { ref }),
+          ...(maxBlocks === undefined ? {} : { maxBlocks }),
           ...(maxChars === undefined ? {} : { maxChars }),
           ...(offset === undefined ? {} : { offset }),
           ...(limit === undefined ? {} : { limit }),
+          ...(blockTypes === undefined ? {} : { blockTypes }),
         });
       }
       case "browser.findPage": {

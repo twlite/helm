@@ -441,33 +441,79 @@ function browserVisitAction(state: TaskState, expectedUrl: string): WorkerAction
   });
 }
 
+function isUsableBrowserEvidenceAction(action: WorkerAction): boolean {
+  if (!['browser.read', 'browser.findPage', 'browser.inspectRegion', 'browser.snapshot', 'browser.query', 'browser.evaluate'].includes(action.tool)
+    || !action.result.ok) return false;
+  const receipt = actionReceipt(action);
+  if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
+  const data = recordValue(action.result.data);
+  if (!data) return false;
+  if (action.tool === 'browser.read') {
+    return data.readable === true && Array.isArray(data.blocks) && data.blocks.length > 0;
+  }
+  if (action.tool === 'browser.findPage') {
+    return Number(data.matchCount) > 0 && Array.isArray(data.results) && data.results.length > 0;
+  }
+  if (action.tool === 'browser.inspectRegion') {
+    return typeof data.text === 'string' && data.text.trim().length > 0
+      || Array.isArray(data.rows) && data.rows.length > 0;
+  }
+  if (action.tool === 'browser.snapshot') {
+    return Array.isArray(data.outline) && data.outline.length > 0
+      || Array.isArray(data.elements) && data.elements.length > 0;
+  }
+  if (action.tool === 'browser.query') return Array.isArray(data.results) && data.results.length > 0;
+  const value = data.result;
+  return value !== null && value !== undefined && value !== ''
+    && (!Array.isArray(value) || value.length > 0)
+    && (typeof value !== 'object' || Array.isArray(value) || Object.keys(value as object).length > 0);
+}
+
 function browserEvidenceAction(state: TaskState): WorkerAction | undefined {
-  return [...verificationActions(state)].reverse().find(action => {
+  return [...verificationActions(state)].reverse().find(isUsableBrowserEvidenceAction);
+}
+
+/** A successful current-run inspection can confirm a transiently failed navigation. */
+function browserVisitEvidenceAction(
+  state: TaskState,
+  expectedUrl: string,
+  currentUrl?: string,
+): WorkerAction | undefined {
+  const actions = verificationActions(state);
+  const resolution = navigationResolutionFor(actions, expectedUrl);
+  const currentPageReached = Boolean(currentUrl && (
+    browserUrlsMatch(currentUrl, expectedUrl)
+    || resolution && browserUrlsMatch(currentUrl, resolution.finalUrl)
+    || actions.some(navigation => {
+      if (navigation.tool !== 'browser.navigate' && navigation.tool !== 'browser.open') return false;
+      const effect = actionReceipt(navigation)?.effect;
+      return effect?.navigationOccurred === true
+        && typeof effect.requestedUrl === 'string'
+        && browserUrlsMatch(effect.requestedUrl, expectedUrl)
+        && typeof effect.urlAfter === 'string'
+        && browserUrlsMatch(currentUrl, effect.urlAfter);
+    })
+  ));
+  if (!currentPageReached || !currentUrl) return undefined;
+  return [...actions].reverse().find(action => {
     if (!['browser.read', 'browser.findPage', 'browser.inspectRegion', 'browser.snapshot', 'browser.query', 'browser.evaluate'].includes(action.tool)
       || !action.result.ok) return false;
     const receipt = actionReceipt(action);
     if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
     const data = recordValue(action.result.data);
-    if (!data) return false;
-    if (action.tool === 'browser.read') {
-      return data.readable === true && Array.isArray(data.blocks) && data.blocks.length > 0;
-    }
-    if (action.tool === 'browser.findPage') {
-      return Number(data.matchCount) > 0 && Array.isArray(data.results) && data.results.length > 0;
-    }
-    if (action.tool === 'browser.inspectRegion') {
-      return typeof data.text === 'string' && data.text.trim().length > 0
-        || Array.isArray(data.rows) && data.rows.length > 0;
-    }
-    if (action.tool === 'browser.snapshot') {
-      return Array.isArray(data.outline) && data.outline.length > 0
-        || Array.isArray(data.elements) && data.elements.length > 0;
-    }
-    if (action.tool === 'browser.query') return Array.isArray(data.results) && data.results.length > 0;
-    const value = data.result;
-    return value !== null && value !== undefined && value !== ''
-      && (!Array.isArray(value) || value.length > 0)
-      && (typeof value !== 'object' || Array.isArray(value) || Object.keys(value as object).length > 0);
+    const evidenceUrl = typeof data?.url === 'string' ? data.url : undefined;
+    if (!evidenceUrl) return false;
+    if (browserUrlsMatch(evidenceUrl, expectedUrl)) return true;
+    if (resolution && browserUrlsMatch(evidenceUrl, resolution.finalUrl)) return true;
+    return actions.some(navigation => {
+      if (navigation.tool !== 'browser.navigate') return false;
+      const effect = actionReceipt(navigation)?.effect;
+      return typeof effect?.requestedUrl === 'string'
+        && browserUrlsMatch(effect.requestedUrl, expectedUrl)
+        && effect.navigationOccurred === true
+        && typeof effect.urlAfter === 'string'
+        && browserUrlsMatch(evidenceUrl, effect.urlAfter);
+    });
   });
 }
 
@@ -490,6 +536,14 @@ function observedSemanticContentRef(
     if (data?.url !== sourceUrl || data.revision !== sourceRevision) return false;
     const collection = action.tool === 'browser.read' ? data.blocks : data.results;
     if (!Array.isArray(collection)) return false;
+    if (action.tool === 'browser.read' && data.documentRef === sourceRef && sourceType === 'document') {
+      const blocks = collection.map(recordValue).filter((item): item is Record<string, unknown> => Boolean(item));
+      const refs = Array.isArray(data.sourceRefs)
+        ? data.sourceRefs.filter((ref): ref is string => typeof ref === 'string')
+        : blocks.map(item => item.ref).filter((ref): ref is string => typeof ref === 'string');
+      return refs.length > 1
+        && refs.every(ref => blocks.some(block => block.ref === ref && isSubstantiveBrowserContentBlock(block)));
+    }
     const block = collection.map(recordValue).find(item => item?.ref === sourceRef);
     return Boolean(block && isSubstantiveBrowserContentBlock(block)
       && (sourceType === undefined || block.type === sourceType));
@@ -563,9 +617,6 @@ function browserResearchAction(state: TaskState): WorkerAction | undefined {
   const discoveryRequired = requirementsForTask(state.task).some(requirement => (
     requirement.target?.action === 'browser.webSearch'
   ));
-  const artifactSelectionRequired = requirementsForTask(state.task).some(requirement => (
-    requirement.id === 'outputFile' && requirement.target?.mode === 'written-from-artifact'
-  ));
   return [...verificationActions(state)].reverse().find(action => {
     if (action.tool !== 'browser.read' || !action.result.ok) return false;
     const receipt = actionReceipt(action);
@@ -573,13 +624,6 @@ function browserResearchAction(state: TaskState): WorkerAction | undefined {
     const data = recordValue(action.result.data);
     if (data?.operation !== 'read' || data.readable !== true || !Array.isArray(data.blocks)) return false;
     if (discoveryRequired && isSearchEngineUrl(typeof data.url === 'string' ? data.url : undefined)) return false;
-    if (artifactSelectionRequired) {
-      const ref = typeof action.input.ref === 'string' ? action.input.ref : undefined;
-      if (!ref || typeof data.url !== 'string' || typeof data.revision !== 'number') return false;
-      const selected = data.blocks.map(recordValue).find(block => block?.ref === ref);
-      if (!selected || !isSubstantiveBrowserContentBlock(selected)) return false;
-      return previouslyObservedBrowserContentRef(state, action, ref, data.url, data.revision);
-    }
     return data.blocks.some(block => {
       const value = recordValue(block);
       return value !== undefined && isSubstantiveBrowserContentBlock(value);
@@ -727,6 +771,27 @@ function successfulCurrentRunAction(
       if (receiptApplication !== target.application) continue;
     }
     if (expectedTool === 'fs.write' && receipt.effect?.writePerformed !== true) continue;
+    if (expectedTool === 'fs.write' && target.mode === 'non-empty') {
+      const bytesWritten = receipt.effect?.bytesWritten ?? data?.size;
+      if (typeof bytesWritten !== 'number' || bytesWritten <= 0) continue;
+    }
+    if (expectedTool === 'fs.write' && target.mode === 'written-from-artifact') {
+      const bytesWritten = receipt.effect?.bytesWritten ?? data?.size;
+      if (typeof data?.sourceRef !== 'string'
+        || typeof data.sourceType !== 'string'
+        || typeof data.sourceUrl !== 'string'
+        || typeof data.sourceRevision !== 'number'
+        || typeof bytesWritten !== 'number'
+        || bytesWritten <= 0
+        || !observedSemanticContentRef(
+          state,
+          action,
+          data.sourceRef,
+          data.sourceRevision,
+          data.sourceUrl,
+          data.sourceType,
+        )) continue;
+    }
     if (expectedTool === 'browser.webSearch' && (
       data?.operation !== 'web_search'
       || data.searchEngine !== 'duckduckgo'
@@ -951,14 +1016,18 @@ async function requirementCheck(
       };
     }
     if (requirement.criterion.type === 'browser.url') {
-      const resolution = navigationResolutionFor(verificationActions(state), requirement.criterion.url);
-      return resolution
+      const actions = verificationActions(state);
+      const resolution = navigationResolutionFor(actions, requirement.criterion.url);
+      const evidenceAction = browserVisitEvidenceAction(state, requirement.criterion.url, observation.browser?.url);
+      return resolution || evidenceAction
         ? {
             passed: true,
-            message: resolution.redirected
+            message: resolution?.redirected
               ? `Browser followed the redirect from ${requirement.criterion.url} to ${resolution.finalUrl}.`
-              : `Browser reached ${requirement.criterion.url}.`,
-            evidence: { browser: observation.browser, navigation: resolution },
+              : evidenceAction
+                ? `Successful current-run browser evidence confirms ${requirement.criterion.url} was reached.`
+                : `Browser reached ${requirement.criterion.url}.`,
+            evidence: { browser: observation.browser, navigation: resolution, action: evidenceAction },
           }
         : {
             passed: false,
@@ -983,9 +1052,16 @@ async function requirementCheck(
   const target = requirement.target ?? {};
   if (requirement.type === 'browser' && target.freshness === 'current-run' && target.url) {
     const action = browserVisitAction(state, target.url);
-    return action
-      ? { passed: true, message: `The requested destination was visited during this run: ${target.url}.`, evidence: action }
-      : { passed: false, message: `No successful current-run browser navigation reached ${target.url}.` };
+    const evidenceAction = browserVisitEvidenceAction(state, target.url, observation.browser?.url);
+    return action || evidenceAction
+      ? {
+          passed: true,
+          message: evidenceAction
+            ? `Successful current-run browser evidence confirms the requested destination ${target.url} was reached.`
+            : `The requested destination was visited during this run: ${target.url}.`,
+          evidence: action ?? evidenceAction,
+        }
+      : { passed: false, message: `No successful current-run browser navigation or page evidence reached ${target.url}.` };
   }
   const expectedAction = requiredActionForRequirement(requirement);
   const currentAction = target.freshness === 'current-run' && expectedAction
@@ -1152,14 +1228,17 @@ export async function verifyTaskState(
   const criteria = legacy.criteria.map(check => {
     if (check.criterion.type === 'browser.url') {
       const resolution = navigationResolutionFor(verificationActions(state), check.criterion.url);
-      return resolution
+      const evidenceAction = browserVisitEvidenceAction(state, check.criterion.url, observation.browser?.url);
+      return resolution || evidenceAction
         ? {
             ...check,
             passed: true,
-            message: resolution.redirected
+            message: resolution?.redirected
               ? `Browser followed the redirect from ${check.criterion.url} to ${resolution.finalUrl}.`
-              : `Browser reached ${check.criterion.url}.`,
-            evidence: { browser: observation.browser, navigation: resolution },
+              : evidenceAction
+                ? `Successful current-run browser evidence confirms ${check.criterion.url} was reached.`
+                : `Browser reached ${check.criterion.url}.`,
+            evidence: { browser: observation.browser, navigation: resolution, action: evidenceAction },
           }
         : {
             ...check,
@@ -1360,6 +1439,8 @@ export function artifactsFromResult(
       ...(typeof data.sourceRef === 'string' ? { sourceRef: data.sourceRef } : {}),
       ...(typeof data.sourceType === 'string' ? { sourceType: data.sourceType as Artifact['sourceType'] } : {}),
       ...(typeof data.sourceRevision === 'number' ? { sourceRevision: data.sourceRevision } : {}),
+      ...(typeof data.sourceCapturedAt === 'string' ? { sourceCapturedAt: data.sourceCapturedAt } : {}),
+      ...(Array.isArray(data.sourceRefs) ? { sourceRefs: data.sourceRefs.filter((ref): ref is string => typeof ref === 'string').slice(0, 100) } : {}),
       ...(typeof data.format === 'string' ? { format: data.format as Artifact['format'] } : {}),
       ...(receipt?.id ? { writeReceiptId: receipt.id } : {}),
       observedAt: iso(now),

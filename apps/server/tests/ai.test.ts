@@ -540,7 +540,8 @@ describe('LM Studio AI adapters', () => {
       description: 'Read current public web information with the browser before answering.',
     });
     expect(JSON.stringify(requestBody)).toContain('DuckDuckGo');
-    expect(JSON.stringify(requestBody)).toContain('browser.read({ query })');
+    expect(JSON.stringify(requestBody)).toContain('browser.read query is natural-language relevance text, not CSS');
+    expect(JSON.stringify(requestBody)).toContain('use browser.query for DOM/CSS');
   });
 
   it('keeps current-information facts out of deterministic effect requirements', async () => {

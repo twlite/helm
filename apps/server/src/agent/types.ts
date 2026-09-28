@@ -127,6 +127,7 @@ export interface ActingAgentContext {
     response: string;
   }): Promise<ToolResult<VerificationResult>>;
   getRequirementSummary(): string;
+  getCurrentVerification?: () => VerificationResult | undefined;
   getToolActionCount?: () => number;
   onDiagnostics?: (diagnostics: RunDiagnostics) => Promise<void> | void;
   drainSteering?: () => Message[];

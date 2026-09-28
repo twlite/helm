@@ -304,6 +304,11 @@ export function RunActivityFeed({
       }
       : undefined);
   const diagnostics = run.diagnostics;
+  const schemaFailures = diagnostics?.modelRequestOutcomes?.flatMap((request) => (
+    request.toolCalls?.flatMap((call) => call.outcome === 'schema-validation-failed'
+      ? [{ request: request.request, tool: call.tool, input: call.input, issues: call.validationIssues ?? [] }]
+      : []) ?? []
+  )) ?? [];
   const latestVerification = [...run.steps]
     .sort((left, right) => right.stepIndex - left.stepIndex)
     .find((step) => step.verification)?.verification;
@@ -342,8 +347,24 @@ export function RunActivityFeed({
       ) : null}
       {diagnostics ? (
         <p className="text-[10px] text-[#606975]">
-          {diagnostics.modelTurns} model turns · {diagnostics.toolActions} tool actions · {diagnostics.completionAttempts} completion checks · {diagnostics.contextCompactions} context compactions
+          {diagnostics.modelTurns} acting turns · {diagnostics.finalizationTurns ?? 0} finalization turns · {diagnostics.toolActions} tool actions · {diagnostics.completionAttempts} completion checks · {diagnostics.contextCompactions} context compactions
         </p>
+      ) : null}
+      {schemaFailures.length > 0 ? (
+        <details className="rounded border border-[var(--border)] px-2 py-1.5 text-[10px] text-[#929aa5]">
+          <summary className="cursor-pointer">{schemaFailures.length} tool input validation {schemaFailures.length === 1 ? 'error' : 'errors'}</summary>
+          <div className="mt-2 space-y-3">
+            {schemaFailures.map((failure, index) => (
+              <div className="space-y-1.5 border-t border-[var(--border)] pt-2" key={`${failure.request}-${failure.tool}-${index}`}>
+                <p className="font-medium text-[#c9d1d9]">Request {failure.request} · {failure.tool}</p>
+                {failure.input !== undefined ? <Detail label="Input" value={displayValue(failure.input)} pre /> : null}
+                {failure.issues.map((issue, issueIndex) => (
+                  <Detail key={`${issue.code}-${issueIndex}`} label={`${issue.path.join('.') || 'input'} · ${issue.code}`} value={issue.message} />
+                ))}
+              </div>
+            ))}
+          </div>
+        </details>
       ) : null}
 
       {rows.length > 0 ? (

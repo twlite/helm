@@ -124,8 +124,10 @@ export interface Artifact {
   sha256?: string;
   sourceUrl?: string;
   sourceRef?: string;
-  sourceType?: BrowserContentType;
+  sourceType?: BrowserContentSourceType;
   sourceRevision?: number;
+  sourceCapturedAt?: string;
+  sourceRefs?: string[];
   format?: BrowserContentFormat;
   writeReceiptId?: string;
   download?: DownloadRecord;
@@ -430,6 +432,8 @@ export interface Run {
 
 export interface RunDiagnostics {
   modelTurns: number;
+  /** Bounded final-response requests after deterministic effects are verified. */
+  finalizationTurns?: number;
   modelRequests: number;
   toolActions: number;
   completionAttempts: number;
@@ -441,7 +445,7 @@ export interface RunDiagnostics {
 
 export interface ModelRequestOutcome {
   request: number;
-  kind: 'acting-turn' | 'context-compaction';
+  kind: 'acting-turn' | 'finalization' | 'context-compaction';
   providerCalls: number;
   providerRetries: number;
   outcome:
@@ -450,6 +454,8 @@ export interface ModelRequestOutcome {
     | 'assistant-text-and-tool-call'
     | 'no-actionable-output'
     | 'provider-error'
+    | 'finalization-error'
+    | 'final-response'
     | 'context-summary-error'
     | 'context-summary';
   finishReason?: string;
@@ -460,6 +466,12 @@ export interface ModelRequestOutcome {
     tool: string;
     outcome: 'succeeded' | 'failed' | 'schema-validation-failed' | 'rejected-before-execution' | 'no-result';
     errorCode?: string;
+    input?: JsonValue;
+    validationIssues?: Array<{
+      path: Array<string | number>;
+      code: string;
+      message: string;
+    }>;
   }>;
 }
 
@@ -737,6 +749,7 @@ export type BrowserContentType =
   | 'other';
 
 export type BrowserContentFormat = 'text' | 'markdown' | 'json' | 'csv';
+export type BrowserContentSourceType = BrowserContentType | 'document';
 
 export interface BrowserContentSource {
   frameUrl?: string;
@@ -800,6 +813,18 @@ export interface BrowserReadSection {
   ref?: string;
 }
 
+export interface BrowserStructuredBlockSummary {
+  ref: string;
+  type: 'table' | 'list' | 'definition' | 'form';
+  heading?: string;
+  headingPath?: string[];
+  caption?: string;
+  rowCount?: number;
+  columnCount?: number;
+  selected: boolean;
+  previewOnly: true;
+}
+
 export interface BrowserReadResult {
   operation: 'read';
   url: string;
@@ -809,10 +834,19 @@ export interface BrowserReadResult {
   source: 'semantic';
   pageType?: BrowserPageType;
   query?: string;
+  /** Durable immutable export of all selected blocks, ordered by page appearance. */
+  documentRef?: string;
   blocks?: BrowserContentSummary[];
   diagnostics?: {
     blockCount: number;
     tableCount: number;
+    selectedBlockCount?: number;
+    structuredBlockCount?: number;
+    structuredBlocksTruncated?: boolean;
+    structuredBlocks?: BrowserStructuredBlockSummary[];
+    sourceTruncated?: boolean;
+    summariesArePreviews?: boolean;
+    documentRef?: string;
     selectedRefs: Array<{ ref: string; relevance?: number }>;
     extractors: string[];
     inaccessibleFrames?: number;

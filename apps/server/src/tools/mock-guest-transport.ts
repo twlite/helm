@@ -7,6 +7,7 @@ import type {
   BrowserContentSummary,
   BrowserQueryResult,
   BrowserRegionKind,
+  BrowserReadResult,
   BrowserReadMode,
   GuestMethod,
   WindowInfo,
@@ -56,6 +57,8 @@ export interface MockGuestOptions {
   redirects?: Record<string, string>;
   /** Deterministic failures for selected browser navigation URLs. */
   navigationFailures?: Record<string, string>;
+  /** A deterministic transient failure returned after the page state has committed. */
+  navigationFailuresAfterReach?: Record<string, string>;
   delayMs?: number;
   downloads?: Record<string, { finalUrl?: string; filename: string; content?: string; context?: string }>;
 }
@@ -90,6 +93,18 @@ interface MockContentReference {
   url: string;
   title: string;
   pageType: 'article' | 'data_table' | 'search_results' | 'documentation' | 'form' | 'application' | 'generic';
+  capturedAt: string;
+}
+
+interface MockDocumentReference {
+  blocks: BrowserContentBlock[];
+  sourceRefs: string[];
+  revision: number;
+  url: string;
+  title: string;
+  pageType: 'article' | 'data_table' | 'search_results' | 'documentation' | 'form' | 'application' | 'generic';
+  capturedAt: string;
+  sourceTruncated: boolean;
 }
 
 interface MockQueryCandidate {
@@ -465,6 +480,7 @@ function mockContentBlocks(
         url: browser.url ?? '',
         title: browser.title ?? '',
         pageType,
+        capturedAt: new Date().toISOString(),
       });
     }
   }
@@ -489,6 +505,7 @@ function mockBlockText(block: BrowserContentBlock): string {
 
 function mockSerializeContent(block: BrowserContentBlock, format: BrowserContentFormat): string {
   if (format === 'json') return `${JSON.stringify({
+    ref: block.ref,
     type: block.type,
     heading: block.heading,
     headingPath: block.headingPath,
@@ -530,6 +547,27 @@ function mockSerializeContent(block: BrowserContentBlock, format: BrowserContent
   }
   const heading = block.type === 'heading' ? undefined : block.headingPath?.join(' / ') || block.heading;
   return `${heading ? `${heading}\n\n` : ''}${text}\n`;
+}
+
+function mockSerializeDocument(document: MockDocumentReference, format: BrowserContentFormat): string {
+  if (format === 'json') return `${JSON.stringify({
+    type: 'document',
+    sourceUrl: document.url,
+    sourceTitle: document.title,
+    capturedAt: document.capturedAt,
+    sourceRevision: document.revision,
+    sourceRefs: document.sourceRefs,
+    sourceTruncated: document.sourceTruncated,
+    blocks: document.blocks.map(block => JSON.parse(mockSerializeContent(block, 'json')) as unknown),
+  }, null, 2)}\n`;
+  if (format === 'csv') {
+    const tables = document.blocks.filter(block => block.type === 'table');
+    if (document.blocks.length !== 1 || tables.length !== 1) {
+      throw new GuestTransportError('UNSUPPORTED_CONTENT_FORMAT', `CSV export requires a single table block with no other blocks; this snapshot contains ${document.blocks.length} blocks and ${tables.length} tables. Use text, markdown, or json for a composite document.`);
+    }
+    return mockSerializeContent(tables[0]!, 'csv');
+  }
+  return document.blocks.map(block => mockSerializeContent(block, format).trimEnd()).filter(Boolean).join('\n\n') + '\n';
 }
 
 function mockContentSummary(block: BrowserContentBlock, previewLimit: number, relevance?: number): BrowserContentSummary {
@@ -610,13 +648,16 @@ export class MockGuestTransport implements GuestTransport {
   private readonly pages: Record<string, string>;
   private readonly redirects: Record<string, string>;
   private readonly navigationFailures: Record<string, string>;
+  private readonly navigationFailuresAfterReach: Record<string, string>;
   private readonly delayMs: number;
   private readonly downloads: Record<string, { finalUrl?: string; filename: string; content?: string; context?: string }>;
   private readonly windows = new Map<string, WindowInfo>();
   private readonly contentReferences = new Map<string, MockContentReference>();
+  private readonly documentReferences = new Map<string, MockDocumentReference>();
   private readonly navigationReferences = new Map<string, MockNavigationReference>();
   private readonly queryElementReferences = new Map<string, MockBrowserElement>();
   private navigationIndex = 0;
+  private documentReferenceIndex = 0;
   private queryReferenceIndex = 0;
   private searchGeneration = 0;
   private contentSessionId = randomUUID().replace(/-/gu, '').slice(0, 8);
@@ -636,6 +677,7 @@ export class MockGuestTransport implements GuestTransport {
     this.pages = { ...(options.pages ?? {}) };
     this.redirects = { ...(options.redirects ?? {}) };
     this.navigationFailures = { ...(options.navigationFailures ?? {}) };
+    this.navigationFailuresAfterReach = { ...(options.navigationFailuresAfterReach ?? {}) };
     this.downloads = options.downloads ?? {};
     this.files.set(DEMO_PAGE_PATH, DEMO_PAGE_HTML);
     this.addDirectoryParents(DEMO_PAGE_PATH);
@@ -685,6 +727,7 @@ export class MockGuestTransport implements GuestTransport {
     this.addDirectoryParents(DEMO_PAGE_PATH);
     this.windows.clear();
     this.contentReferences.clear();
+    this.documentReferences.clear();
     this.navigationReferences.clear();
     this.queryElementReferences.clear();
     this.navigationIndex = 0;
@@ -753,12 +796,16 @@ export class MockGuestTransport implements GuestTransport {
         const path = normalizeGuestPath(input.path);
         let content = input.content;
         let sourceReference: MockContentReference | undefined;
+        let documentReference: MockDocumentReference | undefined;
         if (input.sourceRef) {
           sourceReference = this.contentReferences.get(input.sourceRef);
-          if (!sourceReference) {
+          documentReference = this.documentReferences.get(input.sourceRef);
+          if (!sourceReference && !documentReference) {
             throw new GuestTransportError('UNKNOWN_CONTENT_REF', `Browser content ref ${input.sourceRef} is unknown or expired.`);
           }
-          content = mockSerializeContent(sourceReference.block, input.format ?? 'text');
+          content = sourceReference
+            ? mockSerializeContent(sourceReference.block, input.format ?? 'text')
+            : mockSerializeDocument(documentReference!, input.format ?? 'text');
         }
         if (content === undefined) throw new GuestTransportError('INVALID_INPUT', 'Provide content or sourceRef.');
         const previous = this.files.get(path);
@@ -774,11 +821,13 @@ export class MockGuestTransport implements GuestTransport {
           existedBefore,
           ...(beforeSha256 === undefined ? {} : { beforeSha256 }),
           changed: !existedBefore || beforeSha256 !== sha256,
-          ...(input.sourceRef && sourceReference ? {
+          ...(input.sourceRef && (sourceReference || documentReference) ? {
             sourceRef: input.sourceRef,
-            sourceType: sourceReference.block.type,
-            sourceRevision: sourceReference.revision,
-            sourceUrl: sourceReference.url,
+            sourceType: sourceReference?.block.type ?? 'document',
+            sourceRevision: sourceReference?.revision ?? documentReference?.revision,
+            sourceUrl: sourceReference?.url ?? documentReference?.url,
+            sourceCapturedAt: sourceReference?.capturedAt ?? documentReference?.capturedAt,
+            sourceRefs: sourceReference ? [input.sourceRef] : documentReference?.sourceRefs,
             format: input.format ?? 'text',
           } : {}),
         } as GuestMethodResult[M];
@@ -965,126 +1014,7 @@ export class MockGuestTransport implements GuestTransport {
         if (!this.browser.loaded || !this.browser.url) {
           throw new GuestTransportError('BROWSER_NOT_READY', 'Navigate the browser before reading page content');
         }
-        const input = params as GuestMethodParams['browser.read'];
-        const mode: BrowserReadMode = input.mode ?? 'readable';
-        const maxChars = Math.max(1, Math.min(12_000, input.maxChars ?? 4_000));
-        if (input.ref && this.navigationReferences.has(input.ref)) {
-          throw new GuestTransportError('NAVIGATION_REF_REQUIRES_OPEN', `Browser ref ${input.ref} is an observed navigation destination. Use browser.open({ ref: "${input.ref}" }) to navigate to it.`);
-        }
-        if (input.ref) {
-          const reference = this.contentReferences.get(input.ref);
-          if (!reference) {
-            throw new GuestTransportError('UNKNOWN_CONTENT_REF', `Browser content ref ${input.ref} is unknown or expired.`);
-          }
-          const full = reference.block;
-          const offset = Math.max(0, input.offset ?? 0);
-          const limit = Math.max(1, Math.min(100, input.limit ?? 20));
-          let block = full;
-          let hasMore = false;
-          if (full.type === 'table') {
-            block = { ...full, rows: (full.rows ?? []).slice(offset, offset + limit) };
-            hasMore = offset + (block.rows?.length ?? 0) < (full.rows?.length ?? 0);
-          } else if (full.type === 'list') {
-            const items: string[] = [];
-            let itemChars = 0;
-            for (const item of (full.items ?? []).slice(offset, offset + limit)) {
-              const nextChars = JSON.stringify(item).length;
-              if (items.length > 0 && itemChars + nextChars > maxChars) break;
-              items.push(item);
-              itemChars += nextChars;
-            }
-            block = { ...full, items };
-            hasMore = offset + (block.items?.length ?? 0) < (full.items?.length ?? 0);
-          } else if (['text', 'code', 'other'].includes(full.type) && full.text !== undefined) {
-            block = { ...full, text: full.text.slice(offset, offset + maxChars) };
-            hasMore = offset + (block.text?.length ?? 0) < full.text.length;
-          }
-          const summary = mockContentSummary(block, maxChars);
-          const preview = summary.preview ?? '';
-          if (block.type === 'table') {
-            summary.rows = block.rows ?? [];
-            summary.offset = offset;
-            summary.returnedRowCount = summary.rows.length;
-            hasMore = offset + summary.rows.length < (full.rows?.length ?? 0);
-            if (hasMore) summary.nextOffset = offset + summary.rows.length;
-          } else if (block.type === 'list') {
-            summary.items = block.items ?? [];
-            summary.offset = offset;
-            summary.returnedRowCount = summary.items.length;
-            if (hasMore) summary.nextOffset = offset + summary.items.length;
-          } else if (['text', 'code', 'other'].includes(block.type) && block.text !== undefined) {
-            summary.offset = offset;
-            summary.returnedChars = block.text.length;
-            if (hasMore) summary.nextOffset = offset + block.text.length;
-          }
-          summary.truncated = Boolean(summary.truncated || hasMore);
-          return {
-            operation: 'read',
-            url: reference.url,
-            title: reference.title,
-            revision: reference.revision,
-            mode,
-            source: 'semantic',
-            pageType: reference.pageType,
-            blocks: [summary],
-            diagnostics: { blockCount: 1, tableCount: full.type === 'table' ? 1 : 0, selectedRefs: [{ ref: input.ref }], extractors: [full.source?.extractor ?? 'dom'] },
-            readable: Boolean(preview),
-            sections: [{ ...(summary.heading ? { heading: summary.heading } : {}), text: preview, ref: input.ref }],
-            totalChars: JSON.stringify(full).length,
-            returnedChars: preview.length,
-            truncated: Boolean(full.truncated || hasMore),
-          } as GuestMethodResult[M];
-        }
-
-        const navCounter = { index: this.navigationIndex, searchId: this.searchGeneration };
-        const blocks = mockContentBlocks(this.browser, this.contentReferences, this.contentSessionId, this.navigationReferences, navCounter);
-        this.navigationIndex = navCounter.index;
-        let selected: Array<{ block: BrowserContentBlock; relevance?: number }>;
-        if (input.query) {
-          const ranked = rankBrowserContentBlocks({ query: input.query, blocks, maxResults: 8 });
-          const blocksByRef = new Map(blocks.map(block => [block.ref, block]));
-          selected = ranked.results.flatMap(result => {
-            const block = blocksByRef.get(result.ref);
-            return block ? [{ block, relevance: result.relevance }] : [];
-          });
-        } else {
-          const substantive = blocks.filter(block => !block.boilerplate).sort((left, right) => (
-            (right.importance ?? 0) - (left.importance ?? 0)
-            || ({ table: 0, search_result: 1, text: 2, list: 3, definition: 4, form: 5, code: 6, heading: 7, other: 8, navigation: 9 }[left.type]
-              - { table: 0, search_result: 1, text: 2, list: 3, definition: 4, form: 5, code: 6, heading: 7, other: 8, navigation: 9 }[right.type])
-            || left.ref.localeCompare(right.ref)
-          )).slice(0, 7);
-          const chrome = blocks.find(block => block.boilerplate);
-          selected = [...substantive.map(block => ({ block })), ...(chrome ? [{ block: chrome }] : [])];
-        }
-        const previewChars = Math.max(1, Math.min(520, Math.floor(maxChars / Math.max(1, Math.min(6, selected.length)))));
-        const summaries = selected.map(({ block, relevance }) => mockContentSummary(block, previewChars, relevance));
-        const pageType = blocks.some(block => block.type === 'search_result') ? 'search_results'
-          : blocks.some(block => block.type === 'table') ? 'data_table'
-            : blocks.some(block => block.type === 'form') ? 'form' : 'generic';
-        const sections = summaries.map(block => ({ ...(block.heading ? { heading: block.heading } : {}), text: block.preview ?? '', ref: block.ref }));
-        return {
-          operation: 'read',
-          url: this.browser.url,
-          title: this.browser.title ?? '',
-          revision: this.browser.revision,
-          mode,
-          source: 'semantic',
-          pageType,
-          ...(input.query ? { query: input.query } : {}),
-          blocks: summaries,
-          diagnostics: {
-            blockCount: blocks.length,
-            tableCount: blocks.filter(block => block.type === 'table').length,
-            selectedRefs: summaries.map(block => ({ ref: block.ref, ...(block.relevance === undefined ? {} : { relevance: block.relevance }) })),
-            extractors: ['dom'],
-          },
-          readable: blocks.some(block => Boolean(block.text?.trim() || block.rows?.length || block.items?.length || block.title?.trim() || block.snippet?.trim() || block.links?.length || block.fields?.length || block.definitions?.length)),
-          sections,
-          totalChars: blocks.reduce((sum, block) => sum + JSON.stringify(block).length, 0),
-          returnedChars: JSON.stringify(summaries).length,
-          truncated: summaries.length < selected.length || blocks.length > summaries.length,
-        } as GuestMethodResult[M];
+        return this.readMockContent(params as GuestMethodParams['browser.read']) as GuestMethodResult[M];
       }
       case 'browser.findPage': {
         const input = params as GuestMethodParams['browser.findPage'];
@@ -1372,6 +1302,262 @@ export class MockGuestTransport implements GuestTransport {
     }
   }
 
+  private readMockContent(input: GuestMethodParams['browser.read']): BrowserReadResult {
+    const maxChars = Math.max(1, Math.min(12_000, input.maxChars ?? 4_000));
+    if ('ref' in input) {
+      if (this.navigationReferences.has(input.ref)) {
+        throw new GuestTransportError('NAVIGATION_REF_REQUIRES_OPEN', `Browser ref ${input.ref} is an observed navigation destination. Use browser.open({ ref: "${input.ref}" }) to navigate to it.`);
+      }
+      const document = this.documentReferences.get(input.ref);
+      if (document) {
+        const offset = Math.max(0, input.offset ?? 0);
+        const limit = Math.max(1, Math.min(100, input.limit ?? 20));
+        const candidates = document.blocks.slice(offset, offset + limit);
+        const summaries = candidates.map(block => mockContentSummary(block, Math.max(120, Math.floor(maxChars / Math.max(1, candidates.length)))));
+        const returnedChars = summaries.reduce((sum, summary) => sum + JSON.stringify(summary).length, 0);
+        const structured = document.blocks.filter(block => ['table', 'list', 'definition', 'form'].includes(block.type));
+        const structuredBlocks = structured.slice(0, 20).map(block => this.mockStructuredSummary(block, true));
+        return {
+          operation: 'read',
+          url: document.url,
+          title: document.title,
+          revision: document.revision,
+          mode: 'document',
+          source: 'semantic',
+          pageType: document.pageType,
+          documentRef: input.ref,
+          blocks: summaries,
+          diagnostics: {
+            blockCount: document.blocks.length,
+            tableCount: document.blocks.filter(block => block.type === 'table').length,
+            selectedBlockCount: document.blocks.length,
+            structuredBlockCount: structured.length,
+            structuredBlocksTruncated: structured.length > structuredBlocks.length,
+            structuredBlocks,
+            sourceTruncated: document.sourceTruncated,
+            summariesArePreviews: true,
+            documentRef: input.ref,
+            selectedRefs: summaries.map(block => ({ ref: block.ref })),
+            extractors: [...new Set(document.blocks.map(block => block.source?.extractor ?? 'dom'))],
+          },
+          readable: summaries.length > 0,
+          sections: summaries.map(block => ({ ...(block.heading ? { heading: block.heading } : {}), text: block.preview ?? '', ref: block.ref })),
+          totalChars: document.blocks.reduce((sum, block) => sum + JSON.stringify(block).length, 0),
+          returnedChars,
+          truncated: document.sourceTruncated || offset > 0 || summaries.length < candidates.length || offset + summaries.length < document.blocks.length,
+        };
+      }
+      const reference = this.contentReferences.get(input.ref);
+      if (!reference) throw new GuestTransportError('UNKNOWN_CONTENT_REF', `Browser content ref ${input.ref} is unknown or expired.`);
+      const full = reference.block;
+      const offset = Math.max(0, input.offset ?? 0);
+      const limit = Math.max(1, Math.min(100, input.limit ?? 20));
+      let block: BrowserContentBlock = { ...full };
+      let hasMore = false;
+      let paged = false;
+      if (full.type === 'table') {
+        block = { ...full, rows: (full.rows ?? []).slice(offset, offset + limit) };
+        hasMore = offset + (block.rows?.length ?? 0) < (full.rows?.length ?? 0);
+        paged = true;
+      } else if (full.type === 'list') {
+        block = { ...full, items: (full.items ?? []).slice(offset, offset + limit) };
+        hasMore = offset + (block.items?.length ?? 0) < (full.items?.length ?? 0);
+        paged = true;
+      } else if (full.type === 'definition') {
+        block = { ...full, definitions: (full.definitions ?? []).slice(offset, offset + limit) };
+        hasMore = offset + (block.definitions?.length ?? 0) < (full.definitions?.length ?? 0);
+        paged = true;
+      } else if (full.type === 'form') {
+        block = { ...full, fields: (full.fields ?? []).slice(offset, offset + limit) };
+        hasMore = offset + (block.fields?.length ?? 0) < (full.fields?.length ?? 0);
+        paged = true;
+      } else if (full.type === 'navigation') {
+        block = { ...full, links: (full.links ?? []).slice(offset, offset + limit) };
+        hasMore = offset + (block.links?.length ?? 0) < (full.links?.length ?? 0);
+        paged = true;
+      } else if (['text', 'code', 'other', 'heading'].includes(full.type) && full.text !== undefined) {
+        const charLimit = Math.min(maxChars, input.limit ?? maxChars);
+        block = { ...full, text: full.text.slice(offset, offset + charLimit) };
+        hasMore = offset + (block.text?.length ?? 0) < full.text.length;
+        paged = true;
+      } else if (input.offset !== undefined || input.limit !== undefined) {
+        throw new GuestTransportError('UNSUPPORTED_CONTENT_PAGINATION', `Content ref ${input.ref} is a ${full.type} block and does not support offset/limit pagination.`);
+      }
+      const summary = mockContentSummary(block, maxChars);
+      if (block.type === 'table') {
+        summary.rows = block.rows ?? [];
+        summary.offset = offset;
+        summary.returnedRowCount = summary.rows.length;
+        if (hasMore) summary.nextOffset = offset + summary.rows.length;
+      } else if (block.type === 'list') {
+        summary.items = block.items ?? [];
+        summary.offset = offset;
+        summary.returnedRowCount = summary.items.length;
+        if (hasMore) summary.nextOffset = offset + summary.items.length;
+      } else if (block.type === 'definition') {
+        summary.definitions = block.definitions ?? [];
+        summary.offset = offset;
+        summary.returnedRowCount = summary.definitions.length;
+        if (hasMore) summary.nextOffset = offset + summary.definitions.length;
+      } else if (block.type === 'form') {
+        summary.fields = block.fields ?? [];
+        summary.offset = offset;
+        summary.returnedRowCount = summary.fields.length;
+        if (hasMore) summary.nextOffset = offset + summary.fields.length;
+      } else if (block.type === 'navigation') {
+        summary.links = block.links ?? [];
+        summary.offset = offset;
+        summary.returnedRowCount = summary.links.length;
+        if (hasMore) summary.nextOffset = offset + summary.links.length;
+      } else if (['text', 'code', 'other', 'heading'].includes(block.type) && block.text !== undefined) {
+        summary.offset = offset;
+        summary.returnedChars = block.text.length;
+        if (hasMore) summary.nextOffset = offset + block.text.length;
+      }
+      summary.truncated = Boolean(summary.truncated || (paged && hasMore));
+      return {
+        operation: 'read',
+        url: reference.url,
+        title: reference.title,
+        revision: reference.revision,
+        mode: 'readable',
+        source: 'semantic',
+        pageType: reference.pageType,
+        blocks: [summary],
+        diagnostics: {
+          blockCount: 1,
+          tableCount: full.type === 'table' ? 1 : 0,
+          selectedBlockCount: 1,
+          structuredBlockCount: ['table', 'list', 'definition', 'form'].includes(full.type) ? 1 : 0,
+          structuredBlocks: ['table', 'list', 'definition', 'form'].includes(full.type) ? [this.mockStructuredSummary(full, true)] : [],
+          structuredBlocksTruncated: false,
+          sourceTruncated: false,
+          summariesArePreviews: true,
+          selectedRefs: [{ ref: input.ref }],
+          extractors: [full.source?.extractor ?? 'dom'],
+        },
+        readable: Boolean(summary.preview),
+        sections: [{ ...(summary.heading ? { heading: summary.heading } : {}), text: summary.preview ?? '', ref: input.ref }],
+        totalChars: JSON.stringify(full).length,
+        returnedChars: summary.preview?.length ?? 0,
+        truncated: Boolean(hasMore),
+      };
+    }
+
+    const mode: BrowserReadMode = input.mode ?? 'readable';
+    const maxBlocks = Math.max(1, Math.min(20, input.maxBlocks ?? (mode === 'document' ? 20 : 7)));
+    const navCounter = { index: this.navigationIndex, searchId: this.searchGeneration };
+    const extracted = mockContentBlocks(this.browser, this.contentReferences, this.contentSessionId, this.navigationReferences, navCounter);
+    this.navigationIndex = navCounter.index;
+    const blocks = input.blockTypes ? extracted.filter(block => input.blockTypes!.includes(block.type)) : extracted;
+    let selected: Array<{ block: BrowserContentBlock; relevance?: number }>;
+    if (input.query) {
+      const ranked = rankBrowserContentBlocks({ query: input.query, blocks, maxResults: maxBlocks });
+      const byRef = new Map(blocks.map(block => [block.ref, block]));
+      selected = ranked.results.flatMap(result => {
+        const block = byRef.get(result.ref);
+        return block ? [{ block, relevance: result.relevance }] : [];
+      });
+    } else {
+      const substantive = blocks.filter(block => !block.boilerplate);
+      if (mode === 'document') {
+        selected = substantive.slice(0, maxBlocks).map(block => ({ block }));
+      } else {
+        const ranked = [...substantive].sort((left, right) => (
+          (right.importance ?? 0) - (left.importance ?? 0)
+          || ({ table: 0, search_result: 1, text: 2, list: 3, definition: 4, form: 5, code: 6, heading: 7, other: 8, navigation: 9 }[left.type]
+            - { table: 0, search_result: 1, text: 2, list: 3, definition: 4, form: 5, code: 6, heading: 7, other: 8, navigation: 9 }[right.type])
+          || left.ref.localeCompare(right.ref)
+        )).slice(0, maxBlocks);
+        selected = ranked.map(block => ({ block }));
+        const chrome = blocks.find(block => block.boilerplate);
+        if (chrome && selected.length < maxBlocks) selected.push({ block: chrome });
+      }
+    }
+    selected = selected.slice(0, maxBlocks);
+    if (mode === 'document') {
+      const selectedRefs = new Set(selected.map(entry => entry.block.ref));
+      selected = extracted.filter(block => selectedRefs.has(block.ref)).map(block => ({ block }));
+    }
+    const previewChars = Math.max(120, Math.min(520, Math.floor(maxChars / Math.max(1, Math.min(8, selected.length)))));
+    const summaries: BrowserContentSummary[] = [];
+    let returnedChars = 0;
+    for (const entry of selected) {
+      const summary = mockContentSummary(entry.block, previewChars, entry.relevance);
+      const cost = JSON.stringify(summary).length;
+      if (summaries.length > 0 && returnedChars + cost > maxChars) break;
+      summaries.push(summary);
+      returnedChars += cost;
+    }
+    const selectedRefs = new Set(summaries.map(summary => summary.ref));
+    const documentBlocks = extracted.filter(block => selectedRefs.has(block.ref));
+    const pageType = blocks.some(block => block.type === 'search_result') ? 'search_results'
+      : blocks.some(block => block.type === 'table') ? 'data_table'
+        : blocks.some(block => block.type === 'form') ? 'form' : 'generic';
+    const structured = extracted.filter(block => ['table', 'list', 'definition', 'form'].includes(block.type));
+    const structuredBlocks = structured.slice(0, 20).map(block => this.mockStructuredSummary(block, selectedRefs.has(block.ref)));
+    const documentRef = documentBlocks.length > 1 ? this.registerMockDocumentReference(documentBlocks, pageType) : undefined;
+    return {
+      operation: 'read',
+      url: this.browser.url ?? 'about:blank',
+      title: this.browser.title ?? '',
+      revision: this.browser.revision,
+      mode,
+      source: 'semantic',
+      pageType,
+      ...(input.query ? { query: input.query } : {}),
+      ...(documentRef ? { documentRef } : {}),
+      blocks: summaries,
+      diagnostics: {
+        blockCount: extracted.length,
+        tableCount: extracted.filter(block => block.type === 'table').length,
+        selectedBlockCount: summaries.length,
+        structuredBlockCount: structured.length,
+        structuredBlocksTruncated: structured.length > structuredBlocks.length,
+        structuredBlocks,
+        sourceTruncated: false,
+        summariesArePreviews: true,
+        ...(documentRef ? { documentRef } : {}),
+        selectedRefs: summaries.map(block => ({ ref: block.ref, ...(block.relevance === undefined ? {} : { relevance: block.relevance }) })),
+        extractors: ['dom'],
+      },
+      readable: extracted.some(block => Boolean(block.text?.trim() || block.rows?.length || block.items?.length || block.title?.trim() || block.snippet?.trim() || block.links?.length || block.fields?.length || block.definitions?.length)),
+      sections: summaries.map(block => ({ ...(block.heading ? { heading: block.heading } : {}), text: block.preview ?? '', ref: block.ref })),
+      totalChars: extracted.reduce((sum, block) => sum + JSON.stringify(block).length, 0),
+      returnedChars,
+      truncated: summaries.length < selected.length || extracted.length > summaries.length,
+    };
+  }
+
+  private mockStructuredSummary(block: BrowserContentBlock, selected: boolean) {
+    return {
+      ref: block.ref,
+      type: block.type as 'table' | 'list' | 'definition' | 'form',
+      ...(block.heading ? { heading: block.heading.slice(0, 160) } : {}),
+      ...(block.headingPath ? { headingPath: block.headingPath.slice(0, 8).map(value => value.slice(0, 160)) } : {}),
+      ...(block.caption ? { caption: block.caption.slice(0, 240) } : {}),
+      ...(block.rowCount === undefined ? {} : { rowCount: block.rowCount }),
+      ...(block.columnCount === undefined ? {} : { columnCount: block.columnCount }),
+      selected,
+      previewOnly: true as const,
+    };
+  }
+
+  private registerMockDocumentReference(blocks: BrowserContentBlock[], pageType: MockDocumentReference['pageType']): string {
+    const ref = `d${this.browser.revision}-${this.contentSessionId}-${++this.documentReferenceIndex}`;
+    this.documentReferences.set(ref, {
+      blocks: JSON.parse(JSON.stringify(blocks)) as BrowserContentBlock[],
+      sourceRefs: blocks.map(block => block.ref),
+      revision: this.browser.revision,
+      url: this.browser.url ?? 'about:blank',
+      title: this.browser.title ?? '',
+      pageType,
+      capturedAt: new Date().toISOString(),
+      sourceTruncated: false,
+    });
+    return ref;
+  }
+
   private resolveElementReference(ref: string): MockBrowserElement | undefined {
     const queryRef = ref.match(/^e(\d+)-q([1-9]\d*)$/u);
     if (queryRef) {
@@ -1411,6 +1597,12 @@ export class MockGuestTransport implements GuestTransport {
       regions: mockRegions(document, revision),
     };
     this.upsertWindow('browser', 'Chromium', title, true);
+    const transientFailure = this.navigationFailuresAfterReach[requestedUrl];
+    if (transientFailure) {
+      throw new GuestTransportError('BROWSER_NAVIGATION_FAILED', transientFailure, {
+        details: { url, title, revision, navigationOccurred: true },
+      });
+    }
     return { url, title, loading: false, pageCount: 1, revision };
   }
 

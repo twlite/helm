@@ -167,16 +167,18 @@ describe('acting agent native tool loop', () => {
     expect(written).toBe(true);
     expect(opened).toBe(true);
     expect(requests).toHaveLength(4);
-    expect(requests.map(request => request.body.tool_choice)).toEqual(['auto', 'auto', 'auto', 'auto']);
+    expect(requests.map(request => request.body.tool_choice)).toEqual(['auto', 'auto', 'auto', undefined]);
     const fullToolSet = requestedTools(requests[0]!);
     expect(fullToolSet).toEqual(expect.arrayContaining([
       'browser.navigate', 'browser.webSearch', 'browser.read', 'browser.query', 'browser.evaluate', 'fs.write', 'app.openFile',
     ]));
-    expect(requests.slice(1).every(request => requestedTools(request).sort().join('|') === [...fullToolSet].sort().join('|'))).toBe(true);
+    expect(requests.slice(1, 3).every(request => requestedTools(request).sort().join('|') === [...fullToolSet].sort().join('|'))).toBe(true);
+    expect(requestedTools(requests[3]!)).toEqual([]);
     expect(JSON.stringify(requests[1]!.body.messages)).toContain('FILE_NOT_FOUND');
-    expect(result.diagnostics.modelTurns).toBe(4);
+    expect(result.diagnostics.modelTurns).toBe(3);
+    expect(result.diagnostics.finalizationTurns).toBe(1);
     expect(result.diagnostics.modelRequestOutcomes?.map(outcome => outcome.outcome)).toEqual([
-      'tool-call', 'tool-call', 'tool-call', 'assistant-text',
+      'tool-call', 'tool-call', 'tool-call', 'final-response',
     ]);
     expect(result.diagnostics.modelRequestOutcomes?.map(outcome => outcome.providerCalls)).toEqual([1, 1, 1, 1]);
     expect(result.diagnostics.modelRequestOutcomes?.at(-1)?.completion).toBe('accepted');
@@ -188,7 +190,7 @@ describe('acting agent native tool loop', () => {
   it('records schema rejection separately while continuing the same useful tool conversation', async () => {
     const requests: CapturedRequest[] = [];
     const provider = responseQueue([
-      toolReply('invalid-open-input', 'app.openFile', { path: 'notes.txt' }),
+      toolReply('invalid-open-input', 'app.openFile', { path: 'notes.txt', content: 'x'.repeat(20_000) }),
       toolReply('write-notes', 'fs.write', { path: 'notes.txt', content: 'Notes from the page.' }),
       textReply('done', 'I wrote the notes to notes.txt.'),
     ], requests);
@@ -206,7 +208,7 @@ describe('acting agent native tool loop', () => {
       conversation: [],
       memories: [],
       toolDefinitions: [
-        { name: 'app.openFile', description: 'Open an existing file.', inputSchema: z.object({ path: z.string(), application: z.string() }), execute: async () => ({ ok: true }) },
+        { name: 'app.openFile', description: 'Open an existing file.', inputSchema: z.object({ path: z.string(), application: z.string() }).strict(), execute: async () => ({ ok: true }) },
         { name: 'fs.write', description: 'Write UTF-8 file content.', inputSchema: z.object({ path: z.string(), content: z.string() }), execute: async () => { written = true; return { ok: true }; } },
       ],
       executeTool: async name => {
@@ -230,12 +232,67 @@ describe('acting agent native tool loop', () => {
     });
 
     expect(result.response).toBe('I wrote the notes to notes.txt.');
-    expect(result.diagnostics.modelTurns).toBe(3);
+    expect(result.diagnostics.modelTurns).toBe(2);
     expect(result.diagnostics.toolActions).toBe(1);
-    expect(result.diagnostics.modelRequestOutcomes?.[0]?.toolCalls).toEqual([
-      { tool: 'app.openFile', outcome: 'schema-validation-failed' },
-    ]);
+    expect(result.diagnostics.finalizationTurns).toBe(1);
+    const invalidToolCall = result.diagnostics.modelRequestOutcomes?.[0]?.toolCalls?.[0];
+    expect(invalidToolCall).toMatchObject({
+      tool: 'app.openFile',
+      outcome: 'schema-validation-failed',
+      errorCode: 'INVALID_INPUT',
+      input: { path: 'notes.txt' },
+    });
+    expect(invalidToolCall?.validationIssues?.some(issue => issue.path.join('.') === 'application')).toBe(true);
+    const invalidInput = invalidToolCall?.input;
+    expect(typeof invalidInput === 'object' && invalidInput !== null && !Array.isArray(invalidInput)
+      ? String(invalidInput.content).length
+      : 10_000).toBeLessThan(300);
     expect(requests).toHaveLength(3);
+  });
+
+  it('uses already-produced assistant text once the final tool makes verification complete', async () => {
+    const requests: CapturedRequest[] = [];
+    const provider = responseQueue([
+      textReply('early-answer', 'I wrote notes.txt.'),
+      toolReply('final-write', 'fs.write', { path: 'notes.txt', content: 'Today\'s notes.' }),
+    ], requests);
+    let written = false;
+    const agent = new AiSdkActingAgent({
+      model: provider.chatModel('acting-agent-reuse-final-text-test-model'),
+      maxOutputTokens: 1_000,
+      temperature: 0,
+      requestTimeoutMs: 1_000,
+    });
+    const result = await agent.execute({
+      userMessage: 'Write notes.txt.',
+      task: { id: 'reuse-final-text', threadId: 'reuse-final-text', goal: 'Write notes.txt.', criteria: [], requirements: [] },
+      conversation: [],
+      memories: [],
+      toolDefinitions: [{
+        name: 'fs.write',
+        description: 'Write UTF-8 text to a file.',
+        inputSchema: z.object({ path: z.string(), content: z.string() }),
+        execute: async () => { written = true; return { ok: true }; },
+      }],
+      executeTool: async () => { written = true; return { ok: true }; },
+      verifyCompletion: async ({ response }) => {
+        const complete = written && response.includes('notes.txt');
+        return { ok: complete, data: { complete, criteria: [], requirements: [], summary: complete ? 'Written.' : 'Pending.' } };
+      },
+      getRequirementSummary: () => written ? '[satisfied] notes.txt' : '[pending] notes.txt',
+      maxToolActions: 2,
+      maxModelTurns: 2,
+      maxCompletionRecoveryTurns: 1,
+      maxRepeatedAction: 2,
+    });
+
+    expect(result.response).toBe('I wrote notes.txt.');
+    expect(result.verification.complete).toBe(true);
+    expect(result.diagnostics.modelTurns).toBe(2);
+    expect(result.diagnostics.finalizationTurns).toBe(0);
+    expect(result.diagnostics.completionAttempts).toBe(2);
+    expect(result.diagnostics.modelRequestOutcomes?.at(-1)?.completion).toBe('accepted');
+    expect(requests).toHaveLength(2);
   });
 
   it('records an unknown tool call rejected before execution', async () => {
@@ -261,7 +318,7 @@ describe('acting agent native tool loop', () => {
         }],
         executeTool: async () => { executed = true; return { ok: true }; },
         verifyCompletion: async () => ({ ok: true, data: { complete: true, criteria: [], requirements: [], summary: 'Complete.' } }),
-        getRequirementSummary: () => '',
+        getRequirementSummary: () => '[pending] inspect the current page',
         onDiagnostics: value => { diagnostics = value as unknown as Record<string, unknown>; },
         maxToolActions: 4,
         maxModelTurns: 2,

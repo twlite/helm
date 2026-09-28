@@ -307,7 +307,7 @@ export function extractSemanticBrowserBlocks(
       if (withinList(element)) continue;
       const itemElements = Array.from(element.querySelectorAll("li,[role='listitem']"))
         .filter(item => item instanceof HTMLElement && visible(item)
-          && parentElements(item).find(parent => parent !== element
+          && parentElements(item).find(parent => parent !== item
             && (tagIs(parent, "UL", "OL") || roleOf(parent) === "list")) === element);
       const items = itemElements.map(item => textOf(item as HTMLElement)).filter(Boolean);
       if (items.length > 0) addElement(element, "list", 0.72, {

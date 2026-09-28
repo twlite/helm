@@ -1313,6 +1313,7 @@ export class AgentRuntime {
       completionAttempts: 0,
       completionRejections: 0,
       contextCompactions: 0,
+      finalizationTurns: 0,
       lastUnsatisfiedRequirements: [],
       modelRequestOutcomes: [],
     };
@@ -1597,6 +1598,7 @@ export class AgentRuntime {
         executeTool,
         verifyCompletion,
         getRequirementSummary: () => taskRequirementSummary(state),
+        getCurrentVerification: () => finalVerification,
         getToolActionCount: () => actionCount,
         onDiagnostics: async agentDiagnostics => {
           Object.assign(diagnostics, agentDiagnostics, { toolActions: actionCount });

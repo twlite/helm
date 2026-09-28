@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { chromium } from 'playwright';
+import { guestMethodSchemas } from '../../../packages/shared/src/schemas';
 
 import { GuestRpcError } from '../src/errors';
 import { BrowserController, extractDuckDuckGoSearchPage } from '../src/browser';
@@ -71,7 +72,7 @@ describe('progressive browser perception', () => {
     }
   }, 15_000);
 
-  it('exposes a primary data table ref even when the query has no lexical overlap with its labels', async () => {
+  it('returns no semantic match for an unrelated query and exposes tables through document mode', async () => {
     const root = await mkdtemp(join(tmpdir(), 'helm-primary-table-'));
     const workspace = join(root, 'workspace');
     const sandbox = new GuestSandbox({ root, workspace });
@@ -82,7 +83,10 @@ describe('progressive browser perception', () => {
         <main><h1>Current figures</h1><table><tr><th>Currency</th><th>Buy</th><th>Sell</th></tr>
         <tr><td>USD</td><td>133.20</td><td>134.10</td></tr></table></main></body></html>`);
       await controller.navigate({ url: pathToFileURL(file.path).href });
-      const read = await controller.read({ query: 'exchange rate data' });
+      const noMatch = await controller.read({ query: 'qzxwvv-9347182-uniquetoken' });
+      expect(noMatch.blocks).toHaveLength(0);
+      expect(noMatch.diagnostics?.tableCount).toBe(1);
+      const read = await controller.read({ mode: 'document', blockTypes: ['table'] });
       expect(read.pageType).toBe('data_table');
       expect(read.blocks?.[0]).toMatchObject({ type: 'table', ref: expect.any(String) });
     } finally {
@@ -90,6 +94,195 @@ describe('progressive browser perception', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('recovers a navigation that committed before a transient goto error, but leaves a real load failure failed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-browser-navigation-recovery-'));
+    const sandbox = new GuestSandbox({ root, workspace: join(root, 'workspace') });
+    const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
+    try {
+      const file = await sandbox.write('workspace/recovered.html', '<!doctype html><html><head><title>Recovered</title></head><body><main><h1>Usable page</h1><p>Current content is ready.</p></main></body></html>');
+      await controller.start();
+      const page = (controller as unknown as { page: { goto: (url: string, options?: { waitUntil?: string; timeout?: number }) => Promise<unknown> } }).page;
+      const originalGoto = page.goto.bind(page);
+      page.goto = async (url, options) => {
+        await originalGoto(url, options);
+        throw new Error('net::ERR_EMPTY_RESPONSE');
+      };
+
+      const recovered = await controller.navigate({ url: pathToFileURL(file.path).href });
+      page.goto = originalGoto;
+      expect(recovered).toMatchObject({
+        url: pathToFileURL(file.path).href,
+        title: 'Recovered',
+        navigationRecovery: { originalError: 'net::ERR_EMPTY_RESPONSE' },
+      });
+      const read = await controller.read({ query: 'current content' });
+      expect(read.url).toBe(recovered.url);
+      expect(read.readable).toBe(true);
+
+      page.goto = async () => { throw new Error('net::ERR_NAME_NOT_RESOLVED'); };
+      await expect(controller.navigate({ url: 'https://missing.example.test/' })).rejects.toMatchObject({
+        code: 'BROWSER_NAVIGATION_FAILED',
+        message: expect.stringContaining('ERR_NAME_NOT_RESOLVED'),
+      });
+      page.goto = originalGoto;
+    } finally {
+      await controller.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it('preserves distinct same-heading tables and exports the selected document snapshot losslessly', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-browser-document-ref-'));
+    const workspace = join(root, 'workspace');
+    const sandbox = new GuestSandbox({ root, workspace });
+    const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
+    const runtime = new GuestRuntime({ sandbox, browser: controller });
+    const fixture = async (name: string): Promise<string> => {
+      const html = await readFile(new URL(`./fixtures/${name}`, import.meta.url), 'utf8');
+      return (await sandbox.write(`workspace/${name}`, html)).path;
+    };
+    try {
+      const forexPath = await fixture('forex-two-tables.html');
+      await controller.navigate({ url: pathToFileURL(forexPath).href });
+      const read = await controller.read({ mode: 'document', blockTypes: ['table'], maxBlocks: 20, maxChars: 4_000 });
+      const documentRef = read.documentRef;
+      const tables = read.blocks?.filter(block => block.type === 'table') ?? [];
+      expect(documentRef).toMatch(/^d\d+-/u);
+      expect(read).toMatchObject({ pageType: 'data_table', mode: 'document', documentRef });
+      expect(read.diagnostics).toMatchObject({
+        blockCount: expect.any(Number),
+        tableCount: 2,
+        selectedBlockCount: 2,
+        structuredBlockCount: 2,
+        sourceTruncated: false,
+        summariesArePreviews: true,
+      });
+      expect(tables).toHaveLength(2);
+      expect(tables[0]?.ref).not.toBe(tables[1]?.ref);
+      expect(tables.map(block => block.rowCount)).toEqual([1, 4]);
+      expect(read.diagnostics?.structuredBlocks?.map(block => ({ type: block.type, selected: block.selected, rowCount: block.rowCount }))).toEqual([
+        { type: 'table', selected: true, rowCount: 1 },
+        { type: 'table', selected: true, rowCount: 4 },
+      ]);
+
+      const limited = await controller.read({ mode: 'document', blockTypes: ['table'], maxBlocks: 1 });
+      expect(limited.blocks).toHaveLength(1);
+      expect(limited.diagnostics?.tableCount).toBe(2);
+      expect(limited.diagnostics?.structuredBlocks?.filter(block => !block.selected)).toHaveLength(1);
+      const pageRelevanceRead = await controller.read({ query: 'body', maxBlocks: 1 });
+      expect(pageRelevanceRead.query).toBe('body');
+      expect(pageRelevanceRead.blocks).toHaveLength(0);
+      expect(pageRelevanceRead.diagnostics?.structuredBlocks?.filter(block => block.type === 'table' && !block.selected)).toHaveLength(2);
+      const domRead = await controller.query({ selector: 'table tr', limit: 3 });
+      expect(domRead.results).toHaveLength(3);
+
+      const paged = await controller.read({ ref: tables[1]!.ref, offset: 1, limit: 2 });
+      expect(paged.blocks?.[0]).toMatchObject({
+        type: 'table',
+        offset: 1,
+        returnedRowCount: 2,
+        nextOffset: 3,
+        rows: [
+          ['Euro (EUR)', '1', '174.30', '174.98'],
+          ['British Pound (GBP)', '1', '205.10', '205.80'],
+        ],
+      });
+
+      const internals = controller as unknown as { page: { locator: (selector: string) => { evaluateAll: (fn: (nodes: readonly unknown[]) => unknown) => Promise<unknown> } } };
+      await internals.page.locator('body').evaluateAll(nodes => {
+        const body = nodes[0] as HTMLElement;
+        body.dataset.unrelatedMutation = 'ready';
+        return true;
+      });
+      const otherPath = await fixture('article.html');
+      await controller.navigate({ url: pathToFileURL(otherPath).href });
+      expect(guestMethodSchemas['fs.write'].safeParse({
+        path: 'workspace/multi-rates.txt', sourceRef: documentRef, format: 'text',
+      }).success).toBe(true);
+      const textWrite = await runtime.dispatch({
+        id: 'write-composite-text',
+        method: 'fs.write',
+        params: { path: 'workspace/multi-rates.txt', sourceRef: documentRef!, format: 'text' },
+      });
+      expect(textWrite).toMatchObject({ ok: true, result: {
+        sourceRef: documentRef,
+        sourceType: 'document',
+        sourceUrl: pathToFileURL(forexPath).href,
+        sourceRevision: read.revision,
+        sourceRefs: [tables[0]!.ref, tables[1]!.ref],
+        sourceCapturedAt: expect.any(String),
+      } });
+      const text = await sandbox.read('workspace/multi-rates.txt');
+      for (const currency of ['Indian Rupee (INR)', 'US Dollar (USD)', 'Euro (EUR)', 'British Pound (GBP)', 'Japanese Yen (JPY)']) {
+        expect(text.content).toContain(currency);
+      }
+
+      const jsonWrite = await runtime.dispatch({
+        id: 'write-composite-json',
+        method: 'fs.write',
+        params: { path: 'workspace/multi-rates.json', sourceRef: documentRef!, format: 'json' },
+      });
+      expect(jsonWrite.ok).toBe(true);
+      const json = JSON.parse((await sandbox.read('workspace/multi-rates.json')).content) as {
+        type: string; sourceUrl: string; sourceRefs: string[]; blocks: Array<{ ref: string; type: string; rows: string[][] }>;
+      };
+      expect(json).toMatchObject({
+        type: 'document',
+        sourceUrl: pathToFileURL(forexPath).href,
+        sourceRefs: [tables[0]!.ref, tables[1]!.ref],
+      });
+      expect(json.blocks.map(block => block.ref)).toEqual([tables[0]!.ref, tables[1]!.ref]);
+      expect(json.blocks.flatMap(block => block.rows.flat()).join(' ')).toContain('Japanese Yen (JPY)');
+      const csvWrite = await runtime.dispatch({
+        id: 'write-ambiguous-composite-csv',
+        method: 'fs.write',
+        params: { path: 'workspace/multi-rates.csv', sourceRef: documentRef!, format: 'csv' },
+      });
+      expect(csvWrite).toMatchObject({ ok: false, error: { code: 'UNSUPPORTED_CONTENT_FORMAT', message: expect.stringContaining('single table block with no other blocks') } });
+
+      const mixedPath = (await sandbox.write('workspace/mixed-document.html', `<!doctype html><html><body><main>
+        <h1>Table notes</h1><p>Rates have one supporting note.</p>
+        <table><tr><th>Currency</th><th>Rate</th></tr><tr><td>USD</td><td>133.20</td></tr></table>
+      </main></body></html>`)).path;
+      await controller.navigate({ url: pathToFileURL(mixedPath).href });
+      const mixedDocument = await controller.read({ mode: 'document', maxBlocks: 20 });
+      expect(mixedDocument.documentRef).toBeDefined();
+      const mixedCsvWrite = await runtime.dispatch({
+        id: 'write-mixed-document-csv',
+        method: 'fs.write',
+        params: { path: 'workspace/mixed-rates.csv', sourceRef: mixedDocument.documentRef, format: 'csv' },
+      });
+      expect(mixedCsvWrite).toMatchObject({ ok: false, error: { code: 'UNSUPPORTED_CONTENT_FORMAT', message: expect.stringContaining('3 blocks and 1 tables') } });
+    } finally {
+      await controller.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it('deduplicates exact list, definition, and form blocks while retaining different content', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-browser-structured-dedupe-'));
+    const sandbox = new GuestSandbox({ root, workspace: join(root, 'workspace') });
+    const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
+    try {
+      const file = await sandbox.write('workspace/duplicates.html', `<!doctype html><html><body><main>
+        <h1>Reference</h1>
+        <ul><li>Alpha item</li></ul><ul><li>Alpha item</li></ul><ul><li>Beta item</li></ul>
+        <dl><dt>Term</dt><dd>Definition text</dd></dl><dl><dt>Term</dt><dd>Definition text</dd></dl>
+        <form><label>Email <input name="email" type="email" value="a@example.test"></label></form>
+        <form><label>Email <input name="email" type="email" value="a@example.test"></label></form>
+      </main></body></html>`);
+      await controller.navigate({ url: pathToFileURL(file.path).href });
+      const read = await controller.read({ mode: 'document', maxBlocks: 20 });
+      expect(read.blocks?.filter(block => block.type === 'list')).toHaveLength(2);
+      expect(read.blocks?.filter(block => block.type === 'definition')).toHaveLength(1);
+      expect(read.blocks?.filter(block => block.type === 'form')).toHaveLength(1);
+    } finally {
+      await controller.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it('keeps snapshots bounded, finds late tables, extracts relevant passages, and rejects stale element refs', async () => {
     const root = await mkdtemp(join(tmpdir(), 'helm-browser-perception-'));
     const workspace = join(root, 'workspace');
