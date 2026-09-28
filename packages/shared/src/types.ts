@@ -397,6 +397,7 @@ export interface RequirementRejectionDiagnostic {
   requirementId: string;
   reasonCode: string;
   message: string;
+  evidence?: unknown;
   correctiveTool?: string;
   rejectedAction?: RejectedRequirementAction;
   correctiveArtifact?: CorrectiveArtifactHint;
@@ -845,6 +846,8 @@ export interface BrowserContentBlock {
 /** Compact summary returned by browser.read; full blocks stay in the guest registry. */
 export interface BrowserContentSummary extends Omit<BrowserContentBlock, 'text' | 'rows' | 'items' | 'definitions' | 'fields' | 'links'> {
   preview?: string;
+  /** True only when this exact ref is the complete export.sourceRef for the read. */
+  exportable?: boolean;
   offset?: number;
   nextOffset?: number;
   returnedChars?: number;
@@ -873,6 +876,9 @@ export interface BrowserStructuredBlockSummary {
   selected: boolean;
   /** Whether this full block is included in the immutable documentRef snapshot. */
   includedInDocument?: boolean;
+  /** Diagnostic block refs are inspectable; only export.sourceRef is raw-export capable. */
+  exportable?: boolean;
+  refCapabilities?: Array<'inspect' | 'exportRaw'>;
   previewOnly: true;
 }
 
@@ -891,12 +897,13 @@ export interface BrowserReadResult {
   sourceRefs?: string[];
   /** Returned block summaries are bounded previews, never the complete raw source. */
   previewsAreComplete?: false;
-  /** Durable ref to the complete selected artifact when extraction was not truncated. */
+  /** Complete export ref; omitted whenever export.complete is false. */
   export?: {
     complete: boolean;
     sourceRef?: string;
     recommendedTool?: 'fs.writeFromRef';
     message?: string;
+    sourceType?: BrowserContentSourceType;
   };
   sourceCapturedAt?: string;
   sourceStructuredBlockCount?: number;
@@ -914,6 +921,8 @@ export interface BrowserReadResult {
     structuredBlockCount?: number;
     structuredBlocksTruncated?: boolean;
     structuredBlocks?: BrowserStructuredBlockSummary[];
+    requestedBlockTypes?: BrowserContentType[];
+    availableBlockTypes?: Partial<Record<BrowserContentType, number>>;
     sourceTruncated?: boolean;
     summariesArePreviews?: boolean;
     documentRef?: string;

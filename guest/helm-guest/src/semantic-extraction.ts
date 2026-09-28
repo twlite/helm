@@ -24,6 +24,7 @@ export function extractSemanticBrowserBlocks(
   const maxChars = 2_000_000;
   let usedChars = 0;
   let sourceTruncated = false;
+  let currentBlockTruncated = false;
   const blocks: Array<Omit<BrowserContentBlock, "ref">> = [];
   const all: HTMLElement[] = [];
   const visit = (node: Node): void => {
@@ -45,6 +46,10 @@ export function extractSemanticBrowserBlocks(
       .join(preserveLines ? "\n" : " ")
       .trim();
     return normalized;
+  };
+  const bounded = (value: string, maxChars: number): string => {
+    if (value.length > maxChars) currentBlockTruncated = true;
+    return value.slice(0, maxChars);
   };
   const visible = (element: HTMLElement): boolean => {
     if (element.hidden || element.getAttribute("aria-hidden")?.toLowerCase() === "true") return false;
@@ -199,7 +204,7 @@ export function extractSemanticBrowserBlocks(
       row,
       cells: cellsFor(row).map(cell => ({
         cell,
-        text: textOf(cell).slice(0, 2_000),
+        text: bounded(textOf(cell), 2_000),
         rowspan: Math.max(1, Math.min(100, Number(cell.getAttribute("rowspan")) || 1)),
         colspan: Math.max(1, Math.min(100, Number(cell.getAttribute("colspan")) || 1)),
         header: isAria ? roleOf(cell) === "columnheader" : cell.tagName === "TH",
@@ -293,12 +298,14 @@ export function extractSemanticBrowserBlocks(
     if (tagIs(element, "TABLE") || ["table", "grid", "treegrid"].includes(role ?? "")) {
       if (withinTable(element) || seenTables.has(element)) continue;
       seenTables.add(element);
+      currentBlockTruncated = false;
       const data = tableRows(element);
       if (data.columnCount === 0 && data.rowCount === 0) continue;
       const caption = tableCaption(element);
       addElement(element, "table", 0.98, {
         ...(caption ? { caption } : {}),
         ...data,
+        ...(currentBlockTruncated ? { truncated: true } : {}),
         role: role ?? "table",
       });
       continue;
@@ -334,16 +341,19 @@ export function extractSemanticBrowserBlocks(
       continue;
     }
     if (tagIs(element, "PRE") || (element.tagName === "CODE" && !parentElements(element).some(parent => parent !== element && parent.tagName === "PRE"))) {
-      const code = textOf(element, true).slice(0, 100_000);
+      currentBlockTruncated = false;
+      const code = bounded(textOf(element, true), 100_000);
       const language = clean(element.getAttribute("data-language") ?? element.getAttribute("lang") ?? "").slice(0, 40);
       if (code) addElement(element, "code", 0.82, {
         text: code,
         ...(language ? { language } : {}),
         role: role ?? element.tagName.toLowerCase(),
+        ...(currentBlockTruncated ? { truncated: true } : {}),
       });
       continue;
     }
     if (element.tagName === "FORM" || role === "form") {
+      currentBlockTruncated = false;
       const controls = Array.from(element.querySelectorAll("input,textarea,select,button,[role='textbox'],[role='combobox'],[role='checkbox'],[role='radio']"));
       const fields = controls.flatMap(control => {
         if (!(control instanceof HTMLElement) || !visible(control)) return [];
@@ -358,7 +368,7 @@ export function extractSemanticBrowserBlocks(
         const type = control instanceof HTMLInputElement ? control.type : control.tagName.toLowerCase();
         const value = control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement
           ? control.value
-          : textOf(control).slice(0, 200);
+          : bounded(textOf(control), 200);
         return [{
           label: clean(labelled).slice(0, 240),
           ...(type ? { type } : {}),
@@ -366,15 +376,21 @@ export function extractSemanticBrowserBlocks(
           ...(control.hasAttribute("required") || control.getAttribute("aria-required") === "true" ? { required: true } : {}),
         }];
       });
-      if (fields.length > 0) addElement(element, "form", 0.92, { fields, role: role ?? "form" });
+      if (fields.length > 0) addElement(element, "form", 0.92, {
+        fields,
+        role: role ?? "form",
+        ...(currentBlockTruncated ? { truncated: true } : {}),
+      });
       continue;
     }
     if (tagIs(element, "P", "BLOCKQUOTE")) {
       if (withinTable(element) || withinList(element)) continue;
-      const text = textOf(element, true).slice(0, 10_000);
+      currentBlockTruncated = false;
+      const text = bounded(textOf(element, true), 10_000);
       if (text) addElement(element, "text", element.tagName === "BLOCKQUOTE" ? 0.72 : 0.68, {
         text,
         role: role ?? element.tagName.toLowerCase(),
+        ...(currentBlockTruncated ? { truncated: true } : {}),
       });
       continue;
     }
@@ -398,11 +414,15 @@ export function extractSemanticBrowserBlocks(
     if (anchors / text.length > 0.35 || density < 2) return [];
     return [{ element, text }];
   });
-  for (const candidate of genericBlocks) addElement(candidate.element, "other", 0.52, {
-    text: candidate.text.slice(0, 20_000),
-    links: linksOf(candidate.element),
-    role: roleOf(candidate.element) ?? "region",
-  });
+  for (const candidate of genericBlocks) {
+    currentBlockTruncated = false;
+    addElement(candidate.element, "other", 0.52, {
+      text: bounded(candidate.text, 20_000),
+      links: linksOf(candidate.element),
+      role: roleOf(candidate.element) ?? "region",
+      ...(currentBlockTruncated ? { truncated: true } : {}),
+    });
+  }
 
   // Search result records are constructed only from observed anchors and
   // credible result structures. Ordinary list navigation is never enough to
@@ -500,10 +520,13 @@ export function extractSemanticBrowserBlocks(
           for (let index = blocks.length - 1; index >= 0; index -= 1) {
             const block = blocks[index]!;
             if (block.type !== "text" || !block.text || block.text.length < 30 || block.boilerplate) continue;
-            if (canonical.includes(clean(block.text).toLocaleLowerCase())) blocks.splice(index, 1);
+            if (canonical.includes(clean(block.text).toLocaleLowerCase())) {
+              usedChars = Math.max(0, usedChars - JSON.stringify(block).length);
+              blocks.splice(index, 1);
+            }
           }
           const title = clean(parsed?.title ?? "").slice(0, 300);
-          blocks.push({
+          add({
             type: "text",
             text,
             ...(title ? { heading: title, headingPath: [title] } : {}),
@@ -525,13 +548,15 @@ export function extractSemanticBrowserBlocks(
     block.text?.trim() || block.rows?.length || block.items?.length || block.fields?.length || block.definitions?.length,
   ));
   if (!hasUseful) {
-    const fallback = textOf(body, true).slice(0, 20_000);
+    currentBlockTruncated = false;
+    const fallback = bounded(textOf(body, true), 20_000);
     if (fallback) add({
       type: "text",
       text: fallback,
       source: { ...frameSource, extractor: "dom" },
       importance: 0.45,
       boilerplate: false,
+      ...(currentBlockTruncated ? { truncated: true } : {}),
     });
   }
 

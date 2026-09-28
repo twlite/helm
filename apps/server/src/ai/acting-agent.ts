@@ -19,8 +19,8 @@ const BASE_INSTRUCTIONS = [
   'You decide the sequence of actions. Use actual tool results. If a tool fails, inspect the error and recover.',
   'Do not claim that an external action succeeded unless a tool returned success.',
   'A URL included as data for an artifact is not automatically a browser destination.',
-  'Prefer semantic browser tools for page reading because they are compact. browser.read query is natural-language content relevance text, never a CSS selector; use browser.query for DOM/CSS inspection. Check table counts and row counts, use blockTypes to select a structured block class such as table when appropriate, and use mode document when several relevant blocks should be exported together.',
-  'For raw page-derived data: Use fs.writeFromRef with browser.read.export.sourceRef when export.complete is true. Previews are incomplete and must not be copied into a raw-data file. For a summary or other transformation, use fs.writeText with your authored result.',
+  'Prefer semantic browser tools for page reading because they are compact. browser.read query is natural-language content relevance text, never a CSS selector; use browser.query for DOM/CSS inspection. Omit blockTypes for a general read; add it only to restrict the content classes you want. A filter that selects nothing returns available block-type counts so you can retry.',
+  'For raw page-derived data: use fs.writeFromRef only with browser.read.export.sourceRef when export.complete is true. Previews are incomplete and must not be copied into raw-data files; do not invent placeholders when no export ref exists. Retry browser.read if no complete export is available. For a summary or other transformation, use fs.writeText with your authored result.',
   'Use app.launch only when the user asks to start an application without a file. Use app.openFile for an existing file; it checks the file and launches the selected application if needed.',
   'Finish with a normal concise assistant response only after the user\'s requested task is complete.',
 ].join(' ');

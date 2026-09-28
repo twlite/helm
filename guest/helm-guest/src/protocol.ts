@@ -63,7 +63,7 @@ export const GuestMethodContracts: Readonly<
     description: "Evaluate a JavaScript expression inside the current browser page and return bounded JSON data. It has no guest or host filesystem/process access.",
   },
   "browser.read": {
-    description: "Read bounded semantic blocks. query is natural-language relevance text, not a CSS selector; use browser.query for DOM/CSS inspection. Queries can return no blocks when nothing matches. readable ranks compact blocks; document preserves a broader selection in DOM order. Use blockTypes such as table to select structured blocks. Page reads use maxBlocks/maxChars; refs use offset/limit/maxChars. Multiple selected blocks return a durable documentRef for lossless fs.write sourceRef export.",
+    description: "Read bounded semantic blocks. query is natural-language relevance text, not a CSS selector; use browser.query for DOM/CSS inspection. Omit blockTypes for a general read; a restrictive filter that selects nothing returns available block-type counts as BROWSER_READ_NO_MATCHING_CONTENT. readable ranks compact previews; document preserves a broader selection in DOM order. Page reads use maxBlocks/maxChars; refs use offset/limit/maxChars. Only the exact export.sourceRef is certified for raw export when export.complete is true; diagnostic refs are inspect-only.",
   },
   "browser.findPage": {
     description: "Find and rank content on the current page. This is page-local search and does not search the web.",

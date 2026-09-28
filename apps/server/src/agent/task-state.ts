@@ -443,6 +443,12 @@ export function modelActionForRequirement(requirement: TaskRequirement): string 
   return requirement.target?.mode === 'written-from-artifact' ? 'fs.writeFromRef' : 'fs.writeText';
 }
 
+function modelRecoveryActionForRequirement(requirement: TaskRequirement, state: TaskState): string | undefined {
+  if (requirement.target?.mode === 'written-from-artifact'
+    && !bestCorrectiveBrowserArtifact(requirement, state)) return 'browser.read';
+  return modelActionForRequirement(requirement);
+}
+
 function browserVisitAction(state: TaskState, expectedUrl: string): WorkerAction | undefined {
   return [...verificationActions(state)].reverse().find(action => {
     if (!action.tool.startsWith('browser.') || !action.result.ok) return false;
@@ -549,14 +555,17 @@ function observedSemanticContentRef(
   const writeIndex = actions.lastIndexOf(writeAction);
   if (writeIndex < 0) return false;
   return actions.slice(0, writeIndex).some(action => {
-    if (!['browser.read', 'browser.findPage'].includes(action.tool) || !action.result.ok) return false;
+    if (action.tool !== 'browser.read' || !action.result.ok) return false;
+    if (typeof recordValue(action.input)?.ref === 'string') return false;
     const receipt = actionReceipt(action);
     if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
     const data = recordValue(action.result.data);
-    if (data?.url !== sourceUrl || data.revision !== sourceRevision || data.sourceTruncated === true) return false;
-    const collection = action.tool === 'browser.read' ? data.blocks : data.results;
+    if (data?.url !== sourceUrl || data.revision !== sourceRevision || data.sourceTruncated !== false) return false;
+    const exportInfo = recordValue(data.export);
+    if (exportInfo?.complete !== true || exportInfo.sourceRef !== sourceRef) return false;
+    const collection = data.blocks;
     if (!Array.isArray(collection)) return false;
-    if (action.tool === 'browser.read' && data.documentRef === sourceRef && sourceType === 'document') {
+    if (data.documentRef === sourceRef && sourceType === 'document') {
       const diagnostics = recordValue(data.diagnostics);
       const refs = Array.isArray(data.sourceRefs)
         ? data.sourceRefs.filter((ref): ref is string => typeof ref === 'string')
@@ -619,6 +628,45 @@ function sourceUrlMatchesRequirement(state: TaskState, sourceUrl: string, reques
   });
 }
 
+function latestNoMatchingBrowserRead(state: TaskState): {
+  action: WorkerAction;
+  details: Record<string, unknown>;
+  message: string;
+} | undefined {
+  for (const action of [...verificationActions(state)].reverse()) {
+    if (action.tool !== 'browser.read' || action.result.ok) continue;
+    const error = recordValue(action.result.error);
+    if (error?.code !== 'BROWSER_READ_NO_MATCHING_CONTENT') continue;
+    const details = recordValue(error.details) ?? {};
+    const pageType = typeof details.pageType === 'string' ? details.pageType : undefined;
+    const query = typeof details.query === 'string' ? details.query : undefined;
+    const requestedTypes = Array.isArray(details.requestedBlockTypes)
+      ? details.requestedBlockTypes.filter((type): type is string => typeof type === 'string')
+      : [];
+    const available = recordValue(details.availableBlockTypes) ?? {};
+    const availableSummary = Object.entries(available)
+      .filter((entry): entry is [string, number] => typeof entry[1] === 'number' && entry[1] > 0)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([type, count]) => `${type}=${count}`)
+      .join(', ');
+    const parts = [
+      'The latest browser.read selected no content',
+      pageType ? `pageType=${pageType}` : undefined,
+      query ? `query=${query}` : undefined,
+      requestedTypes.length > 0 ? `requestedBlockTypes=${requestedTypes.join(',')}` : undefined,
+      typeof details.tableCount === 'number' ? `tableCount=${details.tableCount}` : undefined,
+      availableSummary ? `available block types: ${availableSummary}` : undefined,
+      'export.complete=false; no export.sourceRef is available',
+    ].filter((part): part is string => Boolean(part));
+    return {
+      action,
+      details,
+      message: `${parts.join('; ')}. Retry browser.read with a compatible selection or omit blockTypes for a general read.`,
+    };
+  }
+  return undefined;
+}
+
 function bestCorrectiveBrowserArtifact(
   requirement: TaskRequirement,
   state: TaskState,
@@ -628,6 +676,7 @@ function bestCorrectiveBrowserArtifact(
   for (let index = actions.length - 1; index >= 0; index -= 1) {
     const action = actions[index]!;
     if (action.tool !== 'browser.read' || !action.result.ok) continue;
+    if (typeof recordValue(action.input)?.ref === 'string') continue;
     const receipt = actionReceipt(action);
     const data = recordValue(action.result.data);
     if (!receipt || receipt.ok !== true || receipt.tool !== 'browser.read' || !data) continue;
@@ -635,23 +684,27 @@ function bestCorrectiveBrowserArtifact(
     const sourceRevision = typeof data.revision === 'number' ? data.revision : undefined;
     const sourceCapturedAt = typeof data.sourceCapturedAt === 'string' ? data.sourceCapturedAt : undefined;
     const diagnostics = recordValue(data.diagnostics);
+    const exportInfo = recordValue(data.export);
+    const exportedRef = typeof exportInfo?.sourceRef === 'string' ? exportInfo.sourceRef : undefined;
     const refs = Array.isArray(data.sourceRefs)
       ? data.sourceRefs.filter((ref): ref is string => typeof ref === 'string')
       : [];
     if (!sourceUrl || sourceRevision === undefined || !sourceCapturedAt
       || data.sourceTruncated !== false || diagnostics?.sourceTruncated === true
+      || exportInfo?.complete !== true || !exportedRef
       || !sourceUrlMatchesRequirement(state, sourceUrl, requirement.target?.sourceUrls)) continue;
 
     const documentRef = typeof data.documentRef === 'string' ? data.documentRef : undefined;
-    const sourceType = documentRef ? 'document' : undefined;
+    const sourceType = typeof exportInfo.sourceType === 'string'
+      ? exportInfo.sourceType
+      : documentRef === exportedRef ? 'document' : undefined;
     const documentRefs = Array.isArray(diagnostics?.documentSourceRefs)
       ? diagnostics.documentSourceRefs.map(recordValue).filter((ref): ref is Record<string, unknown> => Boolean(ref))
       : [];
     const documentBlockCount = diagnostics?.documentBlockCount;
     const structuredCount = diagnostics?.documentStructuredBlockCount;
     const tableCount = diagnostics?.documentTableCount;
-    const structurallyCompleteDocument = Boolean(documentRef && refs.length > 0
-      && recordValue(data.export)?.complete !== false
+    const structurallyCompleteDocument = Boolean(documentRef && exportedRef === documentRef && sourceType === 'document' && refs.length > 0
       && documentBlockCount === refs.length
       && documentRefs.length === refs.length
       && documentRefs.every(ref => typeof ref.ref === 'string' && refs.includes(ref.ref))
@@ -659,13 +712,13 @@ function bestCorrectiveBrowserArtifact(
       && typeof tableCount === 'number'
       && data.sourceStructuredBlockCount === structuredCount
       && data.sourceTableCount === tableCount);
-    if (structurallyCompleteDocument && documentRef && sourceType) {
+    if (structurallyCompleteDocument && documentRef) {
       candidates.push({
         document: true,
         index,
         hint: {
           sourceRef: documentRef,
-          sourceType,
+          sourceType: 'document',
           sourceUrl,
           sourceRevision,
           sourceCapturedAt,
@@ -677,29 +730,24 @@ function bestCorrectiveBrowserArtifact(
       continue;
     }
 
-    const exportedRef = recordValue(data.export)?.sourceRef;
-    const blockCandidates = Array.isArray(data.blocks)
-      ? data.blocks.map(recordValue).filter((block): block is Record<string, unknown> => Boolean(block))
-      : [];
-    const matchingBlocks = blockCandidates.filter(block => typeof block.ref === 'string'
-      && refs.includes(block.ref)
-      && isSubstantiveBrowserContentBlock(block)
-      && (typeof exportedRef !== 'string' || exportedRef === block.ref));
-    for (const block of matchingBlocks) {
-      const ref = String(block.ref);
-      const blockType = typeof block.type === 'string' ? block.type : 'content';
-      const structured = ['table', 'list', 'definition', 'form'].includes(blockType);
+    if (refs.includes(exportedRef) && sourceType && sourceType !== 'document') {
+      const blockCandidates = Array.isArray(data.blocks)
+        ? data.blocks.map(recordValue).filter((block): block is Record<string, unknown> => Boolean(block))
+        : [];
+      const matchingBlock = blockCandidates.find(block => block.ref === exportedRef && block.type === sourceType);
+      const structured = ['table', 'list', 'definition', 'form'].includes(sourceType);
+      if (matchingBlock && !isSubstantiveBrowserContentBlock(matchingBlock)) continue;
       candidates.push({
         document: false,
         index,
         hint: {
-          sourceRef: ref,
-          sourceType: blockType,
+          sourceRef: exportedRef,
+          sourceType,
           sourceUrl,
           sourceRevision,
           sourceCapturedAt,
-          sourceStructuredBlockCount: structured ? 1 : 0,
-          sourceTableCount: blockType === 'table' ? 1 : 0,
+          sourceStructuredBlockCount: typeof data.sourceStructuredBlockCount === 'number' ? data.sourceStructuredBlockCount : Number(structured),
+          sourceTableCount: typeof data.sourceTableCount === 'number' ? data.sourceTableCount : Number(sourceType === 'table'),
           complete: true,
         },
       });
@@ -720,6 +768,7 @@ function findRejectedArtifactWrite(
   correctiveTool: string;
   rejectedAction: RejectedRequirementAction;
   correctiveArtifact?: CorrectiveArtifactHint;
+  recoveryEvidence?: Record<string, unknown>;
 } | undefined {
   const target = requirement.target;
   if (target?.mode !== 'written-from-artifact' || !target.path) return undefined;
@@ -763,18 +812,27 @@ function findRejectedArtifactWrite(
     reason = `The source ref used for ${target.path} does not have complete, verified current-run browser provenance.`;
   }
 
+  const readFailure = latestNoMatchingBrowserRead(state);
+  if (!correctiveArtifact) {
+    reasonCode = 'NO_EXPORTABLE_BROWSER_ARTIFACT';
+    reason += ' No complete current-run browser export artifact is available.';
+  }
   const artifactMessage = correctiveArtifact
     ? ` A complete current-run browser artifact is available as ${correctiveArtifact.sourceRef} from ${correctiveArtifact.sourceUrl}`
       + (correctiveArtifact.sourceTableCount > 0 ? ` (${correctiveArtifact.sourceTableCount} ${correctiveArtifact.sourceTableCount === 1 ? 'table' : 'tables'})` : '')
       + (correctiveArtifact.sourceStructuredBlockCount > 0 ? ` (${correctiveArtifact.sourceStructuredBlockCount} structured blocks)` : '')
-      + `; use ${modelActionForRequirement(requirement)} with that sourceRef to overwrite ${target.path}.`
-    : ` Use ${modelActionForRequirement(requirement)} with a complete durable ref from the requested source to overwrite ${target.path}.`;
+      + `; use fs.writeFromRef with that exact sourceRef to overwrite ${target.path}.`
+    : ` ${readFailure?.message ?? 'Run browser.read again on the requested source until it returns export.complete=true and export.sourceRef.'} Do not call fs.writeFromRef until that complete export ref exists.`;
   return {
     reasonCode,
     message: `${reason}${artifactMessage}`,
-    correctiveTool: modelActionForRequirement(requirement) ?? 'fs.writeFromRef',
+    correctiveTool: correctiveArtifact ? 'fs.writeFromRef' : 'browser.read',
     rejectedAction,
     ...(correctiveArtifact ? { correctiveArtifact } : {}),
+    ...(!correctiveArtifact ? { recoveryEvidence: {
+      exportAvailable: false,
+      ...(readFailure ? { latestBrowserReadFailure: readFailure.details } : {}),
+    } } : {}),
   };
 }
 
@@ -1228,14 +1286,30 @@ async function requirementCheck(
 }> {
   if (requirement.id === 'browserEvidence' || requirement.target?.factId === 'pageContent') {
     const action = browserEvidenceAction(state);
-    return action
-      ? { passed: true, message: 'Current-run browser content evidence was gathered.', evidence: action }
+    if (action) return { passed: true, message: 'Current-run browser content evidence was gathered.', evidence: action };
+    const readFailure = latestNoMatchingBrowserRead(state);
+    return readFailure
+      ? {
+          passed: false,
+          reasonCode: 'BROWSER_READ_NO_MATCHING_CONTENT',
+          correctiveTool: 'browser.read',
+          message: `${readFailure.message} No substantive browser evidence was recorded.`,
+          evidence: { latestBrowserReadFailure: readFailure.details },
+        }
       : { passed: false, message: 'No successful current-run browser content inspection has been recorded.' };
   }
   if (requirement.id === 'browserResearch') {
     const action = browserResearchAction(state);
-    return action
-      ? { passed: true, message: 'A current-run read exposed substantive page content.', evidence: action }
+    if (action) return { passed: true, message: 'A current-run read exposed substantive page content.', evidence: action };
+    const readFailure = latestNoMatchingBrowserRead(state);
+    return readFailure
+      ? {
+          passed: false,
+          reasonCode: 'BROWSER_READ_NO_MATCHING_CONTENT',
+          correctiveTool: 'browser.read',
+          message: `${readFailure.message} No substantive browser evidence was recorded.`,
+          evidence: { latestBrowserReadFailure: readFailure.details },
+        }
       : { passed: false, message: 'No current-run browser read has exposed substantive page content yet.' };
   }
   if (requirement.criterion) {
@@ -1317,6 +1391,31 @@ async function requirementCheck(
         evidence: {
           rejectedAction: rejectedCandidate.rejectedAction,
           ...(rejectedCandidate.correctiveArtifact ? { correctiveArtifact: rejectedCandidate.correctiveArtifact } : {}),
+          ...(rejectedCandidate.recoveryEvidence ? rejectedCandidate.recoveryEvidence : {}),
+        },
+      };
+    }
+    if (target.mode === 'written-from-artifact') {
+      const correctiveArtifact = bestCorrectiveBrowserArtifact(requirement, state);
+      if (correctiveArtifact) {
+        return {
+          passed: false,
+          reasonCode: 'BROWSER_ARTIFACT_WRITE_REQUIRED',
+          correctiveTool: 'fs.writeFromRef',
+          message: `A complete current-run browser artifact is available as ${correctiveArtifact.sourceRef} from ${correctiveArtifact.sourceUrl}. Use fs.writeFromRef with that exact sourceRef to write ${target.path}.`,
+          correctiveArtifact,
+          evidence: { correctiveArtifact },
+        };
+      }
+      const readFailure = latestNoMatchingBrowserRead(state);
+      return {
+        passed: false,
+        reasonCode: 'NO_EXPORTABLE_BROWSER_ARTIFACT',
+        correctiveTool: 'browser.read',
+        message: `No complete current-run browser export artifact exists for ${target.path}. ${readFailure?.message ?? 'Read the requested source again until browser.read returns export.complete=true and export.sourceRef.'} Do not call fs.writeFromRef until that ref exists.`,
+        evidence: {
+          exportAvailable: false,
+          ...(readFailure ? { latestBrowserReadFailure: readFailure.details } : {}),
         },
       };
     }
@@ -1584,7 +1683,7 @@ export function taskRequirementSummary(state: TaskState): string {
         ? 'blocked'
         : 'pending';
     const target = requirement.target;
-    const modelAction = modelActionForRequirement(requirement);
+    const modelAction = modelRecoveryActionForRequirement(requirement, state);
     const fields = [
       ...(target?.path ? [`path=${target.path}`] : []),
       ...(target?.mode ? [`mode=${target.mode}`] : []),

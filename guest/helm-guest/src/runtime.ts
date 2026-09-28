@@ -117,7 +117,7 @@ export class GuestRuntime {
         const sourceRef = optionalString(params, "sourceRef", { maxLength: 64 });
         if (sourceRef !== undefined) {
           const format = enumValue(params, "format", ["text", "markdown", "json", "csv"] as const, "text");
-          const serialized = await this.browser.serializeContentRef(sourceRef, format);
+          const serialized = await this.browser.serializeExportableContentRef(sourceRef, format);
           return {
             ...await this.sandbox.write(path, serialized.content),
             sourceRef: serialized.sourceRef,

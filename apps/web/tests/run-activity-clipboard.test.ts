@@ -158,6 +158,47 @@ describe('run activity clipboard formatter', () => {
     expect(text).toContain('d1-12345678-1');
   });
 
+  it('copies why a raw export is pending after a no-match browser read', () => {
+    const text = formatRunActivityForClipboard(run({
+      diagnostics: {
+        modelTurns: 6,
+        finalizationTurns: 0,
+        modelRequests: 6,
+        toolActions: 5,
+        completionAttempts: 1,
+        completionRejections: 1,
+        contextCompactions: 0,
+        lastUnsatisfiedRequirements: ['outputFile: no complete browser export artifact exists'],
+        requirementRejections: [{
+          requirementId: 'outputFile',
+          reasonCode: 'NO_EXPORTABLE_BROWSER_ARTIFACT',
+          message: 'No complete current-run browser export artifact exists. The latest browser.read selected no content. tableCount=2; requestedBlockTypes=text; export.complete=false.',
+          correctiveTool: 'browser.read',
+          rejectedAction: { tool: 'fs.writeText', path: 'forex.txt', receiptId: 'receipt-preview-write' },
+          evidence: {
+            exportAvailable: false,
+            latestBrowserReadFailure: {
+              code: 'BROWSER_READ_NO_MATCHING_CONTENT',
+              pageType: 'data_table',
+              requestedBlockTypes: ['text'],
+              availableBlockTypes: { table: 2, form: 3 },
+              tableCount: 2,
+              selectedBlockCount: 0,
+              exportAvailable: false,
+            },
+          },
+        }],
+      },
+    }));
+
+    expect(text).toContain('NO_EXPORTABLE_BROWSER_ARTIFACT');
+    expect(text).toContain('BROWSER_READ_NO_MATCHING_CONTENT');
+    expect(text).toContain('"form": 3');
+    expect(text).toContain('"table": 2');
+    expect(text).toContain('"correctiveTool": "browser.read"');
+    expect(text).toContain('receipt-preview-write');
+  });
+
   it('includes bounded provider rejection details in the copied log', () => {
     const text = formatRunActivityForClipboard(run({
       status: 'failed',

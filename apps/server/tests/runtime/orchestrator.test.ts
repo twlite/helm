@@ -207,10 +207,10 @@ describe('orchestrated agent loop', () => {
         if (!official) throw new Error('DuckDuckGo search did not return the observed official href.');
         const invented = await executeAction(context, 'browser.navigate', { url: 'https://www.nrb.org.np' }, 'invented-host');
         const opened = await executeAction(context, 'browser.open', { ref: official.ref }, 'open-result-ref');
-        const read = await executeAction(context, 'browser.read', { query: 'exchange rate currency buying selling' }, 'read-rates');
-        const readData = read.result.data as { sections?: Array<{ text: string }>; blocks?: Array<{ type: string; ref: string }> };
+        const read = await executeAction(context, 'browser.read', { mode: 'document', query: 'exchange rate currency buying selling' }, 'read-rates');
+        const readData = read.result.data as { sections?: Array<{ text: string }>; blocks?: Array<{ type: string; ref: string }>; export?: { sourceRef?: string } };
         const table = readData.blocks?.find(block => block.type === 'table');
-        if (!table) throw new Error('The exchange table was not surfaced as a content ref.');
+        if (!table || !readData.export?.sourceRef) throw new Error('The exchange table was not surfaced as a complete export ref.');
         const selected = await executeAction(context, 'browser.read', { ref: table.ref }, 'select-table');
         const receiptId = ((read.result.evidence as { receipt?: { id?: string } } | undefined)?.receipt?.id) ?? 'missing-receipt';
         const pageContent = readData.sections?.[0]?.text.split('\n')[0] ?? 'Foreign Exchange Rate';
@@ -221,12 +221,17 @@ describe('orchestrated agent loop', () => {
         };
       },
       async context => {
-        const previousRead = [...context.state.recentActions].reverse().find(action => action.tool === 'browser.read' && action.result.ok);
-        const blocks = (previousRead?.result.data as { blocks?: Array<{ type: string; ref: string }> } | undefined)?.blocks;
+        const previousRead = [...context.state.recentActions].reverse().find(action => {
+          if (action.tool !== 'browser.read' || !action.result.ok || typeof action.input.ref === 'string') return false;
+          const read = action.result.data as { export?: { complete?: boolean; sourceRef?: string } } | undefined;
+          return read?.export?.complete === true && typeof read.export.sourceRef === 'string';
+        });
+        const readData = previousRead?.result.data as { blocks?: Array<{ type: string; ref: string }>; export?: { sourceRef?: string } } | undefined;
+        const blocks = readData?.blocks;
         const table = blocks?.find(block => block.type === 'table');
-        if (!table) throw new Error('No table ref was retained from the browser worker.');
+        if (!table || !readData?.export?.sourceRef) throw new Error('No complete export ref was retained from the browser worker.');
         const intermediate = await executeAction(context, 'fs.write', { path: 'forex.txt', content: 'INTERMEDIATE VERSION' }, 'write-intermediate');
-        const finalWrite = await executeAction(context, 'fs.write', { path: 'forex.txt', sourceRef: table.ref, format: 'text' }, 'write-from-table');
+        const finalWrite = await executeAction(context, 'fs.write', { path: 'forex.txt', sourceRef: readData.export.sourceRef, format: 'text' }, 'write-from-table');
         return {
           status: 'completed', worker: 'filesystem', objectiveId: context.objective.id,
           actions: [intermediate, finalWrite], facts: [], evidence: [], artifacts: [], blockers: [], environmentChanged: true,
@@ -265,7 +270,7 @@ describe('orchestrated agent loop', () => {
     const writes = actions.filter(action => action.tool === 'fs.write');
     expect(writes).toHaveLength(2);
     expect(writes[0]?.result.data).toMatchObject({ existedBefore: true, changed: true });
-    expect(writes[1]?.result.data).toMatchObject({ existedBefore: true, changed: true, sourceType: 'table' });
+    expect(writes[1]?.result.data).toMatchObject({ existedBefore: true, changed: true, sourceType: 'document' });
     const writeReceipts = writes.map(action => (action.result.evidence as { receipt: { id: string; effect: { changed?: boolean; writePerformed?: boolean; beforeSha256?: string; sha256?: string } } }).receipt);
     expect(writeReceipts[0]).toMatchObject({ tool: 'fs.write', ok: true, effect: { changed: true, writePerformed: true } });
     expect(writeReceipts[1]).toMatchObject({ tool: 'fs.write', ok: true, effect: { changed: true, writePerformed: true, beforeSha256: writes[0]?.result.data && (writes[0].result.data as { sha256: string }).sha256 } });
@@ -275,7 +280,7 @@ describe('orchestrated agent loop', () => {
     expect(artifacts[1]).toMatchObject({
       sha256: (writes[1]?.result.data as { sha256: string }).sha256,
       sourceRef: (writes[1]?.result.data as { sourceRef: string }).sourceRef,
-      sourceType: 'table',
+      sourceType: 'document',
       writeReceiptId: writeReceipts[1]?.id,
       version: 2,
     });

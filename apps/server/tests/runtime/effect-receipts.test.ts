@@ -149,6 +149,7 @@ describe('current-run effect receipts', () => {
       operation: 'read', url, revision: 3, readable: true, sourceTruncated: false,
       sourceCapturedAt: capturedAt, sourceStructuredBlockCount: 1, sourceTableCount: 1,
       documentRef, sourceRefs: [contentRef],
+      export: { complete: true, sourceRef: documentRef, sourceType: 'document', recommendedTool: 'fs.writeFromRef' },
       blocks: [{ ref: contentRef, type: 'table', columns: ['Currency'], rows: [['USD']], rowCount: 1 }],
       diagnostics: {
         sourceTruncated: false, documentBlockCount: 1, documentStructuredBlockCount: 1, documentTableCount: 1,
@@ -185,7 +186,7 @@ describe('current-run effect receipts', () => {
         complete: true,
       },
     });
-    expect(rejected?.message).toContain('fs.writeFromRef with that sourceRef to overwrite forex.txt');
+    expect(rejected?.message).toContain('use fs.writeFromRef with that exact sourceRef to overwrite forex.txt');
     expect(rejected?.evidence).toMatchObject({ rejectedAction: { tool: 'fs.writeText' } });
 
     const artifactState = createTaskState(rawTask);
@@ -213,6 +214,76 @@ describe('current-run effect receipts', () => {
     });
   });
 
+  it('routes raw-write recovery to browser.read when a filtered read produced no export artifact', async () => {
+    const baseTask = task();
+    const rawTask: TaskDefinition = {
+      ...baseTask,
+      requirements: baseTask.requirements?.map(requirement => requirement.id === 'outputFile'
+        ? { ...requirement, target: { ...requirement.target, mode: 'written-from-artifact', sourceUrls: [url] } }
+        : requirement),
+    };
+    const state = createTaskState(rawTask);
+    const failedReadReceipt = receipt('browser.read', {}, false);
+    const failedRead: WorkerAction = {
+      id: failedReadReceipt.id,
+      tool: 'browser.read',
+      input: { mode: 'document', query: 'exchange rate data', blockTypes: ['text'] },
+      result: {
+        ok: false,
+        error: {
+          code: 'BROWSER_READ_NO_MATCHING_CONTENT',
+          message: 'The requested browser.read filters selected no content.',
+          details: {
+            pageType: 'data_table',
+            query: 'exchange rate data',
+            requestedBlockTypes: ['text'],
+            availableBlockTypes: { form: 3, list: 2, table: 2 },
+            tableCount: 2,
+            selectedBlockCount: 0,
+            exportAvailable: false,
+          },
+        },
+        evidence: { receipt: failedReadReceipt },
+      },
+      receipt: failedReadReceipt,
+    };
+    state.recentActions = [
+      failedRead,
+      action('fs.writeText', { path: 'forex.txt', content: 'placeholder' }, {
+        path: workspacePath, size: 11,
+      }, receipt('fs.write', { path: workspacePath, bytesWritten: 11, writePerformed: true })),
+    ];
+
+    const verification = await verifyTaskState(
+      rawTask,
+      state,
+      new MockGuestTransport(),
+      { timestamp: Date.now(), task: { completedCriteria: [], remainingCriteria: [] } },
+      new CriterionVerifierRegistry(new MockGuestTransport()),
+    );
+    const output = verification.requirements?.find(check => check.requirement.id === 'outputFile');
+    expect(output).toMatchObject({
+      passed: false,
+      reasonCode: 'NO_EXPORTABLE_BROWSER_ARTIFACT',
+      correctiveTool: 'browser.read',
+      rejectedAction: { tool: 'fs.writeText', path: 'forex.txt' },
+      evidence: {
+        exportAvailable: false,
+        latestBrowserReadFailure: {
+          requestedBlockTypes: ['text'],
+          availableBlockTypes: { form: 3, list: 2, table: 2 },
+          tableCount: 2,
+        },
+      },
+    });
+    expect(output?.message).toContain('pageType=data_table');
+    expect(output?.message).toContain('tableCount=2');
+    expect(output?.message).toContain('available block types: form=3, list=2, table=2');
+    expect(output?.message).toContain('Retry browser.read');
+    expect(output?.message).toContain('Do not call fs.writeFromRef until that complete export ref exists');
+    expect(taskRequirementSummary(state)).toContain('action=browser.read');
+  });
+
   it('shows model-visible write tools in requirement summaries and hides the internal receipt action', () => {
     const baseTask = task();
     const rawRequirement = {
@@ -229,9 +300,23 @@ describe('current-run effect receipts', () => {
     const state = createTaskState({ ...baseTask, requirements: [rawRequirement] });
     const summary = taskRequirementSummary(state);
     expect(summary).toContain('mode=written-from-artifact');
-    expect(summary).toContain('action=fs.writeFromRef');
+    expect(summary).toContain('action=browser.read');
     expect(summary).toContain(`sourceUrl=${url}`);
     expect(summary).not.toContain('action=fs.write ');
+
+    state.recentActions = [
+      action('browser.read', { mode: 'document' }, {
+        operation: 'read', url, revision: 3, readable: true, sourceTruncated: false,
+        sourceCapturedAt: new Date(1).toISOString(), sourceStructuredBlockCount: 1, sourceTableCount: 1,
+        documentRef: 'd3-12345678-1', sourceRefs: ['c3-12345678-1'],
+        export: { complete: true, sourceRef: 'd3-12345678-1', sourceType: 'document' },
+        diagnostics: {
+          documentBlockCount: 1, documentStructuredBlockCount: 1, documentTableCount: 1,
+          documentSourceRefs: [{ ref: 'c3-12345678-1', type: 'table', includedInDocument: true }],
+        },
+      }, receipt('browser.read', {})),
+    ];
+    expect(taskRequirementSummary(state)).toContain('action=fs.writeFromRef');
 
     const visibleNames = createGuestToolRegistry(new MockGuestTransport()).list().map(tool => tool.name);
     expect(visibleNames).toContain('fs.writeFromRef');

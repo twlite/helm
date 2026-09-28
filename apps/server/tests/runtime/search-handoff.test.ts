@@ -78,19 +78,24 @@ describe('model-directed browser search', () => {
       },
     });
     const tools = createGuestToolRegistry(guest);
-    await tools.execute('browser.navigate', { url: sourceUrl });
-    const read = await tools.execute('browser.read', { query: 'currency table' });
+    const runId = 'durable-export-snapshot';
+    await tools.execute('browser.navigate', { url: sourceUrl }, { runId });
+    const read = await tools.execute('browser.read', { mode: 'document', query: 'currency table' }, { runId });
     expect(read.ok).toBe(true);
-    const table = (read.data as { blocks: Array<{ type: string; ref: string }> }).blocks.find(block => block.type === 'table');
+    const readData = read.data as { blocks: Array<{ type: string; ref: string }>; export?: { complete?: boolean; sourceRef?: string } };
+    const table = readData.blocks.find(block => block.type === 'table');
     expect(table?.ref).toMatch(/^c\d+-/u);
+    const exportSourceRef = readData.export?.sourceRef;
+    expect(readData.export?.complete).toBe(true);
+    expect(typeof exportSourceRef).toBe('string');
 
     guest.simulateDomMutation();
-    const afterMutation = await tools.execute('fs.write', { path: 'after-mutation.txt', sourceRef: table!.ref, format: 'text' });
-    expect(afterMutation.ok).toBe(true);
+    const afterMutation = await tools.execute('fs.writeFromRef', { path: 'after-mutation.txt', sourceRef: exportSourceRef, format: 'text' }, { runId });
+    expect(afterMutation.ok, JSON.stringify(afterMutation)).toBe(true);
     expect(guest.getFile('/home/helm/workspace/after-mutation.txt')).toContain('USD | 133.20');
 
-    await tools.execute('browser.navigate', { url: otherUrl });
-    const afterNavigation = await tools.execute('fs.write', { path: 'after-navigation.txt', sourceRef: table!.ref, format: 'text' });
+    await tools.execute('browser.navigate', { url: otherUrl }, { runId });
+    const afterNavigation = await tools.execute('fs.writeFromRef', { path: 'after-navigation.txt', sourceRef: exportSourceRef, format: 'text' }, { runId });
     expect(afterNavigation.ok).toBe(true);
     expect(guest.getFile('/home/helm/workspace/after-navigation.txt')).toContain('USD | 133.20');
   });

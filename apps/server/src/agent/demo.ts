@@ -35,7 +35,7 @@ export function createScriptedDemoDecisions(): ScriptedDecision[] {
     {
       type: 'action',
       tool: 'browser.read',
-      input: { query: 'Helm deterministic demo content' },
+      input: { mode: 'document', query: 'Helm deterministic demo content' },
       reasoningSummary: 'Locate the requested text in the semantic page content.',
     },
     {
@@ -43,7 +43,7 @@ export function createScriptedDemoDecisions(): ScriptedDecision[] {
       tool: 'fs.write',
       input: {
         path: DEMO_OUTPUT_PATH,
-        sourceRef: { fromStep: 2, path: 'data.blocks.0.ref' },
+        sourceRef: { fromStep: 2, path: 'data.export.sourceRef' },
         format: 'text',
       },
       reasoningSummary: 'Persist the complete selected browser content block in the requested workspace file.',

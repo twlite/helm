@@ -697,6 +697,7 @@ export class MockGuestTransport implements GuestTransport {
   private readonly windows = new Map<string, WindowInfo>();
   private readonly contentReferences = new Map<string, MockContentReference>();
   private readonly documentReferences = new Map<string, MockDocumentReference>();
+  private readonly exportableContentRefs = new Set<string>();
   private readonly navigationReferences = new Map<string, MockNavigationReference>();
   private readonly queryElementReferences = new Map<string, MockBrowserElement>();
   private navigationIndex = 0;
@@ -771,6 +772,7 @@ export class MockGuestTransport implements GuestTransport {
     this.windows.clear();
     this.contentReferences.clear();
     this.documentReferences.clear();
+    this.exportableContentRefs.clear();
     this.navigationReferences.clear();
     this.queryElementReferences.clear();
     this.navigationIndex = 0;
@@ -845,6 +847,20 @@ export class MockGuestTransport implements GuestTransport {
           documentReference = this.documentReferences.get(input.sourceRef);
           if (!sourceReference && !documentReference) {
             throw new GuestTransportError('UNKNOWN_CONTENT_REF', `Browser content ref ${input.sourceRef} is unknown or expired.`);
+          }
+          const sourceTruncated = documentReference?.sourceTruncated ?? Boolean(sourceReference?.block.truncated);
+          if (!this.exportableContentRefs.has(input.sourceRef) || sourceTruncated) {
+            throw new GuestTransportError(
+              'SOURCE_REF_NOT_EXPORTABLE',
+              'The supplied browser ref was not exposed as a complete export artifact. Call browser.read again and use export.sourceRef only when export.complete is true.',
+              {
+                sourceRef: input.sourceRef,
+                sourceType: documentReference ? 'document' : sourceReference!.block.type,
+                exportable: false,
+                sourceTruncated,
+                guidance: 'Call browser.read again and pass its exact export.sourceRef to fs.writeFromRef only when export.complete is true.',
+              },
+            );
           }
           content = sourceReference
             ? mockSerializeContent(sourceReference.block, input.format ?? 'text')
@@ -1362,6 +1378,7 @@ export class MockGuestTransport implements GuestTransport {
         const summaries = candidates.map(block => mockContentSummary(block, Math.max(120, Math.floor(maxChars / Math.max(1, candidates.length)))));
         const returnedChars = summaries.reduce((sum, summary) => sum + JSON.stringify(summary).length, 0);
         const structured = document.blocks.filter(block => ['table', 'list', 'definition', 'form'].includes(block.type));
+        const exportComplete = this.exportableContentRefs.has(input.ref) && !document.sourceTruncated;
         const structuredBlocks = structured.slice(0, 20).map(block => this.mockStructuredSummary(block, true));
         return {
           operation: 'read',
@@ -1375,16 +1392,16 @@ export class MockGuestTransport implements GuestTransport {
           sourceRefs: [...document.sourceRefs],
           previewsAreComplete: false,
           export: {
-            complete: !document.sourceTruncated,
-            sourceRef: input.ref,
-            recommendedTool: 'fs.writeFromRef',
+            complete: exportComplete,
+            ...(exportComplete ? { sourceRef: input.ref, recommendedTool: 'fs.writeFromRef' as const, sourceType: 'document' as const } : {}),
+            ...(!exportComplete && !document.sourceTruncated ? { message: 'This document ref is available for inspection but was not certified as a complete export artifact.' } : {}),
             ...(document.sourceTruncated ? { message: 'The extracted source is truncated; a raw export may be incomplete.' } : {}),
           },
           sourceCapturedAt: document.capturedAt,
           sourceStructuredBlockCount: structured.length,
           sourceTableCount: document.blocks.filter(block => block.type === 'table').length,
           sourceTruncated: document.sourceTruncated,
-          blocks: summaries,
+          blocks: summaries.map(summary => ({ ...summary, exportable: false })),
           diagnostics: {
             blockCount: document.blocks.length,
             tableCount: document.blocks.filter(block => block.type === 'table').length,
@@ -1395,7 +1412,7 @@ export class MockGuestTransport implements GuestTransport {
             documentSourceRefs: document.blocks.map(block => ({ ref: block.ref, type: block.type })),
             structuredBlockCount: structured.length,
             structuredBlocksTruncated: structured.length > structuredBlocks.length,
-            structuredBlocks,
+            structuredBlocks: structuredBlocks.map(block => ({ ...block, exportable: false, refCapabilities: ['inspect' as const] })),
             sourceTruncated: document.sourceTruncated,
             summariesArePreviews: true,
             documentRef: input.ref,
@@ -1477,6 +1494,7 @@ export class MockGuestTransport implements GuestTransport {
         if (hasMore) summary.nextOffset = offset + block.text.length;
       }
       summary.truncated = Boolean(summary.truncated || (paged && hasMore));
+      const exportComplete = this.exportableContentRefs.has(input.ref) && !Boolean(full.truncated);
       return {
         operation: 'read',
         url: reference.url,
@@ -1488,22 +1506,24 @@ export class MockGuestTransport implements GuestTransport {
         sourceRefs: [reference.block.ref],
         previewsAreComplete: false,
         export: {
-          complete: !Boolean(full.truncated),
-          sourceRef: input.ref,
-          recommendedTool: 'fs.writeFromRef',
+          complete: exportComplete,
+          ...(exportComplete ? { sourceRef: input.ref, recommendedTool: 'fs.writeFromRef' as const, sourceType: full.type } : {}),
+          ...(!exportComplete && !full.truncated ? { message: 'This ref is available for inspection but was not certified as a complete export artifact.' } : {}),
           ...(full.truncated ? { message: 'The extracted source is truncated; a raw export may be incomplete.' } : {}),
         },
         sourceCapturedAt: reference.capturedAt,
         sourceStructuredBlockCount: Number(mockStructured(reference.block)),
         sourceTableCount: Number(reference.block.type === 'table'),
         sourceTruncated: Boolean(reference.block.truncated),
-        blocks: [summary],
+        blocks: [{ ...summary, exportable: exportComplete }],
         diagnostics: {
           blockCount: 1,
           tableCount: full.type === 'table' ? 1 : 0,
           selectedBlockCount: 1,
           structuredBlockCount: ['table', 'list', 'definition', 'form'].includes(full.type) ? 1 : 0,
-          structuredBlocks: ['table', 'list', 'definition', 'form'].includes(full.type) ? [this.mockStructuredSummary(full, true)] : [],
+          structuredBlocks: ['table', 'list', 'definition', 'form'].includes(full.type)
+            ? [{ ...this.mockStructuredSummary(full, true), exportable: exportComplete, refCapabilities: exportComplete ? ['inspect' as const, 'exportRaw' as const] : ['inspect' as const] }]
+            : [],
           structuredBlocksTruncated: false,
           sourceTruncated: false,
           summariesArePreviews: true,
@@ -1532,9 +1552,9 @@ export class MockGuestTransport implements GuestTransport {
     const documentCandidates = mode === 'document'
       ? blocks.filter(block => includeBoilerplate || (!block.boilerplate && block.type !== 'navigation'))
       : blocks;
-    const pageType = blocks.some(block => block.type === 'search_result') ? 'search_results'
-      : blocks.some(block => block.type === 'table') ? 'data_table'
-        : blocks.some(block => block.type === 'form') ? 'form' : 'generic';
+    const pageType = extracted.some(block => block.type === 'search_result') ? 'search_results'
+      : extracted.some(block => block.type === 'table') ? 'data_table'
+        : extracted.some(block => block.type === 'form') ? 'form' : 'generic';
     let documentBlocks: BrowserContentBlock[];
     let previewCandidates: BrowserContentBlock[];
     const previewRelevance = new Map<string, number>();
@@ -1581,6 +1601,29 @@ export class MockGuestTransport implements GuestTransport {
         if (chrome && previewCandidates.length < maxBlocks) previewCandidates.push(chrome);
       }
     }
+    const hasSelectionConstraints = Boolean(input.query?.trim()) || input.blockTypes !== undefined;
+    const selectedContentCount = mode === 'document' ? documentBlocks.length : previewCandidates.length;
+    if (hasSelectionConstraints && extracted.length > 0 && selectedContentCount === 0) {
+      const availableBlockTypes = extracted.reduce<Partial<Record<BrowserContentBlock['type'], number>>>((counts, block) => {
+        counts[block.type] = (counts[block.type] ?? 0) + 1;
+        return counts;
+      }, {});
+      throw new GuestTransportError(
+        'BROWSER_READ_NO_MATCHING_CONTENT',
+        'The requested browser.read filters selected no content, although the page contains extractable content.',
+        {
+          pageType,
+          ...(input.query?.trim() ? { query: input.query.trim() } : {}),
+          ...(input.blockTypes ? { requestedBlockTypes: input.blockTypes } : {}),
+          availableBlockTypes: Object.fromEntries(Object.entries(availableBlockTypes).sort(([left], [right]) => left.localeCompare(right))),
+          tableCount: extracted.filter(block => block.type === 'table').length,
+          structuredBlockCount: extracted.filter(mockStructured).length,
+          selectedBlockCount: 0,
+          exportAvailable: false,
+          guidance: 'Retry browser.read with a compatible selection or omit blockTypes for a general read. No complete export artifact exists yet.',
+        },
+      );
+    }
     const previewSelection = previewCandidates.slice(0, maxBlocks);
     const previewChars = Math.max(0, Math.min(520, Math.floor(maxChars / Math.max(1, Math.min(8, previewSelection.length)))));
     const summaries: BrowserContentSummary[] = [];
@@ -1616,9 +1659,19 @@ export class MockGuestTransport implements GuestTransport {
     const documentRef = mode === 'document' && documentBlocks.length > 0
       ? this.registerMockDocumentReference(documentBlocks, pageType)
       : undefined;
-    const exportSourceRef = documentRef ?? (sourceBlocks.length === 1 ? sourceBlocks[0]!.ref : undefined);
+    const candidateExportRef = documentRef ?? (sourceBlocks.length === 1 ? sourceBlocks[0]!.ref : undefined);
+    const exportSourceRef = candidateExportRef && sourceBlocks.length > 0 ? candidateExportRef : undefined;
+    const exportComplete = Boolean(exportSourceRef);
+    if (exportSourceRef) this.exportableContentRefs.add(exportSourceRef);
     const documentRefs = new Set(documentBlocks.map(block => block.ref));
-    const structuredBlocks = structured.slice(0, 20).map(block => this.mockStructuredSummary(block, selectedRefs.has(block.ref), documentRefs.has(block.ref)));
+    const structuredBlocks = structured.slice(0, 20).map(block => {
+      const exportable = exportComplete && exportSourceRef === block.ref;
+      return {
+        ...this.mockStructuredSummary(block, selectedRefs.has(block.ref), documentRefs.has(block.ref)),
+        exportable,
+        refCapabilities: exportable ? ['inspect' as const, 'exportRaw' as const] : ['inspect' as const],
+      };
+    });
     const documentStructured = documentBlocks.filter(mockStructured);
     const documentSourceRefs = documentBlocks.map(block => ({ ref: block.ref, type: block.type }));
     return {
@@ -1634,14 +1687,22 @@ export class MockGuestTransport implements GuestTransport {
       sourceRefs: sourceBlocks.map(block => block.ref),
       previewsAreComplete: false,
       export: {
-        complete: Boolean(exportSourceRef),
-        ...(exportSourceRef ? { sourceRef: exportSourceRef, recommendedTool: 'fs.writeFromRef' as const } : {}),
+        complete: exportComplete,
+        ...(exportSourceRef ? {
+          sourceRef: exportSourceRef,
+          recommendedTool: 'fs.writeFromRef' as const,
+          sourceType: documentRef ? 'document' as const : sourceBlocks[0]!.type,
+        } : {}),
+        ...(!exportSourceRef ? { message: 'No complete export artifact was selected. Retry browser.read with a compatible selection.' } : {}),
       },
       ...(documentRef ? { sourceCapturedAt: this.documentReferences.get(documentRef)?.capturedAt } : { sourceCapturedAt: new Date().toISOString() }),
       sourceStructuredBlockCount: sourceBlocks.filter(mockStructured).length,
       sourceTableCount: sourceBlocks.filter(block => block.type === 'table').length,
       sourceTruncated: false,
-      blocks: summaries,
+      blocks: summaries.map(summary => ({
+        ...summary,
+        exportable: exportComplete && summary.ref === exportSourceRef,
+      })),
       diagnostics: {
         blockCount: extracted.length,
         tableCount: extracted.filter(block => block.type === 'table').length,

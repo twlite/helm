@@ -100,12 +100,23 @@ describe('ToolRegistry', () => {
     expect(tools.get('fs.writeFromRef')?.inputSchema?.safeParse({ path: 'rates.txt', sourceRef: 'd1-12345678-1', format: 'text' }).success).toBe(true);
 
     await guest.request('browser.navigate', { url });
-    const read = await guest.request('browser.read', { mode: 'document', query: 'daily rates' });
+    const readResult = await tools.execute('browser.read', { mode: 'document', query: 'daily rates' }, { runId: 'export-run' });
+    expect(readResult.ok).toBe(true);
+    if (!readResult.ok) throw new Error('Expected browser.read to succeed.');
+    const read = readResult.data as import('@helm/shared').BrowserReadResult;
     expect(read.documentRef).toBeDefined();
     const authored = await tools.execute('fs.writeText', { path: 'notes.txt', content: 'hello' });
+    const staleRun = await tools.execute('fs.writeFromRef', {
+      path: 'stale-rates.txt', sourceRef: read.documentRef!, format: 'text',
+    }, { runId: 'another-run' });
+    expect(staleRun).toMatchObject({
+      ok: false,
+      error: { code: 'SOURCE_REF_NOT_EXPORTABLE', details: { currentRunEvidence: false } },
+    });
+    expect(guest.hasFile('/home/helm/workspace/stale-rates.txt')).toBe(false);
     const exported = await tools.execute('fs.writeFromRef', {
       path: 'rates.txt', sourceRef: read.documentRef!, format: 'text',
-    });
+    }, { runId: 'export-run' });
     expect(authored).toMatchObject({ ok: true, data: { path: '/home/helm/workspace/notes.txt' }, evidence: { receipt: { tool: 'fs.write' } } });
     expect(exported).toMatchObject({
       ok: true,
@@ -114,6 +125,41 @@ describe('ToolRegistry', () => {
     });
     expect(guest.getFile('/home/helm/workspace/notes.txt')).toBe('hello');
     expect(guest.getFile('/home/helm/workspace/rates.txt')).toContain('USD');
-    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['fs.writeText', 'fs.writeFromRef']);
+    expect(tools.invocations.map(invocation => invocation.tool)).toEqual([
+      'browser.read', 'fs.writeText', 'fs.writeFromRef', 'fs.writeFromRef',
+    ]);
+  });
+
+  it('rejects diagnostic browser refs before mutating a file and records a failed write receipt', async () => {
+    const url = 'https://fixture.example.test/structured';
+    const guest = new MockGuestTransport({
+      pages: {
+        [url]: `<!doctype html><html><body><main><h1>Market information</h1>
+          <table><caption>Market prices</caption><tr><th>Asset</th><th>Price</th></tr><tr><td>Widget</td><td>42</td></tr></table>
+          <form><label>Contact <input name="email" type="email"></label></form>
+        </main></body></html>`,
+      },
+      initialFiles: { 'preserved.txt': 'keep this file' },
+    });
+    const tools = createGuestToolRegistry(guest);
+    await guest.request('browser.navigate', { url });
+    const readResult = await tools.execute('browser.read', { mode: 'document', query: 'market prices' }, { runId: 'form-ref-run' });
+    expect(readResult.ok).toBe(true);
+    if (!readResult.ok) throw new Error('Expected browser.read to succeed.');
+    const read = readResult.data as import('@helm/shared').BrowserReadResult;
+    const formRef = read.diagnostics?.structuredBlocks?.find(block => block.type === 'form')?.ref;
+    expect(read.export).toMatchObject({ complete: true, sourceType: 'document', sourceRef: read.documentRef });
+    expect(formRef).toBeDefined();
+
+    const rejected = await tools.execute('fs.writeFromRef', {
+      path: 'preserved.txt', sourceRef: formRef!, format: 'text',
+    }, { runId: 'form-ref-run' });
+    expect(rejected).toMatchObject({
+      ok: false,
+      error: { code: 'SOURCE_REF_NOT_EXPORTABLE', details: { sourceType: 'form', exportable: false } },
+      evidence: { receipt: { tool: 'fs.write', ok: false, error: { code: 'SOURCE_REF_NOT_EXPORTABLE' } } },
+    });
+    expect(rejected.evidence?.receipt?.effect).not.toHaveProperty('writePerformed', true);
+    expect(guest.getFile('/home/helm/workspace/preserved.txt')).toBe('keep this file');
   });
 });

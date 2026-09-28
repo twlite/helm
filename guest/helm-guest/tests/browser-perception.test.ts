@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { chromium } from 'playwright';
 import { guestMethodSchemas } from '../../../packages/shared/src/schemas';
+import type { BrowserReadResult } from '../../../packages/shared/src/types';
 
 import { GuestRpcError } from '../src/errors';
 import { BrowserController, extractDuckDuckGoSearchPage } from '../src/browser';
@@ -14,6 +15,144 @@ import { GuestSandbox } from '../src/sandbox';
 import { extractAccessibleCandidate } from '../src/semantic-extraction';
 
 describe('progressive browser perception', () => {
+  it('rejects a filtered read that selects nothing and retries with a complete export artifact', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-browser-read-no-match-'));
+    const sandbox = new GuestSandbox({ root, workspace: join(root, 'workspace') });
+    const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
+    const runtime = new GuestRuntime({ sandbox, browser: controller });
+    try {
+      const html = await readFile(new URL('./fixtures/forex-two-tables.html', import.meta.url), 'utf8');
+      const file = await sandbox.write('workspace/forex.html', html);
+      await controller.navigate({ url: pathToFileURL(file.path).href });
+
+      const filtered = await runtime.dispatch({
+        id: 'read-text-only',
+        method: 'browser.read',
+        params: { mode: 'document', query: 'exchange rate data', blockTypes: ['text'] },
+      });
+      expect(filtered.ok).toBe(false);
+      if (filtered.ok) throw new Error('Expected a no-matching-content error.');
+      expect(filtered.error).toMatchObject({
+        code: 'BROWSER_READ_NO_MATCHING_CONTENT',
+        details: {
+          pageType: 'data_table',
+          query: 'exchange rate data',
+          requestedBlockTypes: ['text'],
+          tableCount: 2,
+          selectedBlockCount: 0,
+          exportAvailable: false,
+          availableBlockTypes: expect.objectContaining({ table: 2 }),
+        },
+      });
+
+      const retried = await runtime.dispatch({
+        id: 'read-general-document',
+        method: 'browser.read',
+        params: { mode: 'document', query: 'exchange rate data' },
+      });
+      expect(retried.ok).toBe(true);
+      if (!retried.ok) throw new Error('Expected the compatible read to succeed.');
+      const read = retried.result as BrowserReadResult;
+      expect(read).toMatchObject({
+        export: { complete: true, sourceType: 'document', sourceRef: read.documentRef },
+        diagnostics: { tableCount: 2, documentTableCount: 2 },
+      });
+      expect(read.export?.sourceRef).toBe(read.documentRef);
+      const write = await runtime.dispatch({
+        id: 'write-complete-document',
+        method: 'fs.write',
+        params: { path: 'workspace/forex.txt', sourceRef: read.export!.sourceRef, format: 'text' },
+      });
+      expect(write.ok).toBe(true);
+      const saved = await sandbox.read('workspace/forex.txt');
+      for (const currency of ['Indian Rupee (INR)', 'US Dollar (USD)', 'Euro (EUR)', 'British Pound (GBP)', 'Japanese Yen (JPY)']) {
+        expect(saved.content).toContain(currency);
+      }
+    } finally {
+      await controller.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it('allows only explicitly certified complete browser refs for raw writes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-browser-export-capability-'));
+    const sandbox = new GuestSandbox({ root, workspace: join(root, 'workspace') });
+    const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
+    const runtime = new GuestRuntime({ sandbox, browser: controller });
+    try {
+      const file = await sandbox.write('workspace/structured.html', `<!doctype html><html><body>
+        <header><nav><a href="#home">Board of Directors</a></nav></header>
+        <main><h1>Reference data</h1>
+          <table><caption>Regional prices</caption><tr><th>Asset</th><th>Price</th></tr><tr><td>Widget</td><td>42</td></tr></table>
+          <table><caption>Warehouse inventory</caption><tr><th>SKU</th><th>Remaining</th></tr><tr><td>Gadget</td><td>${'g'.repeat(2_001)}</td></tr></table>
+          <form><label>Contact <input name="email" type="email"></label></form>
+        </main></body></html>`);
+      await controller.navigate({ url: pathToFileURL(file.path).href });
+      await sandbox.write('workspace/preserved.txt', 'keep this file');
+      const read = await controller.read({ mode: 'document', query: 'regional prices' });
+      expect(read.export).toMatchObject({ complete: true, sourceType: 'document', sourceRef: read.documentRef });
+      const diagnosticBlocks = read.diagnostics?.structuredBlocks ?? [];
+      const form = diagnosticBlocks.find(block => block.type === 'form');
+      const unrelatedTable = diagnosticBlocks.find(block => block.type === 'table' && block.selected === false);
+      expect(form).toMatchObject({ exportable: false, refCapabilities: ['inspect'] });
+      expect(unrelatedTable).toMatchObject({ exportable: false, refCapabilities: ['inspect'] });
+
+      for (const [name, ref, sourceType] of [
+        ['form', form?.ref, 'form'],
+        ['unselected-table', unrelatedTable?.ref, 'table'],
+      ] as const) {
+        expect(ref).toBeDefined();
+        const rejected = await runtime.dispatch({
+          id: `write-${name}`,
+          method: 'fs.write',
+          params: { path: 'workspace/preserved.txt', sourceRef: ref, format: 'text' },
+        });
+        expect(rejected).toMatchObject({
+          ok: false,
+          error: { code: 'SOURCE_REF_NOT_EXPORTABLE', details: { sourceType, exportable: false } },
+        });
+        expect((await sandbox.read('workspace/preserved.txt')).content).toBe('keep this file');
+      }
+
+      const single = await controller.read({ mode: 'readable', query: 'regional prices', blockTypes: ['table'] });
+      expect(single.export).toMatchObject({ complete: true, sourceType: 'table' });
+      expect(single.export?.sourceRef).toBe(single.blocks?.[0]?.ref);
+      const singleWrite = await runtime.dispatch({
+        id: 'write-explicit-single-table',
+        method: 'fs.write',
+        params: { path: 'workspace/single-table.txt', sourceRef: single.export!.sourceRef, format: 'text' },
+      });
+      expect(singleWrite).toMatchObject({ ok: true, result: { sourceType: 'table' } });
+      expect((await sandbox.read('workspace/single-table.txt')).content).toContain('Widget | 42');
+
+      const huge = await sandbox.write('workspace/truncated.html', `<!doctype html><html><body><main>
+        <h1>Long document</h1><p>${'x'.repeat(2_100_100)}</p>
+      </main></body></html>`);
+      await controller.navigate({ url: pathToFileURL(huge.path).href });
+      const truncated = await controller.read({ mode: 'document' });
+      expect(truncated).toMatchObject({
+        sourceTruncated: true,
+        export: { complete: false },
+      });
+      expect(truncated.documentRef).toBeDefined();
+      expect(truncated.export?.sourceRef).toBeUndefined();
+      await sandbox.write('workspace/truncated-target.txt', 'keep this file');
+      const rejectedTruncated = await runtime.dispatch({
+        id: 'write-truncated-document',
+        method: 'fs.write',
+        params: { path: 'workspace/truncated-target.txt', sourceRef: truncated.documentRef!, format: 'text' },
+      });
+      expect(rejectedTruncated).toMatchObject({
+        ok: false,
+        error: { code: 'SOURCE_REF_NOT_EXPORTABLE', details: { sourceType: 'document', sourceTruncated: true } },
+      });
+      expect((await sandbox.read('workspace/truncated-target.txt')).content).toBe('keep this file');
+    } finally {
+      await controller.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it('provides bounded DOM query and page-context evaluation fallbacks', async () => {
     const root = await mkdtemp(join(tmpdir(), 'helm-browser-inspection-'));
     const sandbox = new GuestSandbox({ root, workspace: join(root, 'workspace') });
@@ -83,9 +222,16 @@ describe('progressive browser perception', () => {
         <main><h1>Current figures</h1><table><tr><th>Currency</th><th>Buy</th><th>Sell</th></tr>
         <tr><td>USD</td><td>133.20</td><td>134.10</td></tr></table></main></body></html>`);
       await controller.navigate({ url: pathToFileURL(file.path).href });
-      const noMatch = await controller.read({ query: 'qzxwvv-9347182-uniquetoken' });
-      expect(noMatch.blocks).toHaveLength(0);
-      expect(noMatch.diagnostics?.tableCount).toBe(1);
+      let noMatchError: unknown;
+      try {
+        await controller.read({ query: 'qzxwvv-9347182-uniquetoken', blockTypes: ['code'] });
+      } catch (error) {
+        noMatchError = error;
+      }
+      expect(noMatchError).toMatchObject({
+        code: 'BROWSER_READ_NO_MATCHING_CONTENT',
+        details: { query: 'qzxwvv-9347182-uniquetoken', requestedBlockTypes: ['code'], tableCount: 1, selectedBlockCount: 0, exportAvailable: false },
+      });
       const read = await controller.read({ mode: 'document', blockTypes: ['table'] });
       expect(read.pageType).toBe('data_table');
       expect(read.blocks?.[0]).toMatchObject({ type: 'table', ref: expect.any(String) });
@@ -259,10 +405,16 @@ describe('progressive browser perception', () => {
       expect(limited.blocks).toHaveLength(1);
       expect(limited.diagnostics?.tableCount).toBe(2);
       expect(limited.diagnostics?.structuredBlocks?.filter(block => !block.selected)).toHaveLength(1);
-      const pageRelevanceRead = await controller.read({ query: 'body', maxBlocks: 1 });
-      expect(pageRelevanceRead.query).toBe('body');
-      expect(pageRelevanceRead.blocks).toHaveLength(0);
-      expect(pageRelevanceRead.diagnostics?.structuredBlocks?.filter(block => block.type === 'table' && !block.selected)).toHaveLength(2);
+      let relevanceReadError: unknown;
+      try {
+        await controller.read({ query: 'body', maxBlocks: 1 });
+      } catch (error) {
+        relevanceReadError = error;
+      }
+      expect(relevanceReadError).toMatchObject({
+        code: 'BROWSER_READ_NO_MATCHING_CONTENT',
+        details: { tableCount: 2, selectedBlockCount: 0, exportAvailable: false },
+      });
       const domRead = await controller.query({ selector: 'table tr', limit: 3 });
       expect(domRead.results).toHaveLength(3);
 
@@ -628,7 +780,7 @@ describe('progressive browser perception', () => {
     try {
       const forexPath = await fixture('forex.html');
       await controller.navigate({ url: pathToFileURL(forexPath).href });
-      const forex = await controller.read({ query: 'exchange rate data' });
+      const forex = await controller.read({ mode: 'document', query: 'exchange rate data', blockTypes: ['table'] });
       const table = forex.blocks?.find(block => block.type === 'table');
       expect(forex).toMatchObject({ pageType: 'data_table', query: 'exchange rate data' });
       expect(forex.blocks?.[0]?.type).toBe('table');
@@ -653,6 +805,7 @@ describe('progressive browser perception', () => {
       });
       expect(forex.diagnostics?.tableCount).toBe(1);
       expect(forex.diagnostics?.selectedRefs[0]?.ref).toBe(table?.ref);
+      expect(forex.export).toMatchObject({ complete: true, sourceType: 'document', sourceRef: forex.documentRef });
 
       const overview = await controller.read();
       expect(overview.blocks?.find(block => block.type === 'navigation')).toMatchObject({
@@ -700,13 +853,13 @@ describe('progressive browser perception', () => {
       const write = await runtime.dispatch({
         id: 'forex-source-ref-write',
         method: 'fs.write',
-        params: { path: 'workspace/forex.txt', sourceRef: table!.ref, format: 'text' },
+        params: { path: 'workspace/forex.txt', sourceRef: forex.export!.sourceRef, format: 'text' },
       });
       expect(write).toMatchObject({
         ok: true,
         result: {
-          sourceRef: table!.ref,
-          sourceType: 'table',
+          sourceRef: forex.export!.sourceRef,
+          sourceType: 'document',
           format: 'text',
           sourceRevision: forex.revision,
           sourceUrl: pathToFileURL(forexPath).href,
@@ -725,10 +878,12 @@ describe('progressive browser perception', () => {
       expect(saved.content).not.toContain('Current Account');
       expect(saved.content).not.toContain('Saving Account');
 
+      const csvRead = await controller.read({ mode: 'readable', query: 'exchange rate data', blockTypes: ['table'] });
+      expect(csvRead.export).toMatchObject({ complete: true, sourceType: 'table' });
       const csvWrite = await runtime.dispatch({
         id: 'forex-csv-source-ref-write',
         method: 'fs.write',
-        params: { path: 'workspace/forex.csv', sourceRef: table!.ref, format: 'csv' },
+        params: { path: 'workspace/forex.csv', sourceRef: csvRead.export!.sourceRef, format: 'csv' },
       });
       expect(csvWrite).toMatchObject({ ok: true, result: { sourceType: 'table', format: 'csv' } });
       const csv = await sandbox.read('workspace/forex.csv');
@@ -847,9 +1002,9 @@ describe('progressive browser perception', () => {
       const staleWrite = await runtime.dispatch({
         id: 'stale-source-ref-write',
         method: 'fs.write',
-        params: { path: 'workspace/stale.txt', sourceRef: table!.ref, format: 'text' },
+        params: { path: 'workspace/stale.txt', sourceRef: forex.export!.sourceRef, format: 'text' },
       });
-      expect(staleWrite).toMatchObject({ ok: true, result: { sourceRef: table!.ref, sourceType: 'table' } });
+      expect(staleWrite).toMatchObject({ ok: true, result: { sourceRef: forex.export!.sourceRef, sourceType: 'document' } });
       const afterNavigation = await sandbox.read('workspace/stale.txt');
       expect(afterNavigation.content).toContain('Indian Currency | INR | 100 | 160.00 | 160.00 | 160.15');
     } finally {

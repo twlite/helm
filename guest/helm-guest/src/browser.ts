@@ -831,6 +831,8 @@ export class BrowserController {
   private references = new Map<string, BrowserReference>();
   private contentReferences = new Map<string, SerializableContentReference>();
   private documentReferences = new Map<string, SerializableDocumentReference>();
+  /** Refs explicitly certified by browser.read as complete logical exports. */
+  private readonly exportableContentRefs = new Set<string>();
   private contentReferenceOrder = new Map<string, number>();
   private contentReferenceSequence = 0;
   private contentReferenceBytes = 0;
@@ -1348,7 +1350,7 @@ export class BrowserController {
     maxBlocks?: number;
     maxChars?: number;
     blockTypes?: BrowserContentBlock["type"][];
-  }, attempt = 0): Promise<BrowserReadResult> {
+  }, attempt = 0, allowEmptySelection = false): Promise<BrowserReadResult> {
     const page = await this.ensurePage();
     await this.waitForReadableStability(page);
     await this.installReadabilityScript(page);
@@ -1426,6 +1428,37 @@ export class BrowserController {
     }
     previewSelection = previewSelection.slice(0, maxBlocks);
 
+    if ((query !== undefined || input.blockTypes !== undefined)
+      && extracted.blocks.length > 0
+      && exportSelection.length === 0
+      && !allowEmptySelection) {
+      const availableBlockTypes = extracted.blocks.reduce<Partial<Record<BrowserContentBlock["type"], number>>>((counts, block) => {
+        counts[block.type] = (counts[block.type] ?? 0) + 1;
+        return counts;
+      }, {});
+      const orderedAvailableBlockTypes = Object.fromEntries(
+        Object.entries(availableBlockTypes).sort(([left], [right]) => left.localeCompare(right)),
+      );
+      throw new GuestRpcError(
+        "BROWSER_READ_NO_MATCHING_CONTENT",
+        "The requested browser.read filters selected no content, although the page contains extractable content.",
+        {
+          httpStatus: 422,
+          details: {
+            pageType: extracted.pageType,
+            ...(query ? { query } : {}),
+            ...(input.blockTypes ? { requestedBlockTypes: input.blockTypes } : {}),
+            availableBlockTypes: orderedAvailableBlockTypes,
+            tableCount: extracted.blocks.filter(block => block.type === "table").length,
+            structuredBlockCount: extracted.blocks.filter(isStructuredContentBlock).length,
+            selectedBlockCount: 0,
+            exportAvailable: false,
+            guidance: "Retry browser.read with a compatible selection or omit blockTypes for a general read. No complete export artifact exists yet.",
+          },
+        },
+      );
+    }
+
     const summaries: BrowserContentSummary[] = [];
     let returnedChars = 0;
     const previewChars = Math.max(0, Math.min(DEFAULT_BLOCK_PREVIEW_CHARS, Math.floor(maxChars / Math.max(1, Math.min(8, previewSelection.length)))));
@@ -1463,7 +1496,7 @@ export class BrowserController {
     }));
     const stableRevision = await this.refreshDomRevision(page);
     if (stableRevision !== revision || page.url() !== url) {
-      if (attempt < 2) return this.readSemanticContent(input, attempt + 1);
+      if (attempt < 2) return this.readSemanticContent(input, attempt + 1, allowEmptySelection);
       throw new GuestRpcError("BROWSER_DOM_UNSTABLE", "The page changed repeatedly while semantic content was being read.", { httpStatus: 409 });
     }
     const selectedRefSet = new Set(summaries.map(summary => summary.ref));
@@ -1477,7 +1510,13 @@ export class BrowserController {
     const documentRef = documentBlocks.length > 0 && (mode === "document" || documentBlocks.length > 1)
       ? this.registerDocumentReference(documentBlocks, url, title, extracted.pageType, documentSourceTruncated)
       : undefined;
-    const exportSourceRef = documentRef ?? (documentBlocks.length === 1 ? documentBlocks[0]!.ref : undefined);
+    const candidateExportRef = documentRef ?? (documentBlocks.length === 1
+      && this.contentReferences.has(documentBlocks[0]!.ref)
+      ? documentBlocks[0]!.ref
+      : undefined);
+    const exportComplete = Boolean(candidateExportRef && !documentSourceTruncated);
+    const exportSourceRef = exportComplete ? candidateExportRef : undefined;
+    if (exportSourceRef) this.exportableContentRefs.add(exportSourceRef);
     const documentSnapshot = documentRef ? this.documentReferences.get(documentRef) : undefined;
     const documentRefSet = new Set(documentBlocks.map(block => block.ref));
     const structuredBlocks = extracted.blocks.filter(block => (
@@ -1493,6 +1532,8 @@ export class BrowserController {
       ...(block.columnCount === undefined ? {} : { columnCount: block.columnCount }),
       selected: selectedRefSet.has(block.ref),
       includedInDocument: documentRefSet.has(block.ref),
+      exportable: exportComplete && exportSourceRef === block.ref,
+      refCapabilities: exportComplete && exportSourceRef === block.ref ? ["inspect", "exportRaw"] : ["inspect"],
       previewOnly: true,
     }));
     const documentStructuredBlocks = documentBlocks.filter(isStructuredContentBlock);
@@ -1510,15 +1551,23 @@ export class BrowserController {
       sourceRefs: documentBlocks.map(block => block.ref),
       previewsAreComplete: false,
       export: {
-        complete: Boolean(exportSourceRef && !documentSourceTruncated),
-        ...(exportSourceRef ? { sourceRef: exportSourceRef, recommendedTool: "fs.writeFromRef" as const } : {}),
+        complete: exportComplete,
+        ...(exportSourceRef ? {
+          sourceRef: exportSourceRef,
+          recommendedTool: "fs.writeFromRef" as const,
+          sourceType: documentRef ? "document" as const : documentBlocks[0]!.type,
+        } : {}),
+        ...(!exportSourceRef && !documentSourceTruncated ? { message: "No complete export artifact was selected. Retry browser.read with a compatible selection." } : {}),
         ...(documentSourceTruncated ? { message: "The extracted source is truncated; a raw export may be incomplete." } : {}),
       },
       ...(documentSnapshot ? { sourceCapturedAt: documentSnapshot.capturedAt } : { sourceCapturedAt: new Date().toISOString() }),
       sourceStructuredBlockCount: documentBlocks.filter(isStructuredContentBlock).length,
       sourceTableCount: documentBlocks.filter(block => block.type === "table").length,
       sourceTruncated: documentSourceTruncated,
-      blocks: summaries,
+      blocks: summaries.map(summary => ({
+        ...summary,
+        exportable: exportComplete && summary.ref === exportSourceRef,
+      })),
       diagnostics: {
         blockCount: extracted.blocks.length,
         tableCount: extracted.blocks.filter(block => block.type === "table").length,
@@ -1655,6 +1704,7 @@ export class BrowserController {
     }
     if (paged) summary.truncated = Boolean(summary.truncated || hasMore);
     const preview = summary.preview ?? "";
+    const exportComplete = this.exportableContentRefs.has(input.ref) && !Boolean(full.truncated);
     return {
       operation: "read",
       url: reference.url,
@@ -1666,16 +1716,16 @@ export class BrowserController {
       sourceRefs: [reference.block.ref],
       previewsAreComplete: false,
       export: {
-        complete: !Boolean(reference.block.truncated),
-        sourceRef: input.ref,
-        recommendedTool: "fs.writeFromRef",
+        complete: exportComplete,
+        ...(exportComplete ? { sourceRef: input.ref, recommendedTool: "fs.writeFromRef" as const, sourceType: full.type } : {}),
+        ...(!exportComplete && !full.truncated ? { message: "This ref is available for inspection but was not certified as a complete export artifact." } : {}),
         ...(reference.block.truncated ? { message: "The extracted source is truncated; a raw export may be incomplete." } : {}),
       },
       sourceCapturedAt: reference.capturedAt,
       sourceStructuredBlockCount: isStructuredContentBlock(reference.block) ? 1 : 0,
       sourceTableCount: reference.block.type === "table" ? 1 : 0,
       sourceTruncated: Boolean(reference.block.truncated),
-      blocks: [summary],
+      blocks: [{ ...summary, exportable: exportComplete }],
       diagnostics: {
         blockCount: 1,
         tableCount: full.type === "table" ? 1 : 0,
@@ -1691,6 +1741,8 @@ export class BrowserController {
           ...(full.rowCount === undefined ? {} : { rowCount: full.rowCount }),
           ...(full.columnCount === undefined ? {} : { columnCount: full.columnCount }),
           selected: true,
+          exportable: exportComplete,
+          refCapabilities: exportComplete ? ["inspect", "exportRaw"] : ["inspect"],
           previewOnly: true,
         }] : [],
         sourceTruncated: Boolean(full.truncated),
@@ -1729,6 +1781,7 @@ export class BrowserController {
     }
     const structuredBlocks = document.blocks.filter(block => ["table", "list", "definition", "form"].includes(block.type));
     const selectedRefs = new Set(blocks.map(block => block.ref));
+    const exportComplete = this.exportableContentRefs.has(input.ref) && !document.sourceTruncated;
     const structuredSummaries: BrowserStructuredBlockSummary[] = structuredBlocks.slice(0, 20).map(block => ({
       ref: block.ref,
       type: block.type as BrowserStructuredBlockSummary["type"],
@@ -1739,6 +1792,8 @@ export class BrowserController {
       ...(block.columnCount === undefined ? {} : { columnCount: block.columnCount }),
       selected: selectedRefs.has(block.ref),
       includedInDocument: true,
+      exportable: false,
+      refCapabilities: ["inspect"],
       previewOnly: true,
     }));
     return {
@@ -1753,16 +1808,16 @@ export class BrowserController {
       sourceRefs: [...document.sourceRefs],
       previewsAreComplete: false,
       export: {
-        complete: !document.sourceTruncated,
-        sourceRef: input.ref,
-        recommendedTool: "fs.writeFromRef",
+        complete: exportComplete,
+        ...(exportComplete ? { sourceRef: input.ref, recommendedTool: "fs.writeFromRef" as const, sourceType: "document" as const } : {}),
+        ...(!exportComplete && !document.sourceTruncated ? { message: "This document ref is available for inspection but was not certified as a complete export artifact." } : {}),
         ...(document.sourceTruncated ? { message: "The extracted source is truncated; a raw export may be incomplete." } : {}),
       },
       sourceCapturedAt: document.capturedAt,
       sourceStructuredBlockCount: structuredBlocks.length,
       sourceTableCount: document.blocks.filter(block => block.type === "table").length,
       sourceTruncated: document.sourceTruncated,
-      blocks,
+      blocks: blocks.map(block => ({ ...block, exportable: false })),
       diagnostics: {
         blockCount: document.blocks.length,
         tableCount: document.blocks.filter(block => block.type === "table").length,
@@ -1834,6 +1889,47 @@ export class BrowserController {
         format,
       };
     }, "browser.serializeContentRef");
+  }
+
+  async serializeExportableContentRef(ref: string, format: BrowserContentFormat = "text"): Promise<{
+    content: string;
+    sourceRef: string;
+    sourceType: BrowserContentSourceType;
+    sourceRevision: number;
+    sourceUrl: string;
+    sourceCapturedAt: string;
+    sourceRefs?: string[];
+    sourceStructuredBlockCount: number;
+    sourceTableCount: number;
+    sourceTruncated: boolean;
+    format: BrowserContentFormat;
+  }> {
+    const document = this.documentReferences.get(ref);
+    const reference = this.contentReferences.get(ref);
+    if (!document && !reference) {
+      // Keep the existing unknown/expired ref error distinct from a known ref
+      // that was only exposed for inspection.
+      return this.serializeContentRef(ref, format);
+    }
+    const sourceTruncated = document?.sourceTruncated ?? Boolean(reference?.block.truncated);
+    if (!this.exportableContentRefs.has(ref) || sourceTruncated) {
+      const sourceType = document ? "document" : reference!.block.type;
+      throw new GuestRpcError(
+        "SOURCE_REF_NOT_EXPORTABLE",
+        "The supplied browser ref was not exposed as a complete export artifact. Call browser.read again and use export.sourceRef only when export.complete is true.",
+        {
+          httpStatus: 400,
+          details: {
+            sourceRef: ref,
+            sourceType,
+            exportable: false,
+            sourceTruncated,
+            guidance: "Call browser.read again and pass its exact export.sourceRef to fs.writeFromRef only when export.complete is true.",
+          },
+        },
+      );
+    }
+    return this.serializeContentRef(ref, format);
   }
 
   private registerContentReference(
@@ -1910,6 +2006,7 @@ export class BrowserController {
       const oldestDocument = this.documentReferences.get(oldestRef);
       this.contentReferences.delete(oldestRef);
       this.documentReferences.delete(oldestRef);
+      this.exportableContentRefs.delete(oldestRef);
       this.contentReferenceBytes = Math.max(0, this.contentReferenceBytes - (oldestBlock?.size ?? oldestDocument?.size ?? 0));
     }
   }
@@ -1959,6 +2056,7 @@ export class BrowserController {
   private clearContentReferences(): void {
     this.contentReferences.clear();
     this.documentReferences.clear();
+    this.exportableContentRefs.clear();
     this.contentReferenceOrder.clear();
     this.contentReferenceBytes = 0;
   }
@@ -2443,7 +2541,7 @@ export class BrowserController {
       query: input.query,
       maxChars: 12_000,
       ...(input.maxResults === undefined ? {} : { maxResults: input.maxResults }),
-    }, attempt);
+    }, attempt, true);
     const results = result.blocks ?? [];
     return {
       operation: "find_page",

@@ -371,18 +371,13 @@ describe('AgentRuntime', () => {
             if (!result) throw new Error('The search result did not expose its exact observed href.');
             return { type: 'action', tool: 'browser.open', input: { ref: result.ref } };
           }
-          if (step === 4) return { type: 'action', tool: 'browser.read', input: { query: 'foreign exchange currency buying selling' } };
+          if (step === 4) return { type: 'action', tool: 'browser.read', input: { mode: 'document', query: 'foreign exchange currency buying selling' } };
           if (step === 5) {
-            const table = latestRead(context).blocks?.find(block => block.type === 'table');
-            if (!table) throw new Error('The ranked browser read did not return a table ref.');
-            return { type: 'action', tool: 'browser.read', input: { ref: table.ref } };
+            const sourceRef = (latestRead(context) as { export?: { complete?: boolean; sourceRef?: string } }).export?.sourceRef;
+            if (!sourceRef) throw new Error('The page read did not return a complete export ref.');
+            return { type: 'action', tool: 'fs.write', input: { path: 'forex.txt', sourceRef, format: 'text' } };
           }
-          if (step === 6) {
-            const table = latestRead(context).blocks?.find(block => block.type === 'table');
-            if (!table) throw new Error('The selected browser read did not retain the table ref.');
-            return { type: 'action', tool: 'fs.write', input: { path: 'forex.txt', sourceRef: table.ref, format: 'text' } };
-          }
-          if (step === 7) return { type: 'action', tool: 'app.openFile', input: { path: 'forex.txt', application: 'text-editor' } };
+          if (step === 6) return { type: 'action', tool: 'app.openFile', input: { path: 'forex.txt', application: 'text-editor' } };
           return { type: 'complete' };
         },
       },
@@ -411,7 +406,7 @@ describe('AgentRuntime', () => {
     const rejectedGuess = result.steps.find(step => step.phase === 'act' && step.toolName === 'browser.navigate' && step.toolResult?.error);
     expect(rejectedGuess?.toolResult?.error).toMatchObject({ code: 'UNOBSERVED_NAVIGATION_URL' });
     expect(tools.invocations.filter(invocation => invocation.tool === 'browser.read').map(invocation => invocation.input))
-      .toEqual([{ query: 'foreign exchange currency buying selling' }, { ref: expect.any(String) }]);
+      .toEqual([{ mode: 'document', query: 'foreign exchange currency buying selling' }]);
     const selectedRead = tools.invocations.find(invocation => invocation.tool === 'browser.read');
     expect((selectedRead?.result.data as { blocks: Array<{ type: string; rowCount?: number }> }).blocks[0]).toMatchObject({ type: 'table', rowCount: 12 });
     const saved = guest.getFile('forex.txt') ?? '';
@@ -723,7 +718,7 @@ describe('AgentRuntime', () => {
     const write = demo.tools.invocations.find(invocation => invocation.tool === 'fs.write');
     expect(write?.input).toMatchObject({
       path: '/home/helm/workspace/demo.txt',
-      sourceRef: expect.stringMatching(/^c\d+-/),
+      sourceRef: expect.stringMatching(/^d\d+-/),
       format: 'text',
     });
   });

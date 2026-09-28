@@ -1364,6 +1364,7 @@ export class AgentRuntime {
           requirementId: check.requirement.id,
           reasonCode: check.reasonCode!,
           message: check.message,
+          ...(check.evidence === undefined ? {} : { evidence: check.evidence }),
           ...(check.correctiveTool ? { correctiveTool: check.correctiveTool } : {}),
           ...(check.rejectedAction ? { rejectedAction: check.rejectedAction } : {}),
           ...(check.correctiveArtifact ? { correctiveArtifact: check.correctiveArtifact } : {}),
@@ -1565,6 +1566,7 @@ export class AgentRuntime {
         .map(check => ({
           id: check.requirement.id,
           message: check.message,
+          ...(check.evidence === undefined ? {} : { evidence: check.evidence }),
           ...(check.reasonCode ? { reasonCode: check.reasonCode } : {}),
           ...(check.correctiveTool ? { correctiveTool: check.correctiveTool } : {}),
           ...(check.rejectedAction ? { rejectedAction: check.rejectedAction } : {}),

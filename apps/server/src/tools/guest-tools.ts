@@ -5,9 +5,9 @@ import { z } from 'zod';
 import type {
   GuestMethodParams,
   GuestTransport,
-  GuestTransportError,
 } from './guest-transport';
-import { ToolRegistry, type ToolRegistryOptions } from './tool-registry';
+import { GuestTransportError } from './guest-transport';
+import { ToolRegistry, type ToolExecutionContext, type ToolRegistryOptions } from './tool-registry';
 
 const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'guest.handshake': 'Check the loaded guest build identity, protocol contract, server process ID, and capabilities.',
@@ -20,7 +20,7 @@ const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'browser.navigate': 'Navigate the visible guest browser to a valid HTTP or HTTPS URL. User-provided URLs may be opened directly.',
   'browser.getState': 'Read the visible browser URL, title, loading state, page count, and current DOM revision without reading page text.',
   'browser.snapshot': 'Return a bounded semantic outline of the current page and its visible interactive elements.',
-  'browser.read': 'Read bounded structured semantic content from the current page. query is natural-language relevance text, not a CSS selector; use browser.query for DOM/CSS inspection. readable ranks compact model previews. document preserves substantive content in page order and returns an immutable documentRef for the complete relevant block collection; maxChars and maxBlocks limit previews, not that snapshot. The result marks previewsAreComplete=false and provides export.sourceRef plus export.complete. Do not copy preview text into raw-data files; use export.sourceRef with fs.writeFromRef, and treat export.complete=false as an incomplete source.',
+  'browser.read': 'Read bounded structured semantic content from the current page. query is natural-language relevance text, not a CSS selector; use browser.query for DOM/CSS inspection. Omit blockTypes for a general read; provide it only when restricting the content classes you want. If a filter selects nothing, the tool returns available block-type counts so you can retry. readable ranks compact previews. document preserves substantive content in page order; maxChars and maxBlocks limit previews, not the immutable snapshot. Previews are never complete raw data. Use only export.sourceRef with fs.writeFromRef when export.complete=true; do not copy previews or use diagnostic refs for raw export.',
   'browser.query': 'Inspect a bounded set of current DOM elements by CSS selector, text, role, or name. Returns compact metadata and revision-bound element refs; observed links include navigation refs. Use it to inspect rendered rows or controls when semantic extraction is incomplete.',
   'browser.evaluate': 'Evaluate a JavaScript expression inside the current browser page and return JSON-serializable data (maximum 64 KB; bounded by the browser operation timeout). It runs only in page context and has no guest or host filesystem, process, environment, or host API access.',
   'browser.findPage': 'Find and rank content on the current page. This is page-local search and does not search the web; results include typed current-page refs.',
@@ -201,6 +201,8 @@ function registerGuestTool<M extends GuestMethod>(
     modelVisible?: boolean;
     rpcTimeoutMs?: number;
     executionTimeoutMs?: number;
+    beforeExecute?: (input: Record<string, unknown>, context: ToolExecutionContext) => void | Promise<void>;
+    onSuccess?: (input: Record<string, unknown>, data: unknown, context: ToolExecutionContext) => void;
   } = {},
 ): void {
   const inputSchema = options.inputSchema
@@ -218,11 +220,13 @@ function registerGuestTool<M extends GuestMethod>(
       const rpcTimeoutMs = options.rpcTimeoutMs ?? guestRpcTimeoutFor(method);
       const before = await boundarySnapshot(guest, method, guestInputRecord, context.signal);
       try {
+        await options.beforeExecute?.(guestInputRecord, context);
         const data = await guest.request(method, guestInput, {
           signal: context.signal,
           ...(rpcTimeoutMs === undefined ? {} : { timeoutMs: rpcTimeoutMs }),
         });
         const after = await boundarySnapshot(guest, method, guestInputRecord, context.signal);
+        options.onSuccess?.(guestInputRecord, data, context);
         const receipt: ActionReceipt = {
           id: `receipt-${crypto.randomUUID()}`,
           tool: method,
@@ -267,10 +271,49 @@ export function createGuestToolRegistry(
   options: ToolRegistryOptions = {},
 ): ToolRegistry {
   const registry = new ToolRegistry(options);
+  const currentRunExportRefs = new Map<string, Set<string>>();
+  const currentRunObservedRefs = new Map<string, Map<string, string>>();
+  const runKey = (context: ToolExecutionContext): string => context.runId ?? '__unscoped__';
+  const rememberExportRef = (input: Record<string, unknown>, data: unknown, context: ToolExecutionContext): void => {
+    if (typeof data !== 'object' || data === null || Array.isArray(data)) return;
+    const key = runKey(context);
+    const existing = currentRunExportRefs.get(key);
+    if (typeof input.ref === 'string' && !existing?.has(input.ref)) return;
+    const read = data as Record<string, unknown>;
+    const observedRefs = currentRunObservedRefs.get(key) ?? new Map<string, string>();
+    const observe = (value: unknown): void => {
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) return;
+      const block = value as Record<string, unknown>;
+      if (typeof block.ref === 'string' && typeof block.type === 'string') observedRefs.set(block.ref, block.type);
+    };
+    if (Array.isArray(read.blocks)) read.blocks.forEach(observe);
+    const diagnostics = typeof read.diagnostics === 'object' && read.diagnostics !== null && !Array.isArray(read.diagnostics)
+      ? read.diagnostics as Record<string, unknown>
+      : undefined;
+    if (Array.isArray(diagnostics?.structuredBlocks)) diagnostics.structuredBlocks.forEach(observe);
+    if (Array.isArray(diagnostics?.documentSourceRefs)) diagnostics.documentSourceRefs.forEach(observe);
+    if (typeof read.documentRef === 'string') observedRefs.set(read.documentRef, 'document');
+    currentRunObservedRefs.delete(key);
+    currentRunObservedRefs.set(key, observedRefs);
+    while (currentRunObservedRefs.size > 128) {
+      const oldestRun = currentRunObservedRefs.keys().next().value as string | undefined;
+      if (oldestRun === undefined) break;
+      currentRunObservedRefs.delete(oldestRun);
+      currentRunExportRefs.delete(oldestRun);
+    }
+    if (typeof read.export !== 'object' || read.export === null || Array.isArray(read.export)) return;
+    const exportInfo = read.export as Record<string, unknown>;
+    if (exportInfo.complete !== true || typeof exportInfo.sourceRef !== 'string') return;
+    const refs = existing ?? new Set<string>();
+    refs.add(exportInfo.sourceRef);
+    currentRunExportRefs.delete(key);
+    currentRunExportRefs.set(key, refs);
+  };
   for (const method of Object.keys(guestMethodSchemas) as GuestMethod[]) {
     registerGuestTool(registry, guest, method, {
       ...(method === 'fs.write' ? { modelVisible: false } : {}),
       ...(toolExecutionTimeoutFor(method) === undefined ? {} : { executionTimeoutMs: toolExecutionTimeoutFor(method) }),
+      ...(method === 'browser.read' ? { onSuccess: rememberExportRef } : {}),
     });
   }
   registerGuestTool(registry, guest, 'fs.write', {
@@ -281,9 +324,25 @@ export function createGuestToolRegistry(
   });
   registerGuestTool(registry, guest, 'fs.write', {
     name: 'fs.writeFromRef',
-    description: 'Save raw browser-derived content from browser.read.export.sourceRef (or a returned durable block/document ref). Pass the ref directly; previews are never complete raw data and must not be reconstructed. Defaults to text; format may be text, markdown, json, or csv.',
+    description: 'Save a complete raw browser artifact using the exact browser.read.export.sourceRef from a read where export.complete=true. Diagnostic and inspect-only refs are rejected. Never reconstruct raw data from a preview. Defaults to text; format may be text, markdown, json, or csv.',
     inputSchema: modelToolSchemas['fs.writeFromRef'],
     mapInput: value => value as GuestMethodParams['fs.write'],
+    beforeExecute: (input, context) => {
+      const sourceRef = typeof input.sourceRef === 'string' ? input.sourceRef : undefined;
+      if (!sourceRef || currentRunExportRefs.get(runKey(context))?.has(sourceRef)) return;
+      const sourceType = currentRunObservedRefs.get(runKey(context))?.get(sourceRef);
+      throw new GuestTransportError(
+        'SOURCE_REF_NOT_EXPORTABLE',
+        'fs.writeFromRef requires the exact export.sourceRef from a successful browser.read in this run where export.complete is true.',
+        {
+          ...(sourceRef ? { sourceRef } : {}),
+          ...(sourceType ? { sourceType } : {}),
+          exportable: false,
+          currentRunEvidence: sourceType !== undefined,
+          guidance: 'Call browser.read again and pass its exact export.sourceRef only when export.complete is true.',
+        },
+      );
+    },
     rpcTimeoutMs: GUEST_TOOL_DEADLINES_MS.filesystemWrite.guestRpc,
     executionTimeoutMs: GUEST_TOOL_DEADLINES_MS.filesystemWrite.serverTool,
   });
