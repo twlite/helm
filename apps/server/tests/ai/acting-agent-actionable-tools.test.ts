@@ -340,6 +340,75 @@ describe('acting agent native tool loop', () => {
     expect(requests).toHaveLength(1);
   });
 
+  it('preserves bounded provider response details when an OpenAI-compatible endpoint rejects a request', async () => {
+    const provider = createOpenAICompatible({
+      name: 'acting-agent-provider-error-test',
+      baseURL: 'http://localhost:1234/v1',
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        await request.text();
+        return Response.json({
+          error: {
+            message: 'Invalid tool parameters JSON Schema.',
+            type: 'invalid_request_error',
+            param: 'tools',
+          },
+          debug: 'd'.repeat(10_000),
+          api_key: 'must-not-be-copied-into-diagnostics',
+        }, { status: 400 });
+      },
+    });
+    const agent = new AiSdkActingAgent({
+      model: provider.chatModel('acting-agent-provider-error-test-model'),
+      maxOutputTokens: 1_000,
+      temperature: 0,
+      requestTimeoutMs: 1_000,
+    });
+    let caught: unknown;
+    try {
+      await agent.execute({
+        userMessage: 'Inspect the current page.',
+        task: { id: 'provider-error', threadId: 'provider-error', goal: 'Inspect the current page.', criteria: [], requirements: [] },
+        conversation: [],
+        memories: [],
+        toolDefinitions: [{
+          name: 'browser.read',
+          description: 'Read page content.',
+          inputSchema: z.object({ query: z.string().optional() }),
+          execute: async () => ({ ok: true }),
+        }],
+        executeTool: async () => ({ ok: true }),
+        verifyCompletion: async () => ({ ok: true, data: { complete: true, criteria: [], requirements: [], summary: 'Complete.' } }),
+        getRequirementSummary: () => '[pending] inspect the page',
+        maxToolActions: 2,
+        maxModelTurns: 2,
+        maxCompletionRecoveryTurns: 0,
+        maxRepeatedAction: 2,
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(ActingAgentExecutionError);
+    const failure = caught as ActingAgentExecutionError;
+    expect(failure.code).toBe('MODEL_PROVIDER_REQUEST_FAILED');
+    expect(failure.message).toContain('HTTP 400');
+    expect(failure.message).toContain('Invalid tool parameters JSON Schema.');
+    const outcome = failure.details.modelRequestOutcomes?.[0];
+    expect(outcome?.kind).toBe('acting-turn');
+    expect(outcome?.outcome).toBe('provider-error');
+    expect(outcome?.errorName).toBe('AI_APICallError');
+    expect(outcome?.providerError?.statusCode).toBe(400);
+    expect(outcome?.providerError?.message).toBe('Invalid tool parameters JSON Schema.');
+    expect(outcome?.providerError?.responseBody).toContain('Invalid tool parameters JSON Schema.');
+    expect(outcome?.providerError?.responseBody).toContain('invalid_request_error');
+    expect(outcome?.providerError?.responseBodyTruncated).toBe(true);
+    expect(outcome?.providerError?.url).toBe('http://localhost:1234/v1/chat/completions');
+    expect(outcome?.providerError?.isRetryable).toBe(false);
+    expect(outcome?.providerError?.responseBody?.length).toBeLessThanOrEqual(4_001);
+    expect(outcome?.providerError?.responseBody).not.toContain('must-not-be-copied-into-diagnostics');
+  });
+
   it('stops after one empty provider response instead of silently spending the remaining turn budget', async () => {
     const requests: CapturedRequest[] = [];
     const provider = responseQueue([emptyReply('empty')], requests);

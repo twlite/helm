@@ -1,4 +1,4 @@
-import { generateText, isStepCount, modelMessageSchema, Output, tool, ToolLoopAgent, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
+import { APICallError, generateText, isStepCount, modelMessageSchema, Output, tool, ToolLoopAgent, type LanguageModel, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
 import type { JsonValue, Message, ModelRequestOutcome, RunDiagnostics, ToolResult, VerificationResult } from '@helm/shared';
 
@@ -117,11 +117,86 @@ function issuesFromFailure(value: unknown): NonNullable<NonNullable<ModelRequest
   return undefined;
 }
 
-function errorDiagnostic(caught: unknown): Pick<ModelRequestOutcome, 'errorName' | 'errorCode'> {
+function safeProviderText(value: string, maxLength: number): { text: string; truncated: boolean } {
+  const redacted = value
+    .replace(/\bBearer\s+[^\s"'<>]+/giu, 'Bearer [redacted]')
+    .replace(/(["']?(?:authorization|cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|secret)["']?\s*:\s*)(?:"[^"]*"|'[^']*'|[^,}\s]+)/giu, '$1"[redacted]"')
+    .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/gu, '[redacted]');
+  return {
+    text: redacted.length > maxLength ? `${redacted.slice(0, maxLength)}…` : redacted,
+    truncated: redacted.length > maxLength,
+  };
+}
+
+function safeProviderUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  try {
+    const url = new URL(value);
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.toString().slice(0, 500);
+  } catch {
+    return undefined;
+  }
+}
+
+function providerResponseSummary(responseBody: string | undefined): string | undefined {
+  if (!responseBody) return undefined;
+  const pending: unknown[] = [responseBody];
+  const visited = new Set<object>();
+  while (pending.length > 0 && visited.size < 32) {
+    const candidate = pending.shift();
+    if (typeof candidate === 'string') {
+      try {
+        pending.push(JSON.parse(candidate) as unknown);
+      } catch {
+        if (candidate.trim() && candidate.length <= 500) return candidate.trim();
+      }
+      continue;
+    }
+    if (Array.isArray(candidate)) {
+      for (const item of candidate.slice(0, 16)) pending.push(item);
+      continue;
+    }
+    const value = record(candidate);
+    if (!value || visited.has(value)) continue;
+    visited.add(value);
+    const message = typeof value.message === 'string' ? value.message.trim() : undefined;
+    if (message) {
+      const path = Array.isArray(value.path)
+        ? value.path.slice(0, 8).map(part => typeof part === 'number' ? `[${part}]` : String(part)).join('.')
+        : '';
+      return safeProviderText(path ? `${path}: ${message}` : message, 500).text;
+    }
+    for (const child of Object.values(value).slice(0, 16)) pending.push(child);
+  }
+  return undefined;
+}
+
+function errorDiagnostic(caught: unknown): Pick<ModelRequestOutcome, 'errorName' | 'errorCode' | 'providerError'> {
   const value = record(caught);
+  const responseBody = typeof value?.responseBody === 'string' ? safeProviderText(value.responseBody, 4_000) : undefined;
+  const providerMessage = typeof value?.message === 'string' ? safeProviderText(value.message, 500).text : undefined;
+  const statusCode = typeof value?.statusCode === 'number' && Number.isInteger(value.statusCode)
+    ? value.statusCode
+    : undefined;
+  const url = safeProviderUrl(value?.url);
+  const isRetryable = typeof value?.isRetryable === 'boolean' ? value.isRetryable : undefined;
+  const providerError = statusCode !== undefined || url !== undefined || responseBody !== undefined || isRetryable !== undefined
+    ? {
+      ...(statusCode !== undefined ? { statusCode } : {}),
+      ...(providerMessage ? { message: providerMessage } : {}),
+      ...(responseBody ? { responseBody: responseBody.text, responseBodyTruncated: responseBody.truncated } : {}),
+      ...(url ? { url } : {}),
+      ...(isRetryable !== undefined ? { isRetryable } : {}),
+    }
+    : undefined;
   return {
     ...(caught instanceof Error ? { errorName: caught.name } : typeof value?.name === 'string' ? { errorName: value.name } : {}),
     ...(typeof value?.code === 'string' ? { errorCode: value.code } : {}),
+    ...(providerError ? { providerError } : {}),
   };
 }
 
@@ -381,6 +456,22 @@ export class ActingAgentExecutionError extends Error {
   }
 }
 
+function providerRequestFailure(
+  caught: unknown,
+  diagnostics: RunDiagnostics,
+): ActingAgentExecutionError | undefined {
+  if (!APICallError.isInstance(caught)) return undefined;
+  const providerError = errorDiagnostic(caught).providerError;
+  if (providerError?.statusCode === undefined) return undefined;
+  const summary = providerResponseSummary(providerError.responseBody) ?? providerError.message;
+  const explanation = summary ? `: ${summary}` : '';
+  return new ActingAgentExecutionError(
+    'MODEL_PROVIDER_REQUEST_FAILED',
+    `The model provider rejected the request with HTTP ${providerError.statusCode}${explanation}`,
+    { ...diagnostics, lastUnsatisfiedRequirements: [...diagnostics.lastUnsatisfiedRequirements] },
+  );
+}
+
 /** Runs one coherent conversation with native SDK tool calls and bounded continuation. */
 export class AiSdkActingAgent implements ActingAgentProvider {
   constructor(public readonly options: AiSdkActingAgentOptions) {}
@@ -486,6 +577,8 @@ export class AiSdkActingAgent implements ActingAgentProvider {
               ...errorDiagnostic(caught),
             });
             await emitDiagnostics();
+            const providerFailure = providerRequestFailure(caught, diagnostics);
+            if (providerFailure) throw providerFailure;
             throw caught;
           }
         },
@@ -628,6 +721,8 @@ export class AiSdkActingAgent implements ActingAgentProvider {
             ...errorDiagnostic(caught),
           });
           await emitDiagnostics();
+          const providerFailure = providerRequestFailure(caught, diagnostics);
+          if (providerFailure) throw providerFailure;
         }
       }
 
@@ -684,6 +779,8 @@ export class AiSdkActingAgent implements ActingAgentProvider {
           ...errorDiagnostic(caught),
         });
         await emitDiagnostics();
+        const providerFailure = providerRequestFailure(caught, diagnostics);
+        if (providerFailure) throw providerFailure;
         throw caught;
       }
       const turnOutcome = actingTurnOutcome(

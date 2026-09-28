@@ -461,6 +461,14 @@ export interface ModelRequestOutcome {
   finishReason?: string;
   errorName?: string;
   errorCode?: string;
+  providerError?: {
+    statusCode?: number;
+    message?: string;
+    responseBody?: string;
+    responseBodyTruncated?: boolean;
+    url?: string;
+    isRetryable?: boolean;
+  };
   completion?: 'accepted' | 'rejected';
   toolCalls?: Array<{
     tool: string;

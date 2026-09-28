@@ -25,7 +25,7 @@ type ChatReply = {
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
 };
 
-type CapturedRequest = { body: Record<string, unknown>; reply: ChatReply };
+type CapturedRequest = { body: Record<string, unknown>; reply?: ChatReply; status?: number };
 type ScriptedReply = ChatReply | ((body: Record<string, unknown>) => ChatReply);
 
 function textReply(id: string, content: string): ChatReply {
@@ -135,6 +135,7 @@ function createRuntime(
   requests: CapturedRequest[],
   memory?: MemoryService,
   maxModelTurns = 12,
+  strictToolSchemas = false,
 ) {
   const provider = createOpenAICompatible({
     name: 'acting-agent-test',
@@ -142,10 +143,40 @@ function createRuntime(
     fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = input instanceof Request ? input : new Request(input, init);
       const body = JSON.parse(await request.text()) as Record<string, unknown>;
+      if (strictToolSchemas) {
+        const tools = Array.isArray(body.tools) ? body.tools : [];
+        const unsupported = tools.flatMap((candidate, index) => {
+          const tool = candidate as Record<string, unknown>;
+          const definition = tool.function as Record<string, unknown> | undefined;
+          const parameters = definition?.parameters as Record<string, unknown> | undefined;
+          const reasons = [
+            parameters?.type !== 'object' ? 'parameters.type must be object' : undefined,
+            parameters?.anyOf !== undefined ? 'root anyOf is unsupported' : undefined,
+            parameters?.oneOf !== undefined ? 'root oneOf is unsupported' : undefined,
+            parameters?.allOf !== undefined ? 'root allOf is unsupported' : undefined,
+            parameters?.not !== undefined ? 'root not is unsupported' : undefined,
+            parameters?.$ref !== undefined ? 'root $ref is unsupported' : undefined,
+          ].filter((reason): reason is string => reason !== undefined);
+          return reasons.length > 0
+            ? [{ index, name: definition?.name, reasons }]
+            : [];
+        });
+        if (unsupported.length > 0) {
+          requests.push({ body, status: 400 });
+          return Response.json({
+            error: {
+              message: 'Invalid tool parameters JSON Schema.',
+              type: 'invalid_request_error',
+              param: 'tools',
+              details: unsupported,
+            },
+          }, { status: 400 });
+        }
+      }
       const scripted = replies.shift();
       if (!scripted) throw new Error('The test model has no scripted reply remaining.');
       const reply = typeof scripted === 'function' ? scripted(body) : scripted;
-      requests.push({ body, reply });
+      requests.push({ body, reply, status: 200 });
       return Response.json(reply);
     },
   });
@@ -266,7 +297,7 @@ describe('production acting-agent outcomes', () => {
           source: 'user',
         }),
         textReply('done', 'I saved the exchange rates to forex.txt, opened it in the text viewer, and remembered the source.'),
-      ], requests, memory, 5);
+      ], requests, memory, 5, true);
 
       const result = await runtime.run({
         threadId: 'dynamic-table-full-effect-scenario',
@@ -324,6 +355,40 @@ describe('production acting-agent outcomes', () => {
       expect(result.run.diagnostics?.modelRequestOutcomes?.some(outcome => outcome.errorCode === 'MODEL_TURN_BUDGET_EXCEEDED')).toBe(false);
       expect(requests[4]?.body.tool_choice).toBe('auto');
       expect(requests[5]?.body.tools).toBeUndefined();
+      expect(requests.every(request => request.status === 200)).toBe(true);
+      const firstRequestTools = requests[0]?.body.tools as Array<Record<string, unknown>>;
+      expect(firstRequestTools.length).toBeGreaterThan(29);
+      expect(new TextEncoder().encode(JSON.stringify(firstRequestTools)).length).toBeLessThan(50_000);
+      const toolByName = new Map<string, Record<string, unknown>>();
+      for (const item of firstRequestTools) {
+        expect(item.type).toBe('function');
+        const definition = item.function as Record<string, unknown>;
+        expect(definition).toBeDefined();
+        expect(typeof definition.name).toBe('string');
+        expect(definition.parameters).toBeDefined();
+        expect(typeof definition.description).toBe('string');
+        expect((definition.description as string).length).toBeLessThan(2_000);
+        toolByName.set(definition.name as string, definition);
+      }
+      expect(toolByName.has('memory.remember')).toBe(true);
+      for (const [name, definition] of toolByName) {
+        const parameters = definition.parameters as Record<string, unknown>;
+        expect(parameters.type, `${name} parameters.type`).toBe('object');
+        expect(parameters.anyOf, `${name} root anyOf`).toBeUndefined();
+        expect(parameters.oneOf, `${name} root oneOf`).toBeUndefined();
+        expect(parameters.allOf, `${name} root allOf`).toBeUndefined();
+        expect(parameters.not, `${name} root not`).toBeUndefined();
+        expect(parameters.$ref, `${name} root $ref`).toBeUndefined();
+      }
+      expect(toolByName.get('fs.write')?.parameters).toMatchObject({
+        type: 'object',
+        properties: expect.objectContaining({ path: expect.any(Object), content: expect.any(Object), sourceRef: expect.any(Object) }),
+      });
+      expect(toolByName.get('browser.read')?.parameters).toMatchObject({
+        type: 'object',
+        properties: expect.objectContaining({ ref: expect.any(Object), mode: expect.any(Object), offset: expect.any(Object) }),
+      });
+      expect(result.run.diagnostics?.modelRequestOutcomes?.[0]).toMatchObject({ kind: 'acting-turn', outcome: 'tool-call' });
     } finally {
       persistence.close();
     }

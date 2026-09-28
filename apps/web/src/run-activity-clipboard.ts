@@ -307,6 +307,10 @@ function appendModelRequestOutcomes(lines: string[], run: RunDetails): void {
     if (outcome.errorName) details.push(`errorName=${outcome.errorName}`);
     if (outcome.completion) details.push(`completion=${outcome.completion}`);
     lines.push(`${index + 1}. Request ${outcome.request}: ${details.join(' · ')}`);
+    if (outcome.providerError) {
+      lines.push('   Provider error:');
+      lines.push(formatDiagnosticValue(outcome.providerError));
+    }
     for (const call of outcome.toolCalls ?? []) {
       lines.push(`   - ${call.tool}: ${call.outcome}${call.errorCode ? ` (${call.errorCode})` : ''}`);
       if (call.input !== undefined) lines.push(`     Input: ${formatDiagnosticValue(call.input)}`);

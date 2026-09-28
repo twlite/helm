@@ -10,6 +10,12 @@ describe('guest tool schemas', () => {
       mode: 'document', limit: 20,
     }).success).toBe(false);
     expect(guestMethodSchemas['browser.read'].safeParse({
+      mode: 'document', blockTypes: ['table'], maxBlocks: 20,
+    }).success).toBe(true);
+    expect(guestMethodSchemas['browser.read'].safeParse({
+      offset: 10,
+    }).success).toBe(false);
+    expect(guestMethodSchemas['browser.read'].safeParse({
       ref: 'c1-12345678-1', offset: 10, limit: 5, maxChars: 2_000,
     }).success).toBe(true);
     expect(guestMethodSchemas['browser.read'].safeParse({
@@ -18,6 +24,9 @@ describe('guest tool schemas', () => {
     expect(guestMethodSchemas['browser.read'].safeParse({
       ref: 'c1-12345678-1', query: 'currency',
     }).success).toBe(false);
+    expect(guestMethodSchemas['browser.read'].safeParse({
+      ref: 'd1-12345678-1', mode: 'document',
+    }).success).toBe(false);
   });
 
   it('makes fs.write source serialization explicit and model-authored writes direct', () => {
@@ -25,5 +34,7 @@ describe('guest tool schemas', () => {
     expect(guestMethodSchemas['fs.write'].safeParse({ path: 'notes.txt', sourceRef: 'd1-12345678-1', format: 'text' }).success).toBe(true);
     expect(guestMethodSchemas['fs.write'].safeParse({ path: 'notes.txt', content: 'Notes.', format: 'text' }).success).toBe(false);
     expect(guestMethodSchemas['fs.write'].safeParse({ path: 'notes.txt', content: 'Notes.', sourceRef: 'c1-12345678-1' }).success).toBe(false);
+    expect(guestMethodSchemas['fs.write'].safeParse({ path: 'notes.txt' }).success).toBe(false);
+    expect(guestMethodSchemas['fs.write'].safeParse({ path: 'notes.txt', sourceRef: 'c1-12345678-1', content: 'Notes.' }).success).toBe(false);
   });
 });

@@ -58,37 +58,73 @@ export const completionCriterionSchema = z.discriminatedUnion('type', [
 const coordinateSchema = z.object({ x: z.number().finite(), y: z.number().finite() });
 const browserContentRefSchema = z.string().regex(/^(?:c|d)\d+-[a-f0-9]{8}-[1-9]\d*$/u);
 const browserContentFormatSchema = z.enum(['text', 'markdown', 'json', 'csv']);
-const fsWriteContentSchema = z.object({
+const fsWriteSchema = z.object({
   path: pathSchema,
-  content: z.string().max(50 * 1024 * 1024).describe('UTF-8 content authored by the model.'),
-  sourceRef: z.never().optional(),
-  format: z.never().optional(),
-}).strict();
-const fsWriteSourceSchema = z.object({
-  path: pathSchema,
-  content: z.never().optional(),
-  sourceRef: browserContentRefSchema.describe('A durable browser.read content ref or documentRef.'),
-  format: browserContentFormatSchema.optional().describe('Serialization format for sourceRef. Omit for ordinary model-authored content.'),
-}).strict();
-const browserReadPageSchema = z.object({
+  content: z.string().max(50 * 1024 * 1024).optional()
+    .describe('UTF-8 content authored by the model. Provide content or sourceRef, not both.'),
+  sourceRef: browserContentRefSchema.optional()
+    .describe('A durable browser.read block ref or documentRef. Provide sourceRef or content, not both.'),
+  format: browserContentFormatSchema.optional()
+    .describe('Serialization format for sourceRef. Omit for model-authored content.'),
+}).strict().superRefine((value, context) => {
+  const hasContent = value.content !== undefined;
+  const hasSourceRef = value.sourceRef !== undefined;
+  if (hasContent === hasSourceRef) {
+    context.addIssue({
+      code: 'custom',
+      path: ['content'],
+      message: 'Provide exactly one of content or sourceRef.',
+    });
+  }
+  if (value.format !== undefined && !hasSourceRef) {
+    context.addIssue({
+      code: 'custom',
+      path: ['format'],
+      message: 'format is only valid with sourceRef.',
+    });
+  }
+});
+const browserReadSchema = z.object({
+  ref: browserContentRefSchema.optional()
+    .describe('Read or paginate a durable semantic content ref returned by browser.read.'),
   mode: z.enum(['readable', 'document']).optional().describe('readable ranks compact blocks; document returns a broader DOM-ordered snapshot.'),
   query: z.string().trim().min(1).max(1_000).optional().describe('Natural-language content relevance query, not a CSS selector. Use browser.query for DOM/CSS inspection.'),
   maxBlocks: z.number().int().min(1).max(20).optional().describe('Maximum semantic blocks to return from the current page.'),
   maxChars: z.number().int().min(1).max(12_000).optional().describe('Maximum response size for bounded block previews.'),
   blockTypes: z.array(z.enum(['text', 'heading', 'table', 'list', 'code', 'form', 'definition', 'navigation', 'search_result', 'other']))
     .max(10).optional().describe('Optional semantic block types to include, such as table for structured data.'),
-}).strict();
-const browserReadRefSchema = z.object({
-  ref: browserContentRefSchema.describe('Read or paginate a durable semantic content ref returned by browser.read.'),
-  maxChars: z.number().int().min(1).max(12_000).optional(),
-  offset: z.number().int().min(0).max(1_000_000).optional(),
+  offset: z.number().int().min(0).max(1_000_000).optional()
+    .describe('For ref reads only, start pagination at this item or row offset.'),
   limit: z.number().int().min(1).max(100).optional().describe('For a block ref, page within its rows or items; for a documentRef, page through selected blocks.'),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if (value.ref === undefined) {
+    for (const key of ['offset', 'limit'] as const) {
+      if (value[key] !== undefined) {
+        context.addIssue({
+          code: 'custom',
+          path: [key],
+          message: `${key} is only valid when reading a ref.`,
+        });
+      }
+    }
+    return;
+  }
+
+  for (const key of ['mode', 'query', 'maxBlocks', 'blockTypes'] as const) {
+    if (value[key] !== undefined) {
+      context.addIssue({
+        code: 'custom',
+        path: [key],
+        message: `${key} is only valid for a page-level read without ref.`,
+      });
+    }
+  }
+});
 
 export const guestMethodSchemas = {
   'guest.handshake': z.object({ serverId: z.string().uuid() }).strict(),
   'fs.read': z.object({ path: pathSchema }),
-  'fs.write': z.union([fsWriteContentSchema, fsWriteSourceSchema]),
+  'fs.write': fsWriteSchema,
   'fs.mkdir': z.object({ path: pathSchema }),
   'fs.exists': z.object({ path: pathSchema }),
   'fs.list': z.object({ path: pathSchema }),
@@ -104,7 +140,7 @@ export const guestMethodSchemas = {
     limit: z.number().int().min(1).max(100).optional(),
   }).refine(value => Boolean(value.selector || value.text || value.role || value.name), 'Provide at least one DOM query filter'),
   'browser.evaluate': z.object({ expression: z.string().trim().min(1).max(12_000) }).strict(),
-  'browser.read': z.union([browserReadPageSchema, browserReadRefSchema]),
+  'browser.read': browserReadSchema,
   'browser.findPage': z.object({
     query: z.string().trim().min(1).max(1_000),
     maxResults: z.number().int().min(1).max(20).optional(),

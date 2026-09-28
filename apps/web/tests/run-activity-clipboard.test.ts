@@ -121,6 +121,44 @@ describe('run activity clipboard formatter', () => {
     expect(text).toContain('"lastUnsatisfiedRequirements"');
   });
 
+  it('includes bounded provider rejection details in the copied log', () => {
+    const text = formatRunActivityForClipboard(run({
+      status: 'failed',
+      error: { code: 'MODEL_PROVIDER_REQUEST_FAILED', message: 'The model provider rejected the request with HTTP 400.' },
+      diagnostics: {
+        modelTurns: 1,
+        finalizationTurns: 0,
+        modelRequests: 1,
+        toolActions: 0,
+        completionAttempts: 0,
+        completionRejections: 0,
+        contextCompactions: 0,
+        lastUnsatisfiedRequirements: ['browserVisited1'],
+        modelRequestOutcomes: [{
+          request: 1,
+          kind: 'acting-turn',
+          providerCalls: 1,
+          providerRetries: 0,
+          outcome: 'provider-error',
+          errorName: 'AI_APICallError',
+          providerError: {
+            statusCode: 400,
+            message: 'Bad Request',
+            responseBody: '{"error":"Invalid tool parameters JSON Schema"}',
+            responseBodyTruncated: false,
+            url: 'http://localhost:1234/v1/chat/completions',
+            isRetryable: false,
+          },
+        }],
+      },
+    }));
+
+    expect(text).toContain('Code: MODEL_PROVIDER_REQUEST_FAILED');
+    expect(text).toContain('statusCode');
+    expect(text).toContain('Invalid tool parameters JSON Schema');
+    expect(text).toContain('http://localhost:1234/v1/chat/completions');
+  });
+
   it('shows proposed and executed input separately when runtime inputs differ', () => {
     const text = formatRunActivityForClipboard(run({
       steps: [step({
