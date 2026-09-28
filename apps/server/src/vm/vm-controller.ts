@@ -14,6 +14,7 @@ import type {
 import type { HelmConfig } from '../config';
 import { EventHub } from '../events';
 import { logger } from '../logger';
+import { GUEST_VM_HOST_GRACE_MS } from '@helm/shared';
 import { virtualizationHelperAvailable } from './helper';
 import {
   isGuestIdentityFailure,
@@ -39,6 +40,7 @@ interface PendingHostRequest {
 interface GuestRequestBehavior {
   preserveConnectionOnError?: boolean;
   publishScreenshot?: boolean;
+  requestTimeoutMs?: number;
 }
 
 export interface VmStartOptions {
@@ -527,7 +529,15 @@ export class VmController {
     const request: GuestRequest = { id: `guest_${Date.now()}_${Math.random().toString(36).slice(2)}`, method, params };
     if (this.child) {
       try {
-        const response = await abortable(this.sendHostCommand('vm.guestRequest', request), signal);
+        const requestTimeoutMs = behavior.requestTimeoutMs;
+        const hostCommandTimeoutMs = requestTimeoutMs === undefined
+          ? this.dependencies.hostCommandTimeoutMs
+          : requestTimeoutMs + GUEST_VM_HOST_GRACE_MS;
+        const response = await abortable(this.sendHostCommand(
+          'vm.guestRequest',
+          requestTimeoutMs === undefined ? request : { ...request, timeoutMs: requestTimeoutMs },
+          hostCommandTimeoutMs,
+        ), signal);
         const parsed = guestResponseSchema.safeParse(response.result);
         if (!parsed.success) {
           throw new VmControllerError(
@@ -926,7 +936,11 @@ export class VmController {
     logger.info(message, { component: 'vm-host' });
   }
 
-  private sendHostCommand(method: string, params: unknown): Promise<HostResponse> {
+  private sendHostCommand(
+    method: string,
+    params: unknown,
+    timeoutMs = this.dependencies.hostCommandTimeoutMs,
+  ): Promise<HostResponse> {
     if (!this.child?.stdin.writable) {
       throw new VmControllerError('VM_HELPER_NOT_RUNNING', 'VM helper is not running', undefined, true);
     }
@@ -935,7 +949,7 @@ export class VmController {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new VmControllerError('VM_HELPER_TIMEOUT', `VM helper timed out handling ${method}`, undefined, true));
-      }, this.dependencies.hostCommandTimeoutMs);
+      }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       this.child?.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
     }).then(response => {

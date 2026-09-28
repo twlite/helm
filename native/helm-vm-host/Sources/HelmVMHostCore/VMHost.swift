@@ -487,11 +487,25 @@ public final class VMHost: NSObject, VZVirtualMachineDelegate {
 
         let requestID = object["id"] ?? .string(UUID().uuidString)
         let requestParams = object["params"] ?? .object([:])
+        var requestTimeoutMilliseconds = options.guestRequestTimeoutMilliseconds
+        if let timeoutValue = object["timeoutMs"] {
+            guard case let .number(rawTimeout) = timeoutValue,
+                  rawTimeout.isFinite,
+                  rawTimeout.rounded() == rawTimeout,
+                  rawTimeout >= 1_000,
+                  rawTimeout <= 120_000 else {
+                throw HostFailure(
+                    code: "invalid_guest_request_timeout",
+                    message: "Guest request timeout must be an integer between 1000 and 120000 ms."
+                )
+            }
+            requestTimeoutMilliseconds = Int32(rawTimeout)
+        }
         return try VirtioGuestTransport(
             virtualMachine: existingVM,
             virtualMachineQueue: vmQueue,
             guestPort: options.guestPort,
-            timeoutMilliseconds: options.guestRequestTimeoutMilliseconds
+            timeoutMilliseconds: requestTimeoutMilliseconds
         ).request(id: requestID, method: method, params: requestParams)
     }
 

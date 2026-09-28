@@ -919,7 +919,7 @@ describe('LM Studio AI adapters', () => {
       target: { url: 'https://twlite.dev/', freshness: 'current-run' },
     });
     expect(combinedTask.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
-      target: { path: 'twlite.md', mode: 'non-empty', freshness: 'current-run', action: 'fs.write' },
+      target: { path: 'twlite.md', mode: 'written-from-artifact', freshness: 'current-run', action: 'fs.write', sourceUrls: ['https://twlite.dev/'] },
     });
     expect(combinedTask.requirements?.find(requirement => requirement.id === 'openFile')).toMatchObject({
       target: { path: 'twlite.md', content: 'twlite.md', mode: 'opened', freshness: 'current-run', action: 'app.openFile' },
@@ -929,7 +929,7 @@ describe('LM Studio AI adapters', () => {
     const dataTask = await planner.createTask({ threadId: 'forex-data-thread', userMessage: dataRequest });
     expect(dataTask.requirements?.find(requirement => requirement.id === 'browserEvidence')).toMatchObject({ target: { factId: 'pageContent', freshness: 'current-run' } });
     expect(dataTask.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
-      target: { path: 'forex.txt', mode: 'non-empty', freshness: 'current-run', action: 'fs.write' },
+      target: { path: 'forex.txt', mode: 'written-from-artifact', freshness: 'current-run', action: 'fs.write' },
     });
 
     const exactPrompt = 'fetch the exchange rate data from nepal rastra bank\'s official forex website and save that data to forex.txt file and open it with text viewer application. Use duckduckgo search to find the relevant website. remember to use https://www.nrb.org.np/forex/ for all forex requests about nepal.';
@@ -943,7 +943,7 @@ describe('LM Studio AI adapters', () => {
       target: { factId: 'pageContent', freshness: 'current-run' },
     });
     expect(exactRequirements.find(requirement => requirement.id === 'outputFile')).toMatchObject({
-      target: { path: 'forex.txt', mode: 'non-empty', action: 'fs.write' },
+      target: { path: 'forex.txt', mode: 'written-from-artifact', action: 'fs.write' },
     });
     expect(exactRequirements.find(requirement => requirement.id === 'openFile')).toMatchObject({
       target: { path: 'forex.txt', mode: 'opened', application: 'text-editor', action: 'app.openFile' },

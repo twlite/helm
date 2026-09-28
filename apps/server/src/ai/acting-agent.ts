@@ -20,7 +20,7 @@ const BASE_INSTRUCTIONS = [
   'Do not claim that an external action succeeded unless a tool returned success.',
   'A URL included as data for an artifact is not automatically a browser destination.',
   'Prefer semantic browser tools for page reading because they are compact. browser.read query is natural-language content relevance text, never a CSS selector; use browser.query for DOM/CSS inspection. Check table counts and row counts, use blockTypes to select a structured block class such as table when appropriate, and use mode document when several relevant blocks should be exported together.',
-  'For page-derived raw data, pass a returned durable block ref or documentRef directly to fs.write sourceRef; no additional browser.read is needed. For a summary or other transformation, write your model-authored result with fs.write content.',
+  'For raw page-derived data, pass a returned durable block ref or documentRef directly to fs.writeFromRef. Browser previews may be truncated; do not reconstruct raw data from a preview. For a summary or other transformation, use fs.writeText with your authored result.',
   'Use app.launch only when the user asks to start an application without a file. Use app.openFile for an existing file; it checks the file and launches the selected application if needed.',
   'Finish with a normal concise assistant response only after the user\'s requested task is complete.',
 ].join(' ');

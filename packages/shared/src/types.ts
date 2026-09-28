@@ -49,6 +49,8 @@ export interface TaskConstraint {
 export interface RequirementTarget {
   path?: string;
   url?: string;
+  /** Explicit requested source destinations relevant to a browser-derived output. */
+  sourceUrls?: string[];
   factIds?: string[];
   content?: string;
   /** Exact compiler-owned payload for an explicit user memory instruction. */
@@ -128,6 +130,9 @@ export interface Artifact {
   sourceRevision?: number;
   sourceCapturedAt?: string;
   sourceRefs?: string[];
+  sourceStructuredBlockCount?: number;
+  sourceTableCount?: number;
+  sourceTruncated?: boolean;
   format?: BrowserContentFormat;
   writeReceiptId?: string;
   download?: DownloadRecord;
@@ -830,6 +835,8 @@ export interface BrowserStructuredBlockSummary {
   rowCount?: number;
   columnCount?: number;
   selected: boolean;
+  /** Whether this full block is included in the immutable documentRef snapshot. */
+  includedInDocument?: boolean;
   previewOnly: true;
 }
 
@@ -844,11 +851,21 @@ export interface BrowserReadResult {
   query?: string;
   /** Durable immutable export of all selected blocks, ordered by page appearance. */
   documentRef?: string;
+  /** Full source block refs retained by documentRef, independent of preview limits. */
+  sourceRefs?: string[];
+  sourceCapturedAt?: string;
+  sourceStructuredBlockCount?: number;
+  sourceTableCount?: number;
+  sourceTruncated?: boolean;
   blocks?: BrowserContentSummary[];
   diagnostics?: {
     blockCount: number;
     tableCount: number;
     selectedBlockCount?: number;
+    documentBlockCount?: number;
+    documentTableCount?: number;
+    documentStructuredBlockCount?: number;
+    documentSourceRefs?: Array<{ ref: string; type: BrowserContentType }>;
     structuredBlockCount?: number;
     structuredBlocksTruncated?: boolean;
     structuredBlocks?: BrowserStructuredBlockSummary[];

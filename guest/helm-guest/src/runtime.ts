@@ -126,6 +126,9 @@ export class GuestRuntime {
             sourceUrl: serialized.sourceUrl,
             sourceCapturedAt: serialized.sourceCapturedAt,
             ...(serialized.sourceRefs ? { sourceRefs: serialized.sourceRefs } : {}),
+            sourceStructuredBlockCount: serialized.sourceStructuredBlockCount,
+            sourceTableCount: serialized.sourceTableCount,
+            sourceTruncated: serialized.sourceTruncated,
             format: serialized.format,
           };
         }

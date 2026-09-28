@@ -11,6 +11,7 @@ import type {
   ToolResult,
   WebSocketEvent,
 } from '@helm/shared';
+import { guestRpcTimeoutFor } from '@helm/shared';
 import { createLmStudioModels, DeterministicTaskCompiler, fallbackThreadTitle } from './ai';
 import { MockGuestTransport } from './tools/mock-guest-transport';
 import { createGuestToolRegistry } from './tools/guest-tools';
@@ -290,11 +291,15 @@ export function createHelmApplication(config: HelmConfig = loadConfig()): HelmAp
       method: M,
       params: GuestMethodParams[M],
       options?: GuestRequestOptions,
-    ): Promise<GuestMethodResult[M]> => vm.guestRequest<GuestMethodResult[M]>(
-      method,
-      params,
-      options?.signal,
-    ),
+    ): Promise<GuestMethodResult[M]> => {
+      const timeoutMs = options?.timeoutMs ?? guestRpcTimeoutFor(method);
+      return vm.guestRequest<GuestMethodResult[M]>(
+        method,
+        params,
+        options?.signal,
+        timeoutMs === undefined ? {} : { requestTimeoutMs: timeoutMs },
+      );
+    },
   };
   const models = createLmStudioModels(config);
   const memory = new MemoryService(database.sqlite, {

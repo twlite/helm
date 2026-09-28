@@ -58,6 +58,19 @@ export const completionCriterionSchema = z.discriminatedUnion('type', [
 const coordinateSchema = z.object({ x: z.number().finite(), y: z.number().finite() });
 const browserContentRefSchema = z.string().regex(/^(?:c|d)\d+-[a-f0-9]{8}-[1-9]\d*$/u);
 const browserContentFormatSchema = z.enum(['text', 'markdown', 'json', 'csv']);
+/** Unambiguous model-facing file operations; both dispatch to the guest fs.write RPC. */
+export const modelToolSchemas = {
+  'fs.writeText': z.object({
+    path: pathSchema.describe('Destination path inside the guest filesystem root.'),
+    content: z.string().max(50 * 1024 * 1024).describe('UTF-8 text authored by the model.'),
+  }).strict(),
+  'fs.writeFromRef': z.object({
+    path: pathSchema.describe('Destination path inside the guest filesystem root.'),
+    sourceRef: browserContentRefSchema.describe('Durable block ref or documentRef returned by browser.read.'),
+    format: browserContentFormatSchema.optional().describe('Serialization format for the complete browser snapshot; defaults to text.'),
+  }).strict(),
+} as const;
+
 const fsWriteSchema = z.object({
   path: pathSchema,
   content: z.string().max(50 * 1024 * 1024).optional()

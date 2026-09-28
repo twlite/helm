@@ -133,6 +133,55 @@ describe('current-run effect receipts', () => {
     expect(wrongWrite.requirements?.find(check => check.requirement.id === 'outputFile')?.passed).toBe(false);
   });
 
+  it('requires a browser-derived output write to use the observed durable artifact', async () => {
+    const baseTask = task();
+    const rawTask: TaskDefinition = {
+      ...baseTask,
+      requirements: baseTask.requirements?.map(requirement => requirement.id === 'outputFile'
+        ? { ...requirement, target: { ...requirement.target, mode: 'written-from-artifact', sourceUrls: [url] } }
+        : requirement),
+    };
+    const contentRef = 'c3-12345678-1';
+    const documentRef = 'd3-12345678-1';
+    const capturedAt = new Date(1).toISOString();
+    const readData = {
+      operation: 'read', url, revision: 3, readable: true, sourceTruncated: false,
+      sourceCapturedAt: capturedAt, sourceStructuredBlockCount: 1, sourceTableCount: 1,
+      documentRef, sourceRefs: [contentRef],
+      blocks: [{ ref: contentRef, type: 'table', columns: ['Currency'], rows: [['USD']], rowCount: 1 }],
+      diagnostics: {
+        sourceTruncated: false, documentBlockCount: 1, documentStructuredBlockCount: 1, documentTableCount: 1,
+        documentSourceRefs: [{ ref: contentRef, type: 'table', includedInDocument: true }],
+      },
+    };
+    const validWriteData = {
+      path: workspacePath, size: 24, sourceRef: documentRef, sourceType: 'document',
+      sourceRevision: 3, sourceUrl: url, sourceCapturedAt: capturedAt, sourceRefs: [contentRef],
+      sourceStructuredBlockCount: 1, sourceTableCount: 1, sourceTruncated: false,
+    };
+    const guest = new MockGuestTransport();
+    const observation = { timestamp: Date.now(), task: { completedCriteria: [], remainingCriteria: [] } };
+
+    const unrelatedState = createTaskState(rawTask);
+    unrelatedState.recentActions = [
+      action('browser.read', { mode: 'document' }, readData, receipt('browser.read', {})),
+      action('fs.writeText', { path: 'forex.txt', content: 'some unrelated non-empty text' }, {
+        path: workspacePath, size: 29,
+      }, receipt('fs.write', { path: workspacePath, bytesWritten: 29, writePerformed: true })),
+    ];
+    const unrelated = await verifyTaskState(rawTask, unrelatedState, guest, observation, new CriterionVerifierRegistry(guest));
+    expect(unrelated.requirements?.find(check => check.requirement.id === 'outputFile')?.passed).toBe(false);
+
+    const artifactState = createTaskState(rawTask);
+    artifactState.recentActions = [
+      action('browser.read', { mode: 'document' }, readData, receipt('browser.read', {})),
+      action('fs.writeFromRef', { path: 'forex.txt', sourceRef: documentRef, format: 'text' }, validWriteData,
+        receipt('fs.write', { path: workspacePath, bytesWritten: 24, writePerformed: true })),
+    ];
+    const artifact = await verifyTaskState(rawTask, artifactState, guest, observation, new CriterionVerifierRegistry(guest));
+    expect(artifact.requirements?.find(check => check.requirement.id === 'outputFile')?.passed).toBe(true);
+  });
+
   it('does not let a pre-existing browser URL satisfy a requested visit without a navigation receipt', async () => {
     const criterion: CompletionCriterion = { type: 'browser.url', url };
     const currentTask: TaskDefinition = {

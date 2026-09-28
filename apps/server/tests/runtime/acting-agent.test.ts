@@ -227,7 +227,7 @@ describe('production acting-agent outcomes', () => {
       body => {
         const sourceRef = findTableRef(body.messages);
         if (!sourceRef) throw new Error('The extracted table content ref was not returned to the model.');
-        return toolReply('write', 'fs.write', { path: 'forex.txt', sourceRef, format: 'text' });
+        return toolReply('write', 'fs.writeFromRef', { path: 'forex.txt', sourceRef, format: 'text' });
       },
       toolReply('open', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
       textReply('done', 'I saved the extracted rates to forex.txt and opened it in the text viewer.'),
@@ -242,7 +242,7 @@ describe('production acting-agent outcomes', () => {
     expect(guest.getFile('/home/helm/workspace/forex.txt')).toContain('USD | 133.20 | 134.10');
     expect(guest.getFile('/home/helm/workspace/forex.txt')).toContain('EUR | 145.25 | 146.80');
     const actions = result.run.state?.durableActions ?? [];
-    const write = actions.find(action => action.tool === 'fs.write');
+    const write = actions.find(action => action.tool === 'fs.writeFromRef');
     const open = actions.find(action => action.tool === 'app.openFile');
     expect(write?.result.ok).toBe(true);
     expect(write?.receipt).toMatchObject({ tool: 'fs.write', ok: true });
@@ -252,7 +252,7 @@ describe('production acting-agent outcomes', () => {
       application: 'text-editor',
       title: expect.stringContaining('forex.txt'),
     }));
-    const writeInput = tools.invocations.find(invocation => invocation.tool === 'fs.write')?.input as Record<string, unknown>;
+    const writeInput = tools.invocations.find(invocation => invocation.tool === 'fs.writeFromRef')?.input as Record<string, unknown>;
     expect(writeInput).toMatchObject({ path: 'forex.txt', sourceRef: expect.stringMatching(/^c\d+-/u), format: 'text' });
     expect(writeInput).not.toHaveProperty('content');
     expect(result.run.state?.completedRequirementIds).toEqual(expect.arrayContaining([
@@ -262,7 +262,7 @@ describe('production acting-agent outcomes', () => {
     expect(result.run.diagnostics?.finalizationTurns).toBe(1);
     expect(requests.at(-1)?.body.tool_choice).toBeUndefined();
     expect(result.run.diagnostics?.modelRequestOutcomes?.at(-1)?.kind).toBe('finalization');
-    expect(JSON.stringify(requests[0]?.body)).toContain('no additional browser.read is needed');
+    expect(JSON.stringify(requests[0]?.body)).toContain('Use fs.writeFromRef');
     expect(JSON.stringify(requests[0]?.body)).toContain('Use app.launch only when the user asks to start an application without a file');
     expect(JSON.stringify(requests[0]?.body)).toContain('Use app.openFile for an existing file');
     expect(result.run.diagnostics?.modelRequestOutcomes?.map(outcome => outcome.kind)).toEqual([
@@ -284,11 +284,11 @@ describe('production acting-agent outcomes', () => {
       const memory = new MemoryService(persistence.sqlite);
       const { runtime, tools } = createRuntime(guest, [
         toolReply('navigate', 'browser.navigate', { url }),
-        toolReply('read-document', 'browser.read', { mode: 'document', blockTypes: ['table'] }),
+        toolReply('read-document', 'browser.read', { mode: 'document', query: 'exchange rate data', maxChars: 300 }),
         body => {
           const documentRef = findDocumentRef(body.messages);
           if (!documentRef) throw new Error('The complete multi-table read did not return a documentRef.');
-          return toolReply('write-complete-document', 'fs.write', { path: 'forex.txt', sourceRef: documentRef, format: 'text' });
+        return toolReply('write-complete-document', 'fs.writeFromRef', { path: 'forex.txt', sourceRef: documentRef, format: 'text' });
         },
         toolReply('open-rates', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
         toolReply('remember-source', 'memory.remember', {
@@ -305,10 +305,15 @@ describe('production acting-agent outcomes', () => {
       });
 
       expect(result.status).toBe('completed');
+      expect(result.run.task?.requirements?.find(requirement => requirement.id === 'outputFile')).toMatchObject({
+        target: { mode: 'written-from-artifact', sourceUrls: [url] },
+      });
       const saved = guest.getFile('/home/helm/workspace/forex.txt') ?? '';
       for (const currency of ['Indian Rupee (INR)', 'US Dollar (USD)', 'Euro (EUR)', 'British Pound (GBP)', 'Japanese Yen (JPY)']) {
         expect(saved).toContain(currency);
       }
+      expect(saved).not.toContain('Board of Directors');
+      expect(saved).not.toContain('About NRB');
       expect(saved.length).toBeGreaterThan(0);
       const actions = [
         ...(result.run.state?.durableActions ?? []),
@@ -319,9 +324,19 @@ describe('production acting-agent outcomes', () => {
       });
       expect(actions.filter(action => action.tool === 'browser.navigate')).toHaveLength(1);
       expect(actions.find(action => action.tool === 'browser.read')?.result).toMatchObject({
-        ok: true, data: { url, diagnostics: { tableCount: 2, selectedBlockCount: expect.any(Number) }, documentRef: expect.stringMatching(/^d\d+-/u) },
+        ok: true,
+        data: {
+          url,
+          diagnostics: {
+            tableCount: 2,
+            documentTableCount: 2,
+            documentStructuredBlockCount: 2,
+            selectedBlockCount: expect.any(Number),
+          },
+          documentRef: expect.stringMatching(/^d\d+-/u),
+        },
       });
-      expect(actions.find(action => action.tool === 'fs.write')?.result).toMatchObject({
+      expect(actions.find(action => action.tool === 'fs.writeFromRef')?.result).toMatchObject({
         ok: true,
         data: { sourceType: 'document', sourceRefs: expect.arrayContaining([expect.stringMatching(/^c\d+-/u), expect.stringMatching(/^c\d+-/u)]) },
       });
@@ -329,7 +344,7 @@ describe('production acting-agent outcomes', () => {
         result: { ok: true, data: { action: 'remembered' } },
         receipt: { tool: 'memory.remember', ok: true, effect: { changed: true } },
       });
-      expect(actions.find(action => action.tool === 'fs.write')?.receipt).toMatchObject({
+      expect(actions.find(action => action.tool === 'fs.writeFromRef')?.receipt).toMatchObject({
         tool: 'fs.write', ok: true, effect: { path: '/home/helm/workspace/forex.txt', writePerformed: true },
       });
       expect(actions.find(action => action.tool === 'app.openFile')?.receipt).toMatchObject({
@@ -380,10 +395,21 @@ describe('production acting-agent outcomes', () => {
         expect(parameters.not, `${name} root not`).toBeUndefined();
         expect(parameters.$ref, `${name} root $ref`).toBeUndefined();
       }
-      expect(toolByName.get('fs.write')?.parameters).toMatchObject({
+      expect(toolByName.has('fs.write')).toBe(false);
+      expect(Object.keys((toolByName.get('fs.writeText')?.parameters as Record<string, unknown>).properties as object).sort())
+        .toEqual(['content', 'path']);
+      expect(Object.keys((toolByName.get('fs.writeFromRef')?.parameters as Record<string, unknown>).properties as object).sort())
+        .toEqual(['format', 'path', 'sourceRef']);
+      expect(toolByName.get('fs.writeText')?.parameters).toMatchObject({
         type: 'object',
-        properties: expect.objectContaining({ path: expect.any(Object), content: expect.any(Object), sourceRef: expect.any(Object) }),
+        properties: expect.objectContaining({ path: expect.any(Object), content: expect.any(Object) }),
       });
+      expect(toolByName.get('fs.writeFromRef')?.parameters).toMatchObject({
+        type: 'object',
+        properties: expect.objectContaining({ path: expect.any(Object), sourceRef: expect.any(Object), format: expect.any(Object) }),
+      });
+      expect((toolByName.get('fs.writeText')?.parameters as Record<string, unknown>).anyOf).toBeUndefined();
+      expect((toolByName.get('fs.writeFromRef')?.parameters as Record<string, unknown>).anyOf).toBeUndefined();
       expect(toolByName.get('browser.read')?.parameters).toMatchObject({
         type: 'object',
         properties: expect.objectContaining({ ref: expect.any(Object), mode: expect.any(Object), offset: expect.any(Object) }),
@@ -399,7 +425,7 @@ describe('production acting-agent outcomes', () => {
     const requests: CapturedRequest[] = [];
     const { runtime, tools } = createRuntime(guest, [
       toolReply('open-missing', 'app.openFile', { path: 'notes.txt', application: 'text-editor' }),
-      toolReply('write-notes', 'fs.write', { path: 'notes.txt', content: 'Today I reviewed the project notes.' }),
+      toolReply('write-notes', 'fs.writeText', { path: 'notes.txt', content: 'Today I reviewed the project notes.' }),
       toolReply('open-created', 'app.openFile', { path: 'notes.txt', application: 'text-editor' }),
       textReply('done', 'I wrote notes.txt and opened it in the text editor.'),
     ], requests);
@@ -432,14 +458,14 @@ describe('production acting-agent outcomes', () => {
       body => {
         const rate = findQueryAttribute(body.messages, 'data-rate');
         if (!rate) throw new Error('The DOM query did not expose the data-rate attribute.');
-        return toolReply('write-rate', 'fs.write', { path: 'fallback.txt', content: `USD exchange rate: ${rate}` });
+        return toolReply('write-rate', 'fs.writeText', { path: 'fallback.txt', content: `USD exchange rate: ${rate}` });
       },
       textReply('done', 'I inspected the page data and saved the exchange rate to fallback.txt.'),
     ], requests);
 
     const result = await runtime.run({
       threadId: 'browser-query-fallback',
-      userMessage: `Go to ${url}, extract the USD exchange rate hidden in the page data and save it to fallback.txt.`,
+      userMessage: `Go to ${url}, inspect the USD exchange rate hidden in the page data, summarize that rate, and save the summary to fallback.txt.`,
     });
 
     expect(result.status).toBe('completed');
@@ -461,7 +487,7 @@ describe('production acting-agent outcomes', () => {
     const { runtime, tools } = createRuntime(guest, [
       toolReply('navigate', 'browser.navigate', { url }),
       toolReply('read-briefing', 'browser.read', { query: 'market briefing' }),
-      toolReply('write-summary', 'fs.write', { path: 'summary.txt', content: summary }),
+      toolReply('write-summary', 'fs.writeText', { path: 'summary.txt', content: summary }),
       toolReply('open-summary', 'app.openFile', { path: 'summary.txt', application: 'text-editor' }),
       textReply('done', 'I summarized the briefing in summary.txt and opened it in the text editor.'),
     ], requests);
@@ -475,7 +501,7 @@ describe('production acting-agent outcomes', () => {
     expect(guest.getFile('/home/helm/workspace/summary.txt')).toBe(summary);
     expect(guest.getFile('/home/helm/workspace/summary.txt')?.length).toBeGreaterThan(0);
     expect(result.run.state?.durableActions?.some(action => action.tool === 'browser.read' && action.result.ok)).toBe(true);
-    expect(result.run.state?.durableActions?.find(action => action.tool === 'fs.write')?.receipt)
+    expect(result.run.state?.durableActions?.find(action => action.tool === 'fs.writeText')?.receipt)
       .toMatchObject({ tool: 'fs.write', ok: true });
     expect(result.run.state?.durableActions?.find(action => action.tool === 'app.openFile')?.receipt)
       .toMatchObject({ tool: 'app.openFile', ok: true });

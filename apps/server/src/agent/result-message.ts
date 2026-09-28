@@ -1,6 +1,7 @@
 import type { AgentRuntimeResult, RunStep } from './types';
 
 const MAX_RESULT_MESSAGE_LENGTH = 100_000;
+const FILE_WRITE_TOOL_NAMES = ['fs.write', 'fs.writeText', 'fs.writeFromRef'] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -51,7 +52,7 @@ export function hasVerifiedActionEvidence(result: AgentRuntimeResult): boolean {
 
 /** File/viewer operations are better reported from their receipts than from a model rewrite. */
 export function hasDeterministicFileEvidence(result: AgentRuntimeResult): boolean {
-  return hasSuccessfulAction(result, ['fs.read', 'fs.write', 'app.openFile']);
+  return hasSuccessfulAction(result, ['fs.read', ...FILE_WRITE_TOOL_NAMES, 'app.openFile']);
 }
 
 export function isUnsubstantiatedPlaceholder(value: string): boolean {
@@ -83,7 +84,8 @@ export function assistantMessageForResult(result: AgentRuntimeResult): string {
     return `Here is ${path}:\n\n${boundedText(file.content)}`;
   }
 
-  const written = successfulToolData(result, 'fs.write');
+  const written = FILE_WRITE_TOOL_NAMES.map(toolName => successfulToolData(result, toolName))
+    .find((data): data is Record<string, unknown> => data !== undefined);
   if (written) {
     const path = typeof written.path === 'string' ? written.path : 'the requested file';
     const size = typeof written.size === 'number' ? ` (${written.size} bytes)` : '';

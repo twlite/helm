@@ -68,6 +68,9 @@ export type GuestMethodResult = {
     sourceUrl?: string;
     sourceCapturedAt?: string;
     sourceRefs?: string[];
+    sourceStructuredBlockCount?: number;
+    sourceTableCount?: number;
+    sourceTruncated?: boolean;
     format?: BrowserContentFormat;
   };
   'fs.mkdir': { path: string; existedBefore: boolean; changed?: boolean };
@@ -137,6 +140,8 @@ export type GuestMethodResult = {
 
 export interface GuestRequestOptions {
   signal?: AbortSignal;
+  /** Per-operation outer deadline for the native guest RPC transport. */
+  timeoutMs?: number;
 }
 
 export class GuestTransportError extends Error {

@@ -19,6 +19,8 @@ export interface ToolDefinition<TInput = unknown, TOutput = unknown> {
   name: string;
   description: string;
   inputSchema?: z.ZodType<TInput>;
+  /** Registered tools marked false remain executable internally but are hidden from model tool catalogs. */
+  modelVisible?: boolean;
   /** `schema` is an accepted alias for integrations that use that spelling. */
   schema?: z.ZodType<TInput>;
   timeoutMs?: number;
@@ -70,6 +72,7 @@ type RegisteredToolDefinition = {
   name: string;
   description: string;
   inputSchema: z.ZodType<unknown>;
+  modelVisible: boolean;
   timeoutMs: number;
   execute: ToolHandler<unknown, unknown>;
 };
@@ -163,6 +166,7 @@ export class ToolRegistry {
       name: definition.name,
       description: definition.description,
       inputSchema: inputSchema as z.ZodType<unknown>,
+      modelVisible: definition.modelVisible !== false,
       timeoutMs,
       execute: definition.execute as unknown as ToolHandler<unknown, unknown>,
     });
@@ -182,7 +186,9 @@ export class ToolRegistry {
   }
 
   list(): ToolDefinition[] {
-    return [...this.definitions.values()].map(definition => ({ ...definition }));
+    return [...this.definitions.values()]
+      .filter(definition => definition.modelVisible)
+      .map(definition => ({ ...definition }));
   }
 
   names(): string[] {

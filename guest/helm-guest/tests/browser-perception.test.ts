@@ -132,6 +132,91 @@ describe('progressive browser perception', () => {
     }
   }, 15_000);
 
+  it('exports a query-selected logical data document independent of its compact preview', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-browser-query-document-repro-'));
+    const sandbox = new GuestSandbox({ root, workspace: join(root, 'workspace') });
+    const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
+    const runtime = new GuestRuntime({ sandbox, browser: controller });
+    try {
+      const html = await readFile(new URL('./fixtures/forex-two-tables.html', import.meta.url), 'utf8');
+      const file = await sandbox.write('workspace/query-document.html', html);
+      await controller.navigate({ url: pathToFileURL(file.path).href });
+
+      const read = await controller.read({ mode: 'document', query: 'exchange rate data', maxChars: 300 });
+      const documentRef = read.documentRef;
+      expect(read.diagnostics?.tableCount).toBe(2);
+      expect(read.blocks?.length).toBeGreaterThan(0);
+      expect(read.returnedChars).toBeLessThanOrEqual(300);
+      expect(read.truncated).toBe(true);
+      expect(documentRef).toBeDefined();
+      expect(read.diagnostics).toMatchObject({
+        documentTableCount: 2,
+        documentStructuredBlockCount: 2,
+        documentSourceRefs: expect.arrayContaining([
+          expect.objectContaining({ ref: expect.any(String), type: 'table' }),
+          expect.objectContaining({ ref: expect.any(String), type: 'table' }),
+        ]),
+      });
+      expect(read.blocks?.length).toBeLessThan(2);
+
+      const write = await runtime.dispatch({
+        id: 'reproduce-query-document-export',
+        method: 'fs.write',
+        params: { path: 'workspace/query-document.txt', sourceRef: documentRef!, format: 'text' },
+      });
+      expect(write).toMatchObject({ ok: true, result: {
+        sourceRef: documentRef,
+        sourceType: 'document',
+        sourceRefs: expect.arrayContaining(read.sourceRefs!),
+        sourceTableCount: 2,
+        sourceStructuredBlockCount: 2,
+      } });
+      const exported = (await sandbox.read('workspace/query-document.txt')).content;
+      for (const currency of ['Indian Rupee (INR)', 'US Dollar (USD)', 'Euro (EUR)', 'British Pound (GBP)', 'Japanese Yen (JPY)']) {
+        expect(exported).toContain(currency);
+      }
+      expect(exported).not.toContain('Board of Directors');
+      expect(exported).not.toContain('About NRB');
+    } finally {
+      await controller.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it('does not add a nearby table with a different schema and document section', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'helm-browser-unrelated-table-'));
+    const sandbox = new GuestSandbox({ root, workspace: join(root, 'workspace') });
+    const controller = new BrowserController(sandbox, { headless: true, profilePath: 'browser-profile' });
+    const runtime = new GuestRuntime({ sandbox, browser: controller });
+    try {
+      const file = await sandbox.write('workspace/related-and-unrelated.html', `<!doctype html><html><body><main>
+        <h1>Bulletin</h1>
+        <table><caption>Daily Exchange Rates</caption><tr><th>Currency</th><th>Unit</th><th>Buy</th><th>Sell</th></tr><tr><td>USD</td><td>1</td><td>153</td><td>154</td></tr></table>
+        <table><tr><th>Currency</th><th>Unit</th><th>Buy</th><th>Sell</th></tr><tr><td>INR</td><td>100</td><td>160</td><td>161</td></tr></table>
+        <section><h2>Weather observations</h2><table><caption>Daily Rainfall</caption><tr><th>Station</th><th>Millimeters</th></tr><tr><td>Kathmandu</td><td>12</td></tr></table></section>
+      </main></body></html>`);
+      await controller.navigate({ url: pathToFileURL(file.path).href });
+      const read = await controller.read({ mode: 'document', query: 'exchange rate data' });
+      expect(read.diagnostics?.tableCount).toBe(3);
+      expect(read.diagnostics?.documentTableCount).toBe(2);
+
+      const write = await runtime.dispatch({
+        id: 'write-related-table-group',
+        method: 'fs.write',
+        params: { path: 'workspace/rates.txt', sourceRef: read.documentRef!, format: 'text' },
+      });
+      expect(write.ok).toBe(true);
+      const content = (await sandbox.read('workspace/rates.txt')).content;
+      expect(content).toContain('USD');
+      expect(content).toContain('INR');
+      expect(content).not.toContain('Kathmandu');
+      expect(content).not.toContain('Daily Rainfall');
+    } finally {
+      await controller.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it('preserves distinct same-heading tables and exports the selected document snapshot losslessly', async () => {
     const root = await mkdtemp(join(tmpdir(), 'helm-browser-document-ref-'));
     const workspace = join(root, 'workspace');

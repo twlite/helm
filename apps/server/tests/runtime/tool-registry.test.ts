@@ -83,4 +83,37 @@ describe('ToolRegistry', () => {
       evidence: { receipt: { ok: true, tool: 'fs.write', effect: { changed: false, writePerformed: true, sha256: sameHash } } },
     });
   });
+
+  it('exposes separate model-facing authored-text and durable-ref write operations', async () => {
+    const url = 'https://fixture.example.test/document';
+    const guest = new MockGuestTransport({
+      pages: {
+        [url]: '<!doctype html><html><body><main><h1>Rates</h1><table><caption>Daily rates</caption><tr><th>Currency</th><th>Value</th></tr><tr><td>USD</td><td>133</td></tr></table></main></body></html>',
+      },
+    });
+    const tools = createGuestToolRegistry(guest);
+    const visibleNames = tools.list().map(tool => tool.name);
+    expect(visibleNames).toContain('fs.writeText');
+    expect(visibleNames).toContain('fs.writeFromRef');
+    expect(visibleNames).not.toContain('fs.write');
+    expect(tools.get('fs.writeText')?.inputSchema?.safeParse({ path: 'notes.txt', content: 'hello' }).success).toBe(true);
+    expect(tools.get('fs.writeFromRef')?.inputSchema?.safeParse({ path: 'rates.txt', sourceRef: 'd1-12345678-1', format: 'text' }).success).toBe(true);
+
+    await guest.request('browser.navigate', { url });
+    const read = await guest.request('browser.read', { mode: 'document', query: 'daily rates' });
+    expect(read.documentRef).toBeDefined();
+    const authored = await tools.execute('fs.writeText', { path: 'notes.txt', content: 'hello' });
+    const exported = await tools.execute('fs.writeFromRef', {
+      path: 'rates.txt', sourceRef: read.documentRef!, format: 'text',
+    });
+    expect(authored).toMatchObject({ ok: true, data: { path: '/home/helm/workspace/notes.txt' }, evidence: { receipt: { tool: 'fs.write' } } });
+    expect(exported).toMatchObject({
+      ok: true,
+      data: { sourceType: 'document', sourceTableCount: 1, sourceStructuredBlockCount: 1 },
+      evidence: { receipt: { tool: 'fs.write', ok: true } },
+    });
+    expect(guest.getFile('/home/helm/workspace/notes.txt')).toBe('hello');
+    expect(guest.getFile('/home/helm/workspace/rates.txt')).toContain('USD');
+    expect(tools.invocations.map(invocation => invocation.tool)).toEqual(['fs.writeText', 'fs.writeFromRef']);
+  });
 });

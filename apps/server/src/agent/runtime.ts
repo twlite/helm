@@ -82,6 +82,12 @@ function defaultIdFactory(prefix: string): string {
   return `${prefix}-${crypto.randomUUID()}`;
 }
 
+function actionTimeoutMs(tools: ToolRegistry, tool: string, configured?: number): number | undefined {
+  const definition = tools.get(tool);
+  const timeout = Math.max(configured ?? 0, definition?.timeoutMs ?? 0);
+  return timeout > 0 ? timeout : undefined;
+}
+
 function isTaskDefinition(value: unknown): value is TaskDefinition {
   return (
     typeof value === 'object' &&
@@ -1152,7 +1158,7 @@ export class AgentRuntime {
             runId: run.id,
             stepIndex,
             previousResults,
-            timeoutMs: this.budgetOptions?.toolTimeoutMs,
+            timeoutMs: actionTimeoutMs(this.tools, decision.tool, this.budgetOptions?.toolTimeoutMs),
           });
         if (decision.tool === 'browser.navigate') {
           result = recordNavigationOutcome(result, navigation, navigationPolicy);
@@ -1404,7 +1410,7 @@ export class AgentRuntime {
           runId,
           stepIndex,
           previousResults: clone(previousResults.slice(-12)),
-          timeoutMs: this.budgetOptions?.toolTimeoutMs,
+          timeoutMs: actionTimeoutMs(this.tools, toolName, this.budgetOptions?.toolTimeoutMs),
         });
         if (toolName === 'browser.open') result = recordBrowserOpenOutcome(result);
       }
@@ -1956,7 +1962,7 @@ export class AgentRuntime {
                 signal: cancellation.signal,
                 runId,
                 stepIndex,
-                timeoutMs: this.budgetOptions?.toolTimeoutMs,
+                timeoutMs: actionTimeoutMs(this.tools, tool, this.budgetOptions?.toolTimeoutMs),
               });
               if (tool === 'browser.navigate') {
                 result = recordNavigationOutcome(result, navigation, navigationPolicy);

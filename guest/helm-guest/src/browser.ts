@@ -2,6 +2,7 @@ import { GuestRpcError } from "./errors";
 import type { GuestSandbox } from "./sandbox";
 import { browserUrlsMatch, buildDuckDuckGoSearchUrl, normalizeBrowserUrl } from "../../../packages/shared/src/browser-url";
 import { deriveBrowserReadQuery, rankBrowserContentBlocks } from "../../../packages/shared/src/browser-perception";
+import { GUEST_TOOL_DEADLINES_MS } from "../../../packages/shared/src/tool-timeouts";
 import type {
   BrowserContentBlock,
   BrowserContentFormat,
@@ -414,9 +415,11 @@ const DEFAULT_READ_CHARS = 4_000;
 const DEFAULT_BLOCK_PREVIEW_CHARS = 520;
 const DEFAULT_REGION_CHARS = 8_000;
 const DEFAULT_TABLE_ROWS = 50;
-const BROWSER_OPERATION_TIMEOUT_MS = 10_000;
+const BROWSER_OPERATION_TIMEOUT_MS = GUEST_TOOL_DEADLINES_MS.browserInspection.operation;
+const BROWSER_NAVIGATION_TIMEOUT_MS = GUEST_TOOL_DEADLINES_MS.browserNavigate.pageNavigation;
+const BROWSER_OPEN_TIMEOUT_MS = GUEST_TOOL_DEADLINES_MS.browserOpen.operation;
 const DUCKDUCKGO_NAVIGATION_TIMEOUT_MS = 5_000;
-const DUCKDUCKGO_OPERATION_TIMEOUT_MS = 22_000;
+const DUCKDUCKGO_OPERATION_TIMEOUT_MS = GUEST_TOOL_DEADLINES_MS.browserWebSearch.operation;
 const BROWSER_CONTEXT_RESET_TIMEOUT_MS = 1_000;
 const MAX_CONTENT_REFERENCE_COUNT = 1_024;
 const MAX_CONTENT_REFERENCE_BYTES = 32 * 1024 * 1024;
@@ -595,6 +598,52 @@ function blockText(block: BrowserContentBlock): string {
     return [block.text, ...links].filter(Boolean).join("\n");
   }
   return block.text ?? "";
+}
+
+function isStructuredContentBlock(block: BrowserContentBlock): boolean {
+  return ["table", "list", "definition", "form"].includes(block.type);
+}
+
+function normalizedColumnSchema(block: BrowserContentBlock): string {
+  return (block.columns ?? []).map(column => column.toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "")
+    .trim()).join("|");
+}
+
+function sameHeadingContext(left: BrowserContentBlock, right: BrowserContentBlock): boolean {
+  return JSON.stringify(left.headingPath ?? []) === JSON.stringify(right.headingPath ?? []);
+}
+
+function relatedTableLabel(candidate: BrowserContentBlock, seed: BrowserContentBlock): boolean {
+  if (!candidate.caption || !seed.caption) return true;
+  const terms = (value: string): Set<string> => new Set(value.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
+  const left = terms(candidate.caption);
+  const right = terms(seed.caption);
+  return [...left].some(term => right.has(term));
+}
+
+function logicalDocumentSelection(
+  blocks: readonly BrowserContentBlock[],
+  seeds: readonly BrowserContentBlock[],
+  pageType: BrowserPageType,
+): BrowserContentBlock[] {
+  const selected = new Set(seeds.map(block => block.ref));
+  const tableSeeds = pageType === "data_table" ? seeds.filter(block => block.type === "table") : [];
+  if (tableSeeds.length > 0) {
+    for (const seed of tableSeeds) {
+      const seedIndex = blocks.findIndex(block => block.ref === seed.ref);
+      const schema = normalizedColumnSchema(seed);
+      if (!schema) continue;
+      blocks.forEach((candidate, candidateIndex) => {
+        if (candidate.type !== "table" || !candidate.ref || selected.has(candidate.ref)) return;
+        if (candidateIndex === seedIndex || Math.abs(candidateIndex - seedIndex) > 4) return;
+        if (normalizedColumnSchema(candidate) !== schema || !sameHeadingContext(candidate, seed)) return;
+        if (!relatedTableLabel(candidate, seed)) return;
+        selected.add(candidate.ref);
+      });
+    }
+  }
+  return blocks.filter(block => selected.has(block.ref));
 }
 
 function semanticContentFingerprint(block: BrowserContentBlock): string {
@@ -816,7 +865,7 @@ export class BrowserController {
     const page = await this.ensurePage();
     const urlBefore = page.url();
     const waitUntil = input.waitUntil ?? "domcontentloaded";
-    const timeoutMs = input.timeoutMs ?? 30_000;
+    const timeoutMs = input.timeoutMs ?? BROWSER_NAVIGATION_TIMEOUT_MS;
     this.invalidateReferences();
     this.loading = true;
 
@@ -1312,52 +1361,98 @@ export class BrowserController {
     const maxBlocks = Math.max(1, Math.min(20, Math.trunc(input.maxBlocks ?? (mode === "document" ? 20 : 7))));
     const query = input.query?.trim() || undefined;
     const extracted = await this.extractSemanticContent(page, url, title);
-    const rankingBlocks = input.blockTypes
+    const requestedBlocks = input.blockTypes
       ? extracted.blocks.filter(block => input.blockTypes!.includes(block.type))
       : extracted.blocks;
-    let selected: BrowserContentBlock[];
+    const explicitlyRequestedNavigation = input.blockTypes?.includes("navigation") === true;
+    const includeBoilerplate = mode === "document" && explicitlyRequestedNavigation;
+    const documentCandidates = requestedBlocks.filter(block => includeBoilerplate || !block.boilerplate);
+    const previewCandidates = mode === "document"
+      ? documentCandidates
+      : explicitlyRequestedNavigation || !query
+        ? requestedBlocks
+        : requestedBlocks.filter(block => !block.boilerplate && block.type !== "navigation");
+    let previewSelection: BrowserContentBlock[];
+    let exportSelection: BrowserContentBlock[];
     if (query) {
       const ranked = rankBrowserContentBlocks({
         query,
-        blocks: rankingBlocks,
-        maxResults: maxBlocks,
+        blocks: mode === "document" ? documentCandidates : previewCandidates,
+        maxResults: mode === "document" ? documentCandidates.length : maxBlocks,
       });
-      selected = ranked.results.flatMap(result => {
-        const block = this.contentBlockForRef(result.ref);
-        if (!block) return [];
-        return [{ ...block, relevance: result.relevance }];
+      const rankedRefs = new Map(ranked.results.map(result => [result.ref, result.relevance]));
+      const seeds = documentCandidates.flatMap(block => {
+        const relevance = rankedRefs.get(block.ref);
+        return relevance === undefined ? [] : [{ ...block, relevance }];
       });
+      exportSelection = mode === "document"
+        ? logicalDocumentSelection(documentCandidates, seeds, extracted.pageType)
+        : seeds;
+      const previewRanked = mode === "document" && exportSelection.some(block => block.ref !== seeds[0]?.ref)
+        ? rankBrowserContentBlocks({ query, blocks: exportSelection, maxResults: maxBlocks })
+        : ranked;
+      const previewRelevance = new Map(previewRanked.results.map(result => [result.ref, result.relevance]));
+      previewSelection = previewCandidates.flatMap(block => {
+        const relevance = previewRelevance.get(block.ref);
+        return relevance === undefined ? [] : [{ ...block, relevance }];
+      }).sort((left, right) => (
+        (right.relevance ?? 0) - (left.relevance ?? 0)
+        || previewCandidates.findIndex(block => block.ref === left.ref)
+          - previewCandidates.findIndex(block => block.ref === right.ref)
+      ));
     } else {
-      const substantive = rankingBlocks.filter(block => !block.boilerplate);
       if (mode === "document") {
-        selected = substantive.slice(0, maxBlocks);
+        exportSelection = documentCandidates;
+        previewSelection = exportSelection.slice(0, maxBlocks);
       } else {
-        const boilerplate = rankingBlocks.filter(block => block.boilerplate);
-        selected = [...substantive].sort((left, right) => (
+        const substantive = previewCandidates.filter(block => !block.boilerplate);
+        const boilerplate = previewCandidates.filter(block => block.boilerplate);
+        previewSelection = [...substantive].sort((left, right) => (
           (right.importance ?? 0) - (left.importance ?? 0)
           || this.contentTypePriority(left.type) - this.contentTypePriority(right.type)
           || left.ref.localeCompare(right.ref)
         )).slice(0, maxBlocks);
         const chrome = boilerplate[0];
-        if (chrome) selected.push(chrome);
+        if (chrome) previewSelection.push(chrome);
+        exportSelection = previewSelection;
       }
     }
     if (mode === "document") {
-      const selectedByRef = new Map(selected.map(block => [block.ref, block]));
-      selected = extracted.blocks.flatMap(block => {
-        const selectedBlock = selectedByRef.get(block.ref);
-        return selectedBlock ? [selectedBlock] : [];
-      });
+      const exportRefs = new Set(exportSelection.map(block => block.ref));
+      exportSelection = extracted.blocks.filter(block => exportRefs.has(block.ref));
+      if (!query) {
+        previewSelection = exportSelection.slice(0, maxBlocks);
+      }
     }
-    selected = selected.slice(0, maxBlocks);
+    previewSelection = previewSelection.slice(0, maxBlocks);
 
     const summaries: BrowserContentSummary[] = [];
     let returnedChars = 0;
-    const previewChars = Math.max(120, Math.min(DEFAULT_BLOCK_PREVIEW_CHARS, Math.floor(maxChars / Math.max(1, Math.min(8, selected.length)))));
-    for (const block of selected) {
-      const summary = this.summarizeContentBlock(block, previewChars);
+    const previewChars = Math.max(0, Math.min(DEFAULT_BLOCK_PREVIEW_CHARS, Math.floor(maxChars / Math.max(1, Math.min(8, previewSelection.length)))));
+    for (const block of previewSelection) {
+      const remainingChars = maxChars - returnedChars;
+      const preferred = this.summarizeContentBlock(block, previewChars);
+      const preferredCost = JSON.stringify(preferred).length;
+      let summary = preferred;
+      if (preferredCost > remainingChars) {
+        const minimal: BrowserContentSummary = {
+          ref: block.ref,
+          type: block.type,
+          ...(block.caption ? { caption: block.caption.slice(0, 120) } : {}),
+          ...(block.rowCount === undefined ? {} : { rowCount: block.rowCount }),
+          ...(block.columnCount === undefined ? {} : { columnCount: block.columnCount }),
+        };
+        let preview = preferred.preview ?? "";
+        while (preview.length > 0) {
+          minimal.preview = preview;
+          if (JSON.stringify(minimal).length <= remainingChars) break;
+          preview = preview.slice(0, Math.floor(preview.length / 2));
+        }
+        if (JSON.stringify(minimal).length > remainingChars) break;
+        summary = minimal;
+      }
       const cost = JSON.stringify(summary).length;
-      if (summaries.length > 0 && returnedChars + cost > maxChars) break;
+      if (returnedChars + cost > maxChars) break;
       summaries.push(summary);
       returnedChars += cost;
     }
@@ -1371,18 +1466,21 @@ export class BrowserController {
       if (attempt < 2) return this.readSemanticContent(input, attempt + 1);
       throw new GuestRpcError("BROWSER_DOM_UNSTABLE", "The page changed repeatedly while semantic content was being read.", { httpStatus: 409 });
     }
-    const selectedRefs = summaries.map(summary => summary.ref);
-    const selectedRefSet = new Set(selectedRefs);
-    // A composite snapshot represents a document. Preserve page order even
-    // when readable mode ranked its previews by relevance.
-    const documentBlocks = extracted.blocks.flatMap(block => (
-      selectedRefSet.has(block.ref) ? [this.contentBlockForRef(block.ref)].filter((item): item is BrowserContentBlock => Boolean(item)) : []
-    ));
-    const documentRef = documentBlocks.length > 1
-      ? this.registerDocumentReference(documentBlocks, url, title, extracted.pageType, extracted.sourceTruncated)
+    const selectedRefSet = new Set(summaries.map(summary => summary.ref));
+    const exportRefSet = new Set(exportSelection.map(block => block.ref));
+    const documentBlocks = mode === "document"
+      ? extracted.blocks.filter(block => exportRefSet.has(block.ref))
+      : extracted.blocks.filter(block => exportRefSet.has(block.ref))
+        .map(block => this.contentBlockForRef(block.ref))
+        .filter((item): item is BrowserContentBlock => Boolean(item));
+    const documentSourceTruncated = extracted.sourceTruncated || documentBlocks.some(block => block.truncated === true);
+    const documentRef = documentBlocks.length > 0 && (mode === "document" || documentBlocks.length > 1)
+      ? this.registerDocumentReference(documentBlocks, url, title, extracted.pageType, documentSourceTruncated)
       : undefined;
+    const documentSnapshot = documentRef ? this.documentReferences.get(documentRef) : undefined;
+    const documentRefSet = new Set(documentBlocks.map(block => block.ref));
     const structuredBlocks = extracted.blocks.filter(block => (
-      block.type === "table" || block.type === "list" || block.type === "definition" || block.type === "form"
+      isStructuredContentBlock(block)
     ));
     const structuredSummaries: BrowserStructuredBlockSummary[] = structuredBlocks.slice(0, 20).map(block => ({
       ref: block.ref,
@@ -1393,8 +1491,11 @@ export class BrowserController {
       ...(block.rowCount === undefined ? {} : { rowCount: block.rowCount }),
       ...(block.columnCount === undefined ? {} : { columnCount: block.columnCount }),
       selected: selectedRefSet.has(block.ref),
+      includedInDocument: documentRefSet.has(block.ref),
       previewOnly: true,
     }));
+    const documentStructuredBlocks = documentBlocks.filter(isStructuredContentBlock);
+    const documentSourceRefs = documentBlocks.map(block => ({ ref: block.ref, type: block.type }));
     return {
       operation: "read",
       url,
@@ -1405,15 +1506,24 @@ export class BrowserController {
       pageType: extracted.pageType,
       ...(query ? { query } : {}),
       ...(documentRef ? { documentRef } : {}),
+      sourceRefs: documentBlocks.map(block => block.ref),
+      ...(documentSnapshot ? { sourceCapturedAt: documentSnapshot.capturedAt } : { sourceCapturedAt: new Date().toISOString() }),
+      sourceStructuredBlockCount: documentBlocks.filter(isStructuredContentBlock).length,
+      sourceTableCount: documentBlocks.filter(block => block.type === "table").length,
+      sourceTruncated: documentSourceTruncated,
       blocks: summaries,
       diagnostics: {
         blockCount: extracted.blocks.length,
         tableCount: extracted.blocks.filter(block => block.type === "table").length,
         selectedBlockCount: summaries.length,
+        documentBlockCount: documentBlocks.length,
+        documentTableCount: documentBlocks.filter(block => block.type === "table").length,
+        documentStructuredBlockCount: documentStructuredBlocks.length,
+        documentSourceRefs,
         structuredBlockCount: structuredBlocks.length,
         structuredBlocksTruncated: structuredBlocks.length > structuredSummaries.length,
         structuredBlocks: structuredSummaries,
-        sourceTruncated: extracted.sourceTruncated,
+        sourceTruncated: documentSourceTruncated,
         summariesArePreviews: true,
         ...(documentRef ? { documentRef } : {}),
         selectedRefs: summaries.map(summary => ({ ref: summary.ref, ...(summary.relevance === undefined ? {} : { relevance: summary.relevance }) })),
@@ -1427,7 +1537,7 @@ export class BrowserController {
       sections,
       totalChars: extracted.blocks.reduce((sum, block) => sum + this.contentBlockSize(block), 0),
       returnedChars,
-      truncated: extracted.sourceTruncated || summaries.length < selected.length || extracted.blocks.length > summaries.length,
+      truncated: documentSourceTruncated || summaries.length < previewSelection.length || documentBlocks.length > summaries.length,
     };
   }
 
@@ -1546,6 +1656,11 @@ export class BrowserController {
       mode: "readable",
       source: "semantic",
       pageType: reference.pageType,
+      sourceRefs: [reference.block.ref],
+      sourceCapturedAt: reference.capturedAt,
+      sourceStructuredBlockCount: isStructuredContentBlock(reference.block) ? 1 : 0,
+      sourceTableCount: reference.block.type === "table" ? 1 : 0,
+      sourceTruncated: Boolean(reference.block.truncated),
       blocks: [summary],
       diagnostics: {
         blockCount: 1,
@@ -1599,6 +1714,7 @@ export class BrowserController {
       returnedChars += cost;
     }
     const structuredBlocks = document.blocks.filter(block => ["table", "list", "definition", "form"].includes(block.type));
+    const selectedRefs = new Set(blocks.map(block => block.ref));
     const structuredSummaries: BrowserStructuredBlockSummary[] = structuredBlocks.slice(0, 20).map(block => ({
       ref: block.ref,
       type: block.type as BrowserStructuredBlockSummary["type"],
@@ -1607,7 +1723,8 @@ export class BrowserController {
       ...(block.caption ? { caption: block.caption.slice(0, 240) } : {}),
       ...(block.rowCount === undefined ? {} : { rowCount: block.rowCount }),
       ...(block.columnCount === undefined ? {} : { columnCount: block.columnCount }),
-      selected: true,
+      selected: selectedRefs.has(block.ref),
+      includedInDocument: true,
       previewOnly: true,
     }));
     return {
@@ -1619,11 +1736,20 @@ export class BrowserController {
       source: "semantic",
       pageType: document.pageType,
       documentRef: input.ref,
+      sourceRefs: [...document.sourceRefs],
+      sourceCapturedAt: document.capturedAt,
+      sourceStructuredBlockCount: structuredBlocks.length,
+      sourceTableCount: document.blocks.filter(block => block.type === "table").length,
+      sourceTruncated: document.sourceTruncated,
       blocks,
       diagnostics: {
         blockCount: document.blocks.length,
         tableCount: document.blocks.filter(block => block.type === "table").length,
         selectedBlockCount: document.blocks.length,
+        documentBlockCount: document.blocks.length,
+        documentTableCount: document.blocks.filter(block => block.type === "table").length,
+        documentStructuredBlockCount: structuredBlocks.length,
+        documentSourceRefs: document.blocks.map(block => ({ ref: block.ref, type: block.type })),
         structuredBlockCount: structuredBlocks.length,
         structuredBlocksTruncated: structuredBlocks.length > structuredSummaries.length,
         structuredBlocks: structuredSummaries,
@@ -1649,6 +1775,9 @@ export class BrowserController {
     sourceUrl: string;
     sourceCapturedAt: string;
     sourceRefs?: string[];
+    sourceStructuredBlockCount: number;
+    sourceTableCount: number;
+    sourceTruncated: boolean;
     format: BrowserContentFormat;
   }> {
     return this.withWatchdog(async () => {
@@ -1663,6 +1792,9 @@ export class BrowserController {
           sourceUrl: document.url,
           sourceCapturedAt: document.capturedAt,
           sourceRefs: [...document.sourceRefs],
+          sourceStructuredBlockCount: document.blocks.filter(isStructuredContentBlock).length,
+          sourceTableCount: document.blocks.filter(block => block.type === "table").length,
+          sourceTruncated: document.sourceTruncated,
           format,
         };
       }
@@ -1675,6 +1807,9 @@ export class BrowserController {
         sourceUrl: reference.url,
         sourceCapturedAt: reference.capturedAt,
         sourceRefs: [ref],
+        sourceStructuredBlockCount: isStructuredContentBlock(reference.block) ? 1 : 0,
+        sourceTableCount: reference.block.type === "table" ? 1 : 0,
+        sourceTruncated: Boolean(reference.block.truncated),
         format,
       };
     }, "browser.serializeContentRef");
@@ -2269,7 +2404,7 @@ export class BrowserController {
         sourceType: block.type,
         ...state,
       };
-    }, "browser.open");
+    }, "browser.open", BROWSER_OPEN_TIMEOUT_MS);
   }
 
   private async findPageInternal(input: {
@@ -2970,7 +3105,7 @@ export class BrowserController {
   private async withWatchdog<T>(
     operation: () => Promise<T>,
     name: string,
-    timeoutMs = BROWSER_OPERATION_TIMEOUT_MS,
+    timeoutMs: number = BROWSER_OPERATION_TIMEOUT_MS,
   ): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {

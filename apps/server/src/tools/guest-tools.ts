@@ -1,4 +1,4 @@
-import { browserUrlsMatch, guestMethodSchemas } from '@helm/shared';
+import { browserUrlsMatch, guestMethodSchemas, GUEST_TOOL_DEADLINES_MS, guestRpcTimeoutFor, modelToolSchemas } from '@helm/shared';
 import type { ActionReceipt, GuestMethod, ToolError, ToolResult } from '@helm/shared';
 import { z } from 'zod';
 
@@ -12,7 +12,7 @@ import { ToolRegistry, type ToolRegistryOptions } from './tool-registry';
 const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'guest.handshake': 'Check the loaded guest build identity, protocol contract, server process ID, and capabilities.',
   'fs.read': 'Read a UTF-8 file inside the allowed guest filesystem root.',
-  'fs.write': 'Write UTF-8 text inside the guest filesystem root. Use {path, content} for model-authored text. Use {path, sourceRef, format?} to serialize a durable browser.read block ref or documentRef; format selects text, markdown, json, or csv and applies only to sourceRef. No extra browser.read is needed before writing a returned ref.',
+  'fs.write': 'Internal guest filesystem write operation.',
   'fs.mkdir': 'Create a directory inside the allowed guest filesystem root.',
   'fs.exists': 'Check whether a guest filesystem path exists.',
   'fs.list': 'List immediate entries inside an allowed guest directory.',
@@ -20,7 +20,7 @@ const TOOL_DESCRIPTIONS: Partial<Record<GuestMethod, string>> = {
   'browser.navigate': 'Navigate the visible guest browser to a valid HTTP or HTTPS URL. User-provided URLs may be opened directly.',
   'browser.getState': 'Read the visible browser URL, title, loading state, page count, and current DOM revision without reading page text.',
   'browser.snapshot': 'Return a bounded semantic outline of the current page and its visible interactive elements.',
-  'browser.read': 'Read bounded structured semantic content from the current page. query is natural-language content relevance text, not a CSS selector; use browser.query for DOM/CSS inspection. A query returns matching content and may return no blocks when nothing matches. Use mode readable for compact ranked blocks or mode document for a broader DOM-ordered selection; use blockTypes (for example table) to select a structured block class. Page reads accept maxBlocks/maxChars; ref reads accept offset/limit/maxChars for pagination. Results include durable block refs and, when multiple blocks are selected, a documentRef that fs.write can serialize losslessly with sourceRef.',
+  'browser.read': 'Read bounded structured semantic content from the current page. query is natural-language relevance text, not a CSS selector; use browser.query for DOM/CSS inspection. readable ranks compact model previews. document preserves substantive content in page order and returns an immutable documentRef for the complete relevant block collection; maxChars and maxBlocks limit previews, not that snapshot. Related nearby structured blocks with the same heading and column schema are included together. Navigation and other page chrome are excluded unless explicitly requested by blockTypes. Use fs.writeFromRef to save raw page data without copying a possibly truncated preview.',
   'browser.query': 'Inspect a bounded set of current DOM elements by CSS selector, text, role, or name. Returns compact metadata and revision-bound element refs; observed links include navigation refs. Use it to inspect rendered rows or controls when semantic extraction is incomplete.',
   'browser.evaluate': 'Evaluate a JavaScript expression inside the current browser page and return JSON-serializable data (maximum 64 KB; bounded by the browser operation timeout). It runs only in page context and has no guest or host filesystem, process, environment, or host API access.',
   'browser.findPage': 'Find and rank content on the current page. This is page-local search and does not search the web; results include typed current-page refs.',
@@ -193,36 +193,52 @@ function registerGuestTool<M extends GuestMethod>(
   registry: ToolRegistry,
   guest: GuestTransport,
   method: M,
+  options: {
+    name?: string;
+    description?: string;
+    inputSchema?: z.ZodType<unknown>;
+    mapInput?: (input: unknown) => GuestMethodParams[M];
+    modelVisible?: boolean;
+    rpcTimeoutMs?: number;
+    executionTimeoutMs?: number;
+  } = {},
 ): void {
-  const inputSchema = guestMethodSchemas[method] as unknown as z.ZodType<GuestMethodParams[M]>;
+  const inputSchema = options.inputSchema
+    ?? guestMethodSchemas[method] as unknown as z.ZodType<GuestMethodParams[M]>;
   registry.register({
-    name: method,
-    description: TOOL_DESCRIPTIONS[method] ?? `Invoke guest method ${method}.`,
+    name: options.name ?? method,
+    description: options.description ?? TOOL_DESCRIPTIONS[method] ?? `Invoke guest method ${method}.`,
     inputSchema,
+    ...(options.modelVisible === undefined ? {} : { modelVisible: options.modelVisible }),
+    ...(options.executionTimeoutMs === undefined ? {} : { timeoutMs: options.executionTimeoutMs }),
     execute: async (input, context) => {
       const startedAt = new Date().toISOString();
-      const before = await boundarySnapshot(guest, method, input as Record<string, unknown>, context.signal);
+      const guestInput = options.mapInput ? options.mapInput(input) : input as GuestMethodParams[M];
+      const guestInputRecord = guestInput as Record<string, unknown>;
+      const rpcTimeoutMs = options.rpcTimeoutMs ?? guestRpcTimeoutFor(method);
+      const before = await boundarySnapshot(guest, method, guestInputRecord, context.signal);
       try {
-        const data = await guest.request(method, input as GuestMethodParams[M], {
+        const data = await guest.request(method, guestInput, {
           signal: context.signal,
+          ...(rpcTimeoutMs === undefined ? {} : { timeoutMs: rpcTimeoutMs }),
         });
-        const after = await boundarySnapshot(guest, method, input as Record<string, unknown>, context.signal);
+        const after = await boundarySnapshot(guest, method, guestInputRecord, context.signal);
         const receipt: ActionReceipt = {
           id: `receipt-${crypto.randomUUID()}`,
           tool: method,
           ok: true,
-          effect: receiptEffect(method, input as Record<string, unknown>, before, after, data),
+          effect: receiptEffect(method, guestInputRecord, before, after, data),
           startedAt,
           completedAt: new Date().toISOString(),
         };
         return { ok: true, data, evidence: { receipt, before, after, data } };
       } catch (error) {
-        const after = await boundarySnapshot(guest, method, input as Record<string, unknown>, context.signal);
+        const after = await boundarySnapshot(guest, method, guestInputRecord, context.signal);
         const receipt: ActionReceipt = {
           id: `receipt-${crypto.randomUUID()}`,
           tool: method,
           ok: false,
-          effect: receiptEffect(method, input as Record<string, unknown>, before, after, undefined),
+          effect: receiptEffect(method, guestInputRecord, before, after, undefined),
           startedAt,
           completedAt: new Date().toISOString(),
           error: recordError(error),
@@ -233,6 +249,18 @@ function registerGuestTool<M extends GuestMethod>(
   });
 }
 
+function toolExecutionTimeoutFor(method: GuestMethod): number | undefined {
+  if (method === 'browser.navigate') return GUEST_TOOL_DEADLINES_MS.browserNavigate.serverTool;
+  if (method === 'browser.open') return GUEST_TOOL_DEADLINES_MS.browserOpen.serverTool;
+  if (method === 'browser.download') return GUEST_TOOL_DEADLINES_MS.browserDownload.serverTool;
+  if (method === 'browser.webSearch') return GUEST_TOOL_DEADLINES_MS.browserWebSearch.serverTool;
+  if (['browser.read', 'browser.findPage', 'browser.snapshot', 'browser.query', 'browser.evaluate', 'browser.inspectRegion', 'browser.getState']
+    .includes(method)) return GUEST_TOOL_DEADLINES_MS.browserInspection.serverTool;
+  if (method === 'browser.click' || method === 'browser.type') return GUEST_TOOL_DEADLINES_MS.browserInteraction.serverTool;
+  if (method === 'fs.write') return GUEST_TOOL_DEADLINES_MS.filesystemWrite.serverTool;
+  return undefined;
+}
+
 /** Build the semantic guest tools used by both the real and mock transports. */
 export function createGuestToolRegistry(
   guest: GuestTransport,
@@ -240,8 +268,25 @@ export function createGuestToolRegistry(
 ): ToolRegistry {
   const registry = new ToolRegistry(options);
   for (const method of Object.keys(guestMethodSchemas) as GuestMethod[]) {
-    registerGuestTool(registry, guest, method);
+    registerGuestTool(registry, guest, method, {
+      ...(method === 'fs.write' ? { modelVisible: false } : {}),
+      ...(toolExecutionTimeoutFor(method) === undefined ? {} : { executionTimeoutMs: toolExecutionTimeoutFor(method) }),
+    });
   }
+  registerGuestTool(registry, guest, 'fs.write', {
+    name: 'fs.writeText',
+    description: 'Write UTF-8 text authored by the model to a path inside the guest filesystem root. Use for summaries, transformed output, or new text.',
+    inputSchema: modelToolSchemas['fs.writeText'],
+    mapInput: value => value as GuestMethodParams['fs.write'],
+  });
+  registerGuestTool(registry, guest, 'fs.write', {
+    name: 'fs.writeFromRef',
+    description: 'Save raw browser-derived content from a durable block ref or documentRef returned by browser.read. Pass the ref directly; previews may be truncated and must not be reconstructed as complete data. Defaults to text; format may be text, markdown, json, or csv.',
+    inputSchema: modelToolSchemas['fs.writeFromRef'],
+    mapInput: value => value as GuestMethodParams['fs.write'],
+    rpcTimeoutMs: GUEST_TOOL_DEADLINES_MS.filesystemWrite.guestRpc,
+    executionTimeoutMs: GUEST_TOOL_DEADLINES_MS.filesystemWrite.serverTool,
+  });
   return registry;
 }
 

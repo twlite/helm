@@ -98,7 +98,7 @@ describe('acting agent native tool loop', () => {
     const requests: CapturedRequest[] = [];
     const provider = responseQueue([
       toolReply('open-first', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
-      toolReply('write', 'fs.write', { path: 'forex.txt', content: 'USD 133.20' }),
+      toolReply('write', 'fs.writeText', { path: 'forex.txt', content: 'USD 133.20' }),
       toolReply('open-again', 'app.openFile', { path: 'forex.txt', application: 'text-editor' }),
       textReply('done', 'I wrote forex.txt and opened it in the text editor.'),
     ], requests);
@@ -108,7 +108,7 @@ describe('acting agent native tool loop', () => {
       { name: 'browser.read', description: 'Read semantic page content.', inputSchema: z.object({ query: z.string().optional() }), execute: async () => ({ ok: true }) },
       { name: 'browser.query', description: 'Query the current DOM.', inputSchema: z.object({ selector: z.string().optional(), text: z.string().optional() }), execute: async () => ({ ok: true }) },
       { name: 'browser.evaluate', description: 'Evaluate in page context.', inputSchema: z.object({ expression: z.string() }), execute: async () => ({ ok: true }) },
-      { name: 'fs.write', description: 'Write content to a sandbox file.', inputSchema: z.object({ path: z.string(), content: z.string() }), execute: async () => ({ ok: true }) },
+      { name: 'fs.writeText', description: 'Write content to a sandbox file.', inputSchema: z.object({ path: z.string(), content: z.string() }), execute: async () => ({ ok: true }) },
       { name: 'app.openFile', description: 'Open an existing file; returns FILE_NOT_FOUND when missing.', inputSchema: z.object({ path: z.string(), application: z.string() }), execute: async () => ({ ok: true }) },
     ];
     let written = false;
@@ -136,7 +136,7 @@ describe('acting agent native tool loop', () => {
         if (name === 'app.openFile' && !written) {
           return { ok: false, error: { code: 'FILE_NOT_FOUND', message: 'File does not exist: forex.txt' } };
         }
-        if (name === 'fs.write') {
+        if (name === 'fs.writeText') {
           written = true;
           return { ok: true, data: { path: input.path } };
         }
@@ -170,7 +170,7 @@ describe('acting agent native tool loop', () => {
     expect(requests.map(request => request.body.tool_choice)).toEqual(['auto', 'auto', 'auto', undefined]);
     const fullToolSet = requestedTools(requests[0]!);
     expect(fullToolSet).toEqual(expect.arrayContaining([
-      'browser.navigate', 'browser.webSearch', 'browser.read', 'browser.query', 'browser.evaluate', 'fs.write', 'app.openFile',
+      'browser.navigate', 'browser.webSearch', 'browser.read', 'browser.query', 'browser.evaluate', 'fs.writeText', 'app.openFile',
     ]));
     expect(requests.slice(1, 3).every(request => requestedTools(request).sort().join('|') === [...fullToolSet].sort().join('|'))).toBe(true);
     expect(requestedTools(requests[3]!)).toEqual([]);
@@ -191,7 +191,7 @@ describe('acting agent native tool loop', () => {
     const requests: CapturedRequest[] = [];
     const provider = responseQueue([
       toolReply('invalid-open-input', 'app.openFile', { path: 'notes.txt', content: 'x'.repeat(20_000) }),
-      toolReply('write-notes', 'fs.write', { path: 'notes.txt', content: 'Notes from the page.' }),
+      toolReply('write-notes', 'fs.writeText', { path: 'notes.txt', content: 'Notes from the page.' }),
       textReply('done', 'I wrote the notes to notes.txt.'),
     ], requests);
     let written = false;
@@ -209,11 +209,11 @@ describe('acting agent native tool loop', () => {
       memories: [],
       toolDefinitions: [
         { name: 'app.openFile', description: 'Open an existing file.', inputSchema: z.object({ path: z.string(), application: z.string() }).strict(), execute: async () => ({ ok: true }) },
-        { name: 'fs.write', description: 'Write UTF-8 file content.', inputSchema: z.object({ path: z.string(), content: z.string() }), execute: async () => { written = true; return { ok: true }; } },
+        { name: 'fs.writeText', description: 'Write UTF-8 file content.', inputSchema: z.object({ path: z.string(), content: z.string() }), execute: async () => { written = true; return { ok: true }; } },
       ],
       executeTool: async name => {
         toolActions += 1;
-        if (name === 'fs.write') {
+        if (name === 'fs.writeText') {
           written = true;
           return { ok: true };
         }
@@ -254,7 +254,7 @@ describe('acting agent native tool loop', () => {
     const requests: CapturedRequest[] = [];
     const provider = responseQueue([
       textReply('early-answer', 'I wrote notes.txt.'),
-      toolReply('final-write', 'fs.write', { path: 'notes.txt', content: 'Today\'s notes.' }),
+      toolReply('final-write', 'fs.writeText', { path: 'notes.txt', content: 'Today\'s notes.' }),
     ], requests);
     let written = false;
     const agent = new AiSdkActingAgent({
@@ -269,7 +269,7 @@ describe('acting agent native tool loop', () => {
       conversation: [],
       memories: [],
       toolDefinitions: [{
-        name: 'fs.write',
+        name: 'fs.writeText',
         description: 'Write UTF-8 text to a file.',
         inputSchema: z.object({ path: z.string(), content: z.string() }),
         execute: async () => { written = true; return { ok: true }; },
@@ -313,7 +313,7 @@ describe('acting agent native tool loop', () => {
         conversation: [],
         memories: [],
         toolDefinitions: [{
-          name: 'fs.write', description: 'Write a file.', inputSchema: z.object({ path: z.string(), content: z.string() }),
+          name: 'fs.writeText', description: 'Write a file.', inputSchema: z.object({ path: z.string(), content: z.string() }),
           execute: async () => ({ ok: true }),
         }],
         executeTool: async () => { executed = true; return { ok: true }; },

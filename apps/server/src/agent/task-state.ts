@@ -41,7 +41,9 @@ function compactJsonValue(value: unknown, depth = 0): JsonValue {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .slice(0, 64)
-        .map(([key, item]) => [key, compactJsonValue(item, depth + 1)]),
+        .map(([key, item]) => [key, ['sourceRefs', 'documentSourceRefs'].includes(key) && Array.isArray(item)
+          ? item.slice(0, 1_024).map(entry => compactJsonValue(entry, depth + 1))
+          : compactJsonValue(item, depth + 1)]),
     );
   }
   return String(value);
@@ -412,6 +414,14 @@ function actionReceipt(action: WorkerAction): WorkerAction['receipt'] | undefine
   return receipt as WorkerAction['receipt'] | undefined;
 }
 
+const WRITE_ACTION_TOOL_NAMES = new Set(['fs.write', 'fs.writeText', 'fs.writeFromRef']);
+
+function actionMatchesRequirementTool(action: WorkerAction, expectedTool: string): boolean {
+  return expectedTool === 'fs.write'
+    ? WRITE_ACTION_TOOL_NAMES.has(action.tool)
+    : action.tool === expectedTool;
+}
+
 export function requiredActionForRequirement(requirement: TaskRequirement): string | undefined {
   const target = requirement.target;
   if (target?.action) return target.action;
@@ -524,6 +534,7 @@ function observedSemanticContentRef(
   sourceRevision: number,
   sourceUrl: string,
   sourceType?: string,
+  writeData?: Record<string, unknown>,
 ): boolean {
   const actions = verificationActions(state);
   const writeIndex = actions.lastIndexOf(writeAction);
@@ -533,20 +544,69 @@ function observedSemanticContentRef(
     const receipt = actionReceipt(action);
     if (!receipt || receipt.ok !== true || receipt.tool !== action.tool) return false;
     const data = recordValue(action.result.data);
-    if (data?.url !== sourceUrl || data.revision !== sourceRevision) return false;
+    if (data?.url !== sourceUrl || data.revision !== sourceRevision || data.sourceTruncated === true) return false;
     const collection = action.tool === 'browser.read' ? data.blocks : data.results;
     if (!Array.isArray(collection)) return false;
     if (action.tool === 'browser.read' && data.documentRef === sourceRef && sourceType === 'document') {
-      const blocks = collection.map(recordValue).filter((item): item is Record<string, unknown> => Boolean(item));
+      const diagnostics = recordValue(data.diagnostics);
       const refs = Array.isArray(data.sourceRefs)
         ? data.sourceRefs.filter((ref): ref is string => typeof ref === 'string')
-        : blocks.map(item => item.ref).filter((ref): ref is string => typeof ref === 'string');
-      return refs.length > 1
-        && refs.every(ref => blocks.some(block => block.ref === ref && isSubstantiveBrowserContentBlock(block)));
+        : [];
+      const writtenRefs = Array.isArray(writeData?.sourceRefs)
+        ? writeData.sourceRefs.filter((ref): ref is string => typeof ref === 'string')
+        : [];
+      const documentedRefs = Array.isArray(diagnostics?.documentSourceRefs)
+        ? diagnostics.documentSourceRefs.map(recordValue).filter((item): item is Record<string, unknown> => Boolean(item))
+        : [];
+      const documentBlockCount = diagnostics?.documentBlockCount;
+      const documentStructuredBlockCount = diagnostics?.documentStructuredBlockCount;
+      const documentTableCount = diagnostics?.documentTableCount;
+      const expectedStructuredCount = data.sourceStructuredBlockCount;
+      const expectedTableCount = data.sourceTableCount;
+      const structuredTypes = new Set(['table', 'list', 'definition', 'form']);
+      const structuredRefs = documentedRefs.filter(item => structuredTypes.has(String(item.type)));
+      const tableRefs = documentedRefs.filter(item => item.type === 'table');
+      if (diagnostics?.sourceTruncated === true
+        || refs.length === 0
+        || documentBlockCount !== refs.length
+        || data.sourceTruncated !== false
+        || typeof data.sourceCapturedAt !== 'string'
+        || writeData?.sourceCapturedAt !== data.sourceCapturedAt
+        || writeData?.sourceTruncated !== false
+        || JSON.stringify(writtenRefs) !== JSON.stringify(refs)
+        || expectedStructuredCount !== documentStructuredBlockCount
+        || expectedTableCount !== documentTableCount
+        || writeData?.sourceStructuredBlockCount !== documentStructuredBlockCount
+        || writeData?.sourceTableCount !== documentTableCount
+        || structuredRefs.length !== documentStructuredBlockCount
+        || tableRefs.length !== documentTableCount
+        || documentedRefs.length !== refs.length
+        || !refs.every(ref => documentedRefs.some(item => item.ref === ref && item.includedInDocument !== false))) return false;
+      return true;
     }
     const block = collection.map(recordValue).find(item => item?.ref === sourceRef);
+    const sourceRefs = Array.isArray(data.sourceRefs) ? data.sourceRefs : [];
+    const writtenRefs = Array.isArray(writeData?.sourceRefs) ? writeData.sourceRefs : [];
+    const structuredCount = block && ['table', 'list', 'definition', 'form'].includes(String(block.type)) ? 1 : 0;
+    const tableCount = block?.type === 'table' ? 1 : 0;
     return Boolean(block && isSubstantiveBrowserContentBlock(block)
-      && (sourceType === undefined || block.type === sourceType));
+      && (sourceType === undefined || block.type === sourceType)
+      && typeof data.sourceCapturedAt === 'string'
+      && sourceRefs.includes(sourceRef)
+      && writtenRefs.length === 1 && writtenRefs[0] === sourceRef
+      && writeData?.sourceStructuredBlockCount === structuredCount
+      && writeData?.sourceTableCount === tableCount
+      && writeData.sourceTruncated === false);
+  });
+}
+
+function sourceUrlMatchesRequirement(state: TaskState, sourceUrl: string, requestedSourceUrls: readonly string[] | undefined): boolean {
+  if (!requestedSourceUrls || requestedSourceUrls.length === 0) return true;
+  const actions = verificationActions(state);
+  return requestedSourceUrls.some(requestedUrl => {
+    if (browserUrlsMatch(sourceUrl, requestedUrl)) return true;
+    const resolution = navigationResolutionFor(actions, requestedUrl);
+    return Boolean(resolution && browserUrlsMatch(sourceUrl, resolution.finalUrl));
   });
 }
 
@@ -756,7 +816,7 @@ function successfulCurrentRunAction(
   const expectedTool = requiredActionForRequirement(requirement);
   if (!expectedTool || target?.freshness !== 'current-run') return undefined;
   for (const action of [...verificationActions(state)].reverse()) {
-    if (action.tool !== expectedTool || !action.result.ok) continue;
+    if (!actionMatchesRequirementTool(action, expectedTool) || !action.result.ok) continue;
     const receipt = actionReceipt(action);
     if (!receipt || receipt.ok !== true || receipt.tool !== expectedTool) continue;
     const data = recordValue(action.result.data);
@@ -781,8 +841,10 @@ function successfulCurrentRunAction(
         || typeof data.sourceType !== 'string'
         || typeof data.sourceUrl !== 'string'
         || typeof data.sourceRevision !== 'number'
+        || typeof data.sourceCapturedAt !== 'string'
         || typeof bytesWritten !== 'number'
         || bytesWritten <= 0
+        || !sourceUrlMatchesRequirement(state, data.sourceUrl, target.sourceUrls)
         || !observedSemanticContentRef(
           state,
           action,
@@ -790,6 +852,7 @@ function successfulCurrentRunAction(
           data.sourceRevision,
           data.sourceUrl,
           data.sourceType,
+          data,
         )) continue;
     }
     if (expectedTool === 'browser.webSearch' && (
@@ -1441,6 +1504,9 @@ export function artifactsFromResult(
       ...(typeof data.sourceRevision === 'number' ? { sourceRevision: data.sourceRevision } : {}),
       ...(typeof data.sourceCapturedAt === 'string' ? { sourceCapturedAt: data.sourceCapturedAt } : {}),
       ...(Array.isArray(data.sourceRefs) ? { sourceRefs: data.sourceRefs.filter((ref): ref is string => typeof ref === 'string').slice(0, 100) } : {}),
+      ...(typeof data.sourceStructuredBlockCount === 'number' ? { sourceStructuredBlockCount: data.sourceStructuredBlockCount } : {}),
+      ...(typeof data.sourceTableCount === 'number' ? { sourceTableCount: data.sourceTableCount } : {}),
+      ...(typeof data.sourceTruncated === 'boolean' ? { sourceTruncated: data.sourceTruncated } : {}),
       ...(typeof data.format === 'string' ? { format: data.format as Artifact['format'] } : {}),
       ...(receipt?.id ? { writeReceiptId: receipt.id } : {}),
       observedAt: iso(now),
