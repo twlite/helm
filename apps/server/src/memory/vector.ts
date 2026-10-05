@@ -6,6 +6,8 @@ import type { Database } from '../db/types';
 export interface MemoryVectorMatch {
   memoryId: string;
   distance: number;
+  /** Stored vector where the adapter can return it with the candidate query. */
+  embedding?: Float32Array;
 }
 
 export interface MemoryVectorIndex {
@@ -14,6 +16,9 @@ export interface MemoryVectorIndex {
   upsert(memoryId: string, embedding: Float32Array): Promise<void>;
 
   search(embedding: Float32Array, limit: number): Promise<MemoryVectorMatch[]>;
+
+  /** Fetch stored vectors for a bounded candidate set when search did not return them. */
+  getEmbeddings?(memoryIds: readonly string[]): Promise<Map<string, Float32Array>>;
 
   remove(memoryId: string): Promise<void>;
 }
@@ -35,6 +40,10 @@ export class UnavailableMemoryVectorIndex implements MemoryVectorIndex {
 
   async search(_embedding: Float32Array, _limit: number): Promise<MemoryVectorMatch[]> {
     return [];
+  }
+
+  async getEmbeddings(_memoryIds: readonly string[]): Promise<Map<string, Float32Array>> {
+    return new Map();
   }
 
   async remove(_memoryId: string): Promise<void> {
@@ -101,6 +110,41 @@ function validateEmbedding(embedding: Float32Array, dimensions: number): void {
 function validateLimit(limit: number): number {
   if (!Number.isInteger(limit) || limit < 1) throw new RangeError('Vector search limit must be a positive integer');
   return limit;
+}
+
+const HOST_IS_LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+function decodeStoredEmbedding(value: unknown, dimensions: number): Float32Array {
+  if (value instanceof Float32Array) {
+    if (value.length !== dimensions) throw new RangeError(`Stored embedding has ${value.length} dimensions; expected ${dimensions}`);
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length !== dimensions || value.some(item => typeof item !== 'number' || !Number.isFinite(item))) {
+      throw new TypeError('Stored embedding has an invalid shape or value');
+    }
+    return Float32Array.from(value);
+  }
+  if (value instanceof ArrayBuffer) {
+    if (value.byteLength !== dimensions * Float32Array.BYTES_PER_ELEMENT) {
+      throw new RangeError(`Stored embedding has ${value.byteLength} bytes; expected ${dimensions * Float32Array.BYTES_PER_ELEMENT}`);
+    }
+    if (HOST_IS_LITTLE_ENDIAN) return new Float32Array(value);
+    const view = new DataView(value);
+    return Float32Array.from({ length: dimensions }, (_, index) => view.getFloat32(index * 4, true));
+  }
+  if (ArrayBuffer.isView(value)) {
+    if (value.byteLength !== dimensions * Float32Array.BYTES_PER_ELEMENT) {
+      throw new RangeError(`Stored embedding has ${value.byteLength} bytes; expected ${dimensions * Float32Array.BYTES_PER_ELEMENT}`);
+    }
+    const buffer = value.buffer as ArrayBuffer;
+    if (HOST_IS_LITTLE_ENDIAN && value.byteOffset % Float32Array.BYTES_PER_ELEMENT === 0) {
+      return new Float32Array(buffer, value.byteOffset, dimensions);
+    }
+    const view = new DataView(buffer, value.byteOffset, value.byteLength);
+    return Float32Array.from({ length: dimensions }, (_, index) => view.getFloat32(index * 4, true));
+  }
+  throw new TypeError('SQLite returned an unsupported stored embedding representation');
 }
 
 function quoteIdentifier(identifier: string): string {
@@ -261,15 +305,42 @@ export class SqliteVecMemoryVectorIndex implements MemoryVectorIndex {
     const keys = quoteIdentifier(this.keyTableName);
     const rows = this.database
       .prepare(
-        `SELECT keys.memory_id AS memoryId, vectors.distance AS distance
+        `SELECT keys.memory_id AS memoryId, vectors.distance AS distance, vectors.embedding AS embedding
           FROM ${table} AS vectors
            JOIN ${keys} AS keys ON keys.vector_rowid = vectors.rowid
           WHERE vectors.embedding MATCH ?
             AND vectors.k = ?
           ORDER BY vectors.distance ASC`,
       )
-      .all(embedding, limit) as Array<{ memoryId: string; distance: number }>;
-    return rows.map(row => ({ memoryId: row.memoryId, distance: row.distance }));
+      .all(embedding, limit) as Array<{ memoryId: string; distance: number; embedding: unknown }>;
+    return rows.map(row => ({
+      memoryId: row.memoryId,
+      distance: row.distance,
+      embedding: decodeStoredEmbedding(row.embedding, this.dimensions),
+    }));
+  }
+
+  async getEmbeddings(memoryIds: readonly string[]): Promise<Map<string, Float32Array>> {
+    if (!this.available || memoryIds.length === 0) return new Map();
+    const table = quoteIdentifier(this.tableName);
+    const keys = quoteIdentifier(this.keyTableName);
+    const embeddings = new Map<string, Float32Array>();
+    const uniqueIds = [...new Set(memoryIds)];
+    // Keep batches below common SQLite host-parameter limits.
+    for (let offset = 0; offset < uniqueIds.length; offset += 500) {
+      const batch = uniqueIds.slice(offset, offset + 500);
+      const placeholders = batch.map(() => '?').join(', ');
+      const rows = this.database
+        .prepare(
+          `SELECT keys.memory_id AS memoryId, vectors.embedding AS embedding
+             FROM ${table} AS vectors
+             JOIN ${keys} AS keys ON keys.vector_rowid = vectors.rowid
+            WHERE keys.memory_id IN (${placeholders})`,
+        )
+        .all(...batch) as Array<{ memoryId: string; embedding: unknown }>;
+      for (const row of rows) embeddings.set(row.memoryId, decodeStoredEmbedding(row.embedding, this.dimensions));
+    }
+    return embeddings;
   }
 
   async remove(memoryId: string): Promise<void> {
@@ -316,7 +387,17 @@ export class InMemoryMemoryVectorIndex implements MemoryVectorIndex {
       }
       matches.push({ memoryId, distance: Math.sqrt(distance) });
     }
-    return matches.sort((left, right) => left.distance - right.distance).slice(0, limit);
+    return matches.sort((left, right) => left.distance - right.distance).slice(0, limit)
+      .map(match => ({ ...match, embedding: new Float32Array(this.vectors.get(match.memoryId) as Float32Array) }));
+  }
+
+  async getEmbeddings(memoryIds: readonly string[]): Promise<Map<string, Float32Array>> {
+    const embeddings = new Map<string, Float32Array>();
+    for (const memoryId of memoryIds) {
+      const embedding = this.vectors.get(memoryId);
+      if (embedding) embeddings.set(memoryId, new Float32Array(embedding));
+    }
+    return embeddings;
   }
 
   async remove(memoryId: string): Promise<void> {

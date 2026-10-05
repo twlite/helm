@@ -14,6 +14,7 @@ import {
   type SqliteVecMemoryVectorIndexOptions,
 } from './vector';
 import type { Database } from '../db/types';
+import { calculateMemoryRelevance, type MemoryRelevanceOptions } from './relevance';
 
 export interface MemoryServiceOptions {
   embeddingProvider?: EmbeddingProvider;
@@ -21,6 +22,8 @@ export interface MemoryServiceOptions {
   sqliteVec?: Omit<SqliteVecMemoryVectorIndexOptions, 'dimensions'> & { dimensions?: number };
   /** Conservative upper bound for unkeyed semantic duplicate detection. */
   dedupeMaxDistance?: number;
+  /** Overrides the default weights and decay used when recalling memories. */
+  relevance?: MemoryRelevanceOptions;
 }
 
 export interface MemoryRecallOptions {
@@ -37,11 +40,10 @@ export interface RememberMemoryResult {
   action: 'remembered' | 'updated' | 'already-present';
 }
 
-const DEFAULT_MEMORY_RECALL_LIMIT = 6;
-const DEFAULT_MEMORY_RECALL_CANDIDATE_LIMIT = 24;
-const DEFAULT_MEMORY_RECALL_MAX_DISTANCE = 0.95;
+export const DEFAULT_MEMORY_RECALL_LIMIT = 6;
+export const DEFAULT_MEMORY_RECALL_CANDIDATE_LIMIT = 24;
+export const DEFAULT_MEMORY_RECALL_MAX_DISTANCE = 0.95;
 const DEFAULT_MEMORY_DEDUPE_MAX_DISTANCE = 0.36;
-const RRF_K = 60;
 const RECALL_STOP_WORDS = new Set([
   'a', 'again', 'an', 'and', 'are', 'as', 'at', 'can', 'continue', 'could', 'do', 'does',
   'for', 'from', 'how', 'i', 'in', 'is', 'it', 'me', 'my', 'no', 'now', 'of', 'ok', 'okay',
@@ -84,26 +86,11 @@ function normalizedText(value: string): string {
   return value.normalize('NFKC').toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\s+/gu, ' ');
 }
 
-function recencyBonus(memory: Memory, now: number): number {
-  const updated = Date.parse(memory.updatedAt);
-  const updatedFactor = Number.isFinite(updated) ? Math.exp(-Math.max(0, now - updated) / (365 * 24 * 60 * 60 * 1_000)) : 0;
-  const verification = memory.durability === 'refreshable' && memory.lastVerifiedAt
-    ? Date.parse(memory.lastVerifiedAt)
-    : Number.NaN;
-  const verificationFactor = Number.isFinite(verification)
-    ? Math.exp(-Math.max(0, now - verification) / (90 * 24 * 60 * 60 * 1_000))
-    : 0;
-  return 0.00015 * updatedFactor + 0.0002 * verificationFactor;
-}
-
-function secondaryScore(memory: Memory, now: number): number {
-  const sourceBonus = memory.source === 'user' || memory.source === 'manual' ? 0.0001 : 0;
-  return (0.001 * memory.importance) + sourceBonus + recencyBonus(memory, now);
-}
-
 type RankedCandidate = {
   memory: Memory;
-  score: number;
+  ftsRank?: number;
+  vectorRank?: number;
+  embedding?: Float32Array;
 };
 
 /** Global memory API. Thread IDs are intentionally absent from this surface. */
@@ -112,10 +99,12 @@ export class MemoryService {
   readonly embeddingProvider?: EmbeddingProvider;
   readonly vectorIndex: MemoryVectorIndex;
   private readonly dedupeMaxDistance: number;
+  private readonly relevance: MemoryRelevanceOptions;
 
   constructor(database: Database, options: MemoryServiceOptions = {}) {
     this.repository = new MemoryRepository(database);
     this.embeddingProvider = options.embeddingProvider;
+    this.relevance = options.relevance ?? {};
     this.dedupeMaxDistance = options.dedupeMaxDistance ?? DEFAULT_MEMORY_DEDUPE_MAX_DISTANCE;
     if (!Number.isFinite(this.dedupeMaxDistance) || this.dedupeMaxDistance < 0) {
       throw new RangeError('dedupeMaxDistance must be a non-negative number');
@@ -277,47 +266,102 @@ export class MemoryService {
     const candidateLimit = Math.max(limit, positiveLimit(options.candidateLimit, 'candidateLimit'));
     const maxDistance = recallDistance(options.maxDistance);
     const candidates = new Map<string, RankedCandidate>();
-    const add = (memory: Memory, rank: number) => {
-      const candidate = candidates.get(memory.id) ?? { memory, score: 0 };
-      candidate.score += 1 / (RRF_K + rank);
+    const add = (memory: Memory): RankedCandidate => {
+      const candidate = candidates.get(memory.id) ?? { memory };
       candidates.set(memory.id, candidate);
+      return candidate;
     };
 
     try {
       const ftsResults = this.repository.searchDetailed(normalizedQuery, candidateLimit);
-      ftsResults.forEach(({ memory }, index) => add(memory, index + 1));
+      ftsResults.forEach(({ memory }, index) => {
+        add(memory).ftsRank = index + 1;
+      });
     } catch {
       // Vector candidates remain usable if FTS is missing or damaged.
     }
 
     if (this.embeddingProvider && this.vectorIndex.available) {
+      let queryEmbedding: Float32Array | undefined;
       try {
-        const embedding = await this.embeddingProvider.embed(normalizedQuery);
-        const matches = await this.vectorIndex.search(embedding, candidateLimit);
-        const byId = new Map(
-          this.repository.getManyByIds(matches.map(match => match.memoryId)).map(memory => [memory.id, memory]),
-        );
-        let vectorRank = 0;
-        for (const match of matches) {
-          if (!Number.isFinite(match.distance) || match.distance > maxDistance) continue;
-          const memory = byId.get(match.memoryId);
-          if (!memory) continue;
-          add(memory, ++vectorRank);
-        }
+        queryEmbedding = await this.embeddingProvider.embed(normalizedQuery);
       } catch {
-        // FTS retrieval is still useful if embeddings or sqlite-vec fail.
+        // FTS retrieval is still useful if query embedding fails.
+      }
+
+      if (queryEmbedding) {
+        const relevanceOptions: MemoryRelevanceOptions = {
+          ...this.relevance,
+          now: this.relevance.now ?? Date.now(),
+        };
+        try {
+          const matches = await this.vectorIndex.search(queryEmbedding, candidateLimit);
+          const acceptedMatches = matches
+            .map((match, index) => ({ match, rank: index + 1 }))
+            .filter(({ match }) => Number.isFinite(match.distance) && match.distance >= 0 && match.distance <= maxDistance);
+          const byId = new Map(
+            this.repository.getManyByIds(acceptedMatches.map(({ match }) => match.memoryId))
+              .map(memory => [memory.id, memory]),
+          );
+          for (const { match, rank } of acceptedMatches) {
+            const memory = byId.get(match.memoryId);
+            if (!memory) continue;
+            const candidate = add(memory);
+            candidate.vectorRank = rank;
+            if (match.embedding) candidate.embedding = match.embedding;
+          }
+        } catch {
+          // FTS retrieval and any already-collected candidates remain usable.
+        }
+
+        const withoutEmbedding = [...candidates.values()].filter(candidate => !candidate.embedding);
+        if (withoutEmbedding.length > 0 && this.vectorIndex.getEmbeddings) {
+          try {
+            const stored = await this.vectorIndex.getEmbeddings(withoutEmbedding.map(candidate => candidate.memory.id));
+            for (const candidate of withoutEmbedding) {
+              const embedding = stored.get(candidate.memory.id);
+              if (embedding) candidate.embedding = embedding;
+            }
+          } catch {
+            // Candidates without a readable vector remain available through lexical fallback.
+          }
+        }
+
+        const scored: Array<{ candidate: RankedCandidate; score: number }> = [];
+        const fallback: RankedCandidate[] = [];
+        for (const candidate of candidates.values()) {
+          if (!candidate.embedding) {
+            fallback.push(candidate);
+            continue;
+          }
+          try {
+            scored.push({
+              candidate,
+              score: calculateMemoryRelevance(queryEmbedding, {
+                embedding: candidate.embedding,
+                createdAt: candidate.memory.createdAt,
+                importance: candidate.memory.importance,
+              }, relevanceOptions),
+            });
+          } catch {
+            // A malformed or stale vector must not make an FTS candidate unusable.
+            fallback.push(candidate);
+          }
+        }
+
+        scored.sort((left, right) => right.score - left.score
+          || left.candidate.memory.id.localeCompare(right.candidate.memory.id));
+        fallback.sort((left, right) => (left.ftsRank ?? Number.POSITIVE_INFINITY) - (right.ftsRank ?? Number.POSITIVE_INFINITY)
+          || (left.vectorRank ?? Number.POSITIVE_INFINITY) - (right.vectorRank ?? Number.POSITIVE_INFINITY)
+          || left.memory.id.localeCompare(right.memory.id));
+        return [...scored.map(({ candidate }) => candidate.memory), ...fallback.map(candidate => candidate.memory)]
+          .slice(0, limit);
       }
     }
 
-    const now = Date.now();
     return [...candidates.values()]
-      .map(candidate => ({
-        memory: candidate.memory,
-        score: candidate.score + secondaryScore(candidate.memory, now),
-      }))
-      .sort((left, right) => right.score - left.score
-        || right.memory.importance - left.memory.importance
-        || right.memory.updatedAt.localeCompare(left.memory.updatedAt)
+      .sort((left, right) => (left.ftsRank ?? Number.POSITIVE_INFINITY) - (right.ftsRank ?? Number.POSITIVE_INFINITY)
+        || (left.vectorRank ?? Number.POSITIVE_INFINITY) - (right.vectorRank ?? Number.POSITIVE_INFINITY)
         || left.memory.id.localeCompare(right.memory.id))
       .slice(0, limit)
       .map(candidate => candidate.memory);

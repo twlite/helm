@@ -60,15 +60,39 @@ traces and older thread history are excluded. Production recall returns at most
 six memories. The acting model can search deeper with `memory.search` when
 needed.
 
-Full-text search and optional embedding search independently rank candidates.
-Helm fuses their ranks with reciprocal rank fusion (`k = 60`), de-duplicates by
-memory ID, and filters distant vector matches (default distance limit `0.95`).
-Importance, source, update recency, and verification freshness provide small
-secondary adjustments after relevance. Importance therefore helps order
-similarly relevant memories but cannot make an unrelated high-importance item a
-match. If embeddings are unavailable, full-text search still works; either
-retrieval enhancement may fail without making the SQLite memory rows
-unavailable.
+### Weighted semantic memory relevance ranking
+
+Automatic recall retrieves up to 24 FTS candidates and 24 sqlite-vec candidates,
+deduplicates their union by memory ID, reranks candidates with stored embeddings,
+and returns at most six. `memory.search` defaults to 20 results and searches a
+candidate window of `max(24, min(100, limit * 4))`. An explicit
+`candidateLimit` continues to control the first-stage search size, and an
+explicit result `limit` continues to control the final slice. If the candidate
+limit is smaller than the result limit, retrieval raises it to the result limit.
+
+Embedding-bearing candidates use this weighted score:
+
+```text
+S(q,m) = ws*cosine(q,m) + wr*exp(-lambda*age(m)) + wi*importance(m)
+```
+
+The defaults are `ws = 0.70`, `wr = 0.20`, `wi = 0.10`, and `lambda = 0.03`
+per day. Cosine uses the full dot-product-over-norms calculation and does not
+assume normalized embeddings. Recency uses `createdAt` and treats future dates
+as age zero. Importance uses the existing 0-to-1 memory field, clamps values to
+that range, and uses neutral `0.5` if absent. This is a custom ranking heuristic,
+not a novel algorithm. The scoring functions, default constants, and service
+relevance options are exported for tests and tuning; changing the weights or
+decay does not require a migration or additional embedding/importance calls.
+
+sqlite-vec remains the first-stage vector search and supplies stored embeddings
+for its matches. A bounded adapter lookup also supplies embeddings for FTS
+candidates when they are indexed, so both sources use the same formula. A
+candidate without a readable vector remains available after scored candidates,
+in FTS rank and then vector match order. If query embeddings or sqlite-vec fail,
+FTS candidates still return in lexical rank order; if FTS fails, usable vector
+candidates still return. The default distance limit for vector matches remains
+`0.95`; FTS candidates remain eligible independently of that vector threshold.
 
 Successful searches update `lastAccessedAt` and `accessCount`. The agent sees a
 bounded set of up to six recalled entries with their IDs, keys, kinds, content,

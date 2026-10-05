@@ -12,17 +12,33 @@ import { testDatabase } from './helpers';
 
 class FixedRecallIndex implements MemoryVectorIndex {
   readonly available = true;
+  readonly searchLimits: number[] = [];
+  private storedEmbeddings = new Map<string, Float32Array>();
 
-  constructor(private matches: Array<{ memoryId: string; distance: number }>) {}
+  constructor(private matches: Array<{ memoryId: string; distance: number; embedding?: Float32Array }>) {}
 
-  setMatches(matches: Array<{ memoryId: string; distance: number }>): void {
+  setMatches(matches: Array<{ memoryId: string; distance: number; embedding?: Float32Array }>): void {
     this.matches = matches;
+  }
+
+  setStoredEmbeddings(embeddings: Record<string, Float32Array>): void {
+    this.storedEmbeddings = new Map(Object.entries(embeddings));
   }
 
   async upsert(): Promise<void> {}
 
-  async search(): Promise<Array<{ memoryId: string; distance: number }>> {
-    return this.matches;
+  async search(_embedding: Float32Array, limit: number): Promise<Array<{ memoryId: string; distance: number; embedding?: Float32Array }>> {
+    this.searchLimits.push(limit);
+    return this.matches.slice(0, limit);
+  }
+
+  async getEmbeddings(memoryIds: readonly string[]): Promise<Map<string, Float32Array>> {
+    const wanted = new Set(memoryIds);
+    const embeddings = new Map(this.storedEmbeddings);
+    for (const match of this.matches) {
+      if (match.embedding) embeddings.set(match.memoryId, match.embedding);
+    }
+    return new Map([...embeddings].filter(([memoryId]) => wanted.has(memoryId)));
   }
 
   async remove(): Promise<void> {}
@@ -48,6 +64,20 @@ describe('persistent memory service', () => {
     }
   });
 
+  it('keeps FTS retrieval working when query embedding fails', async () => {
+    const persistence = testDatabase();
+    try {
+      const service = new MemoryService(persistence.sqlite, {
+        embeddingProvider: { dimensions: 2, embed: async () => { throw new Error('embedding service unavailable'); } },
+        vectorIndex: new FixedRecallIndex([]),
+      });
+      const memory = await service.saveText('Remember searchable fallback behavior', 'instruction');
+      await expect(service.recall('searchable fallback')).resolves.toEqual([memory]);
+    } finally {
+      persistence.close();
+    }
+  });
+
   it('uses embeddings and vector adapters when configured', async () => {
     const persistence = testDatabase();
     try {
@@ -63,25 +93,30 @@ describe('persistent memory service', () => {
     }
   });
 
-  it('fuses FTS and vector candidate ranks before returning recall results', async () => {
+  it('scores vector and FTS candidates with their stored embeddings', async () => {
     const persistence = testDatabase();
     try {
       const vectorIndex = new FixedRecallIndex([]);
-      const provider = new DeterministicFakeEmbeddingProvider(4);
-      const service = new MemoryService(persistence.sqlite, { embeddingProvider: provider, vectorIndex });
+      const now = Date.parse('2026-01-10T00:00:00.000Z');
+      const provider = { dimensions: 2, embed: async () => new Float32Array([1, 0]) };
+      const service = new MemoryService(persistence.sqlite, {
+        embeddingProvider: provider,
+        vectorIndex,
+        relevance: { now },
+      });
       const weakFts = service.repository.create({
         id: 'weak-fts',
         content: 'Acme exchange was mentioned in an unrelated note.',
         kind: 'note',
         importance: 0.1,
-        updatedAt: '2026-01-01T00:00:00.000Z',
+        createdAt: '2026-01-09T00:00:00.000Z',
       });
       const strongVector = service.repository.create({
         id: 'strong-vector',
         content: 'The conversion portal is the useful source for daily values.',
         kind: 'fact',
         importance: 0.9,
-        updatedAt: '2026-01-02T00:00:00.000Z',
+        createdAt: '2026-01-02T00:00:00.000Z',
       });
       const highImportanceIrrelevant = service.repository.create({
         id: 'irrelevant-important',
@@ -90,9 +125,10 @@ describe('persistent memory service', () => {
         importance: 1,
       });
       vectorIndex.setMatches([
-        { memoryId: strongVector.id, distance: 0.2 },
-        { memoryId: highImportanceIrrelevant.id, distance: 1.4 },
+        { memoryId: strongVector.id, distance: 0.2, embedding: new Float32Array([0.8, 0.6]) },
+        { memoryId: highImportanceIrrelevant.id, distance: 1.4, embedding: new Float32Array([1, 0]) },
       ]);
+      vectorIndex.setStoredEmbeddings({ [weakFts.id]: new Float32Array([0, 1]) });
 
       const result = await service.recall('Acme exchange values', { limit: 3, candidateLimit: 24 });
       expect(result.map(memory => memory.id)).toEqual(['strong-vector', 'weak-fts']);
@@ -107,20 +143,82 @@ describe('persistent memory service', () => {
     try {
       const vectorIndex = new FixedRecallIndex([]);
       const service = new MemoryService(persistence.sqlite, {
-        embeddingProvider: new DeterministicFakeEmbeddingProvider(4),
+        embeddingProvider: { dimensions: 2, embed: async () => new Float32Array([1, 0]) },
         vectorIndex,
+        relevance: { now: Date.parse('2026-01-10T00:00:00.000Z') },
       });
-      service.repository.create({ id: 'close-low', content: 'Older workstation detail', kind: 'fact', importance: 0.1 });
-      service.repository.create({ id: 'close-high', content: 'Preferred workstation detail', kind: 'fact', importance: 0.95 });
+      service.repository.create({ id: 'close-low', content: 'Older workstation detail', kind: 'fact', importance: 0.1, createdAt: '2026-01-10T00:00:00.000Z' });
+      service.repository.create({ id: 'close-high', content: 'Preferred workstation detail', kind: 'fact', importance: 0.95, createdAt: '2026-01-10T00:00:00.000Z' });
       service.repository.create({ id: 'distant-critical', content: 'Important but unrelated', kind: 'fact', importance: 1 });
       vectorIndex.setMatches([
-        { memoryId: 'close-low', distance: 0.2 },
-        { memoryId: 'close-high', distance: 0.21 },
-        { memoryId: 'distant-critical', distance: 1.5 },
+        { memoryId: 'close-low', distance: 0.2, embedding: new Float32Array([1, 0]) },
+        { memoryId: 'close-high', distance: 0.21, embedding: new Float32Array([1, 0]) },
+        { memoryId: 'distant-critical', distance: 1.5, embedding: new Float32Array([1, 0]) },
       ]);
 
       const result = await service.recall('Which workstation should run it?', { limit: 3 });
       expect(result.map(memory => memory.id)).toEqual(['close-high', 'close-low']);
+    } finally {
+      persistence.close();
+    }
+  });
+
+  it('reranks the larger vector candidate window before applying top-K', async () => {
+    const persistence = testDatabase();
+    try {
+      const vectorIndex = new FixedRecallIndex([]);
+      const now = Date.parse('2026-01-10T00:00:00.000Z');
+      const service = new MemoryService(persistence.sqlite, {
+        embeddingProvider: { dimensions: 2, embed: async () => new Float32Array([1, 0]) },
+        vectorIndex,
+        relevance: { now },
+      });
+      service.repository.create({
+        id: 'nearby-by-distance',
+        content: 'A recent fact about the launch window.',
+        kind: 'fact',
+        importance: 0.5,
+        createdAt: '2026-01-10T00:00:00.000Z',
+      });
+      service.repository.create({
+        id: 'best-cosine',
+        content: 'An older fact about the launch window.',
+        kind: 'fact',
+        importance: 0.5,
+        createdAt: '2026-01-09T00:00:00.000Z',
+      });
+      vectorIndex.setMatches([
+        // Euclidean first-stage order prefers this vector, while weighted
+        // relevance favors the exact-direction vector returned second.
+        { memoryId: 'nearby-by-distance', distance: 0.74, embedding: new Float32Array([0.99, 0.74]) },
+        { memoryId: 'best-cosine', distance: 0.9, embedding: new Float32Array([0.1, 0]) },
+      ]);
+
+      const result = await service.recall('launch window', { limit: 1, candidateLimit: 2 });
+      expect(vectorIndex.searchLimits.at(-1)).toBe(2);
+      expect(result.map(memory => memory.id)).toEqual(['best-cosine']);
+    } finally {
+      persistence.close();
+    }
+  });
+
+  it('keeps FTS-only memories when a vector candidate exists', async () => {
+    const persistence = testDatabase();
+    try {
+      const vectorIndex = new FixedRecallIndex([]);
+      const service = new MemoryService(persistence.sqlite, {
+        embeddingProvider: { dimensions: 2, embed: async () => new Float32Array([1, 0]) },
+        vectorIndex,
+        relevance: { now: Date.parse('2026-01-10T00:00:00.000Z') },
+      });
+      service.repository.create({ id: 'vector-backed', content: 'Searchable launch preference.', kind: 'fact' });
+      service.repository.create({ id: 'fts-only', content: 'Searchable launch instruction without an indexed vector.', kind: 'instruction' });
+      vectorIndex.setMatches([
+        { memoryId: 'vector-backed', distance: 0.1, embedding: new Float32Array([1, 0]) },
+      ]);
+
+      const result = await service.recall('searchable launch', { limit: 2 });
+      expect(result.map(memory => memory.id)).toEqual(['vector-backed', 'fts-only']);
     } finally {
       persistence.close();
     }
