@@ -11,170 +11,170 @@ import type { ChatProgress, Message, RunDetails, StreamingAssistantMessage, Thre
 import { formatTime } from '../format';
 import { Icon } from './Icon';
 import { RunErrorCard } from './RunErrorCard';
-import { Alert } from './ui/alert';
+import { Alert } from './ui/alert'; 
 import { Button } from './ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './ui/dialog';
 import { ScrollArea } from './ui/scroll-area';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table'; 
 import { Textarea } from './ui/textarea';
 
-export type ConversationNotice = {
+export type ConversationNotice = { 
   tone: 'error' | 'info';
   message: string;
 };
-
+ 
 export type ConversationSendMode = 'start' | 'queue' | 'steer';
-
+ 
 type ConversationProps = {
   thread: Thread | null;
   messages: Message[];
   isLoading: boolean;
   draft: string;
   isSending: boolean;
-  onDraftChange: (value: string) => void;
+  onDraftChange: (value: string) => void; 
   onSend: (content: string, mode: ConversationSendMode) => Promise<void>;
   onRunDemo: () => Promise<void>;
   isRunStarting: boolean;
   run: RunDetails | null;
-  isRetryingRun: boolean;
+  isRetryingRun: boolean; 
   onCancelRun: (runId: string) => Promise<void>;
   onRetryRun: (runId?: string) => Promise<void>;
   onOpenActivity: (runId?: string) => void;
   onOpenMobileSidebar: () => void;
-  notice: ConversationNotice | null;
+  notice: ConversationNotice | null; 
   onDismissNotice: () => void;
   isRunActive: boolean;
   chatProgress?: ChatProgress | null;
   isStoppingRun?: boolean;
-  streamingAssistant?: StreamingAssistantMessage | null;
+  streamingAssistant?: StreamingAssistantMessage | null; 
 };
-
+ 
 function roleLabel(role: Message['role']): string {
   switch (role) {
     case 'user':
       return 'You';
-    case 'assistant':
+    case 'assistant': 
       return 'Helm';
     case 'tool':
       return 'Tool';
     case 'system':
-      return 'System';
+      return 'System'; 
   }
 }
 
 function roleIcon(role: Message['role']) {
-  if (role === 'user') {
+  if (role === 'user') { 
     return <span className="text-[11px] font-semibold text-[#aeb7c1]">Y</span>;
   }
   return <Icon name={role === 'assistant' ? 'spark' : role === 'tool' ? 'activity' : 'server'} size={14} />;
 }
-
+ 
 function metadataString(message: Message, key: string): string | undefined {
   const value = message.metadata[key];
   return typeof value === 'string' ? value : undefined;
 }
-
+ 
 function isRunErrorMessage(message: Message): boolean {
   if (message.role !== 'assistant' || metadataString(message, 'source') !== 'ai-run') {
     return false;
   }
-  return ['failed', 'blocked', 'cancelled'].includes(metadataString(message, 'status') ?? '');
+  return ['failed', 'blocked', 'cancelled'].includes(metadataString(message, 'status') ?? '' );
 }
 
-function runErrorTitle(status: string | undefined): string {
+function runErrorTitle(status: string | undefined): string { 
   switch (status) {
     case 'blocked':
       return 'Task blocked';
     case 'cancelled':
       return 'Task stopped';
-    default:
+    default: 
       return 'Task failed';
   }
 }
 
 const MARKDOWN_CLASS = [
-  'min-w-0 max-w-none break-words text-[13px] leading-[1.65] [overflow-wrap:anywhere]',
+  'min-w-0 max-w-none break-words text-[13px] leading-[1.65] [overflow-wrap:anywhere]', 
   '[&_h1]:mb-3 [&_h1]:mt-5 [&_h1]:text-lg [&_h1]:font-semibold [&_h1]:text-[#f1f3f5]',
   '[&_h2]:mb-3 [&_h2]:mt-5 [&_h2]:text-base [&_h2]:font-semibold [&_h2]:text-[#f1f3f5]',
-  '[&_h3]:mb-2 [&_h3]:mt-4 [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:text-[#f1f3f5]',
+  '[&_h3]:mb-2 [&_h3]:mt-4 [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:text-[#f1f3f5]', 
   '[&_p]:my-2 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0',
   '[&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-5 [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-5',
-  '[&_li]:my-1',
+  '[&_li]:my-1', 
   '[&_a]:text-teal-300 [&_a]:underline [&_a]:underline-offset-2 hover:[&_a]:text-teal-200',
   '[&_blockquote]:my-3 [&_blockquote]:border-l-2 [&_blockquote]:border-teal-400/40 [&_blockquote]:pl-3 [&_blockquote]:text-[#aeb7c1]',
   '[&_hr]:my-4 [&_hr]:border-white/[0.08]',
   '[&_pre]:my-3 [&_pre]:max-w-full [&_pre]:overflow-x-auto [&_pre]:rounded-[4px] [&_pre]:border [&_pre]:border-[var(--border)] [&_pre]:bg-[var(--pane-bg)] [&_pre]:p-3',
   '[&_code]:rounded-[3px] [&_code]:bg-white/[0.06] [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[0.9em] [&_code]:text-[var(--text)]',
-  '[&_pre_code]:bg-transparent [&_pre_code]:p-0',
+  '[&_pre_code]:bg-transparent [&_pre_code]:p-0', 
   '[&_img]:max-w-full [&_img]:rounded-lg',
 ].join(' ');
 
 type MarkdownTableProps = ComponentPropsWithoutRef<'table'> & ExtraProps;
 type MarkdownTableSectionProps = ComponentPropsWithoutRef<'thead'> & ExtraProps;
-type MarkdownTableRowProps = ComponentPropsWithoutRef<'tr'> & ExtraProps;
+type MarkdownTableRowProps = ComponentPropsWithoutRef<'tr'> & ExtraProps; 
 type MarkdownTableCellProps = ComponentPropsWithoutRef<'th'> & ExtraProps;
 type MarkdownTableDataCellProps = ComponentPropsWithoutRef<'td'> & ExtraProps;
 
-function MarkdownTableHeader({ node: _node, ...props }: MarkdownTableSectionProps) {
+function MarkdownTableHeader({ node: _node, ...props }: MarkdownTableSectionProps) { 
   return <TableHeader {...props} />;
 }
 
-function MarkdownTableBody({ node: _node, ...props }: ComponentPropsWithoutRef<'tbody'> & ExtraProps) {
+function MarkdownTableBody({ node: _node, ...props }: ComponentPropsWithoutRef<'tbody'> & ExtraProps) { 
   return <TableBody {...props} />;
 }
 
-function MarkdownTableRow({ node: _node, ...props }: MarkdownTableRowProps) {
+function MarkdownTableRow({ node: _node, ...props }: MarkdownTableRowProps) { 
   return <TableRow {...props} />;
 }
 
-function MarkdownTableHead({ node: _node, ...props }: MarkdownTableCellProps) {
+function MarkdownTableHead({ node: _node, ...props }: MarkdownTableCellProps) { 
   return <TableHead {...props} />;
 }
 
 function MarkdownTableCell({ node: _node, ...props }: MarkdownTableDataCellProps) {
-  return <TableCell {...props} />;
+  return <TableCell {...props} />; 
 }
 
 function downloadTable(table: HTMLTableElement) {
-  const data = extractTableDataFromElement(table);
-  const blob = new Blob([tableDataToCSV(data)], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
+  const data = extractTableDataFromElement(table); 
+  const blob = new Blob([tableDataToCSV(data)], { type: 'text/csv;charset=utf-8' }); 
+  const url = URL.createObjectURL(blob); 
+  const link = document.createElement('a'); 
   link.href = url;
-  link.download = 'helm-table.csv';
+  link.download = 'helm-table.csv'; 
   document.body.appendChild(link);
-  link.click();
+  link.click(); 
   link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  window.setTimeout(() => URL.revokeObjectURL(url), 0); 
 }
 
-const MarkdownTable = memo(function MarkdownTable({
+const MarkdownTable = memo(function MarkdownTable({ 
   children,
   className,
-  node: _node,
+  node: _node, 
   ...props
 }: MarkdownTableProps) {
   const tableRef = useRef<HTMLTableElement>(null);
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(false); 
   const [copied, setCopied] = useState(false);
 
   async function copyTable() {
-    if (!tableRef.current || !navigator.clipboard) return;
+    if (!tableRef.current || !navigator.clipboard) return; 
     try {
       const data = extractTableDataFromElement(tableRef.current);
       await navigator.clipboard.writeText(tableDataToMarkdown(data));
-      setCopied(true);
+      setCopied(true); 
       window.setTimeout(() => setCopied(false), 1400);
     } catch {
       setCopied(false);
-    }
+    } 
   }
 
   function tableMarkup(tableClassName: string, ref?: Ref<HTMLTableElement>) {
-    return (
+    return ( 
       <Table
         {...props}
-        className={`min-w-[34rem] text-left text-xs ${tableClassName} ${className ?? ''}`}
+        className={`min-w-[34rem] text-left text-xs ${tableClassName} ${className ?? ''}`} 
         ref={ref}
       >
         {children}
@@ -184,24 +184,24 @@ const MarkdownTable = memo(function MarkdownTable({
 
   return (
     <>
-      <section className="my-4 min-w-0 overflow-hidden rounded-lg border border-[var(--border-strong)] bg-[var(--pane-raised)]">
+      <section className="my-4 min-w-0 overflow-hidden rounded-lg border border-[var(--border-strong)] bg-[var(--pane-raised)]"> 
         <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-3 py-2">
           <span className="text-[11px] font-medium text-[var(--text-muted)]">Table</span>
-          <div className="flex items-center gap-0.5">
+          <div className="flex items-center gap-0.5"> 
             <Button aria-label={copied ? 'Table copied' : 'Copy table as Markdown'} onClick={() => void copyTable()} size="icon-sm" variant="ghost">
-              <Icon name={copied ? 'check' : 'copy'} size={14} />
+              <Icon name={copied ? 'check' : 'copy'} size={14} /> 
             </Button>
             <Button aria-label="Download table as CSV" onClick={() => tableRef.current && downloadTable(tableRef.current)} size="icon-sm" variant="ghost">
               <Icon name="download" size={14} />
             </Button>
             <Button aria-label="Expand table" onClick={() => setExpanded(true)} size="icon-sm" variant="ghost">
-              <Icon name="maximize" size={14} />
+              <Icon name="maximize" size={14} /> 
             </Button>
           </div>
-        </div>
+        </div> 
         <div className="max-h-[22rem] overflow-auto p-1.5">
           {tableMarkup('rounded-md border border-[var(--border)]', tableRef)}
-        </div>
+        </div> 
       </section>
 
       <Dialog onOpenChange={setExpanded} open={expanded}>
@@ -209,51 +209,51 @@ const MarkdownTable = memo(function MarkdownTable({
           <DialogHeader className="shrink-0 border-b border-[var(--border)] px-5 py-4 pr-12">
             <DialogTitle className="text-sm">Expanded table</DialogTitle>
             <DialogDescription className="text-xs">Scroll to view all rows and columns.</DialogDescription>
-          </DialogHeader>
+          </DialogHeader> 
           <div className="min-h-0 flex-1 overflow-auto p-5">
             {tableMarkup('min-w-full rounded-md border border-[var(--border)]')}
           </div>
         </DialogContent>
-      </Dialog>
+      </Dialog> 
     </>
   );
 });
 
 const MARKDOWN_COMPONENTS: Components = {
-  table: MarkdownTable,
+  table: MarkdownTable, 
   thead: MarkdownTableHeader,
   tbody: MarkdownTableBody,
   tr: MarkdownTableRow,
   th: MarkdownTableHead,
   td: MarkdownTableCell,
-};
+}; 
 
 const MarkdownContent = memo(function MarkdownContent({
   content,
   streaming = false,
   className = '',
-}: {
+}: { 
   content: string;
   streaming?: boolean;
   className?: string;
 }) {
   return (
-    <Streamdown
+    <Streamdown 
       className={`${MARKDOWN_CLASS} ${className}`}
       components={MARKDOWN_COMPONENTS}
       lineNumbers={false}
       mode={streaming ? 'streaming' : 'static'}
     >
-      {content}
+      {content} 
     </Streamdown>
   );
 });
 
 const MessageRow = memo(function MessageRow({ message }: { message: Message }) {
-  const isUser = message.role === 'user';
+  const isUser = message.role === 'user'; 
   const isAssistant = message.role === 'assistant';
   return (
-    <article className={`flex min-w-0 w-full [content-visibility:auto] [contain-intrinsic-size:0_96px] ${isUser ? 'justify-end' : 'justify-start'}`}>
+    <article className={`flex min-w-0 w-full [content-visibility:auto] [contain-intrinsic-size:0_96px] ${isUser ? 'justify-end' : 'justify-start'}`}> 
       <div
         className={[
           'min-w-0',
@@ -261,31 +261,31 @@ const MessageRow = memo(function MessageRow({ message }: { message: Message }) {
             ? 'max-w-[min(78%,680px)] rounded-[6px] border border-[var(--border)] bg-[var(--pane-raised)] px-3 py-2.5'
             : isAssistant
               ? 'max-w-[780px]'
-              : 'max-w-[780px] border-l border-teal-400/30 pl-4',
+              : 'max-w-[780px] border-l border-teal-400/30 pl-4', 
         ].join(' ')}
       >
         <div className={`mb-1.5 flex items-center gap-2 text-[11px] ${isUser ? 'justify-end' : ''}`}>
           {!isUser ? <span className="text-[var(--text-muted)]">{roleIcon(message.role)}</span> : null}
-          <span className="font-medium text-[var(--text-secondary)]">{roleLabel(message.role)}</span>
+          <span className="font-medium text-[var(--text-secondary)]">{roleLabel(message.role)}</span> 
           <time className="text-[10px] tabular-nums text-[var(--text-muted)]" dateTime={message.createdAt}>{formatTime(message.createdAt)}</time>
         </div>
-        <MarkdownContent
+        <MarkdownContent 
           className={isUser ? 'text-[var(--text)] [&_p]:whitespace-pre-wrap' : 'text-[#d2d7dc]'}
           content={message.content}
         />
       </div>
     </article>
-  );
+  ); 
 });
 
 function TypingIndicator({ label }: { label: string }) {
   return (
-    <div className="flex items-center gap-2 text-xs text-[var(--text-muted)]" role="status" aria-live="polite">
+    <div className="flex items-center gap-2 text-xs text-[var(--text-muted)]" role="status" aria-live="polite"> 
       <Icon className="animate-pulse text-[var(--accent)]" name="spark" size={13} />
       <span>{label}</span>
     </div>
   );
-}
+} 
 
 function toolInputPreview(input: Record<string, unknown> | undefined): string | undefined {
   if (!input) return undefined;
