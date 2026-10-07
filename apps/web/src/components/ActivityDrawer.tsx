@@ -11,55 +11,55 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '
 
 type ActivityDrawerProps = {
   open: boolean;
-  onOpenChange: (open: boolean) => void;
-  run: RunDetails | null;
+  onOpenChange: (open: boolean) => void; 
+  run: RunDetails | null; 
   onCancelRun: (runId: string) => Promise<void>;
   onRetryRun: (runId?: string) => Promise<void>;
   isRetryingRun: boolean;
   onRunDemo: () => Promise<void>;
   isRunStarting: boolean;
-};
+}; 
 
-function displayValue(value: unknown, empty = 'No data recorded') {
-  if (value === undefined || value === null || value === '') {
+function displayValue(value: unknown, empty = 'No data recorded') { 
+  if (value === undefined || value === null || value === '') { 
     return empty;
   }
-  if (typeof value === 'string') {
+  if (typeof value === 'string') { 
     return value;
   }
-  try {
+  try { 
     return JSON.stringify(value, null, 2) ?? empty;
   } catch {
-    return 'Unable to display this value';
+    return 'Unable to display this value'; 
   }
 }
 
-function criterionLabel(criterion: CompletionCriterion): string {
+function criterionLabel(criterion: CompletionCriterion): string { 
   switch (criterion.type) {
     case 'browser.url':
       return `Browser URL is ${criterion.url}`;
-    case 'file.exists':
+    case 'file.exists': 
       return `File exists: ${criterion.path}`;
     case 'file.contains':
       return `File contains expected content: ${criterion.path}`;
-    case 'window.open':
+    case 'window.open': 
       return `Window open${criterion.titleIncludes ? `: ${criterion.titleIncludes}` : ''}`;
     case 'window.focused':
       return `Window focused${criterion.titleIncludes ? `: ${criterion.titleIncludes}` : ''}`;
-    case 'custom':
+    case 'custom': 
       return criterion.description;
   }
 }
-
+ 
 function statusClasses(status: string) {
   if (['completed', 'connected', 'ok'].includes(status)) {
     return { text: 'text-emerald-300', dot: 'bg-emerald-400' };
-  }
+  } 
   if (['running', 'pending', 'starting', 'reconnecting'].includes(status)) {
     return { text: 'text-teal-300', dot: 'bg-teal-300' };
   }
   if (['failed', 'blocked', 'cancelled', 'error', 'unavailable'].includes(status)) {
-    return { text: 'text-red-300', dot: 'bg-red-400' };
+    return { text: 'text-red-300', dot: 'bg-red-400' }; 
   }
   return { text: 'text-[#79838f]', dot: 'bg-[#606975]' };
 }
@@ -67,27 +67,27 @@ function statusClasses(status: string) {
 function actionText(step: RunStep) {
   if (step.decision?.type === 'action') {
     return `${step.decision.tool}\n${displayValue(step.decision.input)}`;
-  }
+  } 
   if (step.toolName) {
     return `${step.toolName}\n${displayValue(step.toolInput)}`;
   }
   if (step.decision?.type === 'complete') {
-    return 'completion requested';
+    return 'completion requested'; 
   }
   if (step.decision?.type === 'blocked') {
     return `blocked\n${step.decision.reason}`;
   }
-  return 'No action recorded';
+  return 'No action recorded'; 
 }
 
 function stepTitle(step: RunStep) {
   if (step.toolName) {
-    return humanize(step.toolName);
+    return humanize(step.toolName);  
   }
   if (step.decision?.type === 'action') {
     return humanize(step.decision.tool);
   }
-  if (step.decision?.type === 'complete') {
+  if (step.decision?.type === 'complete') { 
     return 'Complete task';
   }
   if (step.decision?.type === 'blocked') {
@@ -95,44 +95,44 @@ function stepTitle(step: RunStep) {
   }
   return humanize(step.phase);
 }
-
+ 
 function StepMark({ active, failed }: { active: boolean; failed: boolean }) {
-  if (failed) {
+  if (failed) { 
     return <span className="flex size-5 items-center justify-center rounded-full bg-red-400/10 text-red-300"><Icon name="x" size={12} /></span>;
   }
-  if (active) {
+  if (active) { 
     return <span className="flex size-5 items-center justify-center rounded-full bg-teal-400/10 text-teal-300"><span className="size-1.5 animate-pulse rounded-full bg-teal-300" /></span>;
   }
-  return <span className="flex size-5 items-center justify-center rounded-full bg-emerald-400/10 text-emerald-300"><Icon name="check" size={12} /></span>;
+  return <span className="flex size-5 items-center justify-center rounded-full bg-emerald-400/10 text-emerald-300"><Icon name="check" size={12} /></span>; 
 }
 
 const TraceStep = memo(function TraceStep({ step, active }: { step: RunStep; active: boolean }) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(false); 
   const failed = step.phase === 'failed' || step.phase === 'blocked';
   const verification = step.verification;
   return (
-    <Collapsible className="border-b border-white/[0.06] last:border-b-0" onOpenChange={setExpanded} open={expanded}>
+    <Collapsible className="border-b border-white/[0.06] last:border-b-0" onOpenChange={setExpanded} open={expanded}> 
       <CollapsibleTrigger className="flex w-full items-center gap-3 py-3 text-left outline-none transition-colors hover:text-[#f1f3f5] focus-visible:ring-2 focus-visible:ring-teal-400/50">
-        <StepMark active={active} failed={failed} />
+        <StepMark active={active} failed={failed} /> 
         <span className="min-w-0 flex-1 truncate text-sm text-[#d7dde3]">{stepTitle(step)}</span>
-        <span className="text-[11px] text-[#606975]">{expanded ? 'Hide' : 'Details'}</span>
+        <span className="text-[11px] text-[#606975]">{expanded ? 'Hide' : 'Details'}</span> 
         <Icon className={`shrink-0 text-[#606975] transition-transform ${expanded ? 'rotate-180' : ''}`} name="chevron-down" size={14} />
       </CollapsibleTrigger>
       <CollapsibleContent className="pb-3 pl-8">
-        <div className="space-y-3 text-xs">
+        <div className="space-y-3 text-xs"> 
           <DetailBlock label="Reason" value={step.decision?.reasoningSummary ?? 'Operational decision recorded by the provider.'} />
           <DetailBlock label="Action" value={actionText(step)} pre />
           <DetailBlock label="Observation" value={displayValue(step.observation ?? step.toolResult)} pre />
-          <div>
+          <div> 
             <p className="mb-1 text-[11px] font-medium text-[#606975]">Verification</p>
-            {verification ? (
+            {verification ? ( 
               <div className="space-y-1.5">
-                {verification.criteria.map((criterion, index) => (
+                {verification.criteria.map((criterion, index) => ( 
                   <div className="flex items-start gap-2 text-[#aeb7c1]" key={`${criterionLabel(criterion.criterion)}-${index}`}>
                     <Icon className={criterion.passed ? 'mt-0.5 shrink-0 text-emerald-300' : 'mt-0.5 shrink-0 text-red-300'} name={criterion.passed ? 'check' : 'x'} size={13} />
                     <span>{criterion.message || criterionLabel(criterion.criterion)}</span>
-                  </div>
-                ))}
+                  </div> 
+                ))} 
                 <p className="pt-1 text-[#79838f]">{verification.summary}</p>
               </div>
             ) : (
