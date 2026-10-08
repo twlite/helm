@@ -2,7 +2,7 @@
 
 Helm's persistent memory is a small global store for information that can help
 with later tasks. It is separate from message history and from run-local
-context compaction. A recalled memory is a contextual hint; it does not prove
+context compaction. A recalled memory is a contextual hint. It does not prove
 that an external fact, page, or resource is still current.
 
 ## Explicit memory in the acting loop
